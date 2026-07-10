@@ -9,6 +9,7 @@ backends, stores, Herdr, Herdres, Telegram, or connector modules.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -27,7 +28,7 @@ from .models import (
 
 COMMAND_SCHEMA_VERSION = 1
 
-ALLOWED_ACTIONS = frozenset({"noop", "read_snapshot", "resolve_target", "send_instruction"})
+ALLOWED_ACTIONS = frozenset({"noop", "read_snapshot", "resolve_target", "send_instruction", "send_keys"})
 REQUEST_ALLOWED_FIELDS = frozenset(
     {"schema_version", "action", "request_id", "dry_run", "target", "instruction", "params"}
 )
@@ -78,6 +79,17 @@ VALID_STATUSES = frozenset(
 # Neutral target fields permitted in command requests.
 TARGET_ALLOWED_FIELDS = frozenset({"worker_id", "worker_fingerprint", "space_id", "name"})
 INSTRUCTION_ALLOWED_FIELDS = frozenset({"text"})
+
+# send_keys carries an ordered `params.steps` list. Each step replays EITHER a run of neutral key
+# tokens (`pane.send_keys`) OR a run of literal text (`pane.send_text`) — enough to answer a TUI
+# prompt (digit+enter, arrow toggles, or navigate + type a write-in). Key tokens are a fixed neutral
+# whitelist (navigation + a digit + ctrl+<letter>); they never carry routing/identity data.
+STEP_ALLOWED_FIELDS = frozenset({"keys", "text"})
+_ALLOWED_KEY_TOKEN_RE = re.compile(
+    r"^(?:enter|tab|space|backspace|escape|up|down|left|right|home|end|delete|pageup|pagedown|[0-9]|ctrl\+[a-z])$"
+)
+MAX_KEYS_STEPS = 32
+MAX_KEYS_PER_STEP = 64
 
 # Connector, low-level terminal, routing, and private fields rejected anywhere in a request.
 FORBIDDEN_REQUEST_FIELDS = FORBIDDEN_FIELD_NAMES
@@ -196,6 +208,45 @@ def validate_instruction_text(text: Any) -> dict[str, Any] | None:
                 STATUS_INVALID_REQUEST,
                 "instruction.text must not contain raw control characters",
             )
+    return None
+
+
+def keys_error(code: str, message: str) -> dict[str, Any]:
+    return error_value(code, message, details={"field": "params.steps"})
+
+
+def validate_pane_steps(steps: Any) -> dict[str, Any] | None:
+    """Validate a send_keys `params.steps` list (ordered key/text replay), or None if valid.
+
+    Each step is a mapping with EXACTLY one of `keys` (a non-empty list of whitelisted neutral key
+    tokens) or `text` (a literal string validated exactly like instruction.text). Text steps reuse
+    validate_instruction_text so a write-in cannot smuggle escape/control sequences."""
+    if not isinstance(steps, list) or not steps:
+        return keys_error(STATUS_INVALID_REQUEST, "params.steps must be a non-empty list")
+    if len(steps) > MAX_KEYS_STEPS:
+        return keys_error(STATUS_INVALID_REQUEST, f"params.steps exceeds {MAX_KEYS_STEPS} steps")
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            return keys_error(STATUS_INVALID_REQUEST, f"params.steps[{index}] must be a mapping")
+        extra = set(step) - STEP_ALLOWED_FIELDS
+        if extra:
+            return keys_error(STATUS_INVALID_REQUEST, f"params.steps[{index}] has disallowed keys {sorted(extra)}")
+        has_keys, has_text = "keys" in step, "text" in step
+        if has_keys == has_text:
+            return keys_error(STATUS_INVALID_REQUEST, f"params.steps[{index}] needs exactly one of keys/text")
+        if has_keys:
+            keys = step["keys"]
+            if not isinstance(keys, list) or not keys:
+                return keys_error(STATUS_INVALID_REQUEST, f"params.steps[{index}].keys must be a non-empty list")
+            if len(keys) > MAX_KEYS_PER_STEP:
+                return keys_error(STATUS_INVALID_REQUEST, f"params.steps[{index}].keys exceeds {MAX_KEYS_PER_STEP}")
+            for token in keys:
+                if not isinstance(token, str) or not _ALLOWED_KEY_TOKEN_RE.match(token):
+                    return keys_error(STATUS_INVALID_REQUEST, f"params.steps[{index}] has an unknown key token {token!r}")
+        else:
+            text_err = validate_instruction_text(step["text"])
+            if text_err is not None:
+                return keys_error(STATUS_INVALID_REQUEST, f"params.steps[{index}].text is invalid")
     return None
 
 
@@ -360,6 +411,23 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
             return error_value(
                 STATUS_INVALID_REQUEST,
                 "non-dry-run send_instruction requires request_id",
+                details={"field": "request_id"},
+            )
+
+    if request.action == "send_keys":
+        if request.target is None or not _target_has_explicit_selector(request.target):
+            return error_value(
+                STATUS_INVALID_REQUEST,
+                "send_keys requires at least one explicit target selector",
+                details={"field": "target", "allowed": sorted(TARGET_ALLOWED_FIELDS)},
+            )
+        steps_err = validate_pane_steps((request.params or {}).get("steps"))
+        if steps_err is not None:
+            return steps_err
+        if not request.dry_run and not has_nonblank_request_id(request.request_id):
+            return error_value(
+                STATUS_INVALID_REQUEST,
+                "non-dry-run send_keys requires request_id",
                 details={"field": "request_id"},
             )
 

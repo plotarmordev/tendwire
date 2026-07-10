@@ -387,6 +387,30 @@ def _submit_private_pane_input(client: Any, pane_id: str, instruction_text: str,
     )
 
 
+def _submit_private_pane_keys(client: Any, pane_id: str, steps: list[Mapping[str, Any]], *, timeout: float) -> None:
+    """Replay an ordered send_keys step list to a pane. Each step sends EITHER a run of neutral key
+    tokens (pane.send_keys) or a run of literal text (pane.send_text). herdres builds the sequence
+    that answers the TUI prompt (digit+enter, arrow toggles, or navigate + write-in); tendwire relays
+    it verbatim. A small inter-step delay lets the foreground TUI repaint between groups."""
+    for index, step in enumerate(steps):
+        if index:
+            time.sleep(_SUBMIT_ENTER_DELAY_SECONDS)
+        if "text" in step:
+            _socket_request(
+                client,
+                "pane.send_text",
+                {"pane_id": pane_id, "text": str(step.get("text") or "")},
+                timeout=timeout,
+            )
+        else:
+            _socket_request(
+                client,
+                "pane.send_keys",
+                {"pane_id": pane_id, "keys": [str(token) for token in (step.get("keys") or [])]},
+                timeout=timeout,
+            )
+
+
 def _target_state_at_send(worker: Worker) -> str:
     status = str(worker.status or "").strip().lower().replace("-", "_")
     return status or "unknown"
@@ -577,6 +601,114 @@ def _socket_send_envelope(
     )
 
 
+def _socket_send_keys_envelope(
+    config: Config,
+    request: CommandRequest,
+    resolved: ResolvedCommandTarget,
+    *,
+    socket_client_factory: SocketClientFactory | None = None,
+) -> CommandEnvelope:
+    """Deliver a send_keys request over the Herdr socket: resolve the neutral target to a pane and
+    replay params.steps via pane.send_keys / pane.send_text. Mirrors _socket_send_envelope's
+    connect/resolve/error handling, but replays a key/text step list instead of instruction text."""
+    steps = list((request.params or {}).get("steps") or [])
+    if not steps:
+        return CommandEnvelope.from_result(
+            request,
+            ok=False,
+            status=STATUS_BACKEND_FAILED,
+            error=error_value(STATUS_BACKEND_FAILED, "send_keys steps are missing after validation"),
+        )
+
+    factory = socket_client_factory or _default_socket_client_factory
+    client: Any | None = None
+    try:
+        client = factory(config)
+        if not hasattr(client, "request"):
+            raise TypeError("socket client does not expose generic request")
+        if hasattr(client, "connect"):
+            client.connect()
+    except Exception:  # noqa: BLE001
+        if client is not None and hasattr(client, "close"):
+            try:
+                client.close()
+            except Exception:
+                pass
+        return _backend_unavailable(request, "Herdr socket could not be reached")
+
+    from .backends.herdr_protocol import HerdrErrorResponse, HerdrProtocolError
+    from .backends.herdr_socket import (
+        HerdrSocketConnectionError,
+        HerdrSocketDisconnectedError,
+        HerdrSocketTimeoutError,
+    )
+
+    try:
+        pane_id = _private_pane_id_for_binding(
+            client,
+            resolved.binding,
+            timeout=config.herdr_timeout_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if hasattr(client, "close"):
+            client.close()
+        if isinstance(exc, HerdrErrorResponse):
+            return _backend_failure(request, "Herdr socket could not resolve the private send target")
+        if isinstance(
+            exc,
+            HerdrSocketConnectionError | HerdrSocketTimeoutError | HerdrSocketDisconnectedError | HerdrProtocolError,
+        ) or isinstance(exc, OSError):
+            return _backend_unavailable(request, "Herdr socket could not resolve the private send target")
+        if isinstance(exc, (TypeError, ValueError)):
+            return _backend_failure(request, "Herdr socket private send target is unsupported")
+        raise
+
+    if not pane_id:
+        if hasattr(client, "close"):
+            client.close()
+        return _backend_failure(request, "Herdr socket private send target has no pane")
+
+    _append_command_event(
+        config,
+        "command.send_started",
+        request,
+        status=STATUS_PENDING,
+        target_worker_id=resolved.worker.id,
+    )
+    try:
+        _submit_private_pane_keys(
+            client,
+            pane_id,
+            steps,
+            timeout=config.herdr_timeout_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, HerdrErrorResponse):
+            return _backend_failure(request, "Herdr socket pane keys returned an error response")
+        if isinstance(
+            exc,
+            HerdrSocketConnectionError | HerdrSocketTimeoutError | HerdrSocketDisconnectedError | HerdrProtocolError,
+        ) or isinstance(exc, OSError):
+            return _backend_uncertain(request, "Herdr socket pane keys state is uncertain after send start")
+        raise
+    finally:
+        if hasattr(client, "close"):
+            client.close()
+
+    return CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_ACCEPTED,
+        result={
+            "target": {"worker_id": resolved.worker.id},
+            "delivery_state": "submitted",
+            "transport_state": "submitted",
+            "target_state_at_send": _target_state_at_send(resolved.worker),
+            "observed_turn_state": "pending_observation",
+        },
+    )
+
+
 def _envelope_from_receipt(request: CommandRequest, receipt: Mapping[str, Any]) -> CommandEnvelope:
     if receipt.get("payload_fingerprint") != request.payload_fingerprint():
         return CommandEnvelope.error(
@@ -615,8 +747,12 @@ def _envelope_from_receipt(request: CommandRequest, receipt: Mapping[str, Any]) 
     return CommandEnvelope.from_dict(data)
 
 
+# Actions that mutate a pane (real, non-dry-run send) and so need receipts + socket delivery.
+_MUTATING_ACTIONS = frozenset({"send_instruction", "send_keys"})
+
+
 def _reserve_mutating_request(config: Config, request: CommandRequest) -> CommandEnvelope | None:
-    if request.action != "send_instruction" or request.dry_run or not has_nonblank_request_id(request.request_id):
+    if request.action not in _MUTATING_ACTIONS or request.dry_run or not has_nonblank_request_id(request.request_id):
         return None
     if config.db_path is None:
         return _backend_unavailable(request, "command receipt store is unavailable")
@@ -659,7 +795,7 @@ def _save_mutating_result(
     *,
     worker: Worker | None = None,
 ) -> None:
-    if request.action != "send_instruction" or request.dry_run or not has_nonblank_request_id(request.request_id):
+    if request.action not in _MUTATING_ACTIONS or request.dry_run or not has_nonblank_request_id(request.request_id):
         return
     if config.db_path is None:
         return
@@ -673,7 +809,7 @@ def _save_mutating_result(
         result_json=envelope_to_receipt_json(envelope),
         uncertain=envelope.status == STATUS_REQUEST_STATE_UNCERTAIN,
     )
-    if envelope.status == STATUS_ACCEPTED and worker is not None:
+    if request.action == "send_instruction" and envelope.status == STATUS_ACCEPTED and worker is not None:
         upsert_command_pending_turn(
             config.db_path,
             config.host_id,
@@ -725,7 +861,7 @@ def submit_command(
     if validation_error is not None:
         return CommandEnvelope.error(request, validation_error)
 
-    if request.action != "send_instruction" or request.dry_run:
+    if request.action not in _MUTATING_ACTIONS or request.dry_run:
         return _execute_non_mutating(config, request)
 
     receipt_envelope = _reserve_mutating_request(config, request)
@@ -744,14 +880,22 @@ def submit_command(
             envelope = resolved
         else:
             resolved_worker = resolved.worker
-            envelope = _duplicate_instruction_envelope(config, request, resolved.worker)
-            if envelope is None:
-                envelope = _socket_send_envelope(
+            if request.action == "send_keys":
+                envelope = _socket_send_keys_envelope(
                     config,
                     request,
                     resolved,
                     socket_client_factory=socket_client_factory,
                 )
+            else:
+                envelope = _duplicate_instruction_envelope(config, request, resolved.worker)
+                if envelope is None:
+                    envelope = _socket_send_envelope(
+                        config,
+                        request,
+                        resolved,
+                        socket_client_factory=socket_client_factory,
+                    )
 
     _save_mutating_result(config, request, envelope, worker=resolved_worker)
     return envelope

@@ -205,6 +205,53 @@ def _send_instruction_result(request: CommandRequest, context: CommandContext) -
     )
 
 
+def _send_keys_result(request: CommandRequest, context: CommandContext) -> CommandEnvelope:
+    """Pure-path handling for send_keys: resolve the target and preview a dry run. The real key
+    replay is delivered through the daemon socket path (command_submission), so a non-dry-run
+    send_keys that reaches this pure path (no socket backend) reports backend_unsupported."""
+    resolved, _candidates, status = resolve_target(
+        request.target,
+        context.workers,
+        allow_disallowed_status=True,
+        include_backend_target=True,
+    )
+    if status != STATUS_RESOLVED:
+        return _resolve_target_result(request, context.workers)
+    resolved_worker = next(
+        (w for w in context.workers if w.id == (resolved or {}).get("worker_id")),
+        None,
+    )
+    if resolved_worker is not None and resolved_worker.status in {"closed", "failed", "unknown"}:
+        return CommandEnvelope.from_result(
+            request,
+            ok=False,
+            status=STATUS_REJECTED,
+            result={"candidates": [worker_candidate(resolved_worker)]},
+            error=error_value(
+                STATUS_REJECTED,
+                f"target worker status does not allow input: {resolved_worker.status!r}",
+            ),
+        )
+    steps = (request.params or {}).get("steps") or []
+    if request.dry_run:
+        public_target = worker_candidate(resolved_worker) if resolved_worker is not None else (resolved or {})
+        return CommandEnvelope.from_result(
+            request,
+            ok=True,
+            status=STATUS_DRY_RUN,
+            result={"target": public_target, "steps": len(steps)},
+        )
+    return CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status=STATUS_BACKEND_UNSUPPORTED,
+        error=error_value(
+            STATUS_BACKEND_UNSUPPORTED,
+            "send_keys is delivered through the daemon socket path",
+        ),
+    )
+
+
 def execute_command(request: CommandRequest, context: CommandContext) -> CommandEnvelope:
     """Execute a validated command request and return a neutral envelope."""
     validation_error = validate_request(request)
@@ -229,6 +276,9 @@ def execute_command(request: CommandRequest, context: CommandContext) -> Command
 
     if request.action == "send_instruction":
         return _send_instruction_result(request, context)
+
+    if request.action == "send_keys":
+        return _send_keys_result(request, context)
 
     return CommandEnvelope.error(
         request,

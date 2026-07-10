@@ -162,7 +162,62 @@ def _assert_no_forbidden_fields(value: Any, path: str = "$") -> None:
 
 
 def test_allowed_actions_frozen() -> None:
-    assert ALLOWED_ACTIONS == {"noop", "read_snapshot", "resolve_target", "send_instruction"}
+    assert ALLOWED_ACTIONS == {"noop", "read_snapshot", "resolve_target", "send_instruction", "send_keys"}
+
+
+# --- send_keys action ---------------------------------------------------------------------------
+
+def _send_keys_request(steps: Any, *, dry_run: bool = False, request_id: str | None = "req-k1", target: Any = None) -> CommandRequest:
+    return CommandRequest(
+        action="send_keys",
+        request_id=request_id,
+        dry_run=dry_run,
+        target=target if target is not None else {"worker_id": "w-1"},
+        params={"steps": steps},
+    )
+
+
+def test_send_keys_valid_key_and_text_steps() -> None:
+    request = _send_keys_request([{"keys": ["2", "enter"]}, {"text": "dragonfruit"}, {"keys": ["enter"]}])
+    assert validate_request(request) is None
+
+
+def test_send_keys_valid_multi_toggle_sequence() -> None:
+    request = _send_keys_request([{"keys": ["down", "enter"]}, {"keys": ["right", "enter"]}])
+    assert validate_request(request) is None
+
+
+def test_send_keys_requires_target_selector() -> None:
+    request = _send_keys_request([{"keys": ["enter"]}], target={})
+    error = validate_request(request)
+    assert error is not None and error["code"] == STATUS_INVALID_REQUEST
+
+
+def test_send_keys_non_dry_run_requires_request_id() -> None:
+    request = _send_keys_request([{"keys": ["enter"]}], request_id=None)
+    error = validate_request(request)
+    assert error is not None and error["code"] == STATUS_INVALID_REQUEST
+
+
+@pytest.mark.parametrize("steps", [
+    [],                                   # empty
+    "enter",                              # not a list
+    [{"keys": ["enter"], "text": "x"}],   # both keys and text
+    [{"keys": []}],                       # empty key run
+    [{"keys": ["ctrl+shift+u"]}],         # unknown key token
+    [{"keys": ["\x1b"]}],                 # escape byte
+    [{"foo": "bar"}],                     # disallowed step field
+    [{"text": "a\x1bb"}],                 # text with escape sequence
+])
+def test_send_keys_rejects_bad_steps(steps: Any) -> None:
+    request = _send_keys_request(steps)
+    error = validate_request(request)
+    assert error is not None and error["code"] == STATUS_INVALID_REQUEST
+
+
+def test_send_keys_dry_run_needs_no_request_id() -> None:
+    request = _send_keys_request([{"keys": ["1", "enter"]}], dry_run=True, request_id=None)
+    assert validate_request(request) is None
 
 
 def test_command_request_defaults_are_dry_run() -> None:
