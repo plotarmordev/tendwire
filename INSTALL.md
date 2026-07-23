@@ -74,6 +74,13 @@ do not consume Tendwire's shipped example. Keep the four shutdown-hardening
 directives synchronized in that Herdres-owned template and verify the generated
 unit after either repository changes.
 
+Herdr 0.7.5 no longer includes the semantic `pane turn` CLI command. A
+Herdres-managed install must keep `TENDWIRE_HERDR_BIN` pointed at
+`herdr_turn_adapter.py` for generic pane-backed turns. Bare Herdr remains usable
+for snapshots, events, commands, and native Codex/OMP session-backed turns, but
+generic pane turn ingestion fails closed rather than treating terminal
+scrollback as canonical prompt/final content.
+
 `KillMode=control-group` is intentional: the daemon's Herdr adapter and
 isolated turn readers are supervised children in the same service cgroup.
 `SIGTERM` starts Tendwire's bounded shutdown, closes the listening socket, and

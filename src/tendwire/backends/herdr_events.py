@@ -82,7 +82,10 @@ DEFAULT_RECONNECT_DELAY_SECONDS = 0.25
 _AGENT_PAYLOAD_KEYS = ("agents", "workers", "data", "items", "results", "result")
 _PANE_PAYLOAD_KEYS = ("panes", "items", "data", "results", "result")
 _SUPPORTED_EVENT_NAMES = HERDR_OFFICIAL_EVENT_NAMES
-_PANE_SCOPED_REPLAY_EVENT_NAMES = frozenset(
+_HERDR_074_EVENT_NAMES = tuple(
+    event_name for event_name in _SUPPORTED_EVENT_NAMES if event_name != "pane.updated"
+)
+_HERDR_074_PANE_SCOPED_REPLAY_EVENT_NAMES = frozenset(
     {
         "workspace.focused",
         "pane.focused",
@@ -90,10 +93,23 @@ _PANE_SCOPED_REPLAY_EVENT_NAMES = frozenset(
         "pane.output_matched",
     }
 )
-_PANE_SCOPED_FALLBACK_EVENT_NAMES = tuple(
+_HERDR_074_PANE_SCOPED_FALLBACK_EVENT_NAMES = tuple(
+    event_name
+    for event_name in _HERDR_074_EVENT_NAMES
+    if event_name not in _HERDR_074_PANE_SCOPED_REPLAY_EVENT_NAMES
+)
+_PARAMETERIZED_EVENT_NAMES = frozenset(
+    {"pane.agent_status_changed", "pane.output_matched"}
+)
+_GLOBAL_EVENT_NAMES = tuple(
     event_name
     for event_name in _SUPPORTED_EVENT_NAMES
-    if event_name not in _PANE_SCOPED_REPLAY_EVENT_NAMES
+    if event_name not in _PARAMETERIZED_EVENT_NAMES
+)
+_HERDR_074_GLOBAL_EVENT_NAMES = tuple(
+    event_name
+    for event_name in _HERDR_074_EVENT_NAMES
+    if event_name not in _PARAMETERIZED_EVENT_NAMES
 )
 _CLOSED_EVENT_NAMES = frozenset({"pane.closed", "pane.exited"})
 _SPACE_EVENT_NAMES = frozenset(
@@ -106,10 +122,15 @@ _SPACE_EVENT_NAMES = frozenset(
     }
 )
 _WORKTREE_EVENT_NAMES = frozenset({"worktree.created", "worktree.opened", "worktree.removed"})
+# ``pane.updated`` is a refresh notification, not an authoritative PaneInfo
+# observation. Herdr 0.7.5 may emit it with partial or differently shaped pane
+# metadata, so routing it through worker projection can replace the identity
+# inputs established by pane.list. Keep the 474e9ce identity path unchanged.
 _PANE_WORKER_EVENT_NAMES = frozenset({"pane.created", "pane.focused"})
 _TURN_REFRESH_EVENT_NAMES = frozenset(
     {
         "pane.created",
+        "pane.updated",
         "pane.focused",
         "pane.moved",
         "pane.closed",
@@ -304,6 +325,7 @@ def _canonical_event_name(raw_name: Any) -> str | None:
             "agent_observed": "pane.agent_detected",
             "agent_status_changed": "pane.agent_status_changed",
             "agent_status_updated": "pane.agent_status_changed",
+            "pane_output_changed": "pane.updated",
             "pane_observed": "pane.created",
             "pane_detected": "pane.created",
             "workspace_observed": "workspace.updated",
@@ -1040,24 +1062,46 @@ class HerdrEventBackend:
                 client.close()
 
     def _subscribe_event_stream(self, client: Any) -> Any:
-        if self.subscribe_method == HERDR_EVENTS_SUBSCRIBE_METHOD and hasattr(client, "events_subscribe"):
+        # Herdr 0.7.5 strictly validates pane-scoped status subscriptions and
+        # added the general pane.updated event.  Use one bounded mixed
+        # subscription: one global entry per lifecycle/update type and one
+        # status entry per pane.
+        # pane.output_matched is intentionally absent because 0.7.5 requires a
+        # caller-provided match expression; pane.updated is the generic turn
+        # and stream refresh signal.
+        subscriptions = [{"type": event_name} for event_name in _GLOBAL_EVENT_NAMES]
+        subscriptions.extend(
+            {"type": "pane.agent_status_changed", "pane_id": pane_id}
+            for pane_id in self._subscription_pane_ids
+        )
+        params = {"subscriptions": subscriptions}
+        if hasattr(client, "subscribe"):
             try:
-                return client.events_subscribe(
-                    _SUPPORTED_EVENT_NAMES,
+                return client.subscribe(
+                    self.subscribe_method,
+                    params,
                     timeout=self.config.herdr_timeout_seconds,
                     event_timeout=self.config.herdr_timeout_seconds,
                 )
             except TypeError:
-                return client.events_subscribe(_SUPPORTED_EVENT_NAMES)
-            except (HerdrEnvelopeError, HerdrErrorResponse):
-                if not self._subscription_pane_ids:
+                return client.subscribe(self.subscribe_method, params)
+            except HerdrErrorResponse as exc:
+                if not exc.uncorrelated:
                     raise
                 if hasattr(client, "close"):
                     client.close()
                 if hasattr(client, "connect"):
                     client.connect()
-                return self._subscribe_pane_scoped_event_stream(client)
-        params = build_events_subscribe_params(_SUPPORTED_EVENT_NAMES)
+                return self._subscribe_legacy_event_stream(client)
+        if hasattr(client, "events_subscribe"):
+            try:
+                return client.events_subscribe(
+                    _HERDR_074_EVENT_NAMES,
+                    timeout=self.config.herdr_timeout_seconds,
+                    event_timeout=self.config.herdr_timeout_seconds,
+                )
+            except TypeError:
+                return client.events_subscribe(_HERDR_074_EVENT_NAMES)
         try:
             return client.subscribe(
                 self.subscribe_method,
@@ -1068,12 +1112,26 @@ class HerdrEventBackend:
         except TypeError:
             return client.subscribe(self.subscribe_method, params)
 
-    def _subscribe_pane_scoped_event_stream(self, client: Any) -> Any:
-        subscriptions = [
-            {"pane_id": pane_id, "type": event_name}
-            for pane_id in self._subscription_pane_ids
-            for event_name in _PANE_SCOPED_FALLBACK_EVENT_NAMES
-        ]
+    def _subscribe_legacy_event_stream(self, client: Any) -> Any:
+        # Preserve 0.7.4's proven compatibility request: its status event is
+        # parameterized by pane, while unrelated global event variants tolerate
+        # the same pane_id field. Replay-only events remain excluded exactly as
+        # before so reconnecting does not synthesize focus/detection activity.
+        if self._subscription_pane_ids:
+            subscriptions = [
+                {"pane_id": pane_id, "type": event_name}
+                for pane_id in self._subscription_pane_ids
+                for event_name in _HERDR_074_PANE_SCOPED_FALLBACK_EVENT_NAMES
+            ]
+        else:
+            # An empty installation still needs a live stream for future
+            # workspace/pane creation.  A zero-entry legacy fallback merely
+            # repeats the negotiation failure/reconnect loop, so retain every
+            # 0.7.4 event that is valid without a pane parameter.
+            subscriptions = [
+                {"type": event_name}
+                for event_name in _HERDR_074_GLOBAL_EVENT_NAMES
+            ]
         params = {"subscriptions": subscriptions}
         try:
             return client.subscribe(

@@ -686,6 +686,10 @@ def _read_private_turn(
             raise _TurnReadFailed from None
         return None
     if completed.returncode != 0:
+        # Herdr 0.7.5 removed ``pane turn``. Its generic pane.read result is
+        # terminal scrollback, not a canonical prompt/final stream and does
+        # not carry a stable turn identity. Fail closed unless the configured
+        # adapter still provides the semantic command.
         if raise_timeout:
             raise _TurnReadFailed
         return None

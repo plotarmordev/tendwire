@@ -425,6 +425,15 @@ resubscribe to the same official event set.
 
 The daemon owns ongoing turn ingestion. It scans eligible durable Codex, OMP,
 and pane bindings immediately at startup and every two seconds by default.
+For pane bindings, a configured wrapper that still implements
+`pane turn PANE_ID --last --format json` remains authoritative. Standalone
+Herdr 0.7.5 removed that CLI subcommand. Tendwire deliberately does not convert
+generic terminal scrollback into canonical turns: `pane.read` has no stable turn
+identity or prompt/final boundary, so doing so can create duplicate turns and
+publish incomplete terminal output as a final. Bare-Herdr pane ingestion
+therefore reports a fixed adapter failure until a semantic wrapper is selected
+with `TENDWIRE_HERDR_BIN`. Codex and OMP session-backed bindings continue to use
+Tendwire's native readers.
 Persisted
 `pane.created`, `pane.focused`, `pane.moved`, `pane.closed`, `pane.exited`,
 `pane.agent_detected`, `pane.agent_status_changed`, and

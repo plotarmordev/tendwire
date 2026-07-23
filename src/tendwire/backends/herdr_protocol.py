@@ -31,6 +31,7 @@ HERDR_OFFICIAL_EVENT_NAMES = (
     "workspace.focused",
     "pane.created",
     "pane.closed",
+    "pane.updated",
     "pane.focused",
     "pane.moved",
     "pane.exited",
@@ -67,9 +68,16 @@ class HerdrRequestIdMismatchError(HerdrEnvelopeError):
 class HerdrErrorResponse(HerdrProtocolError):
     """Raised for a valid protocol error response."""
 
-    def __init__(self, error: Any, request_id: str) -> None:
+    def __init__(
+        self,
+        error: Any,
+        request_id: str,
+        *,
+        uncorrelated: bool = False,
+    ) -> None:
         self.error = error
         self.request_id = request_id
+        self.uncorrelated = uncorrelated
         message = "Herdr returned an error response"
         if isinstance(error, Mapping):
             raw_message = error.get("message")
@@ -269,11 +277,30 @@ def is_event(envelope: Mapping[str, Any]) -> bool:
     return "event" in envelope and "result" not in envelope and "error" not in envelope
 
 
-def validate_response(envelope: Mapping[str, Any]) -> dict[str, Any]:
+def validate_response(
+    envelope: Mapping[str, Any],
+    *,
+    allow_uncorrelated_error: bool = False,
+) -> dict[str, Any]:
     """Validate a response envelope while tolerating unknown fields."""
-    _validated_id(envelope)
     if not is_response(envelope):
         raise HerdrEnvelopeError("Herdr response must contain exactly one of result or error")
+    # Herdr 0.7.5 emits ``{"id":"", "error":...}`` when subscription
+    # parameters fail schema validation. Only the subscription negotiation
+    # path may opt into that compatibility exception; ordinary requests remain
+    # strictly correlated.
+    error = envelope.get("error")
+    uncorrelated_subscription_error = (
+        allow_uncorrelated_error
+        and is_error_response(envelope)
+        and envelope.get("id") == ""
+        and isinstance(error, Mapping)
+        and error.get("code") == "invalid_request"
+        and isinstance(error.get("message"), str)
+        and error["message"].startswith("invalid request:")
+    )
+    if not uncorrelated_subscription_error:
+        _validated_id(envelope)
     return dict(envelope)
 
 
@@ -296,10 +323,17 @@ def validate_event(envelope: Mapping[str, Any]) -> dict[str, Any]:
     return dict(envelope)
 
 
-def validate_server_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
+def validate_server_envelope(
+    envelope: Mapping[str, Any],
+    *,
+    allow_uncorrelated_error: bool = False,
+) -> dict[str, Any]:
     """Validate a decoded server response or event envelope."""
     if is_response(envelope):
-        return validate_response(envelope)
+        return validate_response(
+            envelope,
+            allow_uncorrelated_error=allow_uncorrelated_error,
+        )
     if is_event(envelope):
         return validate_event(envelope)
     _validated_id(envelope)

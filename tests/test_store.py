@@ -4587,6 +4587,106 @@ def test_source_turn_with_matching_prompt_keeps_command_origin(tmp_path: Path) -
     assert source_rows[0]["source"] == "command"
 
 
+@pytest.mark.parametrize("framing", ["\x01", "\x7f", "\x80", "\x9f"])
+def test_source_turn_edge_framing_controls_match_command_origin(
+    tmp_path: Path,
+    framing: str,
+) -> None:
+    db_path = tmp_path / "turn-source-framing-command.db"
+    config = Config(host_id="turn-host", db_path=db_path)
+    snapshot = project_from_raw(
+        config,
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "claude",
+                "status": "active",
+                "space_id": "space-1",
+            }
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    worker = snapshot.workers[0]
+    assert store_sqlite.upsert_command_pending_turn(
+        db_path,
+        "turn-host",
+        worker,
+        request_id="req-1",
+        instruction_text="hello",
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+
+    assert merge_turn_content(
+        db_path,
+        "turn-host",
+        "worker-1",
+        {
+            "user_text": f"{framing}hello{framing}",
+            "assistant_final_text": "Done.",
+            "complete": True,
+            "has_open_turn": False,
+            "source_turn_id": f"source-framed-{ord(framing)}",
+        },
+        observed_at="2026-01-01T00:01:00+00:00",
+    ) == 1
+
+    payload = turns_payload_from_store(db_path, "turn-host", snapshot=snapshot)
+    source_row = next(
+        turn for turn in payload["turns"] if turn.get("assistant_final_text") == "Done."
+    )
+    assert source_row["origin_command_id"] == "req-1"
+
+
+def test_source_turn_interior_control_does_not_match_command_origin(tmp_path: Path) -> None:
+    db_path = tmp_path / "turn-source-interior-control.db"
+    config = Config(host_id="turn-host", db_path=db_path)
+    snapshot = project_from_raw(
+        config,
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "claude",
+                "status": "active",
+                "space_id": "space-1",
+            }
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    worker = snapshot.workers[0]
+    assert store_sqlite.upsert_command_pending_turn(
+        db_path,
+        "turn-host",
+        worker,
+        request_id="req-1",
+        instruction_text="hello",
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+
+    assert merge_turn_content(
+        db_path,
+        "turn-host",
+        "worker-1",
+        {
+            "user_text": "hel\x01lo",
+            "assistant_final_text": "Separate turn.",
+            "complete": True,
+            "has_open_turn": False,
+            "source_turn_id": "source-interior-control",
+        },
+        observed_at="2026-01-01T00:01:00+00:00",
+    ) == 1
+
+    payload = turns_payload_from_store(db_path, "turn-host", snapshot=snapshot)
+    source_row = next(
+        turn
+        for turn in payload["turns"]
+        if turn.get("assistant_final_text") == "Separate turn."
+    )
+    assert source_row.get("origin_command_id") is None
+
+
 def test_store_save_latest_host_scope_and_list_hosts(tmp_path: Path) -> None:
     db_path = tmp_path / "tendwire.db"
     config_a = Config(host_id="host-a", db_path=db_path)

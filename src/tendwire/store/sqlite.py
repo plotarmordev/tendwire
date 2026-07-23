@@ -16875,7 +16875,21 @@ _TURN_IDENTITY_SEED_FIELDS = (
 
 
 def _turn_merge_match_text(value: Any) -> str:
-    return "\n".join(" ".join(line.split()) for line in str(value or "").splitlines()).strip()
+    raw = str(value or "")
+    start = 0
+    end = len(raw)
+
+    def is_framing_control(char: str) -> bool:
+        code = ord(char)
+        return (code < 32 and code not in {9, 10}) or 0x7F <= code <= 0x9F
+
+    while start < end and is_framing_control(raw[start]):
+        start += 1
+    while end > start and is_framing_control(raw[end - 1]):
+        end -= 1
+    return "\n".join(
+        " ".join(line.split()) for line in raw[start:end].splitlines()
+    ).strip()
 
 
 def _turn_merge_score(payload: Mapping[str, Any], content: Mapping[str, Any]) -> tuple[int, str, str]:

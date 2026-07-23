@@ -155,7 +155,11 @@ class HerdrSocketClient:
     ) -> Any:
         """Send one request and return its raw result payload."""
         request_id, deadline = self._send_request(method, params, timeout=timeout)
-        response = self._read_response(request_id, deadline=deadline)
+        response = self._read_response(
+            request_id,
+            deadline=deadline,
+            allow_uncorrelated_error=False,
+        )
         if is_error_response(response):
             raise HerdrErrorResponse(error_payload(response), request_id)
         return result_payload(response)
@@ -170,7 +174,11 @@ class HerdrSocketClient:
     ) -> HerdrEventStream:
         """Send a subscription request and return an iterator over its events."""
         request_id, deadline = self._send_request(method, params, timeout=timeout)
-        response = self._read_response(request_id, deadline=deadline)
+        response = self._read_response(
+            request_id,
+            deadline=deadline,
+            allow_uncorrelated_error=True,
+        )
         if is_error_response(response):
             raise HerdrErrorResponse(error_payload(response), request_id)
         return HerdrEventStream(
@@ -324,9 +332,18 @@ class HerdrSocketClient:
             self.close()
             raise HerdrSocketDisconnectedError("Herdr socket disconnected during write") from exc
 
-    def _read_response(self, request_id: str, *, deadline: float) -> dict[str, Any]:
+    def _read_response(
+        self,
+        request_id: str,
+        *,
+        deadline: float,
+        allow_uncorrelated_error: bool,
+    ) -> dict[str, Any]:
         while True:
-            envelope = self._read_server_envelope(deadline=deadline)
+            envelope = self._read_server_envelope(
+                deadline=deadline,
+                allow_uncorrelated_error=allow_uncorrelated_error,
+            )
             if is_event(envelope):
                 if len(self._pending_events) >= _MAX_PENDING_EVENTS:
                     raise HerdrEnvelopeError(
@@ -334,15 +351,40 @@ class HerdrSocketClient:
                     )
                 self._pending_events.append(envelope)
                 continue
+            if (
+                allow_uncorrelated_error
+                and is_error_response(envelope)
+                and envelope.get("id") == ""
+            ):
+                # Herdr 0.7.5 does not correlate request-schema errors.  They
+                # still belong to the only in-flight synchronous request and
+                # must reach the caller as a server error, not tear down the
+                # event loop as a malformed envelope.
+                payload = envelope.get("error")
+                if not isinstance(payload, Mapping):
+                    raise HerdrEnvelopeError("Herdr error payload must be an object")
+                raise HerdrErrorResponse(
+                    dict(payload),
+                    request_id,
+                    uncorrelated=True,
+                )
             ensure_response_id(envelope, request_id)
             if not (is_result_response(envelope) or is_error_response(envelope)):
                 raise HerdrEnvelopeError("expected Herdr response envelope")
             return envelope
 
-    def _read_server_envelope(self, *, deadline: float) -> dict[str, Any]:
+    def _read_server_envelope(
+        self,
+        *,
+        deadline: float,
+        allow_uncorrelated_error: bool = False,
+    ) -> dict[str, Any]:
         line = self._read_line(deadline=deadline)
         envelope = parse_json_line(line)
-        return validate_server_envelope(envelope)
+        return validate_server_envelope(
+            envelope,
+            allow_uncorrelated_error=allow_uncorrelated_error,
+        )
 
     def _read_line(self, *, deadline: float) -> bytes:
         while True:

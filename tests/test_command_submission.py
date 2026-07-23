@@ -4029,3 +4029,127 @@ def test_completed_source_command_replay_after_owner_churn_adopts_current_projec
     assert current_revision_count == 1
     assert foreign_keys == []
     assert raw_source not in json.dumps(after_public, sort_keys=True)
+
+
+def test_terminal_id_binding_falls_back_to_agent_list_when_agent_get_refuses(monkeypatch) -> None:
+    # Herdr 0.7.5 regression: agent.get no longer resolves terminal-id targets;
+    # agent.list still publishes terminal_id -> pane_id. A definite error from
+    # agent.get must fall back to the listing instead of terminalizing.
+    from tendwire import command_submission as cs
+    from tendwire.backends.herdr_protocol import HerdrErrorResponse
+
+    calls = []
+
+    def fake_socket_request(client, method, params, *, timeout):
+        calls.append(method)
+        if method == "agent.get":
+            raise HerdrErrorResponse({"code": "agent_not_found", "message": "agent target term_new not found"}, "req-1")
+        if method == "agent.list":
+            return {
+                "agents": [
+                    {"terminal_id": "term_other", "pane_id": "w1:p1"},
+                    {"terminal_id": "term_new", "pane_id": "w1:p9"},
+                ]
+            }
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(cs, "_socket_request", fake_socket_request)
+
+    class _Binding:
+        target_kind = "terminal_id"
+        target_value = "term_new"
+
+    pane_id = cs._private_pane_id_for_binding(object(), _Binding(), timeout=5.0)
+    assert pane_id == "w1:p9"
+    assert calls == ["agent.get", "agent.list"]
+
+    # A non-terminal binding kind must NOT consult the listing: the original
+    # error propagates.
+    class _SessionBinding:
+        target_kind = "agent_session"
+        target_value = "sess-1"
+
+    calls.clear()
+    try:
+        cs._private_pane_id_for_binding(object(), _SessionBinding(), timeout=5.0)
+        raise AssertionError("expected HerdrErrorResponse to propagate")
+    except HerdrErrorResponse:
+        pass
+    assert calls == ["agent.get"]
+
+
+def test_terminal_id_agent_list_fallback_rejects_ambiguous_matches(monkeypatch) -> None:
+    from tendwire import command_submission as cs
+    from tendwire.backends.herdr_protocol import HerdrErrorResponse
+
+    def fake_socket_request(client, method, params, *, timeout):
+        if method == "agent.get":
+            raise HerdrErrorResponse(
+                {"code": "agent_not_found", "message": "target not found"},
+                "req-1",
+            )
+        if method == "agent.list":
+            return {
+                "agents": [
+                    {"terminal_id": "term-shared", "pane_id": "w1:p1"},
+                    {"terminal_id": "term-shared", "pane_id": "w1:p2"},
+                ]
+            }
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(cs, "_socket_request", fake_socket_request)
+
+    class _Binding:
+        target_kind = "terminal_id"
+        target_value = "term-shared"
+
+    with pytest.raises(ValueError, match="ambiguous agent.list terminal_id match"):
+        cs._private_pane_id_for_binding(object(), _Binding(), timeout=5.0)
+
+
+@pytest.mark.parametrize(
+    ("agents", "expected"),
+    [
+        (
+            [
+                {"terminal_id": "term-shared", "pane_id": "w1:p1"},
+                {"terminal_id": "term-shared", "pane_id": "w1:p1"},
+            ],
+            "w1:p1",
+        ),
+        ([], ""),
+    ],
+)
+def test_terminal_id_agent_list_fallback_uses_one_unique_mapping(
+    agents,
+    expected,
+) -> None:
+    from tendwire import command_submission as cs
+
+    assert (
+        cs._pane_id_from_terminal_listing(
+            {"agents": agents},
+            "term-shared",
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [
+        None,
+        {},
+        {"agents": {}},
+        {"agents": ["not-an-agent"]},
+        {"agents": [{"terminal_id": "term-shared"}]},
+        {"agents": [{"terminal_id": "", "pane_id": "w1:p1"}]},
+        {"agents": [{"terminal_id": "term-shared", "pane_id": ""}]},
+        {"agents": [{"terminal_id": "term-shared", "pane_id": 7}]},
+    ],
+)
+def test_terminal_id_agent_list_fallback_rejects_malformed_listing(listing) -> None:
+    from tendwire import command_submission as cs
+
+    with pytest.raises(ValueError, match="invalid agent.list"):
+        cs._pane_id_from_terminal_listing(listing, "term-shared")
