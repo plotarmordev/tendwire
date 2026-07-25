@@ -283,6 +283,28 @@ def test_ordinary_request_rejects_uncorrelated_empty_id_error(tmp_path: Path) ->
         client.close()
 
 
+def test_ordinary_request_rejects_idless_unknown_variant_error(
+    tmp_path: Path,
+) -> None:
+    def handler(conn: _Connection) -> None:
+        conn.read_request()
+        conn.send_json(
+            {
+                "id": "",
+                "error": {
+                    "code": "invalid_request",
+                    "message": "invalid request: unknown variant `pane.turns`, expected one of `pane.read`, `pane.list`, `agent.list`",
+                },
+            }
+        )
+
+    with _FakeHerdrServer(tmp_path, handler) as server:
+        client = HerdrSocketClient(str(server.path), timeout=1)
+        with pytest.raises(HerdrEnvelopeError):
+            client.pane_turns({"pane_id": "w1:p1", "since": 0})
+        client.close()
+
+
 def test_client_non_utf8_response_raises_protocol_error(tmp_path: Path) -> None:
     def handler(conn: _Connection) -> None:
         conn.read_request()

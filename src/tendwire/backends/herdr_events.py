@@ -1282,6 +1282,7 @@ class HerdrEventBackend:
         *,
         since: int,
         expected_epoch: int | None,
+        allow_uncorrelated: bool = False,
     ) -> HerdrPaneTurnsReplay:
         params: dict[str, Any] = {
             "pane_id": str(pane_id),
@@ -1289,12 +1290,15 @@ class HerdrEventBackend:
         }
         if expected_epoch is not None:
             params["expected_epoch"] = int(expected_epoch)
+        optional_keywords = {"timeout": self.config.herdr_timeout_seconds}
+        if allow_uncorrelated:
+            optional_keywords["allow_uncorrelated"] = True
         method = getattr(client, "pane_turns", None)
         if callable(method):
             value = _call_with_optional_keywords(
                 method,
                 (params,),
-                {"timeout": self.config.herdr_timeout_seconds},
+                optional_keywords,
             )
         else:
             request = getattr(client, "request", None)
@@ -1303,7 +1307,7 @@ class HerdrEventBackend:
             value = _call_with_optional_keywords(
                 request,
                 ("pane.turns", params),
-                {"timeout": self.config.herdr_timeout_seconds},
+                optional_keywords,
             )
         return _pane_turns_replay(value, pane_id)
 
@@ -1498,13 +1502,18 @@ class HerdrEventBackend:
     @classmethod
     def _turn_api_method_unsupported(cls, exc: HerdrErrorResponse) -> bool:
         code = cls._herdr_error_code(exc).strip().lower().replace("-", "_")
-        message = cls._herdr_error_message(exc).strip().lower()
+        raw_message = cls._herdr_error_message(exc).lower()
+        message = raw_message.strip()
         if code in {
             "method_not_found",
             "unknown_method",
             "unsupported_method",
             "not_implemented",
         }:
+            return True
+        if code == "invalid_request" and raw_message.startswith(
+            "invalid request: unknown variant"
+        ):
             return True
         return code == "invalid_params" and any(
             marker in message
@@ -1537,6 +1546,7 @@ class HerdrEventBackend:
                 pane_id,
                 since=watermark.last_turn if watermark is not None else 0,
                 expected_epoch=watermark.turn_epoch if watermark is not None else None,
+                allow_uncorrelated=True,
             )
         except HerdrErrorResponse as exc:
             if self._turn_api_method_unsupported(exc):

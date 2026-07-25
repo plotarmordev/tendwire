@@ -129,7 +129,7 @@ _PERSISTED_EVENT_EFFECT_TABLES = (
 
 
 def _table_count(db_path: Path, host_id: str, table: str) -> int:
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
         return int(conn.execute(f"SELECT COUNT(*) FROM {table} WHERE host_id = ?", (host_id,)).fetchone()[0])
 
 def _persisted_event_effect_counts(backend: HerdrEventBackend) -> dict[str, int]:
@@ -5483,6 +5483,104 @@ def test_turn_api_absent_preserves_old_subscription_negotiation(tmp_path: Path) 
         backend.config.host_id,
         _turn_api_pane()["pane_id"],
     ) is None
+
+
+def test_turn_api_idless_unknown_variant_probe_is_inert(
+    tmp_path: Path,
+) -> None:
+    backend = _turn_api_backend(
+        tmp_path,
+        "turn-api-idless-unknown-variant",
+        lambda *_args, **_kwargs: SimpleNamespace(status="updated"),
+    )
+    # Exact envelope emitted by live stock Herdr 0.7.5 (reported upstream):
+    # the id is present but EMPTY, and the method name is backticked.
+    raw_probe_error = {
+        "id": "",
+        "error": {
+            "code": "invalid_request",
+            "message": "invalid request: unknown variant `pane.turns`, expected one of `pane.read`, `pane.list`, `agent.list`",
+        },
+    }
+
+    def handler(conn: _SocketConnection) -> None:
+        probe = conn.read_request()
+        assert probe["method"] == "pane.turns"
+        conn.send_json(raw_probe_error)
+
+        ordinary = conn.read_request()
+        assert ordinary["method"] == "workspace.list"
+        conn.send_json({"id": ordinary["id"], "result": {"workspaces": []}})
+
+        subscription = conn.read_request()
+        assert subscription["method"] == HERDR_EVENTS_SUBSCRIBE_METHOD
+        assert all(
+            item["type"] != "pane.turn_completed"
+            for item in subscription["params"]["subscriptions"]
+        )
+        conn.send_json(
+            {
+                "id": subscription["id"],
+                "result": {"type": "subscription_started"},
+            }
+        )
+
+    with _FakeHerdrSocketServer(tmp_path, handler) as server:
+        client = HerdrSocketClient(str(server.path), timeout=1)
+        backend._replay_turns_after_reconcile(client)
+        assert client.workspace_list() == {"workspaces": []}
+        backend._subscribe_event_stream(client)
+        client.close()
+
+    assert [request["method"] for request in server.requests] == [
+        "pane.turns",
+        "workspace.list",
+        HERDR_EVENTS_SUBSCRIBE_METHOD,
+    ]
+    assert backend._turn_api_supported is False
+    assert (
+        _table_count(
+            backend.db_path,
+            backend.config.host_id,
+            "herdr_turn_watermarks",
+        )
+        == 0
+    )
+    assert get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        _turn_api_pane()["pane_id"],
+    ) is None
+
+
+def test_turn_api_unknown_variant_classifier_requires_exact_code_and_prefix() -> None:
+    assert HerdrEventBackend._turn_api_method_unsupported(
+        HerdrErrorResponse(
+            {
+                "code": "invalid_request",
+                "message": "invalid request: unknown variant pane.turns",
+            },
+            "probe",
+        )
+    )
+    assert not HerdrEventBackend._turn_api_method_unsupported(
+        HerdrErrorResponse(
+            {
+                "code": "invalid_params",
+                "message": "invalid request: unknown variant pane.turns",
+            },
+            "probe",
+        )
+    )
+    assert not HerdrEventBackend._turn_api_method_unsupported(
+        HerdrErrorResponse(
+            {
+                "code": "invalid_request",
+                "message": "pane.turns failed: unknown variant",
+            },
+            "probe",
+        )
+    )
 
 
 def test_turn_api_first_connect_baselines_full_ring_without_processing(
