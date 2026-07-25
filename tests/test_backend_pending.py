@@ -1449,7 +1449,7 @@ def test_current_schema_creation_has_exact_binding_and_claim_state(tmp_path: Pat
     db = tmp_path / "current-schema.db"
     init_store(db)
     with sqlite3.connect(db) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == STORE_SCHEMA_VERSION == 18
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == STORE_SCHEMA_VERSION == 19
         columns = {
             str(row[1])
             for row in conn.execute("PRAGMA table_info(backend_pending)").fetchall()

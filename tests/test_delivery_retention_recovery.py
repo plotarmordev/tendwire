@@ -973,7 +973,7 @@ def test_v12_migration_uses_effective_recovery_lineage_without_repost_or_hold(
     api = ConnectorOutboxAPI(db_path, HOST_ID)
     assert api.poll({"name": FINAL_NAME, "limit": 100})["items"] == []
     with sqlite3.connect(str(db_path)) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == store_sqlite.STORE_SCHEMA_VERSION == 18
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == store_sqlite.STORE_SCHEMA_VERSION == 19
         anchor = conn.execute(
             """
             SELECT delivery_kind, status

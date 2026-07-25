@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier
@@ -324,6 +325,143 @@ def test_final_fifo_is_strict_per_worker_but_isolates_other_workers(tmp_path: Pa
     assert [item["key"] for item in items] == [worker_b_key]
 
 
+def test_poll_drains_one_hundred_independent_due_lanes_in_one_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "hundred-lane-backlog.db"
+    current = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(store_sqlite, "utc_timestamp", lambda: current.isoformat())
+    for index in range(100):
+        _enqueue_final_root(
+            db_path,
+            key_suffix=f"{index:064d}",
+            ordering_key=f"worker-{index}",
+        )
+
+    before = store_sqlite.store_status(db_path, "host-a")["outbox"]
+    items = poll_connector_outbox(
+        db_path,
+        "host-a",
+        "turn-final",
+        limit=100,
+        now=(current + timedelta(seconds=29)).isoformat(),
+    )["items"]
+    after = store_sqlite.store_status(db_path, "host-a")["outbox"]
+
+    assert before["due"] == 100
+    assert before["starved"] is False
+    assert len(items) == 100
+    assert len({item["key"] for item in items}) == 100
+    assert after["due"] == 0
+    assert after["starved"] is False
+
+
+def test_outbox_health_ages_retry_from_due_time_and_respects_private_ack_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "outbox-health-deadlines.db"
+    current = [datetime(2026, 1, 2, tzinfo=timezone.utc)]
+    monkeypatch.setattr(
+        store_sqlite,
+        "utc_timestamp",
+        lambda: current[0].isoformat(),
+    )
+    _enqueue(db_path, key="retry-due-now", status="retry")
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
+        conn.execute(
+            """
+            UPDATE connector_outbox
+            SET next_attempt_at = ?
+            WHERE delivery_key = 'retry-due-now'
+            """,
+            (current[0].isoformat(),),
+        )
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at, next_attempt_at
+            ) VALUES (
+                'host-a', 'attention', 'awaiting-private-deadline',
+                'awaiting_ack', '{}', ?, ?, ?, NULL
+            )
+            """,
+            (
+                json.dumps(
+                    {
+                        "ack_deadline_at": (
+                            current[0] + timedelta(seconds=60)
+                        ).isoformat()
+                    }
+                ),
+                "2026-01-01T00:00:00+00:00",
+                current[0].isoformat(),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at, next_attempt_at
+            ) VALUES (
+                'host-a', 'attention', 'awaiting-malformed-private-state',
+                'awaiting_ack', '{}', 'not-json', ?, ?, ?
+            )
+            """,
+            (
+                "2026-01-01T00:00:00+00:00",
+                current[0].isoformat(),
+                (current[0] + timedelta(seconds=90)).isoformat(),
+            ),
+        )
+
+    fresh = store_sqlite.store_status(db_path, "host-a")["outbox"]
+    current[0] += timedelta(seconds=31)
+    starved = store_sqlite.store_status(db_path, "host-a")["outbox"]
+    current[0] += timedelta(seconds=30)
+    overdue = store_sqlite.store_status(db_path, "host-a")["outbox"]
+
+    assert fresh["oldest_due_at"] == "2026-01-02T00:00:00+00:00"
+    assert fresh["starved"] is False
+    assert fresh["overdue_awaiting_ack"] == 0
+    assert starved["starved"] is True
+    assert starved["overdue_awaiting_ack"] == 0
+    assert overdue["overdue_awaiting_ack"] == 1
+
+
+def test_retry_with_malformed_availability_is_due_and_pollable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "malformed-retry-availability.db"
+    current = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    monkeypatch.setattr(store_sqlite, "utc_timestamp", lambda: current.isoformat())
+    _enqueue(db_path, key="retry-malformed-availability", status="retry")
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
+        conn.execute(
+            """
+            UPDATE connector_outbox
+            SET next_attempt_at = 'not-a-timestamp'
+            WHERE delivery_key = 'retry-malformed-availability'
+            """
+        )
+
+    health = store_sqlite.store_status(db_path, "host-a")["outbox"]
+    polled = poll_connector_outbox(
+        db_path,
+        "host-a",
+        "attention",
+        now=current.isoformat(),
+    )["items"]
+
+    assert health["due"] == 1
+    assert health["oldest_due_at"] == "2026-01-01T00:00:00+00:00"
+    assert health["starved"] is True
+    assert [item["key"] for item in polled] == ["retry-malformed-availability"]
+
+
 def test_reclaim_allows_fresh_ref_and_rejects_stale_ref(tmp_path: Path) -> None:
     db_path = tmp_path / "reclaim.db"
     _enqueue(db_path)
@@ -345,6 +483,69 @@ def test_reclaim_allows_fresh_ref_and_rejects_stale_ref(tmp_path: Path) -> None:
     assert stale_ack["ok"] is False
     assert stale_ack["status"] in {"stale_ref", "expired_ref", "invalid_ref"}
     assert _delivery_rows(db_path)[-1][0] == "leased"
+
+
+@pytest.mark.parametrize("lease_expiry", [None, "not-a-timestamp"])
+def test_noncanonical_lease_deadline_is_reclaimed_instead_of_wedging(
+    tmp_path: Path,
+    lease_expiry: str | None,
+) -> None:
+    db_path = tmp_path / "noncanonical-lease-deadline.db"
+    _enqueue(db_path)
+    api = ConnectorOutboxAPI(db_path, "host-a")
+    first = api.poll({"name": "attention", "lease_seconds": 60})["items"][0]
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
+        if lease_expiry is None:
+            conn.execute(
+                """
+                UPDATE connector_deliveries
+                SET private_state_json = json_remove(
+                    private_state_json,
+                    '$.lease_expires_at'
+                )
+                WHERE outbox_id = (
+                    SELECT id
+                    FROM connector_outbox
+                    WHERE delivery_key = ?
+                )
+                """,
+                (first["key"],),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE connector_deliveries
+                SET private_state_json = json_set(
+                    private_state_json,
+                    '$.lease_expires_at',
+                    ?
+                )
+                WHERE outbox_id = (
+                    SELECT id
+                    FROM connector_outbox
+                    WHERE delivery_key = ?
+                )
+                """,
+                (lease_expiry, first["key"]),
+            )
+
+    assert connector_reclaim_due(
+        db_path,
+        "host-a",
+        "attention",
+        now=first["available_at"],
+    )
+    reclaimed = reclaim_expired_connector_leases(
+        db_path,
+        "host-a",
+        "attention",
+        now=first["available_at"],
+    )
+    second = api.poll({"name": "attention"})["items"][0]
+
+    assert reclaimed["reclaimed"] == 1
+    assert second["key"] == first["key"]
+    assert second["attempt"] == 2
 
 
 def test_ack_delivers_sanitized_response_and_blocks_future_poll(tmp_path: Path) -> None:
@@ -1267,7 +1468,7 @@ def test_v6_to_current_plan_migration_is_bounded_atomic_and_preserves_jobs(
             ).fetchall()
         }
         foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
-    assert version == store_sqlite.STORE_SCHEMA_VERSION == 18
+    assert version == store_sqlite.STORE_SCHEMA_VERSION == 19
     assert plan_row == (plan["plan_token"], 1, None, "active")
     assert job_count == 2
     assert outbox_count == 3
@@ -2647,6 +2848,9 @@ def test_repeated_ack_deadline_reclaims_do_not_exhaust_healthy_source(
             now=current[0].isoformat(),
         )
         assert reclaimed["reclaimed"] == 1
+        current[0] += timedelta(
+            seconds=min(1 << cycle, 30),
+        )
 
     fourth = api.poll({"name": "turn-final"})["items"][0]
 
@@ -2699,6 +2903,7 @@ def test_ack_deadline_reclaims_do_not_inflate_later_failure_budget(
         "turn-final",
         now=current[0].isoformat(),
     )["reclaimed"] == 1
+    current[0] += timedelta(seconds=1)
 
     first_real_attempt = api.poll({"name": "turn-final"})["items"][0]
     first_failure = api.fail(
@@ -2723,7 +2928,19 @@ def test_ack_deadline_reclaims_do_not_inflate_later_failure_budget(
     assert second_failure["status"] == "attempts_exhausted"
 
 
-def test_awaiting_ack_deadline_fails_plan_and_requeues_source(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "deadline_damage",
+    [None, "missing", "malformed"],
+    ids=[
+        "persisted-deadline",
+        "legacy-missing-deadline",
+        "malformed-deadline",
+    ],
+)
+def test_restart_orphaned_awaiting_ack_retries_same_dedup_key_and_preserves_fifo(
+    tmp_path: Path,
+    deadline_damage: str | None,
+) -> None:
     db_path = tmp_path / "awaiting-ack-reclaim.db"
     turn_id, revision = _canonical_turn(db_path, final_text="abcdefgh")
     with sqlite3.connect(str(db_path)) as conn:
@@ -2761,17 +2978,85 @@ def test_awaiting_ack_deadline_fails_plan_and_requeues_source(tmp_path: Path) ->
             "source_ref": source["ref"],
         }
     )
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
+        ordering_key = conn.execute(
+            "SELECT ordering_key FROM connector_outbox WHERE id = ?",
+            (source_id,),
+        ).fetchone()[0]
+        if deadline_damage == "missing":
+            conn.execute(
+                """
+                UPDATE connector_outbox
+                SET next_attempt_at = NULL,
+                    private_state_json = json_remove(
+                        private_state_json,
+                        '$.ack_deadline_at'
+                    )
+                WHERE id = ?
+                """,
+                (source_id,),
+            )
+            conn.execute(
+                """
+                UPDATE connector_deliveries
+                SET private_state_json = json_remove(
+                    private_state_json,
+                    '$.ack_deadline_at'
+                )
+                WHERE outbox_id = ? AND status = 'awaiting_ack'
+                """,
+                (source_id,),
+            )
+        elif deadline_damage == "malformed":
+            conn.execute(
+                """
+                UPDATE connector_outbox
+                SET next_attempt_at = 'not-a-timestamp',
+                    private_state_json = json_set(
+                        private_state_json,
+                        '$.ack_deadline_at',
+                        'not-a-timestamp'
+                    )
+                WHERE id = ?
+                """,
+                (source_id,),
+            )
+            conn.execute(
+                """
+                UPDATE connector_deliveries
+                SET private_state_json = json_set(
+                    private_state_json,
+                    '$.ack_deadline_at',
+                    'not-a-timestamp'
+                )
+                WHERE outbox_id = ? AND status = 'awaiting_ack'
+                """,
+                (source_id,),
+            )
+    tail_key = _enqueue_final_root(
+        db_path,
+        key_suffix="restart-orphan-tail",
+        ordering_key=ordering_key,
+    )
     reclaimed = reclaim_expired_connector_leases(
         db_path,
         "host-a",
         "turn-final",
         now="9999-01-01T00:00:00+00:00",
     )
+    during_backoff = poll_connector_outbox(
+        db_path,
+        "host-a",
+        "turn-final",
+        limit=10,
+        now="9999-01-01T00:00:00+00:00",
+    )["items"]
     retry = poll_connector_outbox(
         db_path,
         "host-a",
         "turn-final",
-        now="9999-01-01T00:00:00+00:00",
+        limit=10,
+        now="9999-01-01T00:00:01+00:00",
     )["items"][0]
     with sqlite3.connect(str(db_path)) as conn:
         plan_state = conn.execute(
@@ -2794,10 +3079,12 @@ def test_awaiting_ack_deadline_fails_plan_and_requeues_source(tmp_path: Path) ->
             (committed["plan_token"],),
         ).fetchall()
     assert reclaimed["reclaimed"] == 1
+    assert during_backoff == []
     assert plan_state == "failed"
     assert source_status == "leased"
     assert job_statuses == [("dead_letter",), ("dead_letter",)]
     assert retry["key"] == source["key"]
+    assert retry["key"] != tail_key
     assert retry["attempt"] == 2
 
 
@@ -2857,7 +3144,7 @@ def test_awaiting_ack_deadline_preserves_explicit_suffix_recovery(
         assert conn.execute(
             "SELECT status FROM connector_outbox WHERE id = ?",
             (source_id,),
-        ).fetchone() == ("queued",)
+        ).fetchone() == ("retry",)
     recovered = api.prepare(
         {
             "schema_version": 1,

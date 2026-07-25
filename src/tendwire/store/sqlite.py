@@ -124,13 +124,16 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 18
+STORE_SCHEMA_VERSION = 19
 CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 TURN_CLAIM_HARD_TTL_SECONDS = DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS
 TURN_CLAIM_SWEEP_MIN_GRACE_SECONDS = 60.0
 TURN_CHANGE_RETENTION_DAYS = 7
 TURN_CHANGE_RETENTION_COUNT = 100_000
 TURN_CHANGE_COMPACTION_BATCH_SIZE = 1_000
+HERDR_TURN_RETENTION_DAYS = 30
+HERDR_TURN_RETENTION_COUNT = 4096
+HERDR_TURN_RETENTION_BATCH_SIZE = 100
 TURN_SUBMISSION_OBSERVATION_ADOPTION_WINDOW_SECONDS = 60.0
 ACKNOWLEDGED_FINAL_RETENTION_DAYS = 30
 ACKNOWLEDGED_FINAL_RETENTION_COUNT = 4096
@@ -331,6 +334,20 @@ class TurnRefreshApplyResult:
     pending_changed: bool
     stale_binding: bool = False
     cancelled: bool = False
+
+
+@dataclass(frozen=True)
+class HerdrTurnWatermark:
+    """Durable replay position and retained completeness-break evidence."""
+
+    host_id: str
+    pane_id: str
+    turn_epoch: int
+    last_turn: int
+    completeness_break_count: int
+    last_completeness_break_reason: str | None
+    last_completeness_break_at: str | None
+    updated_at: str
 
 
 _UNSET = object()
@@ -1240,6 +1257,48 @@ CREATE TABLE IF NOT EXISTS backend_pending_claims (
     PRIMARY KEY (host_id, worker_id)
 );
 """
+
+CREATE_HERDR_TURN_WATERMARKS_TABLE = """
+CREATE TABLE IF NOT EXISTS herdr_turn_watermarks (
+    host_id TEXT NOT NULL,
+    pane_id TEXT NOT NULL,
+    turn_epoch INTEGER NOT NULL CHECK (turn_epoch >= 0),
+    last_turn INTEGER NOT NULL CHECK (last_turn >= 0),
+    completeness_break_count INTEGER NOT NULL DEFAULT 0
+        CHECK (completeness_break_count >= 0),
+    last_completeness_break_reason TEXT,
+    last_completeness_break_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (host_id, pane_id)
+);
+"""
+
+CREATE_HERDR_TURN_COMPLETIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS herdr_turn_completions (
+    host_id TEXT NOT NULL,
+    pane_id TEXT NOT NULL,
+    turn_epoch INTEGER NOT NULL CHECK (turn_epoch >= 0),
+    turn INTEGER NOT NULL CHECK (turn >= 0),
+    outcome TEXT NOT NULL CHECK (outcome IN ('completed', 'aborted')),
+    completed_unix_ms INTEGER NOT NULL CHECK (completed_unix_ms >= 0),
+    message TEXT,
+    message_truncated INTEGER NOT NULL DEFAULT 0
+        CHECK (message_truncated IN (0, 1)),
+    agent_session_path TEXT,
+    worker_id TEXT,
+    refreshed_turn_id TEXT,
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY (host_id, pane_id, turn_epoch, turn)
+);
+"""
+
+CREATE_HERDR_TURN_INDEXES = (
+    (
+        "CREATE INDEX IF NOT EXISTS idx_herdr_turn_completions_worker "
+        "ON herdr_turn_completions(host_id, worker_id, turn_epoch, turn)"
+    ),
+)
+
 CREATE_PR6_TABLES = (
     CREATE_EVENTS_TABLE,
     CREATE_SPACES_TABLE,
@@ -1928,6 +1987,42 @@ _CONNECTOR_POLLABLE_STATUSES = frozenset({"queued", "deferred", "retry"})
 _CONNECTOR_TERMINAL_OUTBOX_STATUS = "delivered"
 _CONNECTOR_EXHAUSTED_OUTBOX_STATUS = "dead_letter"
 _CONNECTOR_SUPERSEDED_OUTBOX_STATUS = "superseded"
+_CONNECTOR_ACK_RETRY_BACKOFF_MAX_SECONDS = 30
+_CONNECTOR_DRAIN_TARGET_SECONDS = 30
+_TURN_FINAL_PUBLIC_REASONS = frozenset(
+    {
+        "backpressure",
+        "content_fetch_failed",
+        "content_known_incomplete",
+        "content_revision_not_found",
+        "delivery_rejected",
+        "delivery_uncertain",
+        "invalid_content_page",
+        "invalid_content_schema",
+        "invalid_pending_plan",
+        "invalid_prepare_response",
+        "invalid_presentation_plan",
+        "invalid_recovery_predecessor_receipt",
+        "invalid_turn_final_job",
+        "missing_message_owner_token",
+        "operation_budget_exhausted",
+        "predecessor_pending",
+        "prepare_failed",
+        "rate_limited",
+        "rejected",
+        "revision_conflict",
+        "stale_or_unavailable_content_revision",
+        "stale_or_unroutable_turn_plan",
+        "stale_ref",
+        "stale_revision",
+        "temporary",
+        "timeout",
+        "transient_delivery",
+        "unavailable",
+        "unroutable_final_ready",
+        "upgrade_required",
+    }
+)
 _CONNECTOR_PUBLIC_OUTBOX_STATUSES = frozenset(
     {
         _CONNECTOR_LEASE_STATUS,
@@ -1964,6 +2059,30 @@ def _connector_datetime(value: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _connector_strict_datetime(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _connector_deadline_due(*values: Any, now_dt: datetime) -> bool:
+    """Use the first valid deadline; malformed-only state is already overdue."""
+    for value in values:
+        parsed = _connector_strict_datetime(value)
+        if parsed is not None:
+            return parsed <= now_dt
+    return True
 
 
 def _connector_iso(value: str | datetime) -> str:
@@ -2061,6 +2180,32 @@ def _connector_private_clear_current(raw: Any) -> str:
     return _canonical_json(state)
 
 
+def _connector_ack_retry_state(
+    raw: Any,
+    *,
+    now: str,
+) -> tuple[dict[str, Any], str]:
+    """Record one ACK timeout and return its bounded exponential retry time."""
+    state = _json_object(_connector_private_clear_current(raw))
+    previous = state.get("ack_timeout_count")
+    timeout_count = (
+        int(previous) + 1
+        if (
+            isinstance(previous, int)
+            and not isinstance(previous, bool)
+            and previous >= 0
+        )
+        else 1
+    )
+    state["ack_timeout_count"] = timeout_count
+    state.pop("ack_deadline_at", None)
+    delay_seconds = min(
+        1 << min(timeout_count - 1, 30),
+        _CONNECTOR_ACK_RETRY_BACKOFF_MAX_SECONDS,
+    )
+    return state, _connector_add_seconds(str(now), delay_seconds)
+
+
 def _connector_response(
     *,
     ok: bool,
@@ -2139,7 +2284,7 @@ def _connector_reclaim_expired_leases_conn(
     for delivery_id, outbox_id, delivery_private, outbox_status, outbox_private in rows:
         state = _json_object(delivery_private)
         lease_expires_at = state.get("lease_expires_at")
-        if not lease_expires_at or _connector_datetime(str(lease_expires_at)) > now_dt:
+        if not _connector_deadline_due(lease_expires_at, now_dt=now_dt):
             continue
         conn.execute(
             """
@@ -2217,7 +2362,11 @@ def _connector_reclaim_expired_awaiting_ack_conn(
         params.append(str(name))
     rows = conn.execute(
         f"""
-        SELECT outbox.id, outbox.connector, outbox.private_state_json
+        SELECT
+            outbox.id,
+            outbox.connector,
+            outbox.private_state_json,
+            outbox.next_attempt_at
         FROM connector_outbox AS outbox
         WHERE {" AND ".join(clauses)}
         ORDER BY outbox.id
@@ -2226,9 +2375,9 @@ def _connector_reclaim_expired_awaiting_ack_conn(
     ).fetchall()
     reclaimed = 0
     now_dt = _connector_datetime(now)
-    for outbox_id, connector, private_state_json in rows:
+    for outbox_id, connector, private_state_json, next_attempt_at in rows:
         outbox_state = _json_object(private_state_json)
-        deadline = str(outbox_state.get("ack_deadline_at") or "")
+        deadline = outbox_state.get("ack_deadline_at")
         delivery = conn.execute(
             """
             SELECT id, private_state_json
@@ -2239,11 +2388,19 @@ def _connector_reclaim_expired_awaiting_ack_conn(
             """,
             (int(outbox_id),),
         ).fetchone()
-        if not deadline and delivery is not None:
-            deadline = str(
-                _json_object(delivery[1]).get("ack_deadline_at") or ""
-            )
-        if not deadline or _connector_datetime(deadline) > now_dt:
+        delivery_deadline = (
+            _json_object(delivery[1]).get("ack_deadline_at")
+            if delivery is not None
+            else None
+        )
+        # A legacy/noncanonical awaiting_ack row without a deadline is already
+        # overdue. Every non-terminal state must be swept rather than wedged.
+        if not _connector_deadline_due(
+            deadline,
+            next_attempt_at,
+            delivery_deadline,
+            now_dt=now_dt,
+        ):
             continue
 
         plan = conn.execute(
@@ -2337,19 +2494,21 @@ def _connector_reclaim_expired_awaiting_ack_conn(
                         int(job_outbox_id),
                     ),
                 )
-            source_state = _json_object(
-                _connector_private_clear_current(private_state_json)
+            source_state, retry_at = _connector_ack_retry_state(
+                private_state_json,
+                now=str(now),
             )
             source_state["presentation_generation"] = max(
                 int(source_state.get("presentation_generation") or 1),
                 int(plan[2] or 1) + 1,
             )
-            source_status = "queued"
+            source_status = "retry"
         else:
             source_state = _json_object(
                 _connector_private_clear_current(private_state_json)
             )
             source_status = _CONNECTOR_EXHAUSTED_OUTBOX_STATUS
+            retry_at = None
 
         if delivery is not None:
             conn.execute(
@@ -2382,7 +2541,7 @@ def _connector_reclaim_expired_awaiting_ack_conn(
             """,
             (
                 source_status,
-                str(now) if source_status == "queued" else None,
+                retry_at,
                 str(now),
                 _canonical_json(source_state),
                 int(outbox_id),
@@ -2419,12 +2578,10 @@ def _connector_plan_has_live_job_lease_conn(
         (int(plan_id),),
     ).fetchall()
     return any(
-        (
-            lease_expires_at := str(
-                _json_object(row[0]).get("lease_expires_at") or ""
-            )
+        not _connector_deadline_due(
+            _json_object(row[0]).get("lease_expires_at"),
+            now_dt=now_dt,
         )
-        and _connector_datetime(lease_expires_at) > now_dt
         for row in live_job_leases
     )
 
@@ -2531,16 +2688,15 @@ def connector_reclaim_due(
             params,
         ).fetchall()
         for (private_state_json,) in lease_rows:
-            expires_at = str(
-                _json_object(private_state_json).get("lease_expires_at") or ""
-            )
-            if expires_at and _connector_datetime(expires_at) <= now_dt:
+            expires_at = _json_object(private_state_json).get("lease_expires_at")
+            if _connector_deadline_due(expires_at, now_dt=now_dt):
                 return True
         awaiting_rows = conn.execute(
             f"""
             SELECT
                 outbox.id,
                 outbox.private_state_json,
+                outbox.next_attempt_at,
                 (
                     SELECT deliveries.private_state_json
                     FROM connector_deliveries AS deliveries
@@ -2554,15 +2710,18 @@ def connector_reclaim_due(
             """,
             params,
         ).fetchall()
-        for outbox_id, outbox_private, delivery_private in awaiting_rows:
-            deadline = str(
-                _json_object(outbox_private).get("ack_deadline_at") or ""
-            )
-            if not deadline:
-                deadline = str(
-                    _json_object(delivery_private).get("ack_deadline_at") or ""
-                )
-            if not deadline or _connector_datetime(deadline) > now_dt:
+        for (
+            outbox_id,
+            outbox_private,
+            next_attempt_at,
+            delivery_private,
+        ) in awaiting_rows:
+            if not _connector_deadline_due(
+                _json_object(outbox_private).get("ack_deadline_at"),
+                next_attempt_at,
+                _json_object(delivery_private).get("ack_deadline_at"),
+                now_dt=now_dt,
+            ):
                 continue
             plan = conn.execute(
                 """
@@ -4649,11 +4808,13 @@ def _update_presentation_plan_after_outbox_conn(
                     conn.execute(
                         """
                         UPDATE connector_outbox
-                        SET private_state_json = ?, updated_at = ?
+                        SET private_state_json = ?, next_attempt_at = ?,
+                            updated_at = ?
                         WHERE id = ? AND status = 'awaiting_ack'
                         """,
                         (
                             _canonical_json(source_state),
+                            deadline,
                             str(now),
                             source_outbox_id,
                         ),
@@ -5301,12 +5462,13 @@ def prepare_connector_plan_commit(
                     """
                     UPDATE connector_outbox
                     SET status = 'awaiting_ack',
-                        next_attempt_at = NULL,
+                        next_attempt_at = ?,
                         updated_at = ?,
                         private_state_json = ?
                     WHERE id = ? AND status = 'leased'
                     """,
                     (
+                        ack_deadline_at,
                         current_time,
                         _canonical_json(next_source_state),
                         source_outbox_id,
@@ -5921,7 +6083,8 @@ def poll_connector_outbox(
                   AND (
                       outbox.next_attempt_at IS NULL
                       OR outbox.next_attempt_at = ''
-                      OR outbox.next_attempt_at <= ?
+                      OR julianday(outbox.next_attempt_at) IS NULL
+                      OR julianday(outbox.next_attempt_at) <= julianday(?)
                   )
                   AND (
                       outbox.delivery_kind != 'final_ready'
@@ -6247,8 +6410,11 @@ def _connector_validate_live_ref_conn(
             return row, "stale_ref"
         if str(row[8] or "") != _CONNECTOR_LEASE_STATUS:
             return row, "stale_ref"
-        lease_expires_at = str(delivery_state.get("lease_expires_at") or "")
-        if not lease_expires_at or _connector_datetime(lease_expires_at) <= _connector_datetime(now):
+        lease_expires_at = delivery_state.get("lease_expires_at")
+        if _connector_deadline_due(
+            lease_expires_at,
+            now_dt=_connector_datetime(now),
+        ):
             return row, "expired_ref"
         return row, None
     return None, "invalid_ref"
@@ -6458,14 +6624,7 @@ def _connector_update_ref(
     sanitized_reason = (
         _store_public_label(
             reason,
-            allowed={
-                "backpressure",
-                "rate_limited",
-                "rejected",
-                "temporary",
-                "timeout",
-                "unavailable",
-            },
+            allowed=_TURN_FINAL_PUBLIC_REASONS,
         )
         if str(name) == _TURN_FINAL_NAME
         else _connector_public_reason(reason)
@@ -7344,6 +7503,51 @@ def inspect_connector_outbox(
                 max(0, bounded_limit - len(rows)),
             ),
         ).fetchall()
+        classification_rows = conn.execute(
+            """
+            SELECT
+                CASE
+                    WHEN jobs.id IS NOT NULL THEN 'failed_plan_job'
+                    WHEN outbox.delivery_kind = 'final_ready'
+                        THEN 'final_anchor'
+                    WHEN outbox.delivery_kind = 'final_migration_hold'
+                        THEN 'migration_hold'
+                    ELSE 'other'
+                END,
+                COALESCE(
+                    CASE
+                        WHEN json_valid(deliveries.response_json)
+                        THEN json_extract(deliveries.response_json, '$.status')
+                    END,
+                    'missing'
+                ),
+                COALESCE(
+                    CASE
+                        WHEN json_valid(deliveries.response_json)
+                        THEN json_extract(deliveries.response_json, '$.reason')
+                    END,
+                    'missing'
+                ),
+                COUNT(*)
+            FROM connector_outbox AS outbox
+            LEFT JOIN turn_presentation_jobs AS jobs
+              ON jobs.outbox_id = outbox.id
+            LEFT JOIN connector_deliveries AS deliveries
+              ON deliveries.id = (
+                  SELECT latest.id
+                  FROM connector_deliveries AS latest
+                  WHERE latest.outbox_id = outbox.id
+                  ORDER BY latest.id DESC
+                  LIMIT 1
+              )
+            WHERE outbox.host_id = ?
+              AND outbox.connector = ?
+              AND outbox.status = 'dead_letter'
+            GROUP BY 1, 2, 3
+            ORDER BY COUNT(*) DESC, 1, 2, 3
+            """,
+            (str(host_id), str(name)),
+        ).fetchall()
         total = anchor_total + failed_total
     items: list[dict[str, Any]] = []
     for (
@@ -7421,6 +7625,50 @@ def inspect_connector_outbox(
                 "attempt_count": _bounded_connector_attempt_count(attempt_count),
             }
         )
+    classifications: list[dict[str, Any]] = []
+    classification_statuses = {
+        "ack_deadline_expired",
+        "attempts_exhausted",
+        "deferred",
+        "expired",
+        "missing",
+        "plan_unrecoverable",
+        "retry_scheduled",
+    }
+    classification_reasons = {*_TURN_FINAL_PUBLIC_REASONS, "missing", "unknown"}
+    for kind_value, status_value, reason_value, count_value in classification_rows:
+        kind = _store_public_label(
+            kind_value,
+            allowed={
+                "failed_plan_job",
+                "final_anchor",
+                "migration_hold",
+                "other",
+            },
+        )
+        recovery = (
+            "source_retry"
+            if kind == "failed_plan_job"
+            else "exact_key"
+            if kind in {"final_anchor", "migration_hold"}
+            else "none"
+        )
+        classifications.append(
+            {
+                "kind": kind,
+                "last_status": _store_public_label(
+                    status_value,
+                    allowed=classification_statuses,
+                ),
+                "last_reason": _store_public_label(
+                    reason_value,
+                    allowed=classification_reasons,
+                ),
+                "count": max(0, int(count_value or 0)),
+                "recovery": recovery,
+            }
+        )
+    dead_letter_rows = sum(item["count"] for item in classifications)
     result = dict(
         sanitize_public_value(
             {
@@ -7431,6 +7679,8 @@ def inspect_connector_outbox(
                 "name": str(name),
                 "filter_status": str(status),
                 "total": total,
+                "dead_letter_rows": dead_letter_rows,
+                "classifications": classifications,
                 "items": items,
             }
         )
@@ -12093,8 +12343,12 @@ def _migrate_v15_to_v16_conn(
         state = _json_object(private_state_json)
         state["ack_deadline_at"] = deadline
         conn.execute(
-            "UPDATE connector_outbox SET private_state_json = ? WHERE id = ?",
-            (_canonical_json(state), int(outbox_id)),
+            """
+            UPDATE connector_outbox
+            SET private_state_json = ?, next_attempt_at = ?
+            WHERE id = ?
+            """,
+            (_canonical_json(state), deadline, int(outbox_id)),
         )
         delivery_rows = (
             conn.execute(
@@ -12183,6 +12437,14 @@ def _migrate_v17_to_v18_conn(conn: sqlite3.Connection) -> None:
     _create_available_turn_change_triggers_conn(conn)
 
 
+def _migrate_v18_to_v19_conn(conn: sqlite3.Connection) -> None:
+    """Add durable Herdr turn replay watermarks and completion provenance."""
+    conn.execute(CREATE_HERDR_TURN_WATERMARKS_TABLE)
+    conn.execute(CREATE_HERDR_TURN_COMPLETIONS_TABLE)
+    for statement in CREATE_HERDR_TURN_INDEXES:
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -12202,6 +12464,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(15, 16, _migrate_v15_to_v16_conn),
     Migration(16, 17, _migrate_v16_to_v17_conn),
     Migration(17, 18, _migrate_v17_to_v18_conn),
+    Migration(18, 19, _migrate_v18_to_v19_conn),
 )
 
 
@@ -12251,6 +12514,8 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         conn.execute(CREATE_TURN_CHANGE_JOURNAL_TABLE)
         conn.execute(CREATE_TURN_CHANGE_FLOOR_TABLE)
         conn.execute(CREATE_TURN_CHANGE_STATE_TABLE)
+        conn.execute(CREATE_HERDR_TURN_WATERMARKS_TABLE)
+        conn.execute(CREATE_HERDR_TURN_COMPLETIONS_TABLE)
         for statement in CREATE_COMMAND_RECEIPT_INDEXES:
             conn.execute(statement)
         for statement in CREATE_WORKER_BINDING_INDEXES:
@@ -12265,6 +12530,8 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         for statement in CREATE_TURN_CHANGE_INDEXES:
             conn.execute(statement)
         for statement in CREATE_TURN_CHANGE_TRIGGERS:
+            conn.execute(statement)
+        for statement in CREATE_HERDR_TURN_INDEXES:
             conn.execute(statement)
         for statement in CREATE_ATTENTION_LIFECYCLE_INDEXES:
             conn.execute(statement)
@@ -12392,6 +12659,277 @@ def init_store(
                 1, int(connector_ack_ttl_seconds)
             ),
         )
+
+
+def _herdr_turn_counter(value: Any, field: str) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= _SQLITE_MAX_INTEGER
+    ):
+        raise ValueError(f"{field} must be a nonnegative SQLite integer")
+    return int(value)
+
+
+def _herdr_turn_watermark_from_row(row: tuple[Any, ...]) -> HerdrTurnWatermark:
+    return HerdrTurnWatermark(
+        host_id=str(row[0]),
+        pane_id=str(row[1]),
+        turn_epoch=int(row[2]),
+        last_turn=int(row[3]),
+        completeness_break_count=int(row[4]),
+        last_completeness_break_reason=(
+            str(row[5]) if row[5] is not None else None
+        ),
+        last_completeness_break_at=(
+            str(row[6]) if row[6] is not None else None
+        ),
+        updated_at=str(row[7]),
+    )
+
+
+def get_herdr_turn_watermark(
+    db_path: Path | str,
+    host_id: str,
+    pane_id: str,
+) -> HerdrTurnWatermark | None:
+    """Return one pane's durable Herdr replay watermark."""
+    if not _sqlite_store_exists(db_path):
+        return None
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            """
+            SELECT
+                host_id, pane_id, turn_epoch, last_turn,
+                completeness_break_count, last_completeness_break_reason,
+                last_completeness_break_at, updated_at
+            FROM herdr_turn_watermarks
+            WHERE host_id = ? AND pane_id = ?
+            """,
+            (str(host_id), str(pane_id)),
+        ).fetchone()
+    return _herdr_turn_watermark_from_row(row) if row is not None else None
+
+
+def set_herdr_turn_watermark(
+    db_path: Path | str,
+    host_id: str,
+    pane_id: str,
+    *,
+    turn_epoch: int,
+    last_turn: int,
+    observed_at: str | None = None,
+) -> HerdrTurnWatermark:
+    """Create or re-baseline a watermark while retaining prior break evidence."""
+    epoch = _herdr_turn_counter(turn_epoch, "turn_epoch")
+    turn = _herdr_turn_counter(last_turn, "last_turn")
+    current = observed_at or utc_timestamp()
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO herdr_turn_watermarks (
+                host_id, pane_id, turn_epoch, last_turn, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(host_id, pane_id) DO UPDATE SET
+                turn_epoch = excluded.turn_epoch,
+                last_turn = excluded.last_turn,
+                updated_at = excluded.updated_at
+            """,
+            (str(host_id), str(pane_id), epoch, turn, current),
+        )
+    watermark = get_herdr_turn_watermark(db_path, host_id, pane_id)
+    if watermark is None:
+        raise StoreSchemaError("herdr_turn_watermark_unavailable")
+    return watermark
+
+
+def record_herdr_turn_completeness_break(
+    db_path: Path | str,
+    host_id: str,
+    pane_id: str,
+    *,
+    turn_epoch: int,
+    newest_turn: int,
+    reason: str,
+    observed_at: str | None = None,
+) -> HerdrTurnWatermark:
+    """Persist an explicit replay gap and atomically re-baseline the pane."""
+    epoch = _herdr_turn_counter(turn_epoch, "turn_epoch")
+    newest = _herdr_turn_counter(newest_turn, "newest_turn")
+    break_reason = str(reason).strip()
+    if not break_reason:
+        raise ValueError("reason must not be empty")
+    current = observed_at or utc_timestamp()
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO herdr_turn_watermarks (
+                host_id, pane_id, turn_epoch, last_turn,
+                completeness_break_count, last_completeness_break_reason,
+                last_completeness_break_at, updated_at
+            ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(host_id, pane_id) DO UPDATE SET
+                turn_epoch = excluded.turn_epoch,
+                last_turn = excluded.last_turn,
+                completeness_break_count =
+                    herdr_turn_watermarks.completeness_break_count + 1,
+                last_completeness_break_reason =
+                    excluded.last_completeness_break_reason,
+                last_completeness_break_at =
+                    excluded.last_completeness_break_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(host_id),
+                str(pane_id),
+                epoch,
+                newest,
+                break_reason,
+                current,
+                current,
+            ),
+        )
+    watermark = get_herdr_turn_watermark(db_path, host_id, pane_id)
+    if watermark is None:
+        raise StoreSchemaError("herdr_turn_watermark_unavailable")
+    return watermark
+
+
+def latest_turn_id_for_worker(
+    db_path: Path | str,
+    host_id: str,
+    worker_id: str,
+) -> str | None:
+    """Return the newest live semantic turn row for provenance linking."""
+    if not _sqlite_store_exists(db_path):
+        return None
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            """
+            SELECT turn_id
+            FROM turns
+            WHERE host_id = ?
+              AND worker_id = ?
+              AND COALESCE(json_extract(payload_json, '$.superseded_at'), '') = ''
+            ORDER BY observed_at DESC, list_sequence DESC
+            LIMIT 1
+            """,
+            (str(host_id), str(worker_id)),
+        ).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def record_herdr_turn_completion(
+    db_path: Path | str,
+    host_id: str,
+    pane_id: str,
+    *,
+    turn_epoch: int,
+    turn: int,
+    outcome: str,
+    completed_unix_ms: int,
+    message: str | None,
+    message_truncated: bool,
+    agent_session_path: str | None,
+    worker_id: str | None,
+    refreshed_turn_id: str | None,
+    observed_at: str | None = None,
+) -> HerdrTurnWatermark:
+    """Store completion provenance and advance its replay watermark atomically."""
+    epoch = _herdr_turn_counter(turn_epoch, "turn_epoch")
+    turn_number = _herdr_turn_counter(turn, "turn")
+    completed_ms = _herdr_turn_counter(completed_unix_ms, "completed_unix_ms")
+    normalized_outcome = str(outcome)
+    if normalized_outcome not in {"completed", "aborted"}:
+        raise ValueError("outcome must be completed or aborted")
+    if message is not None and not isinstance(message, str):
+        raise ValueError("message must be text or None")
+    if isinstance(message, str) and len(message.encode("utf-8")) > 8 * 1024:
+        raise ValueError("message must not exceed 8 KiB")
+    if not isinstance(message_truncated, bool):
+        raise ValueError("message_truncated must be a boolean")
+    if agent_session_path is not None and not isinstance(
+        agent_session_path,
+        str,
+    ):
+        raise ValueError("agent_session_path must be text or None")
+    current = observed_at or utc_timestamp()
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = conn.execute(
+                """
+                SELECT turn_epoch, last_turn
+                FROM herdr_turn_watermarks
+                WHERE host_id = ? AND pane_id = ?
+                """,
+                (str(host_id), str(pane_id)),
+            ).fetchone()
+            if existing is not None and int(existing[0]) != epoch:
+                raise StoreSchemaError("herdr_turn_epoch_changed")
+            conn.execute(
+                """
+                INSERT INTO herdr_turn_completions (
+                    host_id, pane_id, turn_epoch, turn, outcome,
+                    completed_unix_ms, message, message_truncated,
+                    agent_session_path, worker_id, refreshed_turn_id, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(host_id, pane_id, turn_epoch, turn) DO UPDATE SET
+                    outcome = excluded.outcome,
+                    completed_unix_ms = excluded.completed_unix_ms,
+                    message = excluded.message,
+                    message_truncated = excluded.message_truncated,
+                    agent_session_path = excluded.agent_session_path,
+                    worker_id = COALESCE(
+                        excluded.worker_id, herdr_turn_completions.worker_id
+                    ),
+                    refreshed_turn_id = COALESCE(
+                        excluded.refreshed_turn_id,
+                        herdr_turn_completions.refreshed_turn_id
+                    ),
+                    observed_at = excluded.observed_at
+                """,
+                (
+                    str(host_id),
+                    str(pane_id),
+                    epoch,
+                    turn_number,
+                    normalized_outcome,
+                    completed_ms,
+                    message,
+                    int(message_truncated),
+                    agent_session_path,
+                    str(worker_id) if worker_id else None,
+                    str(refreshed_turn_id) if refreshed_turn_id else None,
+                    current,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO herdr_turn_watermarks (
+                    host_id, pane_id, turn_epoch, last_turn, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(host_id, pane_id) DO UPDATE SET
+                    last_turn = MAX(
+                        herdr_turn_watermarks.last_turn, excluded.last_turn
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (str(host_id), str(pane_id), epoch, turn_number, current),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    watermark = get_herdr_turn_watermark(db_path, host_id, pane_id)
+    if watermark is None:
+        raise StoreSchemaError("herdr_turn_watermark_unavailable")
+    return watermark
 
 
 def _normalized_command_request_policy(
@@ -12628,6 +13166,11 @@ def store_status(
                 "leased": 0,
                 "completed": 0,
                 "by_status": {},
+                "due": 0,
+                "oldest_due_at": None,
+                "overdue_awaiting_ack": 0,
+                "drain_target_seconds": _CONNECTOR_DRAIN_TARGET_SECONDS,
+                "starved": False,
             },
             "final_retention": final_retention_empty,
             "command_requests": command_requests_empty,
@@ -12695,6 +13238,75 @@ def store_status(
                 """,
                 (str(host_id),),
             ).fetchall()
+            drain_now = utc_timestamp()
+            due_row = conn.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    MIN(
+                        CASE
+                            WHEN next_attempt_at IS NOT NULL
+                             AND next_attempt_at != ''
+                             AND julianday(next_attempt_at) IS NOT NULL
+                             AND julianday(next_attempt_at) > julianday(created_at)
+                            THEN next_attempt_at
+                            ELSE created_at
+                        END
+                    )
+                FROM connector_outbox
+                WHERE host_id = ?
+                  AND status IN ('queued', 'deferred', 'retry')
+                  AND (
+                      next_attempt_at IS NULL
+                      OR next_attempt_at = ''
+                      OR julianday(next_attempt_at) IS NULL
+                      OR julianday(next_attempt_at) <= julianday(?)
+                  )
+                """,
+                (str(host_id), drain_now),
+            ).fetchone()
+            overdue_ack_row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM connector_outbox
+                WHERE host_id = ?
+                  AND status = 'awaiting_ack'
+                  AND COALESCE(
+                      CASE
+                          WHEN json_valid(
+                              connector_outbox.private_state_json
+                          )
+                          THEN julianday(
+                              json_extract(
+                                  connector_outbox.private_state_json,
+                                  '$.ack_deadline_at'
+                              )
+                          )
+                      END,
+                      julianday(connector_outbox.next_attempt_at),
+                      (
+                          SELECT CASE
+                              WHEN json_valid(
+                                  deliveries.private_state_json
+                              )
+                              THEN julianday(
+                                  json_extract(
+                                      deliveries.private_state_json,
+                                      '$.ack_deadline_at'
+                                  )
+                              )
+                          END
+                          FROM connector_deliveries AS deliveries
+                          WHERE deliveries.outbox_id = connector_outbox.id
+                            AND deliveries.status = 'awaiting_ack'
+                          ORDER BY deliveries.id DESC
+                          LIMIT 1
+                      ),
+                      -1
+                  ) <= julianday(?)
+                """,
+                (str(host_id), drain_now),
+            ).fetchone()
             maintenance_row = conn.execute(
                 """
                 SELECT last_completed_at, last_status
@@ -12760,6 +13372,16 @@ def store_status(
             count for status, count in by_status.items() if status in terminal_statuses
         ),
         "by_status": by_status,
+        "due": int(due_row[0] or 0),
+        "oldest_due_at": _strict_utc_timestamp(due_row[1]),
+        "overdue_awaiting_ack": int(overdue_ack_row[0] or 0),
+        "drain_target_seconds": _CONNECTOR_DRAIN_TARGET_SECONDS,
+        "starved": bool(
+            due_row[1] is not None
+            and _connector_datetime(str(due_row[1]))
+            <= _connector_datetime(drain_now)
+            - timedelta(seconds=_CONNECTOR_DRAIN_TARGET_SECONDS)
+        ),
     }
     maintenance = {
         **maintenance_empty,
@@ -14993,6 +15615,16 @@ def maybe_run_automatic_store_maintenance(
         retention_count=command_receipt_retention_count,
         batch_size=policy.batch_size,
     )
+    empty_herdr_turns = {
+        "examined": 0,
+        "deleted": 0,
+        "deleted_completions": 0,
+        "deleted_watermarks": 0,
+        "remaining_candidates": False,
+        "retention_days": policy.retention_days,
+        "retention_count": policy.retention_count,
+        "batch_size": policy.batch_size,
+    }
     if not _sqlite_store_exists(db_path):
         return dict(sanitize_public_value({
             "schema_version": 1,
@@ -15018,6 +15650,7 @@ def maybe_run_automatic_store_maintenance(
                 ),
             },
             "command_requests": empty_command_requests,
+            "herdr_turns": empty_herdr_turns,
             "batch_size": policy.batch_size,
         }))
     cutoff_at = _utc_cutoff(retention_days=policy.retention_days, now=current_at)
@@ -15074,6 +15707,7 @@ def maybe_run_automatic_store_maintenance(
                         ),
                     },
                     "command_requests": empty_command_requests,
+                    "herdr_turns": empty_herdr_turns,
                     "batch_size": policy.batch_size,
                 }))
             candidates, _ = _snapshot_retention_candidates_conn(
@@ -15197,10 +15831,25 @@ def maybe_run_automatic_store_maintenance(
         retention_count=command_receipt_retention_count,
         batch_size=policy.batch_size,
     )
+    herdr_turns = cleanup_herdr_turn_retention(
+        db_path,
+        retention_days=policy.retention_days,
+        retention_count=policy.retention_count,
+        batch_size=policy.batch_size,
+        now=current_at,
+    )
     return dict(sanitize_public_value({
         "schema_version": 1,
-        "ok": bool(command_requests["ok"]),
-        "status": "ok" if command_requests["ok"] else command_requests["status"],
+        "ok": bool(command_requests["ok"]) and bool(herdr_turns["ok"]),
+        "status": (
+            "ok"
+            if command_requests["ok"] and herdr_turns["ok"]
+            else (
+                command_requests["status"]
+                if not command_requests["ok"]
+                else herdr_turns["status"]
+            )
+        ),
         "due": True,
         "last_completed_at": current_at,
         "next_due_at": _connector_add_seconds(current_at, cadence_seconds),
@@ -15221,6 +15870,7 @@ def maybe_run_automatic_store_maintenance(
             ),
         },
         "command_requests": command_requests,
+        "herdr_turns": herdr_turns,
         "batch_size": policy.batch_size,
     }))
 
@@ -16630,6 +17280,165 @@ def compact_turn_change_journal(
     }
 
 
+def cleanup_herdr_turn_retention(
+    db_path: Path | str,
+    *,
+    host_id: str | None = None,
+    retention_days: int = HERDR_TURN_RETENTION_DAYS,
+    retention_count: int = HERDR_TURN_RETENTION_COUNT,
+    batch_size: int = HERDR_TURN_RETENTION_BATCH_SIZE,
+    now: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Bound completion provenance and remove old watermarks for dead panes."""
+    days = max(1, min(int(retention_days), _MAX_RETENTION_DAYS))
+    count = max(1, min(int(retention_count), _SQLITE_MAX_INTEGER))
+    bounded_batch = max(1, min(int(batch_size), 1_000))
+    current_at = _connector_now(now)
+    cutoff_at = _utc_cutoff(retention_days=days, now=current_at)
+    base = {
+        "schema_version": 1,
+        "ok": False,
+        "status": "store_unavailable",
+        "scope": "host" if host_id is not None else "database",
+        "host_id": str(host_id) if host_id is not None else None,
+        "dry_run": bool(dry_run),
+        "retention_days": days,
+        "retention_count": count,
+        "cutoff_at": cutoff_at,
+        "batch_size": bounded_batch,
+    }
+    if not _sqlite_store_exists(db_path):
+        return dict(sanitize_public_value({
+            **base,
+            "examined": 0,
+            "deleted": 0,
+            "deleted_completions": 0,
+            "deleted_watermarks": 0,
+            "remaining_candidates": False,
+        }))
+    host_clause = "AND host_id = :host_id" if host_id is not None else ""
+    watermark_host_clause = (
+        "AND watermarks.host_id = :host_id" if host_id is not None else ""
+    )
+    params: dict[str, Any] = {
+        "host_id": str(host_id) if host_id is not None else "",
+        "cutoff_at": cutoff_at,
+        "current_at": current_at,
+        "retention_count": count,
+        "limit": bounded_batch + 1,
+    }
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            completion_pool = [
+                int(row[0])
+                for row in conn.execute(
+                    f"""
+                    WITH ranked AS (
+                        SELECT
+                            rowid AS completion_rowid,
+                            observed_at,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY host_id
+                                ORDER BY observed_at DESC, rowid DESC
+                            ) AS retention_rank
+                        FROM herdr_turn_completions
+                        WHERE 1 = 1 {host_clause}
+                    )
+                    SELECT completion_rowid
+                    FROM ranked
+                    WHERE observed_at < :cutoff_at
+                      AND retention_rank > :retention_count
+                    ORDER BY observed_at, completion_rowid
+                    LIMIT :limit
+                    """,
+                    params,
+                ).fetchall()
+            ]
+            completion_ids = completion_pool[:bounded_batch]
+            remaining_budget = bounded_batch - len(completion_ids)
+            watermark_params = {
+                **params,
+                # Query one extra row even when completions consume the whole
+                # batch so remaining_candidates still advertises dead panes.
+                "limit": remaining_budget + 1,
+            }
+            watermark_pool = [
+                (str(row[0]), str(row[1]))
+                for row in conn.execute(
+                    f"""
+                    SELECT watermarks.host_id, watermarks.pane_id
+                    FROM herdr_turn_watermarks AS watermarks
+                    WHERE watermarks.updated_at < :cutoff_at
+                      {watermark_host_clause}
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM worker_bindings AS bindings
+                          WHERE bindings.host_id = watermarks.host_id
+                            AND bindings.backend = 'herdr'
+                            AND bindings.expires_at > :current_at
+                            AND (
+                                (
+                                    bindings.target_kind = 'pane_id'
+                                    AND bindings.target_value = watermarks.pane_id
+                                )
+                                OR (
+                                    bindings.turn_target_kind = 'pane_id'
+                                    AND bindings.turn_target_value = watermarks.pane_id
+                                )
+                            )
+                      )
+                    ORDER BY watermarks.updated_at, watermarks.host_id,
+                             watermarks.pane_id
+                    LIMIT :limit
+                    """,
+                    watermark_params,
+                ).fetchall()
+            ]
+            watermark_keys = watermark_pool[:remaining_budget]
+            if not dry_run:
+                if completion_ids:
+                    placeholders = ",".join("?" for _ in completion_ids)
+                    conn.execute(
+                        f"""
+                        DELETE FROM herdr_turn_completions
+                        WHERE rowid IN ({placeholders})
+                        """,
+                        completion_ids,
+                    )
+                if watermark_keys:
+                    conn.executemany(
+                        """
+                        DELETE FROM herdr_turn_watermarks
+                        WHERE host_id = ? AND pane_id = ?
+                        """,
+                        watermark_keys,
+                    )
+                conn.commit()
+            else:
+                conn.rollback()
+        except Exception:
+            conn.rollback()
+            raise
+    examined = len(completion_ids) + len(watermark_keys)
+    remaining = (
+        len(completion_pool) > len(completion_ids)
+        or len(watermark_pool) > len(watermark_keys)
+    )
+    return dict(sanitize_public_value({
+        **base,
+        "ok": True,
+        "status": "ok",
+        "examined": examined,
+        "deleted": examined,
+        "deleted_completions": len(completion_ids),
+        "deleted_watermarks": len(watermark_keys),
+        "remaining_candidates": remaining,
+    }))
+
+
 def run_store_maintenance(
     db_path: Path,
     host_id: str,
@@ -16651,6 +17460,9 @@ def run_store_maintenance(
     turn_change_retention_days: int = TURN_CHANGE_RETENTION_DAYS,
     turn_change_retention_count: int = TURN_CHANGE_RETENTION_COUNT,
     turn_change_batch_size: int = TURN_CHANGE_COMPACTION_BATCH_SIZE,
+    herdr_turn_retention_days: int = HERDR_TURN_RETENTION_DAYS,
+    herdr_turn_retention_count: int = HERDR_TURN_RETENTION_COUNT,
+    herdr_turn_batch_size: int = HERDR_TURN_RETENTION_BATCH_SIZE,
 ) -> dict[str, Any]:
     """Run one bounded batch for every online store-maintenance class."""
     retention = cleanup_event_retention(
@@ -16720,6 +17532,15 @@ def run_store_maintenance(
         now=now,
         dry_run=dry_run,
     )
+    herdr_turns = cleanup_herdr_turn_retention(
+        db_path,
+        host_id=host_id,
+        retention_days=herdr_turn_retention_days,
+        retention_count=herdr_turn_retention_count,
+        batch_size=herdr_turn_batch_size,
+        now=now,
+        dry_run=dry_run,
+    )
     ok = (
         bool(retention.get("ok"))
         and bool(snapshots.get("ok"))
@@ -16728,6 +17549,7 @@ def run_store_maintenance(
         and bool(turn_content.get("ok"))
         and bool(command_requests.get("ok"))
         and bool(turn_changes.get("ok"))
+        and bool(herdr_turns.get("ok"))
     )
     return sanitize_public_value({
         "schema_version": 1,
@@ -16812,6 +17634,30 @@ def run_store_maintenance(
             "examined": int(turn_changes.get("examined") or 0),
             "deleted": int(turn_changes.get("deleted") or 0),
             "remaining_candidates": bool(turn_changes.get("remaining_candidates")),
+        },
+        "herdr_turns": {
+            "dry_run": bool(herdr_turns.get("dry_run")),
+            "retention_days": int(
+                herdr_turns.get("retention_days") or herdr_turn_retention_days
+            ),
+            "retention_count": int(
+                herdr_turns.get("retention_count") or herdr_turn_retention_count
+            ),
+            "cutoff_at": herdr_turns.get("cutoff_at"),
+            "batch_size": int(
+                herdr_turns.get("batch_size") or herdr_turn_batch_size
+            ),
+            "examined": int(herdr_turns.get("examined") or 0),
+            "deleted": int(herdr_turns.get("deleted") or 0),
+            "deleted_completions": int(
+                herdr_turns.get("deleted_completions") or 0
+            ),
+            "deleted_watermarks": int(
+                herdr_turns.get("deleted_watermarks") or 0
+            ),
+            "remaining_candidates": bool(
+                herdr_turns.get("remaining_candidates")
+            ),
         },
         "turn_content": {
             "dry_run": bool(turn_content.get("dry_run")),

@@ -52,7 +52,7 @@ def test_pr16_runtime_knobs_have_documented_defaults(monkeypatch) -> None:
     assert config.max_outbox_attempts == 10
     assert config.connector_claim_ttl_seconds == 60
     assert config.connector_max_claim_ttl_seconds == 300
-    assert config.connector_ack_ttl_seconds == 300
+    assert config.connector_ack_ttl_seconds == 60
     assert config.command_retry_horizon_seconds == 604_800
     assert config.command_receipt_retention_seconds == 2_592_000
     assert config.command_receipt_retention_count == 4096

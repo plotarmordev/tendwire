@@ -174,6 +174,28 @@ def test_inspect_omits_malformed_typed_final_key_without_exposing_private_state(
                 ),
             ],
         )
+        valid_outbox_id = conn.execute(
+            "SELECT id FROM connector_outbox WHERE delivery_key = ?",
+            (valid_key,),
+        ).fetchone()[0]
+        conn.execute(
+            """
+            INSERT INTO connector_deliveries (
+                outbox_id, host_id, connector, delivery_key, attempt,
+                status, response_json, private_state_json, created_at,
+                delivered_at
+            ) VALUES (
+                ?, ?, 'turn-final', ?, 1, 'failed', 'not-json', '{}', ?, ?
+            )
+            """,
+            (
+                valid_outbox_id,
+                host_id,
+                valid_key,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:01+00:00",
+            ),
+        )
 
     inspected = inspect_connector_outbox(
         db_path,
@@ -186,6 +208,16 @@ def test_inspect_omits_malformed_typed_final_key_without_exposing_private_state(
 
     assert inspected["ok"] is True
     assert inspected["total"] == 2
+    assert inspected["dead_letter_rows"] == 2
+    assert inspected["classifications"] == [
+        {
+            "kind": "final_anchor",
+            "last_status": "missing",
+            "last_reason": "missing",
+            "count": 2,
+            "recovery": "exact_key",
+        }
+    ]
     assert inspected["items"][0]["key"] == valid_key
     assert "key" not in inspected["items"][1]
     assert inspected["items"][1]["attempt_count"] == 3

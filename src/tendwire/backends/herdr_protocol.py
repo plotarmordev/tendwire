@@ -23,6 +23,7 @@ _SESSION_ENV_ORDER = (
 )
 
 HERDR_EVENTS_SUBSCRIBE_METHOD = "events.subscribe"
+HERDR_TURN_COMPLETED_EVENT_NAME = "pane.turn_completed"
 HERDR_OFFICIAL_EVENT_NAMES = (
     "workspace.created",
     "workspace.updated",
@@ -281,6 +282,7 @@ def validate_response(
     envelope: Mapping[str, Any],
     *,
     allow_uncorrelated_error: bool = False,
+    allow_uncorrelated_method_error: bool = False,
 ) -> dict[str, Any]:
     """Validate a response envelope while tolerating unknown fields."""
     if not is_response(envelope):
@@ -299,7 +301,20 @@ def validate_response(
         and isinstance(error.get("message"), str)
         and error["message"].startswith("invalid request:")
     )
-    if not uncorrelated_subscription_error:
+    # Stock Herdr 0.7.5 omits the id entirely when an internally tagged RPC
+    # variant is unknown. Only an explicit capability probe may opt into this
+    # narrower exception; ordinary requests remain strictly correlated.
+    uncorrelated_method_error = (
+        allow_uncorrelated_method_error
+        and is_error_response(envelope)
+        and ("id" not in envelope or envelope.get("id") == "")
+        and isinstance(error, Mapping)
+        and error.get("code") == "invalid_request"
+        and isinstance(error.get("message"), str)
+        and error["message"].startswith("invalid request: unknown variant")
+        and "pane.turns" in error["message"]
+    )
+    if not (uncorrelated_subscription_error or uncorrelated_method_error):
         _validated_id(envelope)
     return dict(envelope)
 
@@ -327,12 +342,14 @@ def validate_server_envelope(
     envelope: Mapping[str, Any],
     *,
     allow_uncorrelated_error: bool = False,
+    allow_uncorrelated_method_error: bool = False,
 ) -> dict[str, Any]:
     """Validate a decoded server response or event envelope."""
     if is_response(envelope):
         return validate_response(
             envelope,
             allow_uncorrelated_error=allow_uncorrelated_error,
+            allow_uncorrelated_method_error=allow_uncorrelated_method_error,
         )
     if is_event(envelope):
         return validate_event(envelope)

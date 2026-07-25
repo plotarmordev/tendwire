@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from ..config import DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 from ..core.models import sanitize_public_mapping, sanitize_public_value
 from ..store.sqlite import (
     ack_connector_delivery,
@@ -209,7 +210,7 @@ class ConnectorOutboxAPI:
         *,
         default_lease_seconds: int = 60,
         max_lease_seconds: int = 300,
-        ack_ttl_seconds: int = 300,
+        ack_ttl_seconds: int = DEFAULT_CONNECTOR_ACK_TTL_SECONDS,
         max_attempts: int = 10,
     ) -> None:
         self.db_path = Path(db_path) if db_path is not None else None

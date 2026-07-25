@@ -338,6 +338,31 @@ def _strip_stable_key_fields(value: Any) -> Any:
     return value
 
 
+_TURN_OBSERVATION_FIELD_NAMES = frozenset(
+    {
+        "turn",
+        "turnepoch",
+        "lastcompletedturn",
+        "outcome",
+    }
+)
+
+
+def _strip_turn_observation_fields(value: Any) -> Any:
+    """Remove turn counters and outcomes from every Worker identity surface."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _strip_turn_observation_fields(child)
+            for key, child in value.items()
+            if _compact_field_name(key) not in _TURN_OBSERVATION_FIELD_NAMES
+        }
+    if isinstance(value, list):
+        return [_strip_turn_observation_fields(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_turn_observation_fields(item) for item in value)
+    return value
+
+
 def _private_fingerprint(value: Any) -> str:
     """Return a private adapter-only fingerprint without public sanitization."""
     encoded = json.dumps(
@@ -1412,6 +1437,7 @@ def _worker_record_from_item(
     *,
     pane_info_observed: bool = False,
 ) -> _WorkerRecord:
+    item = _strip_turn_observation_fields(item)
     worker = _worker_from_item(item)
     worker = _worker_with_summary(worker, _bounded_excerpt(worker.summary, _output_excerpt_limit(config)))
     turn_target = _turn_target_from_item(item)

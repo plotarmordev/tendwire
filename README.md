@@ -544,7 +544,7 @@ variables:
 | `max_outbox_attempts` | `TENDWIRE_MAX_OUTBOX_ATTEMPTS` | `10` | integer >= 1 |
 | `connector_claim_ttl_seconds` | `TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS` | `60` | integer >= 1 |
 | `connector_max_claim_ttl_seconds` | `TENDWIRE_CONNECTOR_MAX_CLAIM_TTL_SECONDS` | `300` | integer >= 1; caps `turn-final` poll and renew requests |
-| `connector_ack_ttl_seconds` | `TENDWIRE_CONNECTOR_ACK_TTL_SECONDS` | `300` | integer >= 1; grace period for committed plans awaiting ACK completion |
+| `connector_ack_ttl_seconds` | `TENDWIRE_CONNECTOR_ACK_TTL_SECONDS` | `60` | integer >= 1; grace period for committed plans awaiting ACK completion |
 | `command_retry_horizon_seconds` | `TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS` | `604800` | positive integer no greater than 604800 |
 | `command_receipt_retention_seconds` | `TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS` | `2592000` | integer at least 691200 and strictly greater than the retry horizon |
 | `command_receipt_retention_count` | `TENDWIRE_COMMAND_RECEIPT_RETENTION_COUNT` | `4096` | positive integer; newest bounded inactive receipts per host |
