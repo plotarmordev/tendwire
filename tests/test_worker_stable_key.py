@@ -149,6 +149,62 @@ def test_restore_fixture_matches_verified_herdr_contract() -> None:
         assert "pane" in move["data"]
 
 
+def test_turn_observation_fields_are_byte_identical_identity_exclusions(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path / "identity-turn-exclusion")
+    pane = deepcopy(_fixture()["pre_restore"]["pane_info"])
+    pane["meta"] = {"provider": {"label": "stable"}}
+    _backend, baseline_workers, baseline_bindings, _records = _project(
+        config,
+        [],
+        [pane],
+    )
+    observed = deepcopy(pane)
+    observed.update(
+        {
+            "turn": 41,
+            "turn_epoch": 99,
+            "last_completed_turn": {
+                "turn": 41,
+                "turn_epoch": 99,
+                "completed_unix_ms": 1_700_000_000_000,
+            },
+            "outcome": "aborted",
+            "state_change_seq": 100,
+        }
+    )
+    observed["meta"]["provider"].update(
+        {
+            "turn": 41,
+            "turn_epoch": 99,
+            "last_completed_turn": {"turn": 41},
+            "outcome": "aborted",
+            "state_change_seq": 100,
+        }
+    )
+    _backend, turn_workers, turn_bindings, _records = _project(
+        config,
+        [],
+        [observed],
+    )
+
+    assert len(baseline_workers) == len(turn_workers) == 1
+    assert json.dumps(
+        baseline_workers[0].to_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8") == json.dumps(
+        turn_workers[0].to_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert baseline_workers[0].fingerprint == turn_workers[0].fingerprint
+    assert baseline_bindings[0].private_fingerprint == (
+        turn_bindings[0].private_fingerprint
+    )
+
+
 def test_exact_format_version_and_domain_separated_hmac(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -152,13 +152,19 @@ class HerdrSocketClient:
         params: Mapping[str, Any] | None = None,
         *,
         timeout: float | None = None,
+        allow_uncorrelated: bool = False,
     ) -> Any:
-        """Send one request and return its raw result payload."""
+        """Send one request and return its raw result payload.
+
+        ``allow_uncorrelated`` is reserved for an inert method-capability
+        probe; the default keeps every ordinary request strictly correlated.
+        """
         request_id, deadline = self._send_request(method, params, timeout=timeout)
         response = self._read_response(
             request_id,
             deadline=deadline,
             allow_uncorrelated_error=False,
+            allow_uncorrelated_method_error=allow_uncorrelated,
         )
         if is_error_response(response):
             raise HerdrErrorResponse(error_payload(response), request_id)
@@ -178,6 +184,7 @@ class HerdrSocketClient:
             request_id,
             deadline=deadline,
             allow_uncorrelated_error=True,
+            allow_uncorrelated_method_error=False,
         )
         if is_error_response(response):
             raise HerdrErrorResponse(error_payload(response), request_id)
@@ -271,6 +278,20 @@ class HerdrSocketClient:
     ) -> Any:
         return self.request("pane.read", params, timeout=timeout)
 
+    def pane_turns(
+        self,
+        params: Mapping[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+        allow_uncorrelated: bool = False,
+    ) -> Any:
+        return self.request(
+            "pane.turns",
+            params,
+            timeout=timeout,
+            allow_uncorrelated=allow_uncorrelated,
+        )
+
     def agent_send(
         self,
         params: Mapping[str, Any] | None = None,
@@ -338,11 +359,13 @@ class HerdrSocketClient:
         *,
         deadline: float,
         allow_uncorrelated_error: bool,
+        allow_uncorrelated_method_error: bool,
     ) -> dict[str, Any]:
         while True:
             envelope = self._read_server_envelope(
                 deadline=deadline,
                 allow_uncorrelated_error=allow_uncorrelated_error,
+                allow_uncorrelated_method_error=allow_uncorrelated_method_error,
             )
             if is_event(envelope):
                 if len(self._pending_events) >= _MAX_PENDING_EVENTS:
@@ -352,14 +375,25 @@ class HerdrSocketClient:
                 self._pending_events.append(envelope)
                 continue
             if (
-                allow_uncorrelated_error
+                (allow_uncorrelated_error or allow_uncorrelated_method_error)
                 and is_error_response(envelope)
-                and envelope.get("id") == ""
+                and (
+                    (
+                        allow_uncorrelated_error
+                        and envelope.get("id") == ""
+                    )
+                    or (
+                        allow_uncorrelated_method_error
+                        and (
+                            "id" not in envelope
+                            or envelope.get("id") == ""
+                        )
+                    )
+                )
             ):
-                # Herdr 0.7.5 does not correlate request-schema errors.  They
-                # still belong to the only in-flight synchronous request and
-                # must reach the caller as a server error, not tear down the
-                # event loop as a malformed envelope.
+                # These narrowly validated Herdr 0.7.5 errors belong to the
+                # only in-flight synchronous request and must reach the caller
+                # as server errors rather than poison the connection.
                 payload = envelope.get("error")
                 if not isinstance(payload, Mapping):
                     raise HerdrEnvelopeError("Herdr error payload must be an object")
@@ -378,12 +412,14 @@ class HerdrSocketClient:
         *,
         deadline: float,
         allow_uncorrelated_error: bool = False,
+        allow_uncorrelated_method_error: bool = False,
     ) -> dict[str, Any]:
         line = self._read_line(deadline=deadline)
         envelope = parse_json_line(line)
         return validate_server_envelope(
             envelope,
             allow_uncorrelated_error=allow_uncorrelated_error,
+            allow_uncorrelated_method_error=allow_uncorrelated_method_error,
         )
 
     def _read_line(self, *, deadline: float) -> bytes:

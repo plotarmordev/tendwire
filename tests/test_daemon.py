@@ -1456,8 +1456,8 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
                 "queued",
                 '{"safe":"kept"}',
                 '{"token":"sentinel-private-token"}',
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:00+00:00",
+                "9999-01-01T00:00:00+00:00",
+                "9999-01-01T00:00:00+00:00",
             ),
         )
 
@@ -1918,6 +1918,11 @@ def test_daemon_health_degrades_on_public_safe_final_storage_pressure(
                 "leased": 0,
                 "completed": 0,
                 "by_status": {},
+                "due": 0,
+                "oldest_due_at": None,
+                "overdue_awaiting_ack": 0,
+                "drain_target_seconds": 30,
+                "starved": False,
             },
             "maintenance": {
                 "last_completed_at": None,
@@ -2083,6 +2088,11 @@ def test_daemon_health_rejects_malformed_aggregate_fields_without_leaking(
         "leased": 0,
         "completed": 0,
         "by_status": {},
+        "due": 0,
+        "oldest_due_at": None,
+        "overdue_awaiting_ack": 0,
+        "drain_target_seconds": 30,
+        "starved": False,
     }
     assert health["store"]["maintenance"]["last_completed_at"] is None
     assert health["store"]["final_retention"]["queued"] == 0

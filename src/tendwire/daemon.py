@@ -94,12 +94,27 @@ def _store_counts_health(value: Any) -> tuple[dict[str, int], bool]:
 
 
 def _outbox_health(value: Any) -> tuple[dict[str, Any], bool]:
-    fallback = {"pending": 0, "leased": 0, "completed": 0, "by_status": {}}
+    fallback = {
+        "pending": 0,
+        "leased": 0,
+        "completed": 0,
+        "by_status": {},
+        "due": 0,
+        "oldest_due_at": None,
+        "overdue_awaiting_ack": 0,
+        "drain_target_seconds": 30,
+        "starved": False,
+    }
     if not isinstance(value, Mapping) or set(value) != {
         "pending",
         "leased",
         "completed",
         "by_status",
+        "due",
+        "oldest_due_at",
+        "overdue_awaiting_ack",
+        "drain_target_seconds",
+        "starved",
     }:
         return fallback, False
     by_status_value = value.get("by_status")
@@ -116,10 +131,30 @@ def _outbox_health(value: Any) -> tuple[dict[str, Any], bool]:
     pending = _validated_nonnegative_int(value.get("pending"))
     leased = _validated_nonnegative_int(value.get("leased"))
     completed = _validated_nonnegative_int(value.get("completed"))
+    due = _validated_nonnegative_int(value.get("due"))
+    overdue_awaiting_ack = _validated_nonnegative_int(
+        value.get("overdue_awaiting_ack")
+    )
+    drain_target_seconds = _validated_nonnegative_int(
+        value.get("drain_target_seconds")
+    )
+    oldest_due_at = value.get("oldest_due_at")
+    starved = value.get("starved")
     if (
         pending is None
         or leased is None
         or completed is None
+        or due is None
+        or overdue_awaiting_ack is None
+        or drain_target_seconds != 30
+        or not isinstance(starved, bool)
+        or (
+            oldest_due_at is not None
+            and _valid_observation_timestamp(oldest_due_at) is None
+        )
+        or due > pending
+        or (due == 0 and oldest_due_at is not None)
+        or (due > 0 and oldest_due_at is None)
         or pending
         != sum(by_status.get(status, 0) for status in ("queued", "deferred", "retry"))
         or leased != by_status.get("leased", 0)
@@ -132,6 +167,11 @@ def _outbox_health(value: Any) -> tuple[dict[str, Any], bool]:
         "leased": leased,
         "completed": completed,
         "by_status": by_status,
+        "due": due,
+        "oldest_due_at": oldest_due_at,
+        "overdue_awaiting_ack": overdue_awaiting_ack,
+        "drain_target_seconds": drain_target_seconds,
+        "starved": starved,
     }, True
 
 
@@ -818,7 +858,17 @@ class TendwireDaemon:
             "status": "store_unavailable",
             "host_id": self.config.host_id,
             "counts": {},
-            "outbox": {"pending": 0, "leased": 0, "completed": 0, "by_status": {}},
+            "outbox": {
+                "pending": 0,
+                "leased": 0,
+                "completed": 0,
+                "by_status": {},
+                "due": 0,
+                "oldest_due_at": None,
+                "overdue_awaiting_ack": 0,
+                "drain_target_seconds": 30,
+                "starved": False,
+            },
             "final_retention": {
                 **{key: 0 for key in _FINAL_RETENTION_COUNT_FIELDS},
                 "acknowledged_final_retention_days": (
@@ -928,6 +978,7 @@ class TendwireDaemon:
             or bool(final_retention["storage_pressure"])
             or not command_requests_valid
             or bool(command_requests["storage_pressure"])
+            or bool(outbox["starved"])
         )
         pending_ingestion = _pending_ingestion_health(self.config)
         stored_last_event_at = _valid_observation_timestamp(

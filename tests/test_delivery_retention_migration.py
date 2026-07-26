@@ -875,7 +875,7 @@ def test_v10_to_v12_migration_retains_finals_without_reposting_or_leaking(
     finals = _seed_v10_finals(db_path)
 
     init_store(db_path)
-    assert store_sqlite.STORE_SCHEMA_VERSION == 18
+    assert store_sqlite.STORE_SCHEMA_VERSION == 19
 
     delivered_key = _final_key(*finals["delivered"])
     hold_keys = {_final_key(*finals[label]) for label in ("hold-a", "hold-b")}

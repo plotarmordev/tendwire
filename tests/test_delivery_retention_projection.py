@@ -167,7 +167,7 @@ def _assert_continuity_integrity(db_path: Path) -> None:
     with sqlite3.connect(str(db_path)) as conn:
         assert conn.execute("PRAGMA user_version").fetchone() == (
             store_sqlite.STORE_SCHEMA_VERSION,
-        ) == (18,)
+        ) == (19,)
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         current_counts = conn.execute(
             """

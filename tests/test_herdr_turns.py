@@ -2209,3 +2209,156 @@ def test_complete_reobservation_recovers_known_incomplete_source_turn(
         revision=recovered_revision,
         field="assistant_final_text",
     ) == complete_final
+
+
+def test_completed_pane_refresh_uses_authoritative_binding_hint(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    config = Config(host_id="completion-route", db_path=tmp_path / "route.db")
+    binding = WorkerBinding(
+        host_id=config.host_id,
+        worker_id="worker-1",
+        worker_fingerprint="worker-fingerprint",
+        backend="herdr",
+        target_kind="agent_id",
+        target_value="agent-private",
+        turn_target_kind="codex_session_id",
+        turn_target_value="session-private",
+        sendable=True,
+        observed_at="2026-07-23T00:00:00+00:00",
+        expires_at="9999-12-31T23:59:59+00:00",
+        private_fingerprint="binding-private",
+    )
+    monkeypatch.setattr(
+        herdr_turns,
+        "list_worker_bindings",
+        lambda *_args, **_kwargs: [binding],
+    )
+    refreshed: list[WorkerBinding] = []
+    monkeypatch.setattr(
+        herdr_turns,
+        "_refresh_turn_binding",
+        lambda _config, current, **_kwargs: (
+            refreshed.append((current, _kwargs.get("pane_target_override")))
+            or herdr_turns.TurnRefreshResult("updated", 1)
+        ),
+    )
+    monkeypatch.setattr(
+        herdr_turns,
+        "latest_turn_id_for_worker",
+        lambda *_args, **_kwargs: "public-turn-1",
+    )
+
+    result = herdr_turns.refresh_completed_pane_turn(
+        config,
+        "w123456789abcde:pA",
+        terminal_id="different-terminal",
+        binding_private_fingerprint="binding-private",
+    )
+
+    assert refreshed == [(binding, "w123456789abcde:pA")]
+    assert result == herdr_turns.CompletedPaneTurnRefreshResult(
+        "updated",
+        worker_id="worker-1",
+        refreshed_turn_id="public-turn-1",
+    )
+
+
+def test_completed_pane_refresh_ignores_stale_session_generation_for_content_read(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    db_path = tmp_path / "generation-mismatch.db"
+    config = Config(
+        host_id="generation-mismatch",
+        db_path=db_path,
+        herdr_bin="turn-adapter",
+        herdr_timeout_seconds=2,
+    )
+    snapshot = project_from_raw(
+        config,
+        workers=[
+            {
+                "id": "worker-generation-a",
+                "name": "claude",
+                "status": "idle",
+                "space_id": "space-1",
+            }
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    worker = snapshot.workers[0]
+    stale_binding = WorkerBinding(
+        host_id=config.host_id,
+        worker_id=worker.id,
+        worker_fingerprint=worker.fingerprint,
+        backend="herdr",
+        target_kind="terminal_id",
+        target_value="terminal-stable",
+        turn_target_kind="codex_session_id",
+        turn_target_value="session-generation-a",
+        sendable=True,
+        observed_at="2026-07-23T00:00:00+00:00",
+        expires_at="9999-12-31T23:59:59+00:00",
+        private_fingerprint="binding-generation-a",
+    )
+    upsert_worker_bindings(db_path, [stale_binding])
+    adapter_calls: list[list[str]] = []
+    payload = _pane_turn_payload(
+        user_text="reply with purple elephant 42",
+        final_text="purple elephant 42",
+        source_turn_id="generation-b-turn",
+    )
+
+    def fake_run(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        adapter_calls.append(args)
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+
+    monkeypatch.setattr(herdr_turns.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        herdr_turns,
+        "_read_file_turn_isolated",
+        lambda *_args, **_kwargs: pytest.fail(
+            "completion must not read the stale session generation"
+        ),
+    )
+
+    result = herdr_turns.refresh_completed_pane_turn(
+        config,
+        "pane-generation-b",
+        terminal_id="terminal-stable",
+        binding_private_fingerprint="binding-generation-a",
+    )
+    payload_from_store = turns_payload_from_store(
+        db_path,
+        config.host_id,
+        snapshot=snapshot,
+    )
+
+    assert result.status == "updated"
+    assert result.worker_id == worker.id
+    assert adapter_calls == [
+        [
+            "turn-adapter",
+            "pane",
+            "turn",
+            "pane-generation-b",
+            "--last",
+            "--format",
+            "json",
+        ]
+    ]
+    captured = next(
+        turn
+        for turn in payload_from_store["turns"]
+        if turn.get("assistant_final_text")
+    )
+    assert captured["status"] == "idle"
+    assert captured["assistant_final_text"] == "purple elephant 42"

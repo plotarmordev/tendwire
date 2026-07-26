@@ -12,6 +12,7 @@ import sqlite3
 import stat
 import threading
 import time
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -357,7 +358,7 @@ def test_store_startup_repairs_broad_modes_idempotently_and_preserves_data(
     state_dir.mkdir()
     os.chmod(state_dir, 0o755)
     db_path = state_dir / "tendwire.db"
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
         conn.execute("CREATE TABLE preserved (value TEXT NOT NULL)")
         conn.execute("INSERT INTO preserved (value) VALUES ('kept')")
     conn.close()
@@ -366,13 +367,13 @@ def test_store_startup_repairs_broad_modes_idempotently_and_preserves_data(
 
     init_store(db_path)
     first_modes = (_mode(state_dir), _mode(db_path))
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
         first_value = conn.execute("SELECT value FROM preserved").fetchone()[0]
         first_version = _user_version(conn)
     conn.close()
 
     init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
         second_value = conn.execute("SELECT value FROM preserved").fetchone()[0]
         second_version = _user_version(conn)
     conn.close()
@@ -621,7 +622,7 @@ def test_every_creation_capable_store_path_prepares_private_sqlite_state(
 
     assert _mode(state_dir) == 0o700
     assert _mode(db_path) == 0o600
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
         assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION
 
 
@@ -2157,6 +2158,289 @@ def test_store_maintenance_dry_run_and_exhausted_outbox_status(tmp_path: Path) -
     assert real["outbox"]["updated"] == 1
     assert real_status == "dead_letter"
     assert json.loads(private_state) == {}
+
+
+def test_store_maintenance_bounds_herdr_completions_and_drops_dead_watermarks(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "herdr-turn-maintenance.db"
+    init_store(db_path)
+    host_id = "herdr-retention-host"
+    dead_pane = "workspace:pDead"
+    active_pane = "workspace:pLive"
+    store_sqlite.set_herdr_turn_watermark(
+        db_path,
+        host_id,
+        dead_pane,
+        turn_epoch=7,
+        last_turn=0,
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    for turn in range(1, 4):
+        store_sqlite.record_herdr_turn_completion(
+            db_path,
+            host_id,
+            dead_pane,
+            turn_epoch=7,
+            turn=turn,
+            outcome="completed",
+            completed_unix_ms=turn,
+            message=None,
+            message_truncated=False,
+            agent_session_path=None,
+            worker_id="dead-worker",
+            refreshed_turn_id=None,
+            observed_at=f"2026-01-0{turn}T00:00:00+00:00",
+        )
+    store_sqlite.set_herdr_turn_watermark(
+        db_path,
+        host_id,
+        active_pane,
+        turn_epoch=7,
+        last_turn=9,
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    store_sqlite.record_herdr_turn_completion(
+        db_path,
+        host_id,
+        active_pane,
+        turn_epoch=7,
+        turn=9,
+        outcome="completed",
+        completed_unix_ms=9,
+        message=None,
+        message_truncated=False,
+        agent_session_path=None,
+        worker_id="dead-worker",
+        refreshed_turn_id=None,
+        observed_at="2026-01-09T00:00:00+00:00",
+    )
+    upsert_worker_bindings(
+        db_path,
+        [
+            WorkerBinding(
+                host_id=host_id,
+                # The same logical worker moved from dead_pane to active_pane.
+                # Only a current pane target keeps a watermark alive.
+                worker_id="dead-worker",
+                worker_fingerprint="live-fingerprint",
+                backend="herdr",
+                target_kind="terminal_id",
+                target_value="live-terminal",
+                turn_target_kind="pane_id",
+                turn_target_value=active_pane,
+                sendable=True,
+                observed_at="2026-01-01T00:00:00+00:00",
+                expires_at="9999-12-31T23:59:59+00:00",
+                private_fingerprint="live-private-fingerprint",
+            )
+        ],
+    )
+
+    result = run_store_maintenance(
+        db_path,
+        host_id,
+        retention_days=30,
+        max_outbox_attempts=3,
+        now="2026-03-15T00:00:00+00:00",
+        herdr_turn_retention_days=30,
+        herdr_turn_retention_count=1,
+        herdr_turn_batch_size=4,
+    )
+
+    assert result["ok"] is True
+    assert result["herdr_turns"]["deleted_completions"] == 3
+    assert result["herdr_turns"]["deleted_watermarks"] == 1
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
+        assert conn.execute(
+            """
+            SELECT turn
+            FROM herdr_turn_completions
+            WHERE host_id = ? AND pane_id = ?
+            ORDER BY turn
+            """,
+            (host_id, dead_pane),
+        ).fetchall() == []
+        assert conn.execute(
+            """
+            SELECT pane_id, turn
+            FROM herdr_turn_completions
+            WHERE host_id = ?
+            ORDER BY pane_id, turn
+            """,
+            (host_id,),
+        ).fetchall() == [(active_pane, 9)]
+        assert conn.execute(
+            """
+            SELECT pane_id
+            FROM herdr_turn_watermarks
+            WHERE host_id = ?
+            ORDER BY pane_id
+            """,
+            (host_id,),
+        ).fetchall() == [(active_pane,)]
+
+
+def test_herdr_turn_maintenance_reports_watermark_deferred_by_full_batch(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "herdr-turn-deferred-watermark.db"
+    init_store(db_path)
+    host_id = "herdr-recent-retention-host"
+    active_pane = "workspace:pLive"
+    dead_pane = "workspace:pDead"
+    store_sqlite.set_herdr_turn_watermark(
+        db_path,
+        host_id,
+        dead_pane,
+        turn_epoch=7,
+        last_turn=0,
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    store_sqlite.set_herdr_turn_watermark(
+        db_path,
+        host_id,
+        active_pane,
+        turn_epoch=7,
+        last_turn=0,
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    for turn in range(1, 4):
+        store_sqlite.record_herdr_turn_completion(
+            db_path,
+            host_id,
+            active_pane,
+            turn_epoch=7,
+            turn=turn,
+            outcome="completed",
+            completed_unix_ms=turn,
+            message=None,
+            message_truncated=False,
+            agent_session_path=None,
+            worker_id="live-worker",
+            refreshed_turn_id=None,
+            observed_at=f"2026-01-0{turn}T00:00:00+00:00",
+        )
+    upsert_worker_bindings(
+        db_path,
+        [
+            WorkerBinding(
+                host_id=host_id,
+                worker_id="live-worker",
+                worker_fingerprint="live-fingerprint",
+                backend="herdr",
+                target_kind="terminal_id",
+                target_value="live-terminal",
+                turn_target_kind="pane_id",
+                turn_target_value=active_pane,
+                sendable=True,
+                observed_at="2026-01-01T00:00:00+00:00",
+                expires_at="9999-12-31T23:59:59+00:00",
+                private_fingerprint="live-private-fingerprint",
+            )
+        ],
+    )
+
+    first = store_sqlite.cleanup_herdr_turn_retention(
+        db_path,
+        host_id=host_id,
+        retention_days=30,
+        retention_count=1,
+        batch_size=2,
+        now="2026-03-15T00:00:00+00:00",
+    )
+
+    assert first["deleted_completions"] == 2
+    assert first["deleted_watermarks"] == 0
+    assert first["remaining_candidates"] is True
+
+    second = store_sqlite.cleanup_herdr_turn_retention(
+        db_path,
+        host_id=host_id,
+        retention_days=30,
+        retention_count=1,
+        batch_size=2,
+        now="2026-03-15T00:00:00+00:00",
+    )
+
+    assert second["deleted_completions"] == 0
+    assert second["deleted_watermarks"] == 1
+    assert second["remaining_candidates"] is False
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
+        assert conn.execute(
+            """
+            SELECT turn
+            FROM herdr_turn_completions
+            WHERE host_id = ? AND pane_id = ?
+            ORDER BY turn
+            """,
+            (host_id, active_pane),
+        ).fetchall() == [(3,)]
+        assert conn.execute(
+            """
+            SELECT pane_id
+            FROM herdr_turn_watermarks
+            WHERE host_id = ?
+            ORDER BY pane_id
+            """,
+            (host_id,),
+        ).fetchall() == [(active_pane,)]
+
+
+def test_herdr_turn_maintenance_low_count_preserves_fresh_rows(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "herdr-turn-fresh-count-floor.db"
+    init_store(db_path)
+    host_id = "herdr-fresh-retention-host"
+    pane_id = "workspace:pFresh"
+    store_sqlite.set_herdr_turn_watermark(
+        db_path,
+        host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=0,
+        observed_at="2026-03-14T00:00:00+00:00",
+    )
+    for turn in range(1, 4):
+        store_sqlite.record_herdr_turn_completion(
+            db_path,
+            host_id,
+            pane_id,
+            turn_epoch=7,
+            turn=turn,
+            outcome="completed",
+            completed_unix_ms=turn,
+            message=None,
+            message_truncated=False,
+            agent_session_path=None,
+            worker_id="fresh-worker",
+            refreshed_turn_id=None,
+            observed_at=f"2026-03-14T00:00:0{turn}+00:00",
+        )
+
+    result = store_sqlite.cleanup_herdr_turn_retention(
+        db_path,
+        host_id=host_id,
+        retention_days=30,
+        retention_count=1,
+        batch_size=100,
+        now="2026-03-15T00:00:00+00:00",
+    )
+
+    assert result["deleted_completions"] == 0
+    assert result["deleted_watermarks"] == 0
+    assert result["remaining_candidates"] is False
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
+        assert conn.execute(
+            """
+            SELECT turn
+            FROM herdr_turn_completions
+            WHERE host_id = ? AND pane_id = ?
+            ORDER BY turn
+            """,
+            (host_id, pane_id),
+        ).fetchall() == [(1,), (2,), (3,)]
 
 
 def test_exhaust_connector_retries_reclaims_expired_leases_before_dead_letter(tmp_path: Path) -> None:
@@ -9543,7 +9827,12 @@ def test_turn_content_maintenance_preserves_live_and_young_final_sources(
 
     assert result["turn_content"]["examined"] == 0
     assert result["turn_content"]["deleted"] == 0
-    assert preserved == (source_status,)
+    expected_status = (
+        "dead_letter"
+        if source_status == "awaiting_ack" and attempt_status is None
+        else source_status
+    )
+    assert preserved == (expected_status,)
     assert attempt_count == int(attempt_status is not None)
     assert integrity == "ok"
 
@@ -11294,7 +11583,7 @@ def test_v13_migration_repairs_nonpositive_turn_sequences_and_blocks_recurrence(
     init_store(db_path)
 
     with sqlite3.connect(str(db_path)) as conn:
-        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION == 18
+        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION == 19
         assert conn.execute(
             """
             SELECT turn_id, list_sequence
@@ -15531,3 +15820,42 @@ def test_source_reconciliation_isolates_stable_owners_and_legacy_no_owner(
     assert raw_source not in json.dumps(payload, sort_keys=True)
     with sqlite3.connect(str(db_path)) as conn:
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_v18_to_v19_adds_herdr_turn_watermark_and_provenance_tables(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "herdr-turn-v18.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        store_sqlite._run_migrations(conn, target_version=18)
+        assert conn.execute("PRAGMA user_version").fetchone() == (18,)
+        assert conn.execute(
+            """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'table'
+              AND name IN (
+                  'herdr_turn_watermarks',
+                  'herdr_turn_completions'
+              )
+            """
+        ).fetchone() == (0,)
+    os.chmod(tmp_path, 0o700)
+    os.chmod(db_path, 0o600)
+
+    init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone() == (19,)
+        assert {
+            str(row[0])
+            for row in conn.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table'
+                  AND name IN (
+                      'herdr_turn_watermarks',
+                      'herdr_turn_completions'
+                  )
+                """
+            )
+        } == {"herdr_turn_watermarks", "herdr_turn_completions"}

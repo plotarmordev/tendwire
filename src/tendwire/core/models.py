@@ -1196,10 +1196,43 @@ def _backend_health_counts(value: Any) -> dict[str, int]:
     return counts
 
 
+def _is_turn_api_volatile_key(key: object) -> bool:
+    normalized = str(key).strip().lower().replace("-", "_").replace(".", "_")
+    return (
+        normalized
+        in (
+            "turn",
+            "turn_epoch",
+            "last_completed_turn",
+            "outcome",
+            "state_change_seq",
+        )
+        or normalized.startswith("turn_")
+    )
+
+
+def _strip_turn_api_volatile(value: Any) -> Any:
+    """Drop Herdr turn-API counters from identity-bearing metadata.
+
+    These values advance as panes complete turns or change state. Hashing them
+    into worker or space fingerprints re-keys identity per observation, so the
+    exclusion belongs at the shared model choke point.
+    """
+    if isinstance(value, Mapping):
+        return {
+            key: _strip_turn_api_volatile(item)
+            for key, item in value.items()
+            if not _is_turn_api_volatile_key(key)
+        }
+    if isinstance(value, list):
+        return [_strip_turn_api_volatile(item) for item in value]
+    return value
+
+
 def _status_and_meta(status: Any, meta: Any) -> tuple[str, dict[str, Any]]:
     raw_status = _string_value(status, "unknown").strip()
     normalized = normalize_status(raw_status)
-    clean_meta = sanitize_public_mapping(meta)
+    clean_meta = _strip_turn_api_volatile(sanitize_public_mapping(meta))
     if raw_status and raw_status.lower().replace("_", "-") != normalized:
         public_raw_status = _public_safe_text(raw_status)
         if public_raw_status:
