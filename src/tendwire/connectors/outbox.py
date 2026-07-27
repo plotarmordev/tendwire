@@ -49,7 +49,7 @@ _CONNECTOR_REF_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRST
 _CONNECTOR_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 _PLAN_TOKEN_PREFIX = "twplan1."
 _REVISION_PREFIX = "twrev1."
-_PREPARE_NAME = "turn-final"
+_TURN_FINAL_NAME = "turn-final"
 _FINAL_ID_PREFIX = "twfinal1."
 _FINAL_KEY_PREFIX = "turn-final:revision:twfinal1."
 _PREPARE_MAX_PARTS = 10_000
@@ -235,7 +235,7 @@ class ConnectorOutboxAPI:
             return _error("invalid_params", host_id=self.host_id)
         action = data.get("action")
         name = _name(data.get("name"))
-        if name != _PREPARE_NAME or action not in {"begin", "part", "commit", "recover"}:
+        if name != _TURN_FINAL_NAME or action not in {"begin", "part", "commit", "recover"}:
             return _error("invalid_params", host_id=self.host_id)
         unavailable = self._require_store(name)
         if unavailable is not None:
@@ -418,7 +418,7 @@ class ConnectorOutboxAPI:
                 minimum=1,
                 maximum=(
                     self.max_lease_seconds
-                    if name == _PREPARE_NAME
+                    if name == _TURN_FINAL_NAME
                     else 86400
                 ),
             ),
@@ -519,7 +519,7 @@ class ConnectorOutboxAPI:
             minimum=1,
             maximum=(
                 self.max_lease_seconds
-                if name == _PREPARE_NAME
+                if name == _TURN_FINAL_NAME
                 else 86400
             ),
         )
@@ -588,7 +588,7 @@ class ConnectorOutboxAPI:
         if (
             data.get("schema_version") != 1
             or isinstance(data.get("schema_version"), bool)
-            or name != _PREPARE_NAME
+            or name != _TURN_FINAL_NAME
             or status != "dead_letter"
             or isinstance(limit, bool)
             or not isinstance(limit, int)
@@ -624,7 +624,7 @@ class ConnectorOutboxAPI:
         if (
             data.get("schema_version") != 1
             or isinstance(data.get("schema_version"), bool)
-            or name != _PREPARE_NAME
+            or name != _TURN_FINAL_NAME
             or (
                 "key" in data
                 and (

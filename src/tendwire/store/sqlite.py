@@ -80,6 +80,7 @@ from ..core.models import (
     separate_duplicate_worker_bindings,
     sanitize_canonical_turn_text,
     sanitize_public_mapping,
+    sanitize_public_text,
     sanitize_public_value,
     stable_fingerprint,
     utc_timestamp,
@@ -2207,6 +2208,8 @@ _CONNECTOR_EXHAUSTED_OUTBOX_STATUS = "dead_letter"
 _CONNECTOR_SUPERSEDED_OUTBOX_STATUS = "superseded"
 _CONNECTOR_ACK_RETRY_BACKOFF_MAX_SECONDS = 30
 _CONNECTOR_DRAIN_TARGET_SECONDS = 30
+_TURN_FINAL_REASON_DETAIL_MAX_CHARS = 240
+_CONNECTOR_TERMINAL_DIAGNOSTIC_KEY = "terminal_diagnostic"
 _TURN_FINAL_PUBLIC_REASONS = frozenset(
     {
         "backpressure",
@@ -2369,8 +2372,107 @@ def _store_public_text(
     return clean if isinstance(clean, str) and clean else default
 
 
+def _store_private_diagnostic_text(value: Any) -> str:
+    return sanitize_public_text(
+        str(value or ""),
+        max_chars=_TURN_FINAL_REASON_DETAIL_MAX_CHARS,
+    )
 
 
+def _turn_final_reason_diagnostics(value: Any) -> tuple[str, str]:
+    public_reason = _store_public_label(
+        value,
+        allowed=_TURN_FINAL_PUBLIC_REASONS,
+    )
+    if public_reason != "unknown":
+        return public_reason, ""
+    return public_reason, _store_private_diagnostic_text(value)
+
+
+def _connector_private_with_terminal_diagnostic(
+    raw: Any,
+    *,
+    public_reason: str,
+    reason_detail: str,
+    attempt_count: int,
+    classification: str,
+    terminalized_at: str,
+) -> str:
+    state = _json_object(_connector_private_clear_current(raw))
+    terminal = {
+        "reason": _store_public_label(
+            public_reason,
+            allowed={*_TURN_FINAL_PUBLIC_REASONS, "missing", "unknown"},
+        ),
+        "attempt_count": max(0, min(int(attempt_count), (1 << 63) - 1)),
+        "classification": _store_public_label(classification),
+        "terminalized_at": str(terminalized_at),
+    }
+    if reason_detail:
+        terminal["reason_detail"] = _store_private_diagnostic_text(reason_detail)
+    state[_CONNECTOR_TERMINAL_DIAGNOSTIC_KEY] = terminal
+    return _canonical_json(state)
+
+
+def _connector_private_clear_terminal_diagnostic(raw: Any) -> str:
+    state = _json_object(raw)
+    state.pop(_CONNECTOR_TERMINAL_DIAGNOSTIC_KEY, None)
+    return _canonical_json(state)
+
+
+def _connector_attempt_count_conn(
+    conn: sqlite3.Connection,
+    *,
+    outbox_id: int,
+    private_state_json: Any,
+) -> int:
+    state = _json_object(private_state_json)
+    prior_attempts = state.get("prior_attempt_count")
+    local_attempts = conn.execute(
+        """
+        SELECT COALESCE(MAX(attempt), 0)
+        FROM connector_deliveries
+        WHERE outbox_id = ?
+        """,
+        (int(outbox_id),),
+    ).fetchone()
+    values = (
+        prior_attempts
+        if isinstance(prior_attempts, int) and not isinstance(prior_attempts, bool)
+        else 0,
+        int(local_attempts[0] or 0) if local_attempts is not None else 0,
+    )
+    return min(sum(value for value in values if value >= 0), (1 << 63) - 1)
+
+
+def _turn_final_latest_reason_conn(
+    conn: sqlite3.Connection,
+    *,
+    outbox_id: int,
+) -> tuple[str, str]:
+    row = conn.execute(
+        """
+        SELECT response_json
+        FROM connector_deliveries
+        WHERE outbox_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (int(outbox_id),),
+    ).fetchone()
+    response = _json_object(row[0]) if row is not None else {}
+    if "reason" not in response:
+        return "missing", ""
+    public_reason = _store_public_label(
+        response.get("reason"),
+        allowed={*_TURN_FINAL_PUBLIC_REASONS, "missing", "unknown"},
+    )
+    detail = (
+        _store_private_diagnostic_text(response.get("reason_detail"))
+        if public_reason == "unknown"
+        else ""
+    )
+    return public_reason, detail
 
 
 def _connector_private_with_lease(
@@ -2685,6 +2787,15 @@ def _connector_reclaim_expired_awaiting_ack_conn(
                 (plan_id,),
             ).fetchall()
             for job_outbox_id, job_private in job_rows:
+                job_reason, job_reason_detail = _turn_final_latest_reason_conn(
+                    conn,
+                    outbox_id=int(job_outbox_id),
+                )
+                job_attempt_count = _connector_attempt_count_conn(
+                    conn,
+                    outbox_id=int(job_outbox_id),
+                    private_state_json=job_private,
+                )
                 conn.execute(
                     """
                     UPDATE connector_deliveries
@@ -2708,7 +2819,14 @@ def _connector_reclaim_expired_awaiting_ack_conn(
                     """,
                     (
                         str(now),
-                        _connector_private_clear_current(job_private),
+                        _connector_private_with_terminal_diagnostic(
+                            job_private,
+                            public_reason=job_reason,
+                            reason_detail=job_reason_detail,
+                            attempt_count=job_attempt_count,
+                            classification="ack_deadline_expired",
+                            terminalized_at=str(now),
+                        ),
                         int(job_outbox_id),
                     ),
                 )
@@ -2722,8 +2840,23 @@ def _connector_reclaim_expired_awaiting_ack_conn(
             )
             source_status = "retry"
         else:
+            source_reason, source_reason_detail = _turn_final_latest_reason_conn(
+                conn,
+                outbox_id=int(outbox_id),
+            )
             source_state = _json_object(
-                _connector_private_clear_current(private_state_json)
+                _connector_private_with_terminal_diagnostic(
+                    private_state_json,
+                    public_reason=source_reason,
+                    reason_detail=source_reason_detail,
+                    attempt_count=_connector_attempt_count_conn(
+                        conn,
+                        outbox_id=int(outbox_id),
+                        private_state_json=private_state_json,
+                    ),
+                    classification="plan_unrecoverable",
+                    terminalized_at=str(now),
+                )
             )
             source_status = _CONNECTOR_EXHAUSTED_OUTBOX_STATUS
             retry_at = None
@@ -2851,29 +2984,57 @@ def _connector_exhaust_retryable_conn(
         ).fetchone()
         return int(row[0] or 0)
 
-    cursor = conn.execute(
+    rows = conn.execute(
         f"""
-        UPDATE connector_outbox
-        SET status = ?,
-            next_attempt_at = NULL,
-            updated_at = ?,
-            private_state_json = ?
+        SELECT id, connector, private_state_json
+        FROM connector_outbox
         WHERE {where_sql}
+        ORDER BY id
         """,
-        [
-            _CONNECTOR_EXHAUSTED_OUTBOX_STATUS,
-            now,
-            "{}",
-            *params,
-        ],
-    )
+        params,
+    ).fetchall()
+    for outbox_id, connector, private_state_json in rows:
+        next_private_state = "{}"
+        if str(connector) == _TURN_FINAL_NAME:
+            public_reason, reason_detail = _turn_final_latest_reason_conn(
+                conn,
+                outbox_id=int(outbox_id),
+            )
+            next_private_state = _connector_private_with_terminal_diagnostic(
+                private_state_json,
+                public_reason=public_reason,
+                reason_detail=reason_detail,
+                attempt_count=_connector_attempt_count_conn(
+                    conn,
+                    outbox_id=int(outbox_id),
+                    private_state_json=private_state_json,
+                ),
+                classification="attempts_exhausted",
+                terminalized_at=str(now),
+            )
+        conn.execute(
+            """
+            UPDATE connector_outbox
+            SET status = ?,
+                next_attempt_at = NULL,
+                updated_at = ?,
+                private_state_json = ?
+            WHERE id = ?
+            """,
+            (
+                _CONNECTOR_EXHAUSTED_OUTBOX_STATUS,
+                str(now),
+                next_private_state,
+                int(outbox_id),
+            ),
+        )
     _mark_exhausted_presentation_plans_conn(
         conn,
         host_id=str(host_id),
         name=str(name) if name is not None else None,
         now=str(now),
     )
-    return int(cursor.rowcount or 0)
+    return len(rows)
 
 
 def connector_reclaim_due(
@@ -3603,7 +3764,11 @@ def _reactivate_final_root_conn(
         "DELETE FROM connector_deliveries WHERE outbox_id = ?",
         (int(outbox_id),),
     )
-    state = _json_object(_connector_private_clear_current(state))
+    state = _json_object(
+        _connector_private_clear_terminal_diagnostic(
+            _connector_private_clear_current(state)
+        )
+    )
     state["presentation_generation"] = root_generation
     state["presentation_max_part_count"] = retained_footprint
     state["prior_attempt_count"] = prior_attempt_count
@@ -3801,6 +3966,24 @@ def _ensure_final_ready_anchor_conn(
         if known_incomplete or unroutable or internal_automation
         else "queued"
     )
+    initial_private_state = "{}"
+    if initial_status == _CONNECTOR_EXHAUSTED_OUTBOX_STATUS:
+        hold_reason = (
+            "content_known_incomplete"
+            if known_incomplete
+            else "unroutable_final_ready"
+            if unroutable
+            else "internal_automation"
+        )
+        public_reason, reason_detail = _turn_final_reason_diagnostics(hold_reason)
+        initial_private_state = _connector_private_with_terminal_diagnostic(
+            {},
+            public_reason=public_reason,
+            reason_detail=reason_detail,
+            attempt_count=0,
+            classification="migration_hold",
+            terminalized_at=str(now),
+        )
     payload_json = _canonical_json(payload)
     ordering_key = _turn_ordering_key_conn(
         conn,
@@ -3862,7 +4045,7 @@ def _ensure_final_ready_anchor_conn(
             created_at,
             updated_at,
             next_attempt_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, NULL)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
         ON CONFLICT(host_id, connector, delivery_key) DO NOTHING
         """,
         (
@@ -3875,6 +4058,7 @@ def _ensure_final_ready_anchor_conn(
             ordering_key,
             initial_status,
             payload_json,
+            initial_private_state,
             str(now),
             str(now),
         ),
@@ -6854,14 +7038,11 @@ def _connector_update_ref(
         return _connector_error_response(status="store_unavailable", host_id=host_id, name=name, ref=ref)
     current_time = _connector_now(now)
     sanitized_response = sanitize_public_mapping(response or {}, backend_neutral=True)
-    sanitized_reason = (
-        _store_public_label(
-            reason,
-            allowed=_TURN_FINAL_PUBLIC_REASONS,
-        )
-        if str(name) == _TURN_FINAL_NAME
-        else _connector_public_reason(reason)
-    )
+    if str(name) == _TURN_FINAL_NAME:
+        sanitized_reason, reason_detail = _turn_final_reason_diagnostics(reason)
+    else:
+        sanitized_reason = _connector_public_reason(reason)
+        reason_detail = ""
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
@@ -7043,15 +7224,22 @@ def _connector_update_ref(
             if terminal_after_lease:
                 result_status = "superseded"
                 outbox_status = _CONNECTOR_SUPERSEDED_OUTBOX_STATUS
-            response_json = _canonical_json(
-                sanitize_public_value({
-                    "schema_version": 1,
-                    "status": result_status,
-                    "reason": sanitized_reason,
-                    "available_at": None if terminal_after_lease else available_at,
-                    "response": dict(sanitized_response),
-                })
+            response_payload = dict(
+                sanitize_public_value(
+                    {
+                        "schema_version": 1,
+                        "status": result_status,
+                        "reason": sanitized_reason,
+                        "available_at": (
+                            None if terminal_after_lease else available_at
+                        ),
+                        "response": dict(sanitized_response),
+                    }
+                )
             )
+            if reason_detail:
+                response_payload["reason_detail"] = reason_detail
+            response_json = _canonical_json(response_payload)
             conn.execute(
                 """
                 UPDATE connector_deliveries
@@ -7060,6 +7248,23 @@ def _connector_update_ref(
                 """,
                 (delivery_status, response_json, current_time, int(delivery_id)),
             )
+            next_private_state = _connector_private_clear_current(row[9])
+            if (
+                str(name) == _TURN_FINAL_NAME
+                and outbox_status == _CONNECTOR_EXHAUSTED_OUTBOX_STATUS
+            ):
+                next_private_state = _connector_private_with_terminal_diagnostic(
+                    row[9],
+                    public_reason=sanitized_reason,
+                    reason_detail=reason_detail,
+                    attempt_count=_connector_attempt_count_conn(
+                        conn,
+                        outbox_id=outbox_id,
+                        private_state_json=row[9],
+                    ),
+                    classification=result_status,
+                    terminalized_at=current_time,
+                )
             conn.execute(
                 """
                 UPDATE connector_outbox
@@ -7070,7 +7275,7 @@ def _connector_update_ref(
                     outbox_status,
                     None if exhausted or terminal_after_lease else available_at,
                     current_time,
-                    _connector_private_clear_current(row[9]),
+                    next_private_state,
                     int(outbox_id),
                 ),
             )
@@ -7459,7 +7664,9 @@ def retry_final_ready_delivery(
                 )
             total_attempts = prior_attempts + local_attempts
             next_private_state = _json_object(
-                _connector_private_clear_current(prior_state)
+                _connector_private_clear_terminal_diagnostic(
+                    _connector_private_clear_current(prior_state)
+                )
             )
             next_private_state["prior_attempt_count"] = total_attempts
             conn.execute(
