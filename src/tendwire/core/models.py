@@ -464,6 +464,7 @@ _PUBLIC_ALLOWED_MAPPING_KEYS = frozenset(
         "segment_id",
         "source_turn_id",
         "space_id",
+        "submission_verdict",
         "submission_id",
         "transport_state",
         "turn_id",
@@ -478,6 +479,19 @@ _PUBLIC_STRUCTURAL_MAPPING_KEY_SUFFIXES = (
     "_fingerprints",
 )
 _PUBLIC_VALUE_TEXT_MAX_CHARS = 12000
+_PUBLIC_SUBMISSION_VERDICTS = frozenset(
+    {
+        "submitted",
+        "written_to_pty",
+        "agent_not_ready",
+        "agent_target_ambiguous",
+        "agent_prompt_not_received",
+        "agent_prompt_unsubmitted",
+        "agent_input_pending",
+        "agent_prompt_stalled",
+        "unknown",
+    }
+)
 _PUBLIC_SANITIZE_CACHE_DEFAULT_SIZE = 2048
 _PUBLIC_SANITIZER_CONFIG_VERSION = 1
 _PUBLIC_FREE_TEXT_KEYS = frozenset(
@@ -963,6 +977,19 @@ def sanitize_public_value(
     private. Ordinary numeric topic/message IDs are ambiguous and require key
     provenance at the adapter boundary.
     """
+    normalized_field = str(_field).strip().lower().replace("-", "_")
+    if normalized_field == "composer_state":
+        return _PUBLIC_DROP if _nested else None
+    if normalized_field == "submission_verdict":
+        if not isinstance(value, str):
+            return _PUBLIC_DROP if _nested else None
+        verdict = sanitize_public_text(
+            value,
+            max_chars=_PUBLIC_VALUE_TEXT_MAX_CHARS,
+        )
+        if verdict not in _PUBLIC_SUBMISSION_VERDICTS:
+            return _PUBLIC_DROP if _nested else None
+        return verdict
     if isinstance(value, datetime):
         return utc_timestamp(value)
     if isinstance(value, Mapping):

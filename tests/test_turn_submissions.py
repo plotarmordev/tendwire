@@ -1031,7 +1031,7 @@ def test_shadow_linker_failure_keeps_observation_and_rolls_back_link_attempt(
         )
 
 
-def test_shadow_linker_settles_send_started_to_linked_and_ambiguous(
+def test_shadow_linker_never_uses_unverified_send_started_as_turn_evidence(
     tmp_path: Path,
 ) -> None:
     linked_path = tmp_path / "send-started-linked.db"
@@ -1042,12 +1042,12 @@ def test_shadow_linker_settles_send_started_to_linked_and_ambiguous(
         owner_key=owner_key,
         state="send_started",
     )
-    turn_id = _observe_link_turn(
+    _observe_link_turn(
         linked_path,
         source_turn_id="send-started-linked-source",
     )
     assert _submission_rows(linked_path) == [
-        ("send-started-linked", "linked", turn_id)
+        ("send-started-linked", "expired", None)
     ]
 
     ambiguous_path = tmp_path / "send-started-ambiguous.db"
@@ -1064,8 +1064,8 @@ def test_shadow_linker_settles_send_started_to_linked_and_ambiguous(
         source_turn_id="send-started-ambiguous-source",
     )
     assert _submission_rows(ambiguous_path) == [
-        ("send-started-ambiguous-0", "ambiguous", None),
-        ("send-started-ambiguous-1", "ambiguous", None),
+        ("send-started-ambiguous-0", "expired", None),
+        ("send-started-ambiguous-1", "expired", None),
     ]
 
 
@@ -1256,7 +1256,7 @@ def test_stale_send_started_submission_uses_windowed_settlement(
             seconds=store_sqlite.SUBMISSION_SEND_ACK_TIMEOUT_SECONDS + 1
         )
     ).isoformat()
-    turn_id = _observe_link_turn(
+    _observe_link_turn(
         db_path,
         source_turn_id="stale-send-started-source",
         observed_at=observed_at,
@@ -1280,7 +1280,7 @@ def test_stale_send_started_submission_uses_windowed_settlement(
         now="2026-02-01T12:01:00+00:00",
     )
     assert _submission_rows(db_path) == [
-        ("stale-send-started", "linked", turn_id)
+        ("stale-send-started", "expired", None)
     ]
 
 

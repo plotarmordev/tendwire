@@ -62,14 +62,18 @@ from .store.sqlite import (
     command_reservation_is_live,
     envelope_to_receipt_json,
     finish_command_request,
+    finish_queued_command_request,
+    finish_unverified_queued_command_request,
     get_command_request,
     linked_turn_for_submission,
     latest_snapshot,
     list_worker_bindings,
     mark_command_send_started,
+    record_command_send_queued,
+    recover_unresolved_command_send,
     reserve_command_request,
     reserve_terminal_command_replay,
-    sweep_submission_links,
+    settle_submission_link_for_request,
     start_backend_pending_choice_send,
     start_backend_pending_decision_send,
 )
@@ -416,6 +420,24 @@ def _submit_private_pane_input(client: Any, pane_id: str, instruction_text: str,
 
 class _PaneInputNotStartedError(RuntimeError):
     """The instruction input operation was never attempted."""
+
+
+def _agent_prompt_delivery(value: Any) -> str:
+    if not isinstance(value, Mapping):
+        return ""
+    result = value.get("result")
+    candidate = result if isinstance(result, Mapping) else value
+    delivery = candidate.get("delivery")
+    return delivery if isinstance(delivery, str) else ""
+
+
+def _herdr_error_code(exc: BaseException) -> str:
+    from .backends.herdr_protocol import HerdrErrorResponse
+
+    if not isinstance(exc, HerdrErrorResponse) or not isinstance(exc.error, Mapping):
+        return ""
+    code = exc.error.get("code")
+    return code if isinstance(code, str) else ""
 
 
 def _target_state_at_send(worker: Worker) -> str:
@@ -880,6 +902,8 @@ def _stored_terminal_envelope(
         expected_disposition = DISPOSITION_TERMINAL_ACCEPTED
     elif state == "rejected":
         expected_disposition = DISPOSITION_TERMINAL_REJECTED
+    elif state == "uncertain":
+        expected_disposition = DISPOSITION_TERMINAL_UNCERTAIN
     else:
         return _backend_uncertain(request, malformed)
 
@@ -933,6 +957,9 @@ def _stored_terminal_envelope(
         and status
         not in {STATUS_PENDING, STATUS_ACCEPTED, STATUS_REQUEST_STATE_UNCERTAIN}
         and envelope.ok is False
+        or state == "uncertain"
+        and status == STATUS_REQUEST_STATE_UNCERTAIN
+        and envelope.ok is False
     )
     if not valid_identity or not valid_terminal:
         return _backend_uncertain(
@@ -940,6 +967,36 @@ def _stored_terminal_envelope(
             "stored request result is inconsistent; not retrying mutation",
         )
     return envelope
+
+
+def _stored_in_progress_envelope(
+    request: CommandRequest,
+    receipt: Mapping[str, Any],
+) -> CommandEnvelope:
+    try:
+        data = json.loads(receipt["result_json"])
+        envelope = CommandEnvelope.from_dict(data)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return _request_in_progress(request)
+    if (
+        envelope.action != request.action
+        or envelope.request_id != request.request_id
+        or envelope.dry_run is not False
+        or envelope.ok is not False
+        or envelope.status != STATUS_PENDING
+        or envelope.disposition != DISPOSITION_IN_PROGRESS
+        or receipt.get("status") != STATUS_PENDING
+    ):
+        return _request_in_progress(request)
+    return envelope
+
+
+def _submission_verdict(envelope: CommandEnvelope) -> str:
+    result = envelope.result
+    if not isinstance(result, Mapping):
+        return ""
+    verdict = result.get("submission_verdict")
+    return verdict if isinstance(verdict, str) else ""
 
 
 def _envelope_from_receipt(
@@ -978,13 +1035,19 @@ def _envelope_from_receipt(
                 request,
                 "stored request receipt is inconsistent; not retrying mutation",
             )
-        return _request_in_progress(request)
+        return _stored_in_progress_envelope(request, receipt)
     if state == "uncertain":
         if receipt.get("status") != STATUS_REQUEST_STATE_UNCERTAIN:
             return _backend_uncertain(
                 request,
                 "stored request receipt is inconsistent; not retrying mutation",
             )
+        stored = _stored_terminal_envelope(request, receipt)
+        if (
+            request.action == "send_instruction"
+            and _submission_verdict(stored)
+        ):
+            return stored
         return _backend_uncertain(
             request,
             "previous request state is uncertain; not retrying mutation",
@@ -1006,6 +1069,7 @@ class ReservedCommandMutation:
 class PreparedInstructionMutation:
     client: Any
     pane_id: str
+    target_value: str
     binding_fingerprint: str
 
 
@@ -1066,6 +1130,7 @@ def _prepare_instruction(
     return PreparedInstructionMutation(
         client=client,
         pane_id=pane_or_error,
+        target_value=str(resolved.binding.target_value),
         binding_fingerprint=binding_fingerprint,
     )
 
@@ -1379,6 +1444,8 @@ def _accepted_send_envelope(
     request: CommandRequest,
     worker: Worker,
     turn: Mapping[str, Any],
+    *,
+    submission_verdict: str = "submitted",
 ) -> CommandEnvelope:
     observed_turn_state = "pending_observation"
     if str(turn.get("source_turn_id") or "").strip():
@@ -1399,7 +1466,196 @@ def _accepted_send_envelope(
             "target_state_at_send": _target_state_at_send(worker),
             "turn_id": turn_id,
             "observed_turn_state": observed_turn_state,
+            "submission_verdict": submission_verdict,
         },
+    )
+
+
+def _queued_send_envelope(
+    request: CommandRequest,
+    worker: Worker,
+) -> CommandEnvelope:
+    return CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status=STATUS_PENDING,
+        disposition=DISPOSITION_IN_PROGRESS,
+        result={
+            "target": {"worker_id": worker.id},
+            "delivery_state": "queued",
+            "transport_state": "queued",
+            "target_state_at_send": _target_state_at_send(worker),
+            "turn_id": None,
+            "observed_turn_state": "pending_observation",
+            "submission_verdict": "written_to_pty",
+        },
+        error=error_value(
+            STATUS_PENDING,
+            "instruction is queued for the next agent turn boundary",
+        ),
+    )
+
+
+def _instruction_rejected_envelope(
+    request: CommandRequest,
+    worker: Worker,
+    *,
+    verdict: str,
+) -> CommandEnvelope:
+    return CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status=STATUS_REJECTED,
+        disposition=DISPOSITION_TERMINAL_REJECTED,
+        result={
+            "target": {"worker_id": worker.id},
+            "delivery_state": "not_delivered",
+            "transport_state": "not_submitted",
+            "target_state_at_send": _target_state_at_send(worker),
+            "submission_verdict": verdict,
+        },
+        error=error_value(STATUS_REJECTED, "instruction was not delivered"),
+    )
+
+
+def _instruction_uncertain_envelope(
+    request: CommandRequest,
+    worker: Worker,
+    *,
+    verdict: str,
+) -> CommandEnvelope:
+    return CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status=STATUS_REQUEST_STATE_UNCERTAIN,
+        disposition=DISPOSITION_TERMINAL_UNCERTAIN,
+        result={
+            "target": {"worker_id": worker.id},
+            "delivery_state": "unknown",
+            "transport_state": "unknown",
+            "target_state_at_send": _target_state_at_send(worker),
+            "submission_verdict": verdict,
+        },
+        error=error_value(
+            STATUS_REQUEST_STATE_UNCERTAIN,
+            "instruction delivery is unknown; not retrying mutation",
+        ),
+    )
+
+
+def _recovered_unknown_send_envelope(
+    request: CommandRequest,
+    *,
+    worker_id: str,
+) -> CommandEnvelope:
+    return CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status=STATUS_REQUEST_STATE_UNCERTAIN,
+        disposition=DISPOSITION_TERMINAL_UNCERTAIN,
+        result={
+            "target": {"worker_id": worker_id},
+            "delivery_state": "unknown",
+            "transport_state": "unknown",
+            "submission_verdict": "unknown",
+        },
+        error=error_value(
+            STATUS_REQUEST_STATE_UNCERTAIN,
+            "instruction delivery is unknown after process recovery; not retrying mutation",
+        ),
+    )
+
+
+def _accepted_queued_send_envelope(
+    request: CommandRequest,
+    queued: CommandEnvelope,
+    turn: Mapping[str, Any],
+) -> CommandEnvelope:
+    queued_result = queued.result if isinstance(queued.result, Mapping) else {}
+    raw_turn_id = turn.get("id")
+    turn_id = raw_turn_id if isinstance(raw_turn_id, str) and raw_turn_id else None
+    observed_turn_state = (
+        "complete"
+        if turn.get("complete") is True
+        else "observed"
+        if str(turn.get("source_turn_id") or "").strip()
+        else "pending_observation"
+    )
+    return CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_ACCEPTED,
+        disposition=DISPOSITION_TERMINAL_ACCEPTED,
+        result={
+            "target": queued_result.get("target"),
+            "delivery_state": "submitted",
+            "transport_state": "queued",
+            "target_state_at_send": queued_result.get("target_state_at_send"),
+            "turn_id": turn_id,
+            "observed_turn_state": observed_turn_state,
+            "submission_verdict": "written_to_pty",
+        },
+    )
+
+
+def _unverified_queued_send_envelope(
+    request: CommandRequest,
+    queued: CommandEnvelope,
+) -> CommandEnvelope:
+    queued_result = queued.result if isinstance(queued.result, Mapping) else {}
+    return CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status=STATUS_REQUEST_STATE_UNCERTAIN,
+        disposition=DISPOSITION_TERMINAL_UNCERTAIN,
+        result={
+            "target": queued_result.get("target"),
+            "delivery_state": "unknown",
+            "transport_state": "unknown",
+            "target_state_at_send": queued_result.get("target_state_at_send"),
+            "turn_id": None,
+            "submission_verdict": "written_to_pty",
+        },
+        error=error_value(
+            STATUS_REQUEST_STATE_UNCERTAIN,
+            (
+                "instruction verification expired; delivery is unknown "
+                "and will not be retried"
+            ),
+        ),
+    )
+
+
+def _record_queued_send(
+    config: Config,
+    request: CommandRequest,
+    worker: Worker,
+    reservation: ReservedCommandMutation,
+    envelope: CommandEnvelope,
+) -> CommandEnvelope:
+    assert config.db_path is not None
+    try:
+        queued = record_command_send_queued(
+            config.db_path,
+            host_id=config.host_id,
+            request_id=request.request_id or "",
+            canonical_fingerprint=reservation.canonical.fingerprint,
+            owner_token=reservation.owner_token,
+            result_json=envelope_to_receipt_json(envelope),
+            event_payload=_transition_payload(
+                request,
+                worker_id=worker.id,
+                envelope=envelope,
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        return _recover_request(config, request, reservation.canonical)
+    if not isinstance(queued, Mapping):
+        return _recover_request(config, request, reservation.canonical)
+    return _envelope_from_receipt(
+        request,
+        reservation.canonical,
+        queued.get("receipt"),
     )
 
 
@@ -1431,17 +1687,56 @@ def _submit_instruction(
         observed_turn = send_started
 
         try:
-            _submit_private_pane_input(
+            response = _socket_request(
                 prepared.client,
-                prepared.pane_id,
-                _instruction_text(request),
-                timeout=config.herdr_timeout_seconds,
+                "agent.prompt",
+                {
+                    "target": prepared.target_value,
+                    "text": _instruction_text(request),
+                    "wait": {
+                        "until": ["working"],
+                        "timeout_ms": max(
+                            1,
+                            int(config.herdr_timeout_seconds * 1000),
+                        ),
+                    },
+                },
+                timeout=config.herdr_timeout_seconds + 1.0,
             )
-        except _PaneInputNotStartedError:
-            envelope = _backend_uncertain(
-                request,
-                "Herdr socket pane input did not start after send start",
-            )
+        except Exception as exc:  # noqa: BLE001
+            verdict = _herdr_error_code(exc)
+            if verdict in {
+                "agent_not_ready",
+                "agent_target_ambiguous",
+                "agent_prompt_not_received",
+                "agent_prompt_unsubmitted",
+                "agent_input_pending",
+            }:
+                envelope = _instruction_rejected_envelope(
+                    request,
+                    worker,
+                    verdict=verdict,
+                )
+                return _finish_request(
+                    config,
+                    request,
+                    reservation,
+                    envelope,
+                    expected_state="send_started",
+                    terminal_state="rejected",
+                )
+            if verdict == "agent_prompt_stalled":
+                envelope = _instruction_uncertain_envelope(
+                    request,
+                    worker,
+                    verdict=verdict,
+                )
+            else:
+                envelope = _instruction_uncertain_envelope(
+                    request,
+                    worker,
+                    verdict="unknown",
+                )
             return _finish_request(
                 config,
                 request,
@@ -1450,16 +1745,26 @@ def _submit_instruction(
                 expected_state="send_started",
                 terminal_state="uncertain",
             )
-        except Exception:  # noqa: BLE001
-            envelope = _backend_uncertain(
+
+        verdict = _agent_prompt_delivery(response)
+        if verdict == "written_to_pty":
+            return _record_queued_send(
+                config,
                 request,
-                "Herdr socket pane input state is uncertain after send start",
+                worker,
+                reservation,
+                _queued_send_envelope(request, worker),
             )
+        if verdict != "submitted":
             return _finish_request(
                 config,
                 request,
                 reservation,
-                envelope,
+                _instruction_uncertain_envelope(
+                    request,
+                    worker,
+                    verdict="unknown",
+                ),
                 expected_state="send_started",
                 terminal_state="uncertain",
             )
@@ -1479,7 +1784,12 @@ def _submit_instruction(
     finally:
         _close_socket_client(prepared.client)
 
-    accepted = _accepted_send_envelope(request, worker, observed_turn)
+    accepted = _accepted_send_envelope(
+        request,
+        worker,
+        observed_turn,
+        submission_verdict="submitted",
+    )
     return _finish_request(
         config,
         request,
@@ -2141,7 +2451,108 @@ def _receipt_authority(
         return _reserve_terminal_replay(config, request, canonical, receipt, replay)
     if replay.status != STATUS_PENDING:
         return replay
-    if state == "send_started" or command_reservation_is_live(receipt):
+    if state == "send_started":
+        verdict = _submission_verdict(replay)
+        if verdict == "written_to_pty":
+            if config.db_path is None:
+                return replay
+            try:
+                settlement = settle_submission_link_for_request(
+                    config.db_path,
+                    host_id=config.host_id,
+                    request_id=request.request_id or "",
+                )
+                linked = linked_turn_for_submission(
+                    config.db_path,
+                    host_id=config.host_id,
+                    request_id=request.request_id or "",
+                )
+            except Exception:  # noqa: BLE001
+                return replay
+            if isinstance(linked, Mapping):
+                accepted = _accepted_queued_send_envelope(request, replay, linked)
+                try:
+                    finished = finish_queued_command_request(
+                        config.db_path,
+                        host_id=config.host_id,
+                        request_id=request.request_id or "",
+                        canonical_fingerprint=canonical.fingerprint,
+                        queued_result_json=str(receipt.get("result_json") or ""),
+                        accepted_result_json=envelope_to_receipt_json(accepted),
+                        event_payload=_transition_payload(
+                            request,
+                            worker_id=proven,
+                            envelope=accepted,
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    return replay
+                if not isinstance(finished, Mapping):
+                    return replay
+                return _envelope_from_receipt(
+                    request,
+                    canonical,
+                    finished.get("receipt"),
+                )
+            if (
+                not isinstance(settlement, Mapping)
+                or settlement.get("state") not in {"ambiguous", "expired"}
+            ):
+                return replay
+            uncertain = _unverified_queued_send_envelope(request, replay)
+            try:
+                finished = finish_unverified_queued_command_request(
+                    config.db_path,
+                    host_id=config.host_id,
+                    request_id=request.request_id or "",
+                    canonical_fingerprint=canonical.fingerprint,
+                    queued_result_json=str(receipt.get("result_json") or ""),
+                    uncertain_result_json=envelope_to_receipt_json(uncertain),
+                    event_payload=_transition_payload(
+                        request,
+                        worker_id=proven,
+                        envelope=uncertain,
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                return replay
+            if not isinstance(finished, Mapping):
+                return replay
+            return _envelope_from_receipt(
+                request,
+                canonical,
+                finished.get("receipt"),
+            )
+        if command_reservation_is_live(receipt):
+            return replay
+        unknown = _recovered_unknown_send_envelope(
+            request,
+            worker_id=proven,
+        )
+        try:
+            recovered = recover_unresolved_command_send(
+                config.db_path,
+                host_id=config.host_id,
+                request_id=request.request_id or "",
+                canonical_fingerprint=canonical.fingerprint,
+                unresolved_result_json=str(receipt.get("result_json") or ""),
+                uncertain_result_json=envelope_to_receipt_json(unknown),
+                event_payload=_transition_payload(
+                    request,
+                    worker_id=proven,
+                    envelope=unknown,
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            return replay
+        if not isinstance(recovered, Mapping):
+            return replay
+        return _envelope_from_receipt(
+            request,
+            canonical,
+            recovered.get("receipt"),
+        )
+    if command_reservation_is_live(receipt):
         return replay
     # An abandoned reservation never reached a send. Re-driving it is the
     # existing state machine's recovery, not a replay of a finished mutation.
@@ -2436,9 +2847,10 @@ def _negotiated_submission_envelope(
     )
     if config.db_path is not None:
         try:
-            sweep_submission_links(
+            settle_submission_link_for_request(
                 config.db_path,
                 host_id=config.host_id,
+                request_id=request.request_id or "",
             )
             linked_turn = linked_turn_for_submission(
                 config.db_path,
