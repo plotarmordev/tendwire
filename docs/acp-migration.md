@@ -74,6 +74,28 @@ Herdres must never receive a raw thought event. A future public summary feature
 requires a separate schema, sanitizer, explicit operator opt-in, and tests that
 prove raw reasoning cannot cross the boundary.
 
+## Upstream upgrade boundary
+
+Tendwire integrates with the stable ACP wire protocol, not an adapter's source
+tree. Official adapters such as `codex-acp` and `claude-agent-acp` remain
+separately installed executables and must be replaceable without vendoring,
+rebasing, or resolving Tendwire source conflicts.
+
+The boundary has four rules:
+
+- negotiate protocol version and capabilities at every process start;
+- never import adapter implementation modules or depend on their repository
+  layout, generated internal types, commits, or private event handlers;
+- ignore unknown standard update variants conservatively and retain explicitly
+  namespaced extension metadata only on Tendwire's private side;
+- verify adapter releases with black-box ACP compatibility fixtures before
+  promotion, while keeping the previously proven executable for rollback.
+
+An adapter upgrade therefore restarts only its owned process/session; it does
+not require a Tendwire rebase. A session may resume when the new adapter
+advertises that capability. Otherwise Tendwire opens a new transport generation
+and reconciles it through the durable semantic journal.
+
 ## Runtime lifecycle
 
 For ACP v1 stdio, the component that owns the adapter process also owns framing,
