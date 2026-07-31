@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,9 @@ import pytest
 from tendwire.backends.acp_client import (
     AcpCapabilityError,
     AcpClient,
+    AcpEventQueueFullError,
     AcpRequestTimeoutError,
+    AcpTransportError,
     ClientState,
 )
 from tendwire.backends.acp_protocol import AcpProtocolError, SessionUpdateKind, StopReason
@@ -30,6 +33,9 @@ def test_initialize_capabilities_and_session_lifecycle() -> None:
         assert initialized.capabilities.load_session
         assert initialized.capabilities.session_list
         assert initialized.capabilities.session_resume
+        assert initialized.capabilities.session_close
+        assert initialized.capabilities.session_delete
+        assert initialized.capabilities.raw["vendorFutureCapability"] == {"level": 2}
         assert acp.state is ClientState.INITIALIZED
 
         created = acp.new_session(
@@ -53,8 +59,8 @@ def test_initialize_capabilities_and_session_lifecycle() -> None:
         assert second.sessions[0].title == "second"
         assert second.next_cursor is None
 
-        acp.initialized()
-        assert acp.next_notification(timeout=1).method == "fake/initialized_seen"
+        assert acp.close_session("s1")["vendorReceipt"] == "session/close"
+        assert acp.delete_session("s2")["vendorReceipt"] == "session/delete"
 
     assert acp.state is ClientState.CLOSED
     assert acp.exit is not None
@@ -108,6 +114,23 @@ def test_cancel_resolves_pending_permissions_as_cancelled() -> None:
         assert result[0].stop_reason is StopReason.CANCELLED
 
 
+def test_cancel_also_resolves_permission_that_races_after_notification() -> None:
+    with client("cancel_race") as acp:
+        acp.initialize()
+        result: list[object] = []
+        thread = threading.Thread(target=lambda: result.append(acp.prompt("s1", "wait")))
+        thread.start()
+        acp.next_update(timeout=1)
+        acp.next_permission_request(timeout=1)
+        acp.cancel("s1")
+        acp.next_update(timeout=1)
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert result[0].stop_reason is StopReason.CANCELLED
+        with pytest.raises(AcpRequestTimeoutError):
+            acp.next_permission_request(timeout=0.05)
+
+
 def test_optional_methods_require_advertised_capabilities() -> None:
     with client("baseline") as acp:
         acp.initialize()
@@ -115,6 +138,10 @@ def test_optional_methods_require_advertised_capabilities() -> None:
             acp.list_sessions()
         with pytest.raises(AcpCapabilityError):
             acp.load_session("s1", "/tmp")
+        with pytest.raises(AcpCapabilityError):
+            acp.close_session("s1")
+        with pytest.raises(AcpCapabilityError):
+            acp.delete_session("s1")
 
 
 def test_request_timeout_does_not_poison_transport() -> None:
@@ -125,7 +152,7 @@ def test_request_timeout_does_not_poison_transport() -> None:
         assert acp.state is ClientState.INITIALIZED
 
 
-@pytest.mark.parametrize("mode", ["malformed", "oversize"])
+@pytest.mark.parametrize("mode", ["malformed", "oversize", "partial_eof"])
 def test_malformed_or_oversized_stdout_fails_connection(mode: str) -> None:
     with client(mode, max_frame_bytes=1024) as acp:
         with pytest.raises(AcpProtocolError):
@@ -138,3 +165,135 @@ def test_absolute_session_paths_are_enforced_before_write() -> None:
         acp.initialize()
         with pytest.raises(ValueError, match="absolute"):
             acp.new_session("relative/path")
+
+
+def test_concurrent_initialize_is_exactly_once_and_returns_same_result() -> None:
+    with client() as acp:
+        results: list[object] = []
+        failures: list[BaseException] = []
+
+        def initialize() -> None:
+            try:
+                results.append(acp.initialize())
+            except BaseException as exc:  # pragma: no cover - diagnostic path
+                failures.append(exc)
+
+        threads = [threading.Thread(target=initialize) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+        assert not failures
+        assert len(results) == 6
+        assert all(result is results[0] for result in results)
+
+
+def test_backpressure_failure_remains_visible_after_full_queue_drains() -> None:
+    with client("flood", max_pending_events=1) as acp:
+        acp.initialize()
+        deadline = time.monotonic() + 1
+        while acp.state is not ClientState.FAILED and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert acp.state is ClientState.FAILED
+        assert isinstance(acp.failure, AcpEventQueueFullError)
+        first = acp.next_update(timeout=1)
+        assert first.update_kind == "vendor_progress"
+        with pytest.raises(AcpTransportError):
+            acp.next_update(timeout=1)
+
+
+def test_blocked_or_partial_stdin_write_is_bounded_and_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_write = AcpClient._write_chunk
+    select_calls = 0
+
+    def partial_write(fd: int, data: memoryview) -> int:
+        return real_write(fd, data[:8])
+
+    def writable_once(fd: int, timeout: float) -> bool:
+        nonlocal select_calls
+        select_calls += 1
+        return select_calls == 1
+
+    monkeypatch.setattr(AcpClient, "_write_chunk", staticmethod(partial_write))
+    monkeypatch.setattr(AcpClient, "_wait_writable", staticmethod(writable_once))
+    acp = client("no_read", request_timeout=0.2, close_timeout=0.05)
+    try:
+        started = time.monotonic()
+        with pytest.raises(AcpTransportError, match="partial write"):
+            acp.initialize(
+                client_capabilities={"vendor/padding": "small"},
+                timeout=0.2,
+            )
+        assert time.monotonic() - started < 1
+        assert acp.state is ClientState.FAILED
+    finally:
+        acp.close()
+
+
+def test_close_escalates_to_kill_for_stubborn_adapter() -> None:
+    acp = client("stubborn", close_timeout=0.05)
+    acp.initialize()
+    acp.close()
+    assert acp.state is ClientState.CLOSED
+    assert acp.exit is not None
+    assert acp.exit.returncode != 0
+
+
+def test_stderr_tail_is_bounded_and_keeps_suffix() -> None:
+    acp = client("stderr_tail", stderr_limit_bytes=64)
+    acp.initialize()
+    acp.close()
+    tail = acp.stderr_tail()
+    assert len(tail.encode()) <= 64
+    assert tail.endswith("-TAIL")
+
+
+def test_unknown_adapter_extensions_remain_observable() -> None:
+    with client("extensions") as acp:
+        initialized = acp.initialize()
+        assert initialized.capabilities.raw["vendorFutureCapability"] == {"level": 2}
+        notification = acp.next_notification(timeout=1)
+        assert notification.method == "vendor/future_notification"
+        assert notification.params["opaque"] == {"revision": 9}
+
+
+def test_uncorrelated_null_error_response_does_not_poison_transport() -> None:
+    with client("null_response") as acp:
+        acp.initialize()
+        time.sleep(0.05)
+        assert acp.state is ClientState.INITIALIZED
+
+
+def test_unexpected_clean_stdout_eof_is_transport_failure() -> None:
+    with client("exit_after_init") as acp:
+        acp.initialize()
+        deadline = time.monotonic() + 1
+        while acp.state is not ClientState.FAILED and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert acp.state is ClientState.FAILED
+        assert isinstance(acp.failure, AcpTransportError)
+
+
+def test_boolean_protocol_version_is_not_accepted_as_integer_one() -> None:
+    with client("bool_version") as acp:
+        with pytest.raises(AcpProtocolError, match="protocol version"):
+            acp.initialize()
+        assert acp.state is ClientState.FAILED
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"cwd": "relative"},
+        {"cwd": "/tmp/bad\x00path"},
+        {"env": {"BAD=NAME": "value"}},
+        {"env": {"NAME": "bad\x00value"}},
+    ],
+)
+def test_process_paths_and_environment_are_validated(
+    kwargs: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        client(**kwargs)

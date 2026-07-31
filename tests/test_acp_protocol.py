@@ -17,6 +17,7 @@ from tendwire.backends.acp_protocol import (
     parse_permission_request,
     parse_session_update,
     request_envelope,
+    validate_envelope,
 )
 
 
@@ -106,12 +107,74 @@ def test_capability_presence_uses_acp_object_semantics() -> None:
             "loadSession": True,
             "sessionCapabilities": {
                 "list": {},
+                "delete": {},
                 "resume": {},
+                "close": {},
                 "additionalDirectories": {},
             },
+            "vendorFutureCapability": {"revision": 3},
         }
     )
     assert capabilities.load_session
     assert capabilities.session_list
     assert capabilities.session_resume
+    assert capabilities.session_close
+    assert capabilities.session_delete
     assert capabilities.additional_directories
+    assert capabilities.raw["vendorFutureCapability"] == {"revision": 3}
+
+
+def test_request_ids_follow_acp_json_rpc_domain() -> None:
+    assert isinstance(
+        validate_envelope({"jsonrpc": "2.0", "id": "", "method": "vendor/x"}),
+        JsonRpcRequest,
+    )
+    null_request = validate_envelope(
+        {"jsonrpc": "2.0", "id": None, "method": "vendor/x"}
+    )
+    assert isinstance(null_request, JsonRpcRequest)
+    assert null_request.request_id is None
+    assert isinstance(
+        validate_envelope(
+            {"jsonrpc": "2.0", "id": 2**63 - 1, "result": {}}
+        ),
+        JsonRpcResponse,
+    )
+    for invalid_id in (True, 2**63, -(2**63) - 1, 1.5):
+        with pytest.raises(AcpEnvelopeError):
+            validate_envelope(
+                {"jsonrpc": "2.0", "id": invalid_id, "method": "vendor/x"}
+            )
+
+
+def test_permission_option_ids_must_be_unambiguous() -> None:
+    request = JsonRpcRequest(
+        42,
+        "session/request_permission",
+        {
+            "sessionId": "s1",
+            "toolCall": {"toolCallId": "tool-1"},
+            "options": [
+                {"optionId": "same", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "same", "name": "Reject", "kind": "reject_once"},
+            ],
+        },
+    )
+    with pytest.raises(AcpEnvelopeError, match="unique"):
+        parse_permission_request(request)
+
+
+def test_unknown_update_and_nested_extension_payload_are_preserved() -> None:
+    extension = parse_session_update(
+        {
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "vendor/future_progress",
+                "opaque": {"revision": 7, "items": [1, 2]},
+            },
+            "_meta": {"vendor.example/trace": "abc"},
+        }
+    )
+    assert extension.update_kind == "vendor/future_progress"
+    assert extension.update["opaque"] == {"revision": 7, "items": [1, 2]}
+    assert extension.meta == {"vendor.example/trace": "abc"}

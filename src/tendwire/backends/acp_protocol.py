@@ -18,7 +18,10 @@ JSONRPC_VERSION = "2.0"
 ACP_PROTOCOL_VERSION = 1
 DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024
 
-RequestId: TypeAlias = str | int
+RequestId: TypeAlias = str | int | None
+
+_MIN_REQUEST_NUMBER = -(2**63)
+_MAX_REQUEST_NUMBER = 2**63 - 1
 
 
 class AcpProtocolError(Exception):
@@ -154,6 +157,14 @@ class AgentCapabilities:
         return _is_capability_object(self._session_capabilities().get("resume"))
 
     @property
+    def session_close(self) -> bool:
+        return _is_capability_object(self._session_capabilities().get("close"))
+
+    @property
+    def session_delete(self) -> bool:
+        return _is_capability_object(self._session_capabilities().get("delete"))
+
+    @property
     def additional_directories(self) -> bool:
         return _is_capability_object(
             self._session_capabilities().get("additionalDirectories")
@@ -243,8 +254,16 @@ def _is_capability_object(value: Any) -> bool:
 
 
 def _valid_request_id(value: Any) -> bool:
-    return (isinstance(value, str) and bool(value)) or (
-        isinstance(value, int) and not isinstance(value, bool)
+    # ACP v1 inherits JSON-RPC's String, integral Number, or Null request IDs.
+    # The official schema represents Number as a signed 64-bit integer.
+    return (
+        value is None
+        or isinstance(value, str)
+        or (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and _MIN_REQUEST_NUMBER <= value <= _MAX_REQUEST_NUMBER
+        )
     )
 
 
@@ -328,7 +347,9 @@ def validate_envelope(value: Any) -> JsonRpcMessage:
             return JsonRpcNotification(method=method, params=frozen_params)
         request_id = value["id"]
         if not _valid_request_id(request_id):
-            raise AcpEnvelopeError("JSON-RPC request id must be a non-empty string or integer")
+            raise AcpEnvelopeError(
+                "JSON-RPC request id must be a string, signed 64-bit integer, or null"
+            )
         return JsonRpcRequest(
             request_id=request_id,
             method=method,
@@ -464,10 +485,14 @@ def parse_permission_request(request: JsonRpcRequest) -> PermissionRequest:
     if not isinstance(raw_options, list) or not raw_options:
         raise AcpEnvelopeError("permission request options must be a non-empty array")
     options: list[PermissionOption] = []
+    seen_option_ids: set[str] = set()
     for raw in raw_options:
         if not isinstance(raw, Mapping):
             raise AcpEnvelopeError("permission option must be an object")
         option_id = _required_string(raw, "optionId")
+        if option_id in seen_option_ids:
+            raise AcpEnvelopeError("permission option IDs must be unique")
+        seen_option_ids.add(option_id)
         name = _required_string(raw, "name")
         kind_value = _required_string(raw, "kind")
         try:

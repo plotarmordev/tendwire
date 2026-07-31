@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import sys
 import time
 
@@ -34,6 +35,13 @@ def update(session_id: str, kind: str, **values: object) -> None:
 
 pending_prompt_id: object | None = None
 pending_prompt_session = ""
+pending_permission_ids: set[object] = set()
+
+if MODE == "no_read":
+    time.sleep(60)
+
+if MODE == "stubborn":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 for line in sys.stdin:
     message = json.loads(line)
@@ -46,13 +54,17 @@ for line in sys.stdin:
             sys.stdout.write("not-json\n")
             sys.stdout.flush()
             continue
+        if MODE == "partial_eof":
+            sys.stdout.write('{"jsonrpc":"2.0","id":')
+            sys.stdout.flush()
+            raise SystemExit(0)
         if MODE == "oversize":
             response(request_id, {"protocolVersion": 1, "padding": "x" * 10000})
             continue
         response(
             request_id,
             {
-                "protocolVersion": 1,
+                "protocolVersion": True if MODE == "bool_version" else 1,
                 "agentCapabilities": (
                     {}
                     if MODE == "baseline"
@@ -60,22 +72,48 @@ for line in sys.stdin:
                         "loadSession": True,
                         "sessionCapabilities": {
                             "list": {},
+                            "delete": {},
                             "resume": {},
+                            "close": {},
                             "additionalDirectories": {},
                         },
+                        "vendorFutureCapability": {"level": 2},
                     }
                 ),
                 "agentInfo": {"name": "fake", "version": "1.0"},
             },
         )
-    elif method == "initialized":
-        send(
-            {
-                "jsonrpc": "2.0",
-                "method": "fake/initialized_seen",
-                "params": {},
-            }
-        )
+        if MODE == "extensions":
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "vendor/future_notification",
+                    "params": {"opaque": {"revision": 9}},
+                }
+            )
+        if MODE == "null_response":
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "unrelated invalid request"},
+                }
+            )
+        if MODE == "stderr_tail":
+            sys.stderr.write("prefix-" + "x" * 500 + "-TAIL")
+            sys.stderr.flush()
+        if MODE == "exit_after_init":
+            time.sleep(0.05)
+            raise SystemExit(0)
+        if MODE == "flood":
+            time.sleep(0.05)
+            for index in range(4):
+                update(
+                    "s-flood",
+                    "vendor_progress",
+                    sequence=index,
+                    vendor={"opaque": True},
+                )
     elif method == "session/new":
         update("s-new", "agent_message_chunk", content={"type": "text", "text": "hi"})
         response(
@@ -84,6 +122,8 @@ for line in sys.stdin:
         )
     elif method == "session/load" or method == "session/resume":
         response(request_id, {"configOptions": [{"id": "model", "currentValue": "x"}]})
+    elif method == "session/close" or method == "session/delete":
+        response(request_id, {"vendorReceipt": method})
     elif method == "session/list":
         if MODE == "slow":
             time.sleep(2)
@@ -133,18 +173,43 @@ for line in sys.stdin:
                 },
             }
         )
+        pending_permission_ids.add(900)
     elif method == "session/cancel":
-        # The client must additionally resolve permission request 900 as cancelled.
-        pass
-    elif request_id == 900 and pending_prompt_id is not None:
+        if MODE == "cancel_race" and pending_prompt_id is not None:
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 901,
+                    "method": "session/request_permission",
+                    "params": {
+                        "sessionId": pending_prompt_session,
+                        "toolCall": {"toolCallId": "tool-race", "status": "pending"},
+                        "options": [
+                            {
+                                "optionId": "allow-race",
+                                "name": "Allow once",
+                                "kind": "allow_once",
+                            }
+                        ],
+                    },
+                }
+            )
+            pending_permission_ids.add(901)
+    elif request_id in pending_permission_ids and pending_prompt_id is not None:
         outcome = message["result"]["outcome"]["outcome"]
-        update(
-            pending_prompt_session,
-            "plan",
-            entries=[{"content": "done", "status": "completed"}],
-        )
-        response(
-            pending_prompt_id,
-            {"stopReason": "cancelled" if outcome == "cancelled" else "end_turn"},
-        )
-        pending_prompt_id = None
+        pending_permission_ids.remove(request_id)
+        if not pending_permission_ids:
+            update(
+                pending_prompt_session,
+                "plan",
+                entries=[{"content": "done", "status": "completed"}],
+            )
+            response(
+                pending_prompt_id,
+                {"stopReason": "cancelled" if outcome == "cancelled" else "end_turn"},
+            )
+            pending_prompt_id = None
+
+if MODE == "stubborn":
+    while True:
+        time.sleep(60)
