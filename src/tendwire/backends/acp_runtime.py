@@ -19,7 +19,7 @@ from typing import Any, Protocol
 
 from ..config import Config
 from ..core.models import WorkerBinding, stable_fingerprint
-from ..store.sqlite import list_worker_bindings
+from ..store.sqlite import expire_worker_bindings, list_worker_bindings
 from .acp_ingestion import AcpSessionIngestor
 from .acp_protocol import (
     PermissionRequest,
@@ -258,7 +258,10 @@ class AcpRuntime:
         self._ingestor: AcpSessionIngestor | None = None
         self._failure: BaseException | None = None
         self._state_lock = threading.RLock()
-        self._lifecycle_lock = threading.Lock()
+        # Session binders are embedding callbacks and may synchronously call
+        # stop().  Reentrancy must terminate startup, not deadlock on our own
+        # lifecycle lock.
+        self._lifecycle_lock = threading.RLock()
         self._ingest_lock = threading.Lock()
         self._prompt_lock = threading.Lock()
         self._idle_condition = threading.Condition(self._state_lock)
@@ -266,6 +269,7 @@ class AcpRuntime:
         self._threads: tuple[threading.Thread, ...] = ()
         self._event_idle_epoch = 0
         self._setup_replay = False
+        self._provisional_binding: WorkerBinding | None = None
         self._close_thread: threading.Thread | None = None
         self._close_failures: list[BaseException] = []
 
@@ -347,6 +351,7 @@ class AcpRuntime:
                         raise self._failure
                     self._state = RuntimeState.RUNNING
             except BaseException as exc:
+                self._release_derived_binding(reason="acp_startup_rollback")
                 self._record_failure(exc)
                 # ``__enter__`` is never completed when start fails, so no
                 # caller cleanup can be assumed. Bound shutdown prevents an
@@ -374,6 +379,7 @@ class AcpRuntime:
             with self._state_lock:
                 self._prompts_started += 1
             try:
+                self._require_current_binding(self._binding)
                 prepared_prompt = _prepare_prompt_content(self._client, prompt)
                 prompt_event = ingestor.begin_prompt(
                     prepared_prompt,
@@ -522,6 +528,8 @@ class AcpRuntime:
                 self._record_failure(error)
                 raise error
 
+            self._release_derived_binding(reason="acp_runtime_stopped")
+
             with self._state_lock:
                 failure = self._failure
             if self._close_failures and failure is None:
@@ -601,35 +609,103 @@ class AcpRuntime:
             raise AcpRuntimeBindingError("ACP session binding is unavailable")
         continuity = self._binding
         self._require_current_binding(continuity)
-        bound = callback(session_id, continuity)
-        if not isinstance(bound, WorkerBinding):
-            raise AcpRuntimeBindingError("ACP session binder returned an invalid binding")
-        if (
-            bound.host_id != continuity.host_id
-            or bound.worker_id != continuity.worker_id
-            or bound.worker_fingerprint != continuity.worker_fingerprint
-            or bound.backend != continuity.backend
-            or bound.target_kind != continuity.target_kind
-            or bound.target_value != continuity.target_value
-        ):
-            raise AcpRuntimeBindingError("ACP session binder changed worker continuity")
-        if (
-            bound.turn_target_kind != "acp_session_id"
-            or bound.turn_target_value != session_id
-        ):
-            raise AcpRuntimeBindingError("ACP session binder returned the wrong session")
-        if (
-            not bound.private_fingerprint
-            or bound.private_fingerprint == continuity.private_fingerprint
-        ):
-            raise AcpRuntimeBindingError(
-                "ACP session binder did not establish a distinct private binding"
-            )
-        # The callback must add a distinct ACP binding. It must not repurpose or
-        # overwrite the Herdr continuity row it was given.
-        self._require_current_binding(continuity)
-        self._require_current_binding(bound)
+        existing_acp = self._binding_fingerprints(continuity.host_id, backend="acp")
+        try:
+            bound = callback(session_id, continuity)
+            with self._state_lock:
+                if self._state is not RuntimeState.STARTING:
+                    raise AcpRuntimeStateError(
+                        "ACP runtime stopped during session binding"
+                    )
+            if not isinstance(bound, WorkerBinding):
+                raise AcpRuntimeBindingError(
+                    "ACP session binder returned an invalid binding"
+                )
+            if (
+                bound.host_id != continuity.host_id
+                or bound.worker_id != continuity.worker_id
+                or bound.worker_fingerprint != continuity.worker_fingerprint
+                or bound.backend != "acp"
+                or bound.target_kind != continuity.target_kind
+                or bound.target_value != continuity.target_value
+            ):
+                raise AcpRuntimeBindingError(
+                    "ACP session binder changed worker continuity"
+                )
+            if (
+                bound.turn_target_kind != "acp_session_id"
+                or bound.turn_target_value != session_id
+            ):
+                raise AcpRuntimeBindingError(
+                    "ACP session binder returned the wrong session"
+                )
+            if (
+                not bound.private_fingerprint
+                or bound.private_fingerprint == continuity.private_fingerprint
+            ):
+                raise AcpRuntimeBindingError(
+                    "ACP session binder did not establish a distinct private binding"
+                )
+            # The callback must add a distinct ACP binding. It must not
+            # repurpose or overwrite the Herdr continuity row it was given.
+            self._require_current_binding(continuity)
+            self._require_current_binding(bound)
+        except BaseException:
+            self._expire_new_acp_bindings(continuity.host_id, existing_acp)
+            raise
+        if bound.private_fingerprint not in existing_acp:
+            self._provisional_binding = bound
         return bound
+
+    def _binding_fingerprints(self, host_id: str, *, backend: str) -> set[str]:
+        db_path = self._config.db_path
+        if db_path is None:  # pragma: no cover - constructor invariant
+            return set()
+        return {
+            item.private_fingerprint
+            for item in list_worker_bindings(Path(db_path), host_id, backend=backend)
+        }
+
+    def _expire_new_acp_bindings(
+        self,
+        host_id: str,
+        existing_fingerprints: set[str],
+    ) -> None:
+        db_path = self._config.db_path
+        if db_path is None:  # pragma: no cover - constructor invariant
+            return
+        current = list_worker_bindings(Path(db_path), host_id, backend="acp")
+        created = [
+            item
+            for item in current
+            if item.private_fingerprint not in existing_fingerprints
+        ]
+        for item in created:
+            expire_worker_bindings(
+                Path(db_path),
+                host_id,
+                backend="acp",
+                private_fingerprints=[item.private_fingerprint],
+                # Callback clocks are untrusted.  Using the row's own
+                # observation instant guarantees a future-dated provisional
+                # lease is still revocable.
+                now=item.observed_at,
+                reason="acp_startup_rollback",
+            )
+
+    def _release_derived_binding(self, *, reason: str) -> None:
+        bound = self._provisional_binding
+        self._provisional_binding = None
+        if bound is None or self._config.db_path is None:
+            return
+        expire_worker_bindings(
+            Path(self._config.db_path),
+            bound.host_id,
+            backend="acp",
+            private_fingerprints=[bound.private_fingerprint],
+            now=bound.observed_at,
+            reason=reason,
+        )
 
     def _require_current_binding(self, expected: WorkerBinding) -> None:
         db_path = self._config.db_path
@@ -814,6 +890,7 @@ class AcpRuntime:
             self._cancellation_requests += 1
 
     def _record_failure(self, failure: BaseException) -> None:
+        self._release_derived_binding(reason="acp_runtime_failed")
         with self._idle_condition:
             if self._failure is None:
                 self._failure = failure

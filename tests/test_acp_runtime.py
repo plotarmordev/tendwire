@@ -27,6 +27,7 @@ from tendwire.backends.acp_runtime import (
     AcpRuntime,
     AcpRuntimeBindingError,
     AcpRuntimeProtocolError,
+    AcpRuntimeStateError,
     AcpRuntimeStopTimeout,
     RuntimeState,
     SessionOpenMode,
@@ -34,6 +35,8 @@ from tendwire.backends.acp_runtime import (
 from tendwire.config import Config
 from tendwire.core.models import WorkerBinding
 from tendwire.store.sqlite import (
+    expire_stale_worker_bindings,
+    expire_worker_bindings,
     list_agent_events,
     list_worker_bindings,
     upsert_worker_bindings,
@@ -244,6 +247,7 @@ def binding_callback(db_path: Path):
     ) -> WorkerBinding:
         bound = replace(
             continuity,
+            backend="acp",
             turn_target_kind="acp_session_id",
             turn_target_value=session_id,
             private_fingerprint="",
@@ -535,6 +539,171 @@ def test_new_accepts_unpredictable_agent_generated_session_id(tmp_path: Path) ->
         service.stop()
 
 
+def test_new_acp_binding_survives_herdr_refresh_and_normal_stop(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    db_path = tmp_path / "events.db"
+    continuity = continuity_binding()
+    upsert_worker_bindings(db_path, [continuity])
+    service = AcpRuntime(
+        client,  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=continuity,
+        cwd=tmp_path,
+        session_binding_callback=binding_callback(db_path),
+        ingestor=FakeIngestor(),  # type: ignore[arg-type]
+        poll_timeout=0.01,
+        stop_timeout=0.5,
+    ).start()
+
+    derived = list_worker_bindings(db_path, "host-a", backend="acp")
+    assert len(derived) == 1
+    assert derived[0].turn_target_value == "session-private"
+    expire_stale_worker_bindings(
+        db_path,
+        "host-a",
+        backend="herdr",
+        current_private_fingerprints=[continuity.private_fingerprint],
+    )
+    assert list_worker_bindings(db_path, "host-a", backend="acp") == derived
+    service.stop()
+    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
+    released = list_worker_bindings(
+        db_path,
+        "host-a",
+        backend="acp",
+        include_expired=True,
+    )
+    assert len(released) == 1
+    assert released[0].reason == "acp_runtime_stopped"
+
+
+@pytest.mark.parametrize("failure_mode", ("raise", "bad_return"))
+def test_new_cleans_binding_persisted_by_failed_callback(
+    tmp_path: Path,
+    failure_mode: str,
+) -> None:
+    client = FakeClient()
+    db_path = tmp_path / "events.db"
+    continuity = continuity_binding()
+    upsert_worker_bindings(db_path, [continuity])
+
+    def fail_after_persist(session_id: str, anchor: WorkerBinding):
+        bound = binding_callback(db_path)(session_id, anchor)
+        if failure_mode == "raise":
+            raise RuntimeError("after persist")
+        return object()
+
+    service = AcpRuntime(
+        client,  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=continuity,
+        cwd=tmp_path,
+        session_binding_callback=fail_after_persist,  # type: ignore[arg-type]
+        poll_timeout=0.01,
+        stop_timeout=0.5,
+    )
+    with pytest.raises((RuntimeError, AcpRuntimeBindingError)):
+        service.start()
+
+    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
+    retired = list_worker_bindings(
+        db_path,
+        "host-a",
+        backend="acp",
+        include_expired=True,
+    )
+    assert len(retired) == 1
+    assert retired[0].reason == "acp_startup_rollback"
+    assert list_worker_bindings(db_path, "host-a", backend="herdr") == [continuity]
+
+
+def test_new_rolls_back_persisted_binding_when_ingestor_startup_fails(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    db_path = tmp_path / "events.db"
+    continuity = continuity_binding()
+    upsert_worker_bindings(db_path, [continuity])
+
+    def fail_factory(*_args: object, **_kwargs: object) -> FakeIngestor:
+        raise RuntimeError("factory failed")
+
+    service = AcpRuntime(
+        client,  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=continuity,
+        cwd=tmp_path,
+        session_binding_callback=binding_callback(db_path),
+        ingestor_factory=fail_factory,  # type: ignore[arg-type]
+        poll_timeout=0.01,
+        stop_timeout=0.5,
+    )
+    with pytest.raises(RuntimeError, match="factory failed"):
+        service.start()
+    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
+
+
+def test_new_callback_can_stop_runtime_without_lifecycle_deadlock(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    db_path = tmp_path / "events.db"
+    continuity = continuity_binding()
+    upsert_worker_bindings(db_path, [continuity])
+    service: AcpRuntime
+
+    def stop_during_bind(session_id: str, anchor: WorkerBinding) -> WorkerBinding:
+        bound = binding_callback(db_path)(session_id, anchor)
+        service.stop(timeout=0.2)
+        return bound
+
+    service = AcpRuntime(
+        client,  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=continuity,
+        cwd=tmp_path,
+        session_binding_callback=stop_during_bind,
+        poll_timeout=0.01,
+        stop_timeout=0.5,
+    )
+    started = time.monotonic()
+    with pytest.raises(AcpRuntimeStateError, match="stopped during"):
+        service.start()
+    assert time.monotonic() - started < 0.5
+    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
+
+
+def test_prompt_rechecks_binding_before_remote_send(tmp_path: Path) -> None:
+    client = FakeClient()
+    db_path = tmp_path / "events.db"
+    continuity = continuity_binding()
+    upsert_worker_bindings(db_path, [continuity])
+    service = AcpRuntime(
+        client,  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=continuity,
+        cwd=tmp_path,
+        session_binding_callback=binding_callback(db_path),
+        ingestor=FakeIngestor(),  # type: ignore[arg-type]
+        poll_timeout=0.01,
+        stop_timeout=0.5,
+    ).start()
+    derived = list_worker_bindings(db_path, "host-a", backend="acp")[0]
+    expire_worker_bindings(
+        db_path,
+        derived.host_id,
+        backend="acp",
+        private_fingerprints=[derived.private_fingerprint],
+        reason="test_expiry",
+    )
+
+    with pytest.raises(AcpRuntimeBindingError):
+        service.prompt("must not send")
+    assert [call[0] for call in client.calls].count("prompt") == 0
+
+
 def test_new_requires_explicit_session_binder_before_launch(tmp_path: Path) -> None:
     client = FakeClient()
 
@@ -644,6 +813,7 @@ def test_new_rejects_valid_shaped_binding_that_was_not_persisted(
     def dishonest(session_id: str, anchor: WorkerBinding) -> WorkerBinding:
         return replace(
             anchor,
+            backend="acp",
             turn_target_kind="acp_session_id",
             turn_target_value=session_id,
             private_fingerprint="",
@@ -689,6 +859,7 @@ def test_new_rejects_binder_that_overwrites_herdr_continuity(
         )
         bound = replace(
             anchor,
+            backend="acp",
             turn_target_kind="acp_session_id",
             turn_target_value=session_id,
             private_fingerprint="",
