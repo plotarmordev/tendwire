@@ -1,0 +1,437 @@
+"""Durable ACP ingestion bound to one authenticated Tendwire worker.
+
+The transport, semantic projector, and SQLite journal are deliberately separate.
+This module is the narrow authority bridge: it binds one ACP session generation
+to one private Herdr worker binding, records every accepted semantic event, and
+projects only user/assistant text into the existing turn model.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from ..config import Config
+from ..core.agent_events import AgentEvent, agent_event
+from ..core.models import WorkerBinding, stable_fingerprint
+from ..store.sqlite import (
+    AppendAgentEventResult,
+    TurnRefreshApplyResult,
+    append_agent_event,
+    apply_turn_refresh,
+    list_worker_bindings,
+)
+from .acp_projection import AcpEventProjector
+
+
+AppendEvent = Callable[[Path | str, str, AgentEvent], AppendAgentEventResult]
+ApplyTurn = Callable[..., TurnRefreshApplyResult]
+BindingIsCurrent = Callable[[Path | str, str, WorkerBinding], bool]
+
+
+@dataclass(frozen=True)
+class AcpIngestionResult:
+    """Outcome of accepting, ignoring, or projecting one ACP event."""
+
+    kind: str | None
+    event: AppendAgentEventResult | None = None
+    turn: TurnRefreshApplyResult | None = None
+    ignored_reason: str | None = None
+
+
+class AcpSessionIngestor:
+    """Ingest one ACP session generation for one private worker binding.
+
+    ``stream_generation`` must change whenever a transport is recreated. ACP v1
+    does not require a stable event ID for notifications, so generation-scoped
+    synthetic IDs avoid corrupting the append-only journal. Notifications with
+    authoritative source IDs still deduplicate across reconnects.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        session_id: str,
+        stream_generation: str,
+        binding: WorkerBinding,
+        projector: AcpEventProjector | None = None,
+        append_event: AppendEvent = append_agent_event,
+        apply_turn: ApplyTurn = apply_turn_refresh,
+        binding_is_current: BindingIsCurrent | None = None,
+    ) -> None:
+        if config.db_path is None:
+            raise ValueError("ACP ingestion requires a sqlite db path")
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("ACP session and stream generation are required")
+        if not isinstance(stream_generation, str) or not stream_generation.strip():
+            raise ValueError("ACP session and stream generation are required")
+        if binding.host_id != config.host_id:
+            raise ValueError("ACP binding host does not match configuration")
+        if not binding.private_fingerprint:
+            raise ValueError("ACP ingestion requires an authenticated private binding")
+        if (
+            binding.turn_target_kind != "acp_session_id"
+            or binding.turn_target_value != session_id.strip()
+        ):
+            raise ValueError("ACP session does not match the private worker binding")
+        if config.agent_event_source == "legacy":
+            raise ValueError("ACP ingestion is disabled by agent_event_source=legacy")
+        self.config = config
+        self.session_id = session_id.strip()
+        self.stream_generation = stream_generation.strip()
+        self.binding = binding
+        self.projector = projector or AcpEventProjector()
+        self._append_event = append_event
+        self._apply_turn = apply_turn
+        self._binding_is_current = binding_is_current or _binding_is_current
+        self._turn_ordinal = 0
+        self._source_turn_id: str | None = None
+        self._turn_complete = False
+
+    @property
+    def source_turn_id(self) -> str | None:
+        """Return the opaque public-safe identity of the active ACP turn."""
+
+        return self._source_turn_id
+
+    def start_turn(self, *, producer_turn_id: str | None = None) -> str:
+        """Reset message assembly and allocate one opaque turn identity."""
+
+        if producer_turn_id is not None and (
+            not isinstance(producer_turn_id, str) or not producer_turn_id.strip()
+        ):
+            raise ValueError("producer_turn_id must be non-empty text or None")
+        self._turn_ordinal += 1
+        self.projector.reset_turn(self.session_id)
+        # An authoritative producer turn ID must retain identity across ACP
+        # transport recreation.  Generation only scopes locally synthesized
+        # ordinals, whose meaning cannot survive a reconnect.
+        identity = (
+            {
+                "source": "acp",
+                "session": self.session_id,
+                "producer_turn": producer_turn_id.strip(),
+            }
+            if producer_turn_id is not None
+            else {
+                "source": "acp",
+                "session": self.session_id,
+                "generation": self.stream_generation,
+                "turn": self._turn_ordinal,
+            }
+        )
+        self._source_turn_id = f"acpt_{stable_fingerprint(identity)}"
+        self._turn_complete = False
+        return self._source_turn_id
+
+    def ingest_update(
+        self,
+        notification: Mapping[str, Any],
+        *,
+        source_event_id: str | None = None,
+        replay: bool = False,
+    ) -> AcpIngestionResult:
+        """Normalize, journal, and conditionally project ``session/update``."""
+
+        mismatch = _notification_mismatch(
+            notification,
+            method="session/update",
+            session_id=self.session_id,
+        )
+        if mismatch is not None:
+            return AcpIngestionResult(None, ignored_reason=mismatch)
+        update_kind = _session_update_kind(notification)
+        if self._turn_complete and update_kind in _TURN_SCOPED_UPDATES:
+            return AcpIngestionResult(None, ignored_reason="turn_already_complete")
+        thought_rejection = _thought_rejection_reason(
+            notification,
+            policy=self.config.acp_thought_policy,
+        )
+        if thought_rejection is not None:
+            return AcpIngestionResult("thought", ignored_reason=thought_rejection)
+        if not self._current_binding_is_valid():
+            return AcpIngestionResult(None, ignored_reason="stale_binding")
+        canonical = self.projector.normalize_session_update(
+            notification,
+            source_event_id=source_event_id,
+            replay=replay,
+        )
+        if canonical is None:
+            return AcpIngestionResult(None, ignored_reason="unsupported_or_duplicate")
+        return self._accept(canonical)
+
+    def ingest_permission_request(
+        self,
+        request: Mapping[str, Any],
+        *,
+        source_event_id: str | None = None,
+        replay: bool = False,
+    ) -> AcpIngestionResult:
+        """Journal a permission request as a private tool lifecycle update."""
+
+        mismatch = _notification_mismatch(
+            request,
+            method="session/request_permission",
+            session_id=self.session_id,
+        )
+        if mismatch is not None:
+            return AcpIngestionResult(None, ignored_reason=mismatch)
+        if self._turn_complete:
+            return AcpIngestionResult(None, ignored_reason="turn_already_complete")
+        if not self._current_binding_is_valid():
+            return AcpIngestionResult(None, ignored_reason="stale_binding")
+        canonical = self.projector.normalize_permission_request(
+            request,
+            source_event_id=source_event_id,
+            replay=replay,
+        )
+        if canonical is None:
+            return AcpIngestionResult(None, ignored_reason="duplicate")
+        return self._accept(canonical)
+
+    def mark_prompt_complete(self) -> AcpIngestionResult:
+        """Finalize the current text projection after ``session/prompt`` returns."""
+
+        if self._source_turn_id is None:
+            return AcpIngestionResult(None, ignored_reason="no_active_turn")
+        if self._turn_complete:
+            return AcpIngestionResult(None, ignored_reason="turn_already_complete")
+        if not self._current_binding_is_valid():
+            return AcpIngestionResult(None, ignored_reason="stale_binding")
+        content = self.projector.mark_turn_complete(self.session_id)
+        content["source_turn_id"] = self._source_turn_id
+        if self.config.agent_event_source == "acp_shadow":
+            self._turn_complete = True
+            return AcpIngestionResult("agent_message")
+        turn = self._project_turn(content)
+        self._turn_complete = True
+        return AcpIngestionResult(
+            "agent_message",
+            turn=turn,
+            ignored_reason="stale_binding" if turn.stale_binding else None,
+        )
+
+    def _accept(self, canonical: Mapping[str, Any]) -> AcpIngestionResult:
+        kind = str(canonical.get("kind") or "")
+        if kind == "thought" and self.config.acp_thought_policy == "disabled":
+            return AcpIngestionResult(kind, ignored_reason="thought_policy_disabled")
+        if self._source_turn_id is None and kind in {
+            "user_message",
+            "agent_message",
+            "thought",
+            "tool_call",
+            "tool_call_update",
+            "plan",
+        }:
+            self.start_turn()
+
+        payload = canonical.get("payload")
+        if not isinstance(payload, Mapping):
+            raise ValueError("canonical ACP event payload must be a mapping")
+        sequence = canonical.get("sequence")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+            raise ValueError("canonical ACP event sequence must be nonnegative")
+        explicit_event_id = canonical.get("source_event_id")
+        source_id = (
+            str(explicit_event_id)
+            if explicit_event_id is not None and str(explicit_event_id)
+            else f"stream:{self.stream_generation}:{sequence}"
+        )
+        event = agent_event(
+            kind=kind,
+            source="acp",
+            worker_id=self.binding.worker_id,
+            payload=payload,
+            source_session_id=self.session_id,
+            source_turn_id=self._source_turn_id,
+            source_item_id=_source_item_id(kind, payload),
+            source_message_id=_source_message_id(kind, payload),
+            source_event_id=source_id,
+            source_sequence=sequence,
+            # The complete structured journal is private initially. Public and
+            # connector views require a separate explicit sanitizing projection.
+            visibility="private",
+        )
+        appended = self._append_event(
+            Path(self.config.db_path),
+            self.config.host_id,
+            event,
+        )
+
+        turn: TurnRefreshApplyResult | None = None
+        if (
+            kind in {"user_message", "agent_message"}
+            and self.config.agent_event_source != "acp_shadow"
+            and appended.inserted
+        ):
+            content = self.projector.project_turn_content(self.session_id)
+            if self._source_turn_id is not None:
+                content["source_turn_id"] = self._source_turn_id
+            turn = self._project_turn(content)
+        return AcpIngestionResult(
+            kind,
+            event=appended,
+            turn=turn,
+            ignored_reason=(
+                "stale_binding"
+                if turn is not None and turn.stale_binding
+                else "duplicate_event"
+                if not appended.inserted
+                else None
+            ),
+        )
+
+    def _current_binding_is_valid(self) -> bool:
+        try:
+            return bool(
+                self._binding_is_current(
+                    Path(self.config.db_path),
+                    self.config.host_id,
+                    self.binding,
+                )
+            )
+        except Exception:
+            # Binding lookup is an authority check. Any lookup failure must
+            # fail closed rather than accepting an unauthenticated event.
+            return False
+
+    def _project_turn(self, content: Mapping[str, Any]) -> TurnRefreshApplyResult:
+        return self._apply_turn(
+            Path(self.config.db_path),
+            self.config.host_id,
+            self.binding.worker_id,
+            content,
+            expected_binding=self.binding,
+            pending_stale_grace_seconds=self.config.pending_stale_grace_seconds,
+            turn_model=self.config.turn_model,
+        )
+
+
+def _source_message_id(kind: str, payload: Mapping[str, Any]) -> str | None:
+    if kind not in {"user_message", "agent_message", "thought"}:
+        return None
+    value = payload.get("message_id")
+    return str(value) if value is not None and str(value) else None
+
+
+def _source_item_id(kind: str, payload: Mapping[str, Any]) -> str | None:
+    if kind not in {"tool_call", "tool_call_update"}:
+        return None
+    value = payload.get("tool_call_id")
+    return str(value) if value is not None and str(value) else None
+
+
+_TURN_SCOPED_UPDATES = frozenset(
+    {
+        "user_message_chunk",
+        "agent_message_chunk",
+        "agent_thought_chunk",
+        "tool_call",
+        "tool_call_update",
+        "plan",
+    }
+)
+_THOUGHT_RAW_LABELS = frozenset(
+    {"raw", "reasoning", "raw_reasoning", "raw-reasoning", "chain_of_thought"}
+)
+
+
+def _params(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    params = value.get("params")
+    return params if isinstance(params, Mapping) else value
+
+
+def _notification_mismatch(
+    value: Mapping[str, Any],
+    *,
+    method: str,
+    session_id: str,
+) -> str | None:
+    supplied_method = value.get("method")
+    if supplied_method is not None and supplied_method != method:
+        return "method_mismatch"
+    supplied_session = _params(value).get("sessionId")
+    if supplied_session != session_id:
+        return "session_mismatch"
+    return None
+
+
+def _session_update(value: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    update = _params(value).get("update")
+    return update if isinstance(update, Mapping) else None
+
+
+def _session_update_kind(value: Mapping[str, Any]) -> str | None:
+    update = _session_update(value)
+    kind = update.get("sessionUpdate") if update is not None else None
+    return kind if isinstance(kind, str) else None
+
+
+def _thought_classification(value: Mapping[str, Any]) -> str | None:
+    update = _session_update(value)
+    if update is None or update.get("sessionUpdate") != "agent_thought_chunk":
+        return None
+    candidates: list[Mapping[str, Any]] = []
+    for container in (update, update.get("content")):
+        if not isinstance(container, Mapping):
+            continue
+        meta = container.get("_meta")
+        if not isinstance(meta, Mapping):
+            continue
+        candidates.append(meta)
+        tendwire = meta.get("tendwire")
+        if isinstance(tendwire, Mapping):
+            candidates.insert(0, tendwire)
+    for meta in candidates:
+        for key in ("thought_kind", "thoughtKind", "reasoning_kind", "reasoningKind"):
+            label = meta.get(key)
+            if isinstance(label, str) and label.strip():
+                return label.strip().lower()
+    return "unclassified"
+
+
+def _thought_rejection_reason(
+    value: Mapping[str, Any],
+    *,
+    policy: str,
+) -> str | None:
+    classification = _thought_classification(value)
+    if classification is None:
+        return None
+    if policy == "disabled":
+        return "thought_policy_disabled"
+    if policy == "private_summary" and classification in _THOUGHT_RAW_LABELS:
+        return "thought_policy_requires_summary"
+    return None
+
+
+def _binding_is_current(
+    db_path: Path | str,
+    host_id: str,
+    expected: WorkerBinding,
+) -> bool:
+    """Check the durable private authority immediately before accepting data."""
+
+    for current in list_worker_bindings(
+        Path(db_path),
+        str(host_id),
+        backend=expected.backend,
+    ):
+        if (
+            current.worker_id == expected.worker_id
+            and current.worker_fingerprint == expected.worker_fingerprint
+            and current.backend == expected.backend
+            and current.target_kind == expected.target_kind
+            and current.target_value == expected.target_value
+            and current.turn_target_kind == expected.turn_target_kind
+            and current.turn_target_value == expected.turn_target_value
+            and current.private_fingerprint == expected.private_fingerprint
+        ):
+            return True
+    return False
+
+
+__all__ = ["AcpIngestionResult", "AcpSessionIngestor"]
