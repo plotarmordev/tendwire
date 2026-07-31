@@ -17,18 +17,16 @@ from ..config import Config
 from ..core.agent_events import AgentEvent, agent_event
 from ..core.models import WorkerBinding, stable_fingerprint
 from ..store.sqlite import (
-    AppendAgentEventResult,
+    AppendBoundAgentEventResult,
     TurnRefreshApplyResult,
-    append_agent_event,
+    append_agent_event_for_binding,
     apply_turn_refresh,
-    list_worker_bindings,
 )
 from .acp_projection import AcpEventProjector
 
 
-AppendEvent = Callable[[Path | str, str, AgentEvent], AppendAgentEventResult]
+AppendEvent = Callable[..., AppendBoundAgentEventResult]
 ApplyTurn = Callable[..., TurnRefreshApplyResult]
-BindingIsCurrent = Callable[[Path | str, str, WorkerBinding], bool]
 
 
 @dataclass(frozen=True)
@@ -36,7 +34,7 @@ class AcpIngestionResult:
     """Outcome of accepting, ignoring, or projecting one ACP event."""
 
     kind: str | None
-    event: AppendAgentEventResult | None = None
+    event: AppendBoundAgentEventResult | None = None
     turn: TurnRefreshApplyResult | None = None
     ignored_reason: str | None = None
 
@@ -58,9 +56,8 @@ class AcpSessionIngestor:
         stream_generation: str,
         binding: WorkerBinding,
         projector: AcpEventProjector | None = None,
-        append_event: AppendEvent = append_agent_event,
+        append_event: AppendEvent = append_agent_event_for_binding,
         apply_turn: ApplyTurn = apply_turn_refresh,
-        binding_is_current: BindingIsCurrent | None = None,
     ) -> None:
         if config.db_path is None:
             raise ValueError("ACP ingestion requires a sqlite db path")
@@ -86,7 +83,6 @@ class AcpSessionIngestor:
         self.projector = projector or AcpEventProjector()
         self._append_event = append_event
         self._apply_turn = apply_turn
-        self._binding_is_current = binding_is_current or _binding_is_current
         self._turn_ordinal = 0
         self._source_turn_id: str | None = None
         self._turn_complete = False
@@ -152,8 +148,6 @@ class AcpSessionIngestor:
         )
         if thought_rejection is not None:
             return AcpIngestionResult("thought", ignored_reason=thought_rejection)
-        if not self._current_binding_is_valid():
-            return AcpIngestionResult(None, ignored_reason="stale_binding")
         canonical = self.projector.normalize_session_update(
             notification,
             source_event_id=source_event_id,
@@ -181,8 +175,6 @@ class AcpSessionIngestor:
             return AcpIngestionResult(None, ignored_reason=mismatch)
         if self._turn_complete:
             return AcpIngestionResult(None, ignored_reason="turn_already_complete")
-        if not self._current_binding_is_valid():
-            return AcpIngestionResult(None, ignored_reason="stale_binding")
         canonical = self.projector.normalize_permission_request(
             request,
             source_event_id=source_event_id,
@@ -199,8 +191,6 @@ class AcpSessionIngestor:
             return AcpIngestionResult(None, ignored_reason="no_active_turn")
         if self._turn_complete:
             return AcpIngestionResult(None, ignored_reason="turn_already_complete")
-        if not self._current_binding_is_valid():
-            return AcpIngestionResult(None, ignored_reason="stale_binding")
         content = self.projector.mark_turn_complete(self.session_id)
         content["source_turn_id"] = self._source_turn_id
         if self.config.agent_event_source == "acp_shadow":
@@ -259,13 +249,14 @@ class AcpSessionIngestor:
             Path(self.config.db_path),
             self.config.host_id,
             event,
+            expected_binding=self.binding,
         )
 
         turn: TurnRefreshApplyResult | None = None
         if (
             kind in {"user_message", "agent_message"}
             and self.config.agent_event_source != "acp_shadow"
-            and appended.inserted
+            and appended.status == "inserted"
         ):
             content = self.projector.project_turn_content(self.session_id)
             if self._source_turn_id is not None:
@@ -277,26 +268,13 @@ class AcpSessionIngestor:
             turn=turn,
             ignored_reason=(
                 "stale_binding"
-                if turn is not None and turn.stale_binding
+                if appended.status == "binding_changed"
+                or (turn is not None and turn.stale_binding)
                 else "duplicate_event"
-                if not appended.inserted
+                if appended.status == "replayed"
                 else None
             ),
         )
-
-    def _current_binding_is_valid(self) -> bool:
-        try:
-            return bool(
-                self._binding_is_current(
-                    Path(self.config.db_path),
-                    self.config.host_id,
-                    self.binding,
-                )
-            )
-        except Exception:
-            # Binding lookup is an authority check. Any lookup failure must
-            # fail closed rather than accepting an unauthenticated event.
-            return False
 
     def _project_turn(self, content: Mapping[str, Any]) -> TurnRefreshApplyResult:
         return self._apply_turn(
@@ -406,32 +384,6 @@ def _thought_rejection_reason(
     if policy == "private_summary" and classification in _THOUGHT_RAW_LABELS:
         return "thought_policy_requires_summary"
     return None
-
-
-def _binding_is_current(
-    db_path: Path | str,
-    host_id: str,
-    expected: WorkerBinding,
-) -> bool:
-    """Check the durable private authority immediately before accepting data."""
-
-    for current in list_worker_bindings(
-        Path(db_path),
-        str(host_id),
-        backend=expected.backend,
-    ):
-        if (
-            current.worker_id == expected.worker_id
-            and current.worker_fingerprint == expected.worker_fingerprint
-            and current.backend == expected.backend
-            and current.target_kind == expected.target_kind
-            and current.target_value == expected.target_value
-            and current.turn_target_kind == expected.turn_target_kind
-            and current.turn_target_value == expected.turn_target_value
-            and current.private_fingerprint == expected.private_fingerprint
-        ):
-            return True
-    return False
 
 
 __all__ = ["AcpIngestionResult", "AcpSessionIngestor"]
