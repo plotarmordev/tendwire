@@ -183,8 +183,9 @@ def test_permission_request_updates_tool_and_keeps_options() -> None:
     assert event["kind"] == "tool_call_update"
     assert event["payload"]["permission"]["required"] is True
     assert event["payload"]["permission"]["options"][1]["optionId"] == "no"
-    assert event["source_event_id"] == "42"
-    assert event["event_id"] == "acp:session-1:42"
+    assert event["source_event_id"] == "request:42"
+    assert event["event_id"] == "acp:session-1:request:42"
+    assert "payload.permission" in event["private_fields"]
 
     assert (
         projector.normalize_permission_request(
@@ -195,7 +196,18 @@ def test_permission_request_updates_tool_and_keeps_options() -> None:
                 "params": {
                     "sessionId": "session-1",
                     "toolCall": {"toolCallId": "tool-9", "status": "pending"},
-                    "options": [],
+                    "options": [
+                        {
+                            "optionId": "yes",
+                            "name": "Allow",
+                            "kind": "allow_once",
+                        },
+                        {
+                            "optionId": "no",
+                            "name": "Reject",
+                            "kind": "reject_once",
+                        },
+                    ],
                 },
             }
         )
@@ -315,3 +327,305 @@ def test_sessions_have_independent_ordering_and_defensive_snapshots() -> None:
     assert snapshot is not None
     snapshot["usage"]["used"] = 999
     assert projector.session_snapshot("session-1")["usage"]["used"] == 1
+
+
+def test_interleaved_explicit_messages_and_implicit_v1_chunks_do_not_alias() -> None:
+    projector = AcpEventProjector()
+
+    for message_id, text in (("a", "A1"), ("b", "B"), ("a", "A2")):
+        projector.normalize_session_update(
+            _update(
+                "agent_message_chunk",
+                messageId=message_id,
+                content={"type": "text", "text": text},
+            )
+        )
+    implicit = projector.normalize_session_update(
+        _update(
+            "agent_message_chunk",
+            content={"type": "text", "text": "stable-v1"},
+        )
+    )
+
+    assert implicit is not None
+    assert implicit["payload"]["message_id"] == "implicit-agent_message-1"
+    assert projector.project_turn_content("session-1")["assistant_stream_text"] == (
+        "A1A2\n\nB\n\nstable-v1"
+    )
+
+
+def test_replay_identity_collision_is_rejected_and_sessions_are_isolated() -> None:
+    projector = AcpEventProjector()
+    first = _update(
+        "agent_message_chunk",
+        content={"type": "text", "text": "one"},
+    )
+    assert projector.normalize_session_update(first, source_event_id="event-7")
+    assert projector.normalize_session_update(first, source_event_id="event-7") is None
+
+    with pytest.raises(AcpProjectionError, match="reused for different content"):
+        projector.normalize_session_update(
+            _update(
+                "agent_message_chunk",
+                content={"type": "text", "text": "different"},
+            ),
+            source_event_id="event-7",
+        )
+
+    other = {
+        "sessionId": "session-2",
+        "update": first["params"]["update"],
+    }
+    isolated = projector.normalize_session_update(other, source_event_id="event-7")
+    assert isolated is not None and isolated["sequence"] == 1
+
+
+def test_permission_request_ids_do_not_collide_with_notification_event_ids() -> None:
+    projector = AcpEventProjector()
+    notification = _update(
+        "tool_call",
+        toolCallId="tool-1",
+        status="pending",
+        _meta={"eventId": 42},
+    )
+    assert projector.normalize_session_update(notification) is not None
+    permission = projector.normalize_permission_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "session-1",
+                "toolCall": {"toolCallId": "tool-1"},
+                "options": [
+                    {"optionId": "yes", "name": "Allow", "kind": "allow_once"}
+                ],
+            },
+        }
+    )
+    assert permission is not None
+    assert permission["source_event_id"] == "request:42"
+
+
+def test_namespaced_extension_metadata_is_private_and_adapter_neutral() -> None:
+    projector = AcpEventProjector(max_sessions=1)
+    # Unknown variants neither allocate a session nor consume ordering state.
+    assert projector.normalize_session_update(_update("vendor/future", value=1)) is None
+    event = projector.normalize_session_update(
+        {
+            "params": {
+                "sessionId": "session-2",
+                "_meta": {"vendor.example/params": {"trace": "abc"}},
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "safe",
+                        "_meta": {
+                            "vendor.example/content": {"revision": 1},
+                            "unscoped": "discard",
+                        },
+                    },
+                    "_meta": {
+                        "vendor.example/update": {"opaque": True},
+                        "adapterInternal": "discard",
+                    },
+                },
+            },
+        }
+    )
+    assert event is not None
+    assert event["sequence"] == 1
+    assert event["payload"]["extensions"] == {
+        "vendor.example/params": {"trace": "abc"},
+        "vendor.example/update": {"opaque": True}
+    }
+    assert event["payload"]["content"]["_meta"] == {
+        "vendor.example/content": {"revision": 1}
+    }
+    assert "adapterInternal" not in repr(event["payload"])
+    assert "unscoped" not in repr(event["payload"])
+
+
+def test_plan_is_a_validated_full_replacement() -> None:
+    projector = AcpEventProjector()
+    projector.normalize_session_update(
+        _update("plan", entries=[{"content": "old", "status": "pending"}])
+    )
+    replacement = projector.normalize_session_update(
+        _update("plan", entries=[{"content": "new", "status": "completed"}])
+    )
+    assert replacement is not None
+    assert replacement["payload"]["entries"] == [
+        {"content": "new", "status": "completed"}
+    ]
+    with pytest.raises(AcpProjectionError, match="entries must be an array"):
+        projector.normalize_session_update(_update("plan", entries="bad"))
+    assert projector.session_snapshot("session-1")["plan"] == [
+        {"content": "new", "status": "completed"}
+    ]
+
+
+def test_completion_is_not_reopened_by_session_updates_and_requires_reset() -> None:
+    projector = AcpEventProjector()
+    projector.normalize_session_update(
+        _update(
+            "agent_message_chunk",
+            content={"type": "text", "text": "final"},
+        )
+    )
+    projector.mark_turn_complete("session-1")
+    projector.normalize_session_update(_update("usage_update", used=9, size=10))
+    projector.normalize_session_update(
+        _update("session_info_update", title="still complete")
+    )
+    assert projector.project_turn_content("session-1")["complete"] is True
+    assert projector.project_turn_content("session-1", complete=False)["complete"] is True
+    with pytest.raises(AcpProjectionError, match="reset_turn"):
+        projector.normalize_session_update(
+            _update(
+                "agent_message_chunk",
+                content={"type": "text", "text": "late"},
+            )
+        )
+
+    projector.reset_turn("session-1")
+    projector.normalize_session_update(
+        _update(
+            "agent_message_chunk",
+            content={"type": "text", "text": "next"},
+        )
+    )
+    assert projector.project_turn_content("session-1")["assistant_stream_text"] == "next"
+
+
+def test_bounded_state_fails_closed_and_drop_session_releases_capacity() -> None:
+    projector = AcpEventProjector(
+        max_sessions=1,
+        max_source_events_per_session=1,
+        max_messages_per_kind=1,
+        max_tool_calls_per_session=1,
+        max_state_fields=1,
+        max_plan_entries=1,
+        max_text_chars_per_message=3,
+        max_event_bytes=1024,
+    )
+    assert projector.normalize_session_update(
+        _update("usage_update", used=1), source_event_id="one"
+    )
+    with pytest.raises(AcpProjectionError, match="replay window"):
+        projector.normalize_session_update(
+            _update("usage_update", used=2), source_event_id="two"
+        )
+    with pytest.raises(AcpProjectionError, match="session limit"):
+        projector.normalize_session_update(
+            {
+                "sessionId": "session-2",
+                "update": {"sessionUpdate": "usage_update", "used": 1},
+            }
+        )
+    assert projector.drop_session("session-1") is True
+    assert projector.drop_session("session-1") is False
+    assert projector.normalize_session_update(
+        {
+            "sessionId": "session-2",
+            "update": {"sessionUpdate": "usage_update", "used": 1},
+        }
+    )
+
+
+def test_failed_or_oversized_input_does_not_allocate_or_mutate_session() -> None:
+    projector = AcpEventProjector(max_sessions=1, max_event_bytes=128)
+    with pytest.raises(AcpProjectionError, match="bounded JSON"):
+        projector.normalize_session_update(
+            _update("session_info_update", invalid={1, 2, 3})
+        )
+    assert projector.session_snapshot("session-1") is None
+
+    with pytest.raises(AcpProjectionError, match="size limit"):
+        projector.normalize_session_update(
+            _update("session_info_update", value="x" * 200)
+        )
+    assert projector.session_snapshot("session-1") is None
+    accepted = projector.normalize_session_update(
+        {
+            "sessionId": "session-2",
+            "update": {"sessionUpdate": "usage_update", "used": 1},
+        }
+    )
+    assert accepted is not None and accepted["sequence"] == 1
+
+
+def test_aggregate_retained_session_state_has_a_hard_budget() -> None:
+    projector = AcpEventProjector(max_session_state_bytes=12)
+    with pytest.raises(AcpProjectionError, match="retained session state"):
+        projector.normalize_session_update(
+            _update("session_info_update", title="far too large")
+        )
+    assert projector.session_snapshot("session-1") is None
+
+
+def test_total_retained_state_is_bounded_across_isolated_sessions() -> None:
+    projector = AcpEventProjector(
+        max_session_state_bytes=100,
+        max_total_state_bytes=18,
+    )
+    assert projector.normalize_session_update(
+        {
+            "sessionId": "session-a",
+            "update": {"sessionUpdate": "session_info_update", "value": "1234"},
+        }
+    )
+    with pytest.raises(AcpProjectionError, match="total retained state"):
+        projector.normalize_session_update(
+            {
+                "sessionId": "session-b",
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "value": "1234",
+                },
+            }
+        )
+    assert projector.session_snapshot("session-b") is None
+
+
+def test_all_non_message_events_remain_unreachable_from_legacy_turns() -> None:
+    projector = AcpEventProjector()
+    projector.normalize_session_update(
+        _update(
+            "agent_thought_chunk",
+            content={"type": "text", "text": "do not leak thought"},
+        )
+    )
+    projector.normalize_session_update(
+        _update(
+            "tool_call",
+            toolCallId="tool-secret",
+            rawInput={"secret": "do not leak raw input"},
+        )
+    )
+    projector.normalize_session_update(
+        _update("plan", entries=[{"content": "do not leak plan"}])
+    )
+    projector.normalize_permission_request(
+        {
+            "jsonrpc": "2.0",
+            "id": "permission-secret",
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "session-1",
+                "toolCall": {"toolCallId": "tool-secret"},
+                "options": [
+                    {"optionId": "secret", "name": "Private", "kind": "reject_once"}
+                ],
+            },
+        }
+    )
+    legacy = projector.project_turn_content("session-1")
+    assert legacy == {
+        "user_text": "",
+        "assistant_stream_text": "",
+        "assistant_final_text": "",
+        "complete": False,
+        "has_open_turn": False,
+    }
