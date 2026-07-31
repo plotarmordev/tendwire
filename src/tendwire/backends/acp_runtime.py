@@ -19,6 +19,7 @@ from typing import Any, Protocol
 
 from ..config import Config
 from ..core.models import WorkerBinding, stable_fingerprint
+from ..store.sqlite import list_worker_bindings
 from .acp_ingestion import AcpSessionIngestor
 from .acp_protocol import (
     PermissionRequest,
@@ -88,6 +89,16 @@ class AcpRuntimeStatus:
 
 PermissionCallback = Callable[[PermissionRequest], str | None]
 IngestorFactory = Callable[..., AcpSessionIngestor]
+
+
+class SessionBindingCallback(Protocol):
+    """Atomically persist an ACP binding derived from one continuity anchor."""
+
+    def __call__(
+        self,
+        session_id: str,
+        continuity_binding: WorkerBinding,
+    ) -> WorkerBinding: ...
 
 
 class AcpRuntimeClient(Protocol):
@@ -172,6 +183,7 @@ class AcpRuntime:
         mcp_servers: Sequence[Mapping[str, Any]] = (),
         additional_directories: Sequence[str | Path] = (),
         permission_callback: PermissionCallback | None = None,
+        session_binding_callback: SessionBindingCallback | None = None,
         ingestor: AcpSessionIngestor | None = None,
         ingestor_factory: IngestorFactory = AcpSessionIngestor,
         poll_timeout: float = 0.05,
@@ -185,17 +197,30 @@ class AcpRuntime:
             raise ValueError(f"session_id is required for ACP {mode.value}")
         if mode is SessionOpenMode.NEW and session_id is not None:
             raise ValueError("session_id must be omitted when creating an ACP session")
+        if mode is SessionOpenMode.NEW and session_binding_callback is None:
+            raise ValueError("session_binding_callback is required for ACP new")
+        if mode is not SessionOpenMode.NEW and session_binding_callback is not None:
+            raise ValueError(
+                "session_binding_callback is only valid when creating an ACP session"
+            )
         if binding.host_id != config.host_id:
             raise ValueError("ACP runtime binding host does not match configuration")
         if not binding.private_fingerprint:
             raise ValueError("ACP runtime requires an authenticated private binding")
-        if binding.turn_target_kind != "acp_session_id":
-            raise ValueError("ACP runtime requires an ACP session worker binding")
         if (
-            mode is not SessionOpenMode.NEW
-            and binding.turn_target_value != session_id
+            mode is SessionOpenMode.NEW
+            and binding.turn_target_kind == "acp_session_id"
         ):
-            raise ValueError("ACP runtime session does not match the worker binding")
+            raise ValueError(
+                "ACP new requires a non-ACP worker continuity binding"
+            )
+        if mode is not SessionOpenMode.NEW:
+            if binding.turn_target_kind != "acp_session_id":
+                raise ValueError("ACP runtime requires an ACP session worker binding")
+            if binding.turn_target_value != session_id:
+                raise ValueError("ACP runtime session does not match the worker binding")
+        if config.db_path is None:
+            raise ValueError("ACP runtime requires a sqlite db path")
         resolved_cwd = Path(cwd)
         if not resolved_cwd.is_absolute():
             raise ValueError("ACP runtime cwd must be absolute")
@@ -215,6 +240,7 @@ class AcpRuntime:
         self._mcp_servers = tuple(dict(server) for server in mcp_servers)
         self._additional_directories = tuple(Path(path) for path in additional_directories)
         self._permission_callback = permission_callback
+        self._session_binding_callback = session_binding_callback
         self._provided_ingestor = ingestor
         self._ingestor_factory = ingestor_factory
         self._poll_timeout = float(poll_timeout)
@@ -269,23 +295,25 @@ class AcpRuntime:
                     )
                 self._state = RuntimeState.STARTING
             try:
+                self._require_current_binding(self._binding)
                 self._client.initialize(client_capabilities=self._client_capabilities)
                 session = self._open_session()
                 if not isinstance(session, SessionResult) or not session.session_id:
                     raise AcpRuntimeProtocolError(
                         "ACP session setup returned an invalid response"
                     )
-                if session.session_id != self._binding.turn_target_value:
-                    raise AcpRuntimeProtocolError(
-                        "ACP session setup did not return the bound session"
-                    )
-                if (
-                    self._requested_session_id is not None
-                    and session.session_id != self._requested_session_id
-                ):
-                    raise AcpRuntimeProtocolError(
-                        "ACP session setup returned an unexpected session"
-                    )
+                if self._session_mode is SessionOpenMode.NEW:
+                    self._binding = self._bind_new_session(session.session_id)
+                else:
+                    if session.session_id != self._binding.turn_target_value:
+                        raise AcpRuntimeProtocolError(
+                            "ACP session setup did not return the bound session"
+                        )
+                    if session.session_id != self._requested_session_id:
+                        raise AcpRuntimeProtocolError(
+                            "ACP session setup returned an unexpected session"
+                        )
+                    self._require_current_binding(self._binding)
                 self._session_id = session.session_id
                 self._ingestor = self._make_ingestor(session.session_id)
                 threads = (
@@ -543,6 +571,54 @@ class AcpRuntime:
             binding=self._binding,
         )
 
+    def _bind_new_session(self, session_id: str) -> WorkerBinding:
+        callback = self._session_binding_callback
+        if callback is None:  # pragma: no cover - constructor invariant
+            raise AcpRuntimeBindingError("ACP session binding is unavailable")
+        continuity = self._binding
+        self._require_current_binding(continuity)
+        bound = callback(session_id, continuity)
+        if not isinstance(bound, WorkerBinding):
+            raise AcpRuntimeBindingError("ACP session binder returned an invalid binding")
+        if (
+            bound.host_id != continuity.host_id
+            or bound.worker_id != continuity.worker_id
+            or bound.worker_fingerprint != continuity.worker_fingerprint
+            or bound.backend != continuity.backend
+            or bound.target_kind != continuity.target_kind
+            or bound.target_value != continuity.target_value
+        ):
+            raise AcpRuntimeBindingError("ACP session binder changed worker continuity")
+        if (
+            bound.turn_target_kind != "acp_session_id"
+            or bound.turn_target_value != session_id
+        ):
+            raise AcpRuntimeBindingError("ACP session binder returned the wrong session")
+        if (
+            not bound.private_fingerprint
+            or bound.private_fingerprint == continuity.private_fingerprint
+        ):
+            raise AcpRuntimeBindingError(
+                "ACP session binder did not establish a distinct private binding"
+            )
+        # The callback must add a distinct ACP binding. It must not repurpose or
+        # overwrite the Herdr continuity row it was given.
+        self._require_current_binding(continuity)
+        self._require_current_binding(bound)
+        return bound
+
+    def _require_current_binding(self, expected: WorkerBinding) -> None:
+        db_path = self._config.db_path
+        if db_path is None:  # pragma: no cover - constructor invariant
+            raise AcpRuntimeBindingError("ACP binding store is unavailable")
+        current = list_worker_bindings(
+            Path(db_path),
+            expected.host_id,
+            backend=expected.backend,
+        )
+        if expected not in current:
+            raise AcpRuntimeBindingError("ACP worker binding is not current")
+
     def _consume_updates(self) -> None:
         try:
             while True:
@@ -766,5 +842,6 @@ __all__ = [
     "AcpRuntimeStopTimeout",
     "PermissionCallback",
     "RuntimeState",
+    "SessionBindingCallback",
     "SessionOpenMode",
 ]

@@ -32,7 +32,11 @@ from tendwire.backends.acp_runtime import (
 )
 from tendwire.config import Config
 from tendwire.core.models import WorkerBinding
-from tendwire.store.sqlite import list_agent_events, upsert_worker_bindings
+from tendwire.store.sqlite import (
+    list_agent_events,
+    list_worker_bindings,
+    upsert_worker_bindings,
+)
 
 
 _END = object()
@@ -48,6 +52,7 @@ class FakeClient:
         self.prompt_failure: BaseException | None = None
         self.initialize_failure: BaseException | None = None
         self.new_session_result: SessionResult | None = None
+        self.restored_session_result: SessionResult | None = None
         self.closed = False
         self.close_calls = 0
 
@@ -67,13 +72,17 @@ class FakeClient:
         self, session_id: str, cwd: Path, **kwargs: Any
     ) -> SessionResult:
         self.calls.append(("load", (session_id, cwd), kwargs))
-        return SessionResult(session_id, None, (), {})
+        return self.restored_session_result or SessionResult(
+            session_id, None, (), {}
+        )
 
     def resume_session(
         self, session_id: str, cwd: Path, **kwargs: Any
     ) -> SessionResult:
         self.calls.append(("resume", (session_id, cwd), kwargs))
-        return SessionResult(session_id, None, (), {})
+        return self.restored_session_result or SessionResult(
+            session_id, None, (), {}
+        )
 
     def prompt(self, session_id: str, prompt: object, **kwargs: Any) -> object:
         self.calls.append(("prompt", (session_id, prompt), kwargs))
@@ -170,18 +179,53 @@ def binding(session_id: str = "session-private") -> WorkerBinding:
     )
 
 
+def continuity_binding() -> WorkerBinding:
+    return WorkerBinding(
+        host_id="host-a",
+        worker_id="worker-public",
+        worker_fingerprint="worker-fingerprint",
+        backend="herdr",
+        target_kind="pane_id",
+        target_value="pane-private-secret",
+        turn_target_kind="pane_id",
+        turn_target_value="pane-private-secret",
+        private_fingerprint="continuity-binding-private-secret",
+    )
+
+
+def binding_callback(db_path: Path):
+    def establish(
+        session_id: str,
+        continuity: WorkerBinding,
+    ) -> WorkerBinding:
+        bound = replace(
+            continuity,
+            turn_target_kind="acp_session_id",
+            turn_target_value=session_id,
+            private_fingerprint="",
+        )
+        upsert_worker_bindings(db_path, [bound])
+        return bound
+
+    return establish
+
+
 def runtime(
     tmp_path: Path,
     client: FakeClient,
     ingestor: FakeIngestor | None = None,
     **kwargs: Any,
 ) -> AcpRuntime:
+    db_path = tmp_path / "events.db"
+    continuity = continuity_binding()
+    upsert_worker_bindings(db_path, [continuity])
     return AcpRuntime(
         client,  # type: ignore[arg-type]
-        config=Config(host_id="host-a", db_path=tmp_path / "events.db"),
-        binding=binding(),
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=continuity,
         cwd=tmp_path,
         stream_generation="generation-private-secret",
+        session_binding_callback=binding_callback(db_path),
         ingestor=ingestor or FakeIngestor(),  # type: ignore[arg-type]
         poll_timeout=0.01,
         stop_timeout=0.5,
@@ -206,6 +250,8 @@ def bound_runtime(
         ),
         binding=current_binding,
         cwd=tmp_path,
+        session_mode=SessionOpenMode.LOAD,
+        session_id=current_binding.turn_target_value,
         stream_generation="generation-private-secret",
         poll_timeout=0.01,
         stop_timeout=0.5,
@@ -275,6 +321,9 @@ def test_start_negotiates_opens_one_session_and_binds_factory(tmp_path: Path) ->
     client = FakeClient()
     captured: dict[str, object] = {}
     ingestor = FakeIngestor()
+    db_path = tmp_path / "events.db"
+    continuity = continuity_binding()
+    upsert_worker_bindings(db_path, [continuity])
 
     def factory(config: Config, **kwargs: object) -> FakeIngestor:
         captured.update(kwargs)
@@ -283,11 +332,12 @@ def test_start_negotiates_opens_one_session_and_binds_factory(tmp_path: Path) ->
 
     service = AcpRuntime(
         client,  # type: ignore[arg-type]
-        config=Config(host_id="host-a", db_path=tmp_path / "events.db"),
-        binding=binding(),
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=continuity,
         cwd=tmp_path,
         stream_generation="generation-private-secret",
         client_capabilities={"fs": {"readTextFile": True}},
+        session_binding_callback=binding_callback(db_path),
         ingestor_factory=factory,  # type: ignore[arg-type]
         poll_timeout=0.01,
         stop_timeout=0.5,
@@ -342,10 +392,13 @@ def test_load_and_resume_use_requested_session(
     tmp_path: Path, mode: SessionOpenMode, method: str
 ) -> None:
     client = FakeClient()
+    db_path = tmp_path / "events.db"
+    existing = binding("existing-private")
+    upsert_worker_bindings(db_path, [existing])
     service = AcpRuntime(
         client,  # type: ignore[arg-type]
-        config=Config(host_id="host-a", db_path=tmp_path / "events.db"),
-        binding=binding("existing-private"),
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=existing,
         cwd=tmp_path,
         session_mode=mode,
         session_id="existing-private",
@@ -360,17 +413,246 @@ def test_load_and_resume_use_requested_session(
         service.stop()
 
 
-def test_start_rejects_unbound_session_and_closes_adapter(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", [SessionOpenMode.LOAD, SessionOpenMode.RESUME])
+def test_load_and_resume_reject_agent_session_mismatch_and_close(
+    tmp_path: Path,
+    mode: SessionOpenMode,
+) -> None:
     client = FakeClient()
-    client.new_session_result = SessionResult("other-private", None, (), {})
-    service = runtime(tmp_path, client)
+    client.restored_session_result = SessionResult(
+        "attacker-session-private",
+        None,
+        (),
+        {},
+    )
+    db_path = tmp_path / "events.db"
+    existing = binding("existing-private")
+    upsert_worker_bindings(db_path, [existing])
+    service = AcpRuntime(
+        client,  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=existing,
+        cwd=tmp_path,
+        session_mode=mode,
+        session_id="existing-private",
+        poll_timeout=0.01,
+        stop_timeout=0.5,
+    )
 
     with pytest.raises(AcpRuntimeProtocolError, match="bound session"):
         service.start()
 
     assert client.closed
     assert client.close_calls == 1
-    assert service.join(timeout=0.1)
+    assert service.status().state is RuntimeState.FAILED
+
+
+def test_new_accepts_unpredictable_agent_generated_session_id(tmp_path: Path) -> None:
+    client = FakeClient()
+    generated = "agent-generated-unpredictable-7f94"
+    client.new_session_result = SessionResult(generated, None, (), {})
+    db_path = tmp_path / "events.db"
+    continuity = continuity_binding()
+    upsert_worker_bindings(db_path, [continuity])
+    seen: list[tuple[str, WorkerBinding]] = []
+
+    def establish(session_id: str, anchor: WorkerBinding) -> WorkerBinding:
+        seen.append((session_id, anchor))
+        return binding_callback(db_path)(session_id, anchor)
+
+    service = AcpRuntime(
+        client,  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=continuity,
+        cwd=tmp_path,
+        session_binding_callback=establish,
+        ingestor=FakeIngestor(generated),  # type: ignore[arg-type]
+        poll_timeout=0.01,
+        stop_timeout=0.5,
+    ).start()
+    try:
+        assert seen == [(generated, continuity)]
+        assert service.status().healthy
+    finally:
+        service.stop()
+
+
+def test_new_requires_explicit_session_binder_before_launch(tmp_path: Path) -> None:
+    client = FakeClient()
+
+    with pytest.raises(ValueError, match="session_binding_callback is required"):
+        AcpRuntime(
+            client,  # type: ignore[arg-type]
+            config=Config(host_id="host-a", db_path=tmp_path / "events.db"),
+            binding=continuity_binding(),
+            cwd=tmp_path,
+        )
+
+    assert client.calls == []
+    assert client.close_calls == 0
+
+
+@pytest.mark.parametrize("mismatch", ["session", "worker"])
+def test_new_rejects_malicious_binder_return_and_closes_adapter(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    client = FakeClient()
+    db_path = tmp_path / "events.db"
+    continuity = continuity_binding()
+    upsert_worker_bindings(db_path, [continuity])
+
+    def malicious(session_id: str, anchor: WorkerBinding) -> WorkerBinding:
+        return replace(
+            anchor,
+            worker_id=(
+                "attacker-worker-private"
+                if mismatch == "worker"
+                else anchor.worker_id
+            ),
+            turn_target_kind="acp_session_id",
+            turn_target_value=(
+                "attacker-session-private"
+                if mismatch == "session"
+                else session_id
+            ),
+            private_fingerprint="",
+        )
+
+    service = AcpRuntime(
+        client,  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=continuity,
+        cwd=tmp_path,
+        session_binding_callback=malicious,
+        poll_timeout=0.01,
+        stop_timeout=0.5,
+    )
+
+    with pytest.raises(AcpRuntimeBindingError):
+        service.start()
+
+    assert client.closed
+    assert client.close_calls == 1
+    assert service.status().state is RuntimeState.FAILED
+    assert service.status().failure_type == "AcpRuntimeBindingError"
+    assert list_worker_bindings(db_path, "host-a", backend="herdr") == [
+        continuity
+    ]
+
+
+def test_new_binder_exception_closes_adapter_and_fails_terminally(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    db_path = tmp_path / "events.db"
+    continuity = continuity_binding()
+    upsert_worker_bindings(db_path, [continuity])
+    failure = RuntimeError("binder-private-failure")
+
+    def fail(_session_id: str, _anchor: WorkerBinding) -> WorkerBinding:
+        raise failure
+
+    service = AcpRuntime(
+        client,  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=continuity,
+        cwd=tmp_path,
+        session_binding_callback=fail,
+        poll_timeout=0.01,
+        stop_timeout=0.5,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        service.start()
+
+    assert raised.value is failure
+    assert client.closed
+    assert client.close_calls == 1
+    status = service.status()
+    assert status.state is RuntimeState.FAILED
+    assert status.failure_type == "RuntimeError"
+    assert "binder-private-failure" not in repr(status)
+
+
+def test_new_rejects_valid_shaped_binding_that_was_not_persisted(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    db_path = tmp_path / "events.db"
+    continuity = continuity_binding()
+    upsert_worker_bindings(db_path, [continuity])
+
+    def dishonest(session_id: str, anchor: WorkerBinding) -> WorkerBinding:
+        return replace(
+            anchor,
+            turn_target_kind="acp_session_id",
+            turn_target_value=session_id,
+            private_fingerprint="",
+        )
+
+    service = AcpRuntime(
+        client,  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=continuity,
+        cwd=tmp_path,
+        session_binding_callback=dishonest,
+        poll_timeout=0.01,
+        stop_timeout=0.5,
+    )
+
+    with pytest.raises(AcpRuntimeBindingError, match="not current"):
+        service.start()
+
+    assert client.closed
+    assert client.close_calls == 1
+    assert service.status().state is RuntimeState.FAILED
+
+
+def test_new_rejects_binder_that_overwrites_herdr_continuity(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    db_path = tmp_path / "events.db"
+    continuity = continuity_binding()
+    upsert_worker_bindings(db_path, [continuity])
+
+    def destructive(session_id: str, anchor: WorkerBinding) -> WorkerBinding:
+        upsert_worker_bindings(
+            db_path,
+            [
+                replace(
+                    anchor,
+                    worker_id="replacement-worker-private",
+                    worker_fingerprint="replacement-fingerprint-private",
+                    observed_at="2026-08-01T00:00:00+00:00",
+                )
+            ],
+        )
+        bound = replace(
+            anchor,
+            turn_target_kind="acp_session_id",
+            turn_target_value=session_id,
+            private_fingerprint="",
+        )
+        upsert_worker_bindings(db_path, [bound])
+        return bound
+
+    service = AcpRuntime(
+        client,  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=continuity,
+        cwd=tmp_path,
+        session_binding_callback=destructive,
+        poll_timeout=0.01,
+        stop_timeout=0.5,
+    )
+
+    with pytest.raises(AcpRuntimeBindingError, match="not current"):
+        service.start()
+
+    assert client.closed
+    assert client.close_calls == 1
     assert service.status().state is RuntimeState.FAILED
 
 
