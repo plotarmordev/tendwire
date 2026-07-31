@@ -144,6 +144,13 @@ original sequence and a replay-contract fingerprint, allowing exact retries to
 remain idempotent and conflicting reuse to fail closed without retaining
 messages, thoughts, raw tool input/output, or other source payloads.
 
+Schema v26 tombstones also retain the original event `observed_at` as the only
+authority time for a one-time repair when the matching owned turn projection
+is provably absent. Exact replays never re-merge caller timestamp or content
+into an existing live or superseded projection, so they cannot reorder final
+connector delivery. Tombstones migrated from pre-v26 stores have no retained
+authority time; they remain deduplication evidence but cannot repair a turn.
+
 Each tombstone has bounded per-event identity metadata, but tombstone count is
 permanent and therefore grows with the number of distinct source events.
 Tombstones are intentionally not deleted automatically: removing them would make

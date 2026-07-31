@@ -145,7 +145,7 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 25
+STORE_SCHEMA_VERSION = 26
 CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 _LEGACY_TURN_CLAIM_HARD_TTL_SECONDS = 86_400
 TURN_CHANGE_RETENTION_DAYS = 7
@@ -1671,6 +1671,25 @@ CREATE_AGENT_EVENT_INDEXES = (
 )
 
 CREATE_AGENT_EVENT_TOMBSTONES_TABLE = """
+CREATE TABLE IF NOT EXISTS agent_event_tombstones (
+    host_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    replay_fingerprint TEXT NOT NULL CHECK (length(replay_fingerprint) = 64),
+    observed_at TEXT,
+    retired_at TEXT NOT NULL CHECK (length(retired_at) BETWEEN 20 AND 40),
+    PRIMARY KEY (host_id, event_id),
+    CHECK (length(host_id) BETWEEN 1 AND 2048),
+    CHECK (instr(host_id, char(0)) = 0),
+    CHECK (length(event_id) = 64),
+    CHECK (observed_at IS NULL OR length(observed_at) BETWEEN 20 AND 40)
+);
+"""
+
+# v24/v25 tombstones predate retained replay-authority time.  Migration code
+# must build the historical shape rather than whatever the current target DDL
+# happens to contain.
+CREATE_AGENT_EVENT_TOMBSTONES_V25_TABLE = """
 CREATE TABLE IF NOT EXISTS agent_event_tombstones (
     host_id TEXT NOT NULL,
     event_id TEXT NOT NULL,
@@ -13342,11 +13361,23 @@ def _migrate_v22_to_v23_conn(conn: sqlite3.Connection) -> None:
                 host_id = normalize_agent_event_identifier(
                     row[1], "host_id", required=True
                 )
+                # v22 allowed tool/plan rows to be public.  The current
+                # constructor and table correctly reject that historical
+                # shape, so normalize it while it is still in the private
+                # migration transaction instead of rebuilding through the
+                # latest DDL and failing before v24 -> v25 can privatise it.
+                legacy_sensitive = str(row[3]) in {
+                    "thought",
+                    "tool_call",
+                    "tool_call_update",
+                    "plan",
+                    "extension",
+                }
                 canonical = agent_event(
                     kind=row[3],
                     source=row[4],
                     worker_id=row[5],
-                    visibility=row[6],
+                    visibility="private" if legacy_sensitive else row[6],
                     source_session_id=row[7],
                     source_turn_id=row[8],
                     source_item_id=row[9],
@@ -13371,7 +13402,7 @@ def _migrate_v22_to_v23_conn(conn: sqlite3.Connection) -> None:
                     raise StoreSchemaError("invalid_v22_agent_event_identity")
                 if str(row[14]) != canonical.payload_fingerprint:
                     raise StoreSchemaError("invalid_v22_agent_event_fingerprint")
-                if public_payload != canonical.public_payload:
+                if not legacy_sensitive and public_payload != canonical.public_payload:
                     raise StoreSchemaError("invalid_v22_agent_event_projection")
             except (TypeError, ValueError, OverflowError) as exc:
                 raise StoreSchemaError("invalid_v22_agent_event_row") from exc
@@ -13425,10 +13456,20 @@ def _migrate_v23_to_v24_conn(conn: sqlite3.Connection) -> None:
             payload_fingerprint, private_payload_json, public_payload_json
         )
         SELECT
-            sequence, host_id, event_id, kind, source, worker_id, visibility,
+            sequence, host_id, event_id, kind, source, worker_id,
+            CASE
+                WHEN kind IN ('thought', 'tool_call', 'tool_call_update', 'plan', 'extension')
+                THEN 'private'
+                ELSE visibility
+            END,
             source_session_id, source_turn_id, source_item_id,
             source_message_id, source_event_id, source_sequence, observed_at,
-            payload_fingerprint, private_payload_json, public_payload_json
+            payload_fingerprint, private_payload_json,
+            CASE
+                WHEN kind IN ('thought', 'tool_call', 'tool_call_update', 'plan', 'extension')
+                THEN '{}'
+                ELSE public_payload_json
+            END
         FROM agent_events_v23
         ORDER BY sequence
         """
@@ -13436,7 +13477,7 @@ def _migrate_v23_to_v24_conn(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE agent_events_v23")
     for statement in CREATE_AGENT_EVENT_INDEXES:
         conn.execute(statement)
-    conn.execute(CREATE_AGENT_EVENT_TOMBSTONES_TABLE)
+    conn.execute(CREATE_AGENT_EVENT_TOMBSTONES_V25_TABLE)
     for statement in CREATE_AGENT_EVENT_TOMBSTONE_INDEXES:
         conn.execute(statement)
 
@@ -13477,6 +13518,19 @@ def _migrate_v24_to_v25_conn(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+def _migrate_v25_to_v26_conn(conn: sqlite3.Connection) -> None:
+    """Retain original event authority time for safe tombstone repair."""
+    if "observed_at" in _table_columns(conn, "agent_event_tombstones"):
+        return
+    conn.execute(
+        """
+        ALTER TABLE agent_event_tombstones
+        ADD COLUMN observed_at TEXT
+        CHECK (observed_at IS NULL OR length(observed_at) BETWEEN 20 AND 40)
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -13503,6 +13557,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(22, 23, _migrate_v22_to_v23_conn),
     Migration(23, 24, _migrate_v23_to_v24_conn),
     Migration(24, 25, _migrate_v24_to_v25_conn),
+    Migration(25, 26, _migrate_v25_to_v26_conn),
 )
 
 
@@ -17494,14 +17549,15 @@ _AGENT_EVENT_RETENTION_SELECT = """
 SELECT
     sequence, host_id, event_id, kind, source, worker_id, visibility,
     source_session_id, source_turn_id, source_item_id, source_message_id,
-    source_event_id, source_sequence, payload_fingerprint, public_payload_json
+    source_event_id, source_sequence, payload_fingerprint, public_payload_json,
+    observed_at
 FROM agent_events
 """
 
 
 def _agent_event_retention_candidate(
     row: tuple[Any, ...],
-) -> tuple[str, str, int, str]:
+) -> tuple[str, str, int, str, str]:
     """Reduce one bounded metadata row to its durable tombstone fields."""
     public_payload_json = str(row[14])
     public_payload = _json_object(public_payload_json)
@@ -17526,6 +17582,7 @@ def _agent_event_retention_candidate(
             payload_fingerprint=str(row[13]),
             public_payload_json=public_payload_json,
         ),
+        str(row[15]),
     )
 
 
@@ -17545,14 +17602,16 @@ def _cleanup_agent_event_retention_conn(
         + " ORDER BY observed_at, sequence LIMIT ?",
         (str(host_id), cutoff_at, int(batch_size) + 1),
     )
-    candidates: list[tuple[str, str, int, str]] = []
+    candidates: list[tuple[str, str, int, str, str]] = []
     remaining = False
     for row in cursor:
         if len(candidates) >= batch_size:
             remaining = True
             break
         if dry_run:
-            candidates.append((str(row[1]), str(row[2]), int(row[0]), ""))
+            candidates.append(
+                (str(row[1]), str(row[2]), int(row[0]), "", str(row[15]))
+            )
         else:
             candidates.append(_agent_event_retention_candidate(row))
 
@@ -17561,12 +17620,26 @@ def _cleanup_agent_event_retention_conn(
         conn.executemany(
             """
             INSERT INTO agent_event_tombstones (
-                host_id, event_id, sequence, replay_fingerprint, retired_at
-            ) VALUES (?, ?, ?, ?, ?)
+                host_id, event_id, sequence, replay_fingerprint,
+                observed_at, retired_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
-                (candidate_host, event_id, sequence, fingerprint, retired_at)
-                for candidate_host, event_id, sequence, fingerprint in candidates
+                (
+                    candidate_host,
+                    event_id,
+                    sequence,
+                    fingerprint,
+                    observed_at,
+                    retired_at,
+                )
+                for (
+                    candidate_host,
+                    event_id,
+                    sequence,
+                    fingerprint,
+                    observed_at,
+                ) in candidates
             ),
         )
         sequences = [candidate[2] for candidate in candidates]
@@ -23278,6 +23351,54 @@ def _agent_event_binding_matches_conn(
     )
 
 
+def _agent_event_authority_observed_at_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    event_id: str,
+) -> str | None:
+    """Return the immutable event time, including retained replay metadata.
+
+    Tombstones written before schema v26 have no retained authority time.
+    They remain valid deduplication evidence but cannot authorize a repair.
+    """
+    row = conn.execute(
+        "SELECT observed_at FROM agent_events WHERE host_id = ? AND event_id = ?",
+        (str(host_id), str(event_id)),
+    ).fetchone()
+    if row is None:
+        row = conn.execute(
+            "SELECT observed_at FROM agent_event_tombstones "
+            "WHERE host_id = ? AND event_id = ?",
+            (str(host_id), str(event_id)),
+        ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    observed_at = _strict_utc_timestamp(row[0])
+    if observed_at is None:
+        raise StoreSchemaError("invalid_agent_event_authority_time")
+    return observed_at
+
+
+def _owned_turn_projection_exists_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    worker_id: str,
+    source_turn_id: str,
+) -> bool:
+    """Fail closed when any live or superseded owned projection still exists."""
+    rows = conn.execute(
+        "SELECT payload_json FROM turns WHERE host_id = ? AND worker_id = ?",
+        (str(host_id), str(worker_id)),
+    ).fetchall()
+    for row in rows:
+        payload = _json_object(row[0])
+        if _owned_source_turn_matches(payload, source_turn_id) or _source_turn_matches(
+            payload, source_turn_id
+        ):
+            return True
+    return False
+
+
 def _turn_refresh_is_cancelled(
     *,
     deadline_monotonic: float | None,
@@ -23333,10 +23454,9 @@ def append_agent_event_and_apply_turn_for_binding(
 ) -> AppendProjectedAgentEventResult:
     """Atomically journal an agent event and apply its text-only turn projection.
 
-    A replay still runs the idempotent projection merge. This lets a retry
-    repair a projection that was independently removed without duplicating the
-    journal event or its revision-keyed connector delivery. Retention
-    tombstones participate in the same replay contract as live event rows.
+    A replay may repair a provably absent projection exactly once, using the
+    immutable observation time retained with the original event.  It never
+    re-merges caller data into a live or superseded owned projection.
     """
 
     normalized_host = normalize_agent_event_identifier(
@@ -23356,7 +23476,9 @@ def append_agent_event_and_apply_turn_for_binding(
         raise ValueError(f"turn_model must be one of: {allowed}")
     if _fault_inject is not None and not callable(_fault_inject):
         raise TypeError("_fault_inject must be callable or None")
-    current_time, _ = _pending_observed_time(observed_at or event.observed_at)
+    # Validate the compatibility argument, but never grant it replay authority.
+    if observed_at is not None:
+        _pending_observed_time(observed_at)
     rearm_key: tuple[str, str] | None = None
 
     def fault(boundary: str) -> None:
@@ -23388,7 +23510,29 @@ def append_agent_event_and_apply_turn_for_binding(
             )
             fault("after_event_append")
             turn: TurnRefreshApplyResult | None = None
-            if content is not None:
+            authority_time = _agent_event_authority_observed_at_conn(
+                conn,
+                normalized_host or "",
+                event.event_id,
+            )
+            projection_allowed = content is not None
+            if not appended.inserted and content is not None:
+                durable_source_turn = str(event.source_turn_id or "").strip()
+                caller_source_turn = str(content.get("source_turn_id") or "").strip()
+                projection_allowed = bool(
+                    authority_time is not None
+                    and durable_source_turn
+                    and caller_source_turn == durable_source_turn
+                    and not _owned_turn_projection_exists_conn(
+                        conn,
+                        normalized_host or "",
+                        event.worker_id,
+                        durable_source_turn,
+                    )
+                )
+            if projection_allowed and content is not None:
+                if authority_time is None:
+                    raise StoreSchemaError("agent_event_authority_time_missing")
                 worker_exists = conn.execute(
                     "SELECT 1 FROM workers WHERE host_id = ? AND worker_id = ?",
                     (normalized_host or "", event.worker_id),
@@ -23400,7 +23544,7 @@ def append_agent_event_and_apply_turn_for_binding(
                     normalized_host or "",
                     event.worker_id,
                     content,
-                    observed_at=current_time,
+                    observed_at=authority_time,
                     turn_model=normalized_turn_model,
                 )
                 rearm_key = (
@@ -23414,7 +23558,7 @@ def append_agent_event_and_apply_turn_for_binding(
                         normalized_host or "",
                         owner_key,
                         fingerprint,
-                        now=current_time,
+                        now=authority_time,
                     )
                 turn = TurnRefreshApplyResult(merge_result.updated, False)
             fault("after_turn_projection")

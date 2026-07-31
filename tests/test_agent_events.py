@@ -23,6 +23,124 @@ from tendwire.core.models import WorkerBinding
 from tendwire.store import sqlite as store_sqlite
 
 
+# Exact production table shapes from schema v22 and v23.  These fixtures do
+# not use the current target DDL, because doing so masks cross-version rebuild
+# failures when historical public tool/plan rows are populated.
+_HISTORICAL_V22_AGENT_EVENTS_DDL = """
+CREATE TABLE agent_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    host_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (
+        kind IN (
+            'user_message', 'agent_message', 'thought', 'tool_call',
+            'tool_call_update', 'plan', 'usage', 'session_info'
+        )
+    ),
+    source TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    visibility TEXT NOT NULL CHECK (visibility IN ('private', 'public')),
+    source_session_id TEXT,
+    source_turn_id TEXT,
+    source_item_id TEXT,
+    source_message_id TEXT,
+    source_event_id TEXT,
+    source_sequence INTEGER CHECK (source_sequence >= 0),
+    observed_at TEXT NOT NULL,
+    payload_fingerprint TEXT NOT NULL,
+    private_payload_json TEXT NOT NULL,
+    public_payload_json TEXT NOT NULL,
+    UNIQUE (host_id, event_id),
+    CHECK (source_event_id IS NOT NULL OR source_sequence IS NOT NULL),
+    CHECK (kind != 'thought' OR visibility = 'private')
+)
+"""
+
+_HISTORICAL_V23_AGENT_EVENTS_DDL = """
+CREATE TABLE agent_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    host_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (
+        kind IN (
+            'user_message', 'agent_message', 'thought', 'tool_call',
+            'tool_call_update', 'plan', 'usage', 'session_info', 'extension'
+        )
+    ),
+    source TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    visibility TEXT NOT NULL CHECK (visibility IN ('private', 'public')),
+    source_session_id TEXT,
+    source_turn_id TEXT,
+    source_item_id TEXT,
+    source_message_id TEXT,
+    source_event_id TEXT,
+    source_sequence INTEGER CHECK (source_sequence >= 0),
+    observed_at TEXT NOT NULL,
+    payload_fingerprint TEXT NOT NULL,
+    private_payload_json TEXT NOT NULL,
+    public_payload_json TEXT NOT NULL,
+    UNIQUE (host_id, event_id),
+    CHECK (length(host_id) BETWEEN 1 AND 2048),
+    CHECK (instr(host_id, char(0)) = 0),
+    CHECK (length(event_id) = 64),
+    CHECK (length(source) BETWEEN 1 AND 2048),
+    CHECK (instr(source, char(0)) = 0),
+    CHECK (length(worker_id) BETWEEN 1 AND 2048),
+    CHECK (instr(worker_id, char(0)) = 0),
+    CHECK (
+        source_session_id IS NULL OR (
+            length(source_session_id) BETWEEN 1 AND 2048
+            AND instr(source_session_id, char(0)) = 0
+        )
+    ),
+    CHECK (
+        source_turn_id IS NULL OR (
+            length(source_turn_id) BETWEEN 1 AND 2048
+            AND instr(source_turn_id, char(0)) = 0
+        )
+    ),
+    CHECK (
+        source_item_id IS NULL OR (
+            length(source_item_id) BETWEEN 1 AND 2048
+            AND instr(source_item_id, char(0)) = 0
+        )
+    ),
+    CHECK (
+        source_message_id IS NULL OR (
+            length(source_message_id) BETWEEN 1 AND 2048
+            AND instr(source_message_id, char(0)) = 0
+        )
+    ),
+    CHECK (
+        source_event_id IS NULL OR (
+            length(source_event_id) BETWEEN 1 AND 2048
+            AND instr(source_event_id, char(0)) = 0
+        )
+    ),
+    CHECK (length(observed_at) BETWEEN 20 AND 40),
+    CHECK (length(payload_fingerprint) = 64),
+    CHECK (
+        CASE WHEN json_valid(private_payload_json)
+        THEN json_type(private_payload_json) = 'object' ELSE 0 END
+    ),
+    CHECK (length(CAST(private_payload_json AS BLOB)) <= 65536),
+    CHECK (
+        CASE WHEN json_valid(public_payload_json)
+        THEN json_type(public_payload_json) = 'object' ELSE 0 END
+    ),
+    CHECK (length(CAST(public_payload_json AS BLOB)) <= 65536),
+    CHECK (visibility != 'private' OR public_payload_json = '{}'),
+    CHECK (source_event_id IS NOT NULL OR source_sequence IS NOT NULL),
+    CHECK (
+        source_event_id IS NOT NULL
+        OR (source_session_id IS NOT NULL AND source_sequence IS NOT NULL)
+    ),
+    CHECK (kind NOT IN ('thought', 'extension') OR visibility = 'private')
+)
+"""
+
+
 def _message_event(
     *,
     sequence: int,
@@ -782,7 +900,7 @@ def test_retention_conflict_rolls_back_and_serializes_concurrent_append(
 
     def blocking_candidate(
         row: tuple[object, ...],
-    ) -> tuple[str, str, int, str]:
+    ) -> tuple[str, str, int, str, str]:
         entered.set()
         assert release.wait(timeout=5)
         return original(row)
@@ -897,7 +1015,9 @@ def test_v23_to_v24_preserves_populated_journal_sequence(tmp_path: Path) -> None
         )
         conn.commit()
         store_sqlite._run_migrations(conn)
-        assert conn.execute("PRAGMA user_version").fetchone() == (25,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (
+            store_sqlite.STORE_SCHEMA_VERSION,
+        )
         assert conn.execute(
             "SELECT sequence FROM agent_events WHERE event_id = ?",
             (event.event_id,),
@@ -927,7 +1047,7 @@ def test_v24_to_v25_privatises_populated_tool_and_plan_rows(tmp_path: Path) -> N
     ]
     with sqlite3.connect(db_path) as conn:
         store_sqlite._run_migrations(conn, target_version=24)
-        conn.execute("DROP TABLE agent_events")
+        conn.execute("DROP TABLE IF EXISTS agent_events")
         conn.execute(
             store_sqlite.CREATE_AGENT_EVENTS_TABLE.replace(
                 """kind NOT IN (
@@ -969,7 +1089,9 @@ def test_v24_to_v25_privatises_populated_tool_and_plan_rows(tmp_path: Path) -> N
             )
         conn.commit()
         store_sqlite._run_migrations(conn)
-        assert conn.execute("PRAGMA user_version").fetchone() == (25,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (
+            store_sqlite.STORE_SCHEMA_VERSION,
+        )
         assert conn.execute(
             "SELECT sequence, kind, visibility, public_payload_json "
             "FROM agent_events ORDER BY sequence"
@@ -987,6 +1109,138 @@ def test_v24_to_v25_privatises_populated_tool_and_plan_rows(tmp_path: Path) -> N
         stored.event.kind
         for stored in store_sqlite.list_agent_events(db_path, "host-1")
     ] == list(kinds)
+
+
+@pytest.mark.parametrize(
+    ("source_version", "historical_ddl"),
+    (
+        (22, _HISTORICAL_V22_AGENT_EVENTS_DDL),
+        (23, _HISTORICAL_V23_AGENT_EVENTS_DDL),
+    ),
+)
+def test_authentic_populated_public_tool_migrations_reach_current_private_schema(
+    tmp_path: Path,
+    source_version: int,
+    historical_ddl: str,
+) -> None:
+    db_path = tmp_path / f"authentic-v{source_version}.db"
+    kinds = ("tool_call", "tool_call_update", "plan")
+    with sqlite3.connect(db_path) as conn:
+        store_sqlite._run_migrations(conn, target_version=source_version - 1)
+        conn.execute("DROP TABLE IF EXISTS agent_events")
+        conn.execute(historical_ddl)
+        for sequence, kind in enumerate(kinds, 51):
+            event = agent_event(
+                kind=kind,
+                source="acp",
+                worker_id="worker-1",
+                source_session_id="private-session",
+                source_sequence=sequence,
+                payload={"content": [{"type": "text", "text": f"private-{kind}"}]},
+                observed_at="2026-07-31T00:00:00+00:00",
+            )
+            event_id = event.event_id
+            if source_version == 22:
+                legacy_identity = {
+                    "schema_version": 1,
+                    "source": event.source,
+                    "session_id": event.source_session_id,
+                    "event_id": event.source_event_id,
+                    "sequence": event.source_sequence,
+                    "kind": event.kind,
+                }
+                event_id = hashlib.sha256(
+                    store_sqlite._canonical_json(legacy_identity).encode("utf-8")
+                ).hexdigest()
+            conn.execute(
+                """
+                INSERT INTO agent_events (
+                    sequence, host_id, event_id, kind, source, worker_id,
+                    visibility, source_session_id, source_turn_id,
+                    source_item_id, source_message_id, source_event_id,
+                    source_sequence, observed_at, payload_fingerprint,
+                    private_payload_json, public_payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, 'public', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sequence,
+                    "host-1",
+                    event_id,
+                    event.kind,
+                    event.source,
+                    event.worker_id,
+                    event.source_session_id,
+                    event.source_turn_id,
+                    event.source_item_id,
+                    event.source_message_id,
+                    event.source_event_id,
+                    event.source_sequence,
+                    event.observed_at,
+                    event.payload_fingerprint,
+                    store_sqlite._canonical_json(event.payload),
+                    store_sqlite._canonical_json(event.payload),
+                ),
+            )
+        conn.execute(f"PRAGMA user_version = {source_version}")
+        conn.commit()
+
+        store_sqlite._run_migrations(conn)
+
+        assert conn.execute("PRAGMA user_version").fetchone() == (
+            store_sqlite.STORE_SCHEMA_VERSION,
+        )
+        assert conn.execute(
+            "SELECT sequence, kind, visibility, public_payload_json "
+            "FROM agent_events ORDER BY sequence"
+        ).fetchall() == [
+            (51, "tool_call", "private", "{}"),
+            (52, "tool_call_update", "private", "{}"),
+            (53, "plan", "private", "{}"),
+        ]
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+
+
+def test_v25_to_v26_retains_legacy_tombstones_as_dedup_only(tmp_path: Path) -> None:
+    db_path = tmp_path / "v25-tombstone.db"
+    legacy_event_id = "a" * 64
+    with sqlite3.connect(db_path) as conn:
+        store_sqlite._run_migrations(conn, target_version=25)
+        assert "observed_at" not in {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(agent_event_tombstones)")
+        }
+        conn.execute(
+            """
+            INSERT INTO agent_event_tombstones (
+                host_id, event_id, sequence, replay_fingerprint, retired_at
+            ) VALUES ('host-1', ?, 1, ?, '2026-01-02T00:00:00+00:00')
+            """,
+            (legacy_event_id, "b" * 64),
+        )
+        conn.commit()
+        store_sqlite._run_migrations(conn)
+        assert conn.execute("PRAGMA user_version").fetchone() == (26,)
+        assert conn.execute(
+            "SELECT observed_at FROM agent_event_tombstones WHERE event_id = ?",
+            (legacy_event_id,),
+        ).fetchone() == (None,)
+
+    event = replace(
+        _message_event(sequence=901, visibility="private"),
+        observed_at="2020-01-01T00:00:00+00:00",
+    )
+    store_sqlite.append_agent_event(db_path, "host-1", event)
+    assert store_sqlite.cleanup_agent_event_retention(
+        db_path,
+        "host-1",
+        retention_days=1,
+        now="2021-01-01T00:00:00+00:00",
+    )["tombstoned"] == 1
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT observed_at FROM agent_event_tombstones WHERE event_id = ?",
+            (event.event_id,),
+        ).fetchone() == ("2020-01-01T00:00:00+00:00",)
 
 
 @pytest.mark.parametrize("source_version", range(store_sqlite.STORE_SCHEMA_VERSION))
@@ -1026,7 +1280,9 @@ def test_v21_migration_is_idempotent_and_preserves_existing_store(
     store_sqlite.init_store(db_path)
     store_sqlite.init_store(db_path)
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone() == (25,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (
+            store_sqlite.STORE_SCHEMA_VERSION,
+        )
         columns = {
             str(row[1]) for row in conn.execute("PRAGMA table_info(agent_events)")
         }
@@ -1087,7 +1343,9 @@ def test_v22_migration_rekeys_legacy_event_identity_without_losing_sequence(
             "SELECT sequence, event_id FROM agent_events"
         ).fetchone()
         assert row == (19, event.event_id)
-        assert conn.execute("PRAGMA user_version").fetchone() == (25,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (
+            store_sqlite.STORE_SCHEMA_VERSION,
+        )
 
     replay = store_sqlite.append_agent_event(db_path, "host-1", event)
     assert replay.inserted is False
