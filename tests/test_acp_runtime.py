@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import queue
+import sqlite3
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -21,6 +24,7 @@ from tendwire.backends.acp_protocol import (
 )
 from tendwire.backends.acp_runtime import (
     AcpRuntime,
+    AcpRuntimeBindingError,
     AcpRuntimeProtocolError,
     AcpRuntimeStopTimeout,
     RuntimeState,
@@ -28,6 +32,7 @@ from tendwire.backends.acp_runtime import (
 )
 from tendwire.config import Config
 from tendwire.core.models import WorkerBinding
+from tendwire.store.sqlite import list_agent_events, upsert_worker_bindings
 
 
 _END = object()
@@ -124,25 +129,31 @@ class FakeIngestor:
         self.completions = 0
         self.update_failure: BaseException | None = None
         self.permission_failure: BaseException | None = None
+        self.update_result: object = None
+        self.permission_result: object = None
+        self.completion_result: object = None
 
     def start_turn(self, *, producer_turn_id: str | None = None) -> str:
         self.started.append(producer_turn_id)
         return "opaque-turn"
 
-    def ingest_update(self, raw: object) -> None:
+    def ingest_update(self, raw: object) -> object:
         if self.update_failure is not None:
             raise self.update_failure
         self.updates.append(raw)
+        return self.update_result
 
     def ingest_permission_request(
         self, raw: object, *, source_event_id: str | None = None
-    ) -> None:
+    ) -> object:
         if self.permission_failure is not None:
             raise self.permission_failure
         self.permissions.append((raw, source_event_id))
+        return self.permission_result
 
-    def mark_prompt_complete(self) -> None:
+    def mark_prompt_complete(self) -> object:
         self.completions += 1
+        return self.completion_result
 
 
 def binding(session_id: str = "session-private") -> WorkerBinding:
@@ -172,6 +183,30 @@ def runtime(
         cwd=tmp_path,
         stream_generation="generation-private-secret",
         ingestor=ingestor or FakeIngestor(),  # type: ignore[arg-type]
+        poll_timeout=0.01,
+        stop_timeout=0.5,
+        **kwargs,
+    )
+
+
+def bound_runtime(
+    tmp_path: Path,
+    client: FakeClient,
+    current_binding: WorkerBinding,
+    **kwargs: Any,
+) -> AcpRuntime:
+    db_path = tmp_path / "bound-events.db"
+    upsert_worker_bindings(db_path, [current_binding])
+    return AcpRuntime(
+        client,  # type: ignore[arg-type]
+        config=Config(
+            host_id="host-a",
+            db_path=db_path,
+            agent_event_source="acp_required",
+        ),
+        binding=current_binding,
+        cwd=tmp_path,
+        stream_generation="generation-private-secret",
         poll_timeout=0.01,
         stop_timeout=0.5,
         **kwargs,
@@ -259,15 +294,44 @@ def test_start_negotiates_opens_one_session_and_binds_factory(tmp_path: Path) ->
     ).start()
     try:
         assert [call[0] for call in client.calls[:2]] == ["initialize", "new"]
-        assert client.calls[0][2]["client_capabilities"] == {
-            "fs": {"readTextFile": True}
-        }
+        assert client.calls[0][2]["client_capabilities"] == {}
         assert captured["session_id"] == "session-private"
         assert captured["binding"] is not None
         assert captured["stream_generation"] == "generation-private-secret"
         assert service.status().healthy
     finally:
         service.stop()
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        {"fs": {"readTextFile": True, "writeTextFile": True}},
+        {"terminal": True},
+        {"elicitation": {"form": {}, "url": {}}},
+        {"session": {"configOptions": {"boolean": {}}}},
+        {"_meta": {"example.test/capability": True}},
+    ],
+)
+def test_runtime_strips_client_capabilities_it_cannot_serve(
+    tmp_path: Path,
+    claims: dict[str, object],
+) -> None:
+    client = FakeClient()
+    service = runtime(tmp_path, client, client_capabilities=claims).start()
+    try:
+        assert client.calls[0][2]["client_capabilities"] == {}
+    finally:
+        service.stop()
+
+
+def test_runtime_rejects_unknown_extension_capability_claims(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unsupported client capabilities"):
+        runtime(
+            tmp_path,
+            FakeClient(),
+            client_capabilities={"example.test/custom": {}},
+        )
 
 
 @pytest.mark.parametrize(
@@ -411,6 +475,78 @@ def test_permission_ingestion_failure_cancels_before_runtime_fails(
     assert raised.value is failure
 
 
+def test_replaced_binding_cancels_permission_before_callback_and_is_terminal(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    current = binding()
+    callback_called = threading.Event()
+
+    def unsafe_allow(_request: PermissionRequest) -> str:
+        callback_called.set()
+        return "allow-once"
+
+    service = bound_runtime(
+        tmp_path,
+        client,
+        current,
+        permission_callback=unsafe_allow,
+    ).start()
+    replacement = replace(
+        current,
+        worker_id="replacement-worker-private",
+        worker_fingerprint="replacement-fingerprint-private",
+        observed_at="2026-08-01T00:00:00+00:00",
+    )
+    upsert_worker_bindings(tmp_path / "bound-events.db", [replacement])
+    client.permissions.put(permission())
+    wait_until(lambda: service.status().state is RuntimeState.FAILED)
+
+    status = service.status()
+    assert callback_called.is_set() is False
+    assert client.permission_responses == [(7, None, True)]
+    assert status.permissions_ingested == 0
+    assert status.permissions_selected == 0
+    assert status.permissions_cancelled == 1
+    assert status.failure_type == "AcpRuntimeBindingError"
+    assert list_agent_events(tmp_path / "bound-events.db", "host-a") == ()
+    rendered = repr(status)
+    assert "replacement-worker-private" not in rendered
+    assert "binding-private-secret" not in rendered
+    with pytest.raises(AcpRuntimeBindingError):
+        service.stop()
+
+
+def test_binding_expiry_after_start_rejects_update_and_is_terminal(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    current = binding()
+    service = bound_runtime(tmp_path, client, current).start()
+    with sqlite3.connect(tmp_path / "bound-events.db") as conn:
+        conn.execute(
+            "UPDATE worker_bindings SET expires_at = ? "
+            "WHERE host_id = ? AND private_fingerprint = ?",
+            (
+                "2000-01-01T00:00:00+00:00",
+                current.host_id,
+                current.private_fingerprint,
+            ),
+        )
+    client.updates.put(update())
+    wait_until(lambda: service.status().state is RuntimeState.FAILED)
+
+    status = service.status()
+    assert status.updates_ingested == 0
+    assert status.failure_type == "AcpRuntimeBindingError"
+    assert list_agent_events(tmp_path / "bound-events.db", "host-a") == ()
+    rendered = repr(status)
+    assert "session-private" not in rendered
+    assert "binding-private-secret" not in rendered
+    with pytest.raises(AcpRuntimeBindingError):
+        service.stop()
+
+
 def test_permission_source_identity_distinguishes_jsonrpc_id_types(
     tmp_path: Path,
 ) -> None:
@@ -451,6 +587,31 @@ def test_prompt_finalizes_only_after_valid_response_and_update_drain(
         assert status.prompts_completed == 1
         assert status.prompts_failed == 0
     finally:
+        service.stop()
+
+
+def test_stale_binding_completion_is_terminal_and_not_counted_complete(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    ingestor = FakeIngestor()
+    ingestor.completion_result = SimpleNamespace(
+        ignored_reason="stale_binding",
+        event=None,
+        turn=None,
+    )
+    service = runtime(tmp_path, client, ingestor).start()
+
+    with pytest.raises(AcpRuntimeBindingError):
+        service.prompt("question")
+
+    status = service.status()
+    assert status.state is RuntimeState.FAILED
+    assert status.failure_type == "AcpRuntimeBindingError"
+    assert status.prompts_started == 1
+    assert status.prompts_completed == 0
+    assert status.prompts_failed == 1
+    with pytest.raises(AcpRuntimeBindingError):
         service.stop()
 
 

@@ -41,6 +41,10 @@ class AcpRuntimeProtocolError(AcpRuntimeError):
     """The ACP client returned data that cannot be safely bound or finalized."""
 
 
+class AcpRuntimeBindingError(AcpRuntimeProtocolError):
+    """The runtime's authenticated worker binding is no longer current."""
+
+
 class AcpRuntimeStopTimeout(AcpRuntimeError, TimeoutError):
     """The runtime could not stop all supervised work within its deadline."""
 
@@ -205,7 +209,9 @@ class AcpRuntime:
         self._session_mode = mode
         self._requested_session_id = session_id
         self._stream_generation = stream_generation or uuid.uuid4().hex
-        self._client_capabilities = dict(client_capabilities or {})
+        self._client_capabilities = _runtime_client_capabilities(
+            client_capabilities
+        )
         self._mcp_servers = tuple(dict(server) for server in mcp_servers)
         self._additional_directories = tuple(Path(path) for path in additional_directories)
         self._permission_callback = permission_callback
@@ -366,7 +372,8 @@ class AcpRuntime:
             try:
                 self._wait_for_post_response_idle(wait_limit)
                 with self._ingest_lock:
-                    ingestor.mark_prompt_complete()
+                    completion = ingestor.mark_prompt_complete()
+                    _raise_for_binding_rejection(completion)
             except BaseException as exc:
                 with self._state_lock:
                     self._prompts_failed += 1
@@ -554,7 +561,8 @@ class AcpRuntime:
                     )
                 ingestor = self._require_ingestor()
                 with self._ingest_lock:
-                    ingestor.ingest_update(update.raw)
+                    outcome = ingestor.ingest_update(update.raw)
+                    _raise_for_binding_rejection(outcome)
                 with self._state_lock:
                     self._updates_ingested += 1
         except BaseException as exc:
@@ -591,10 +599,11 @@ class AcpRuntime:
                 )
             ingestor = self._require_ingestor()
             with self._ingest_lock:
-                ingestor.ingest_permission_request(
+                outcome = ingestor.ingest_permission_request(
                     request.raw,
                     source_event_id=_permission_source_event_id(request.request_id),
                 )
+                _raise_for_binding_rejection(outcome)
             with self._state_lock:
                 self._permissions_ingested += 1
 
@@ -706,8 +715,49 @@ def _permission_source_event_id(request_id: RequestId) -> str:
     return f"permission:{stable_fingerprint({'request_id': request_id})}"
 
 
+def _runtime_client_capabilities(
+    capabilities: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return only client capabilities this runtime can actually service.
+
+    The runtime handles ACP session updates and permission requests, neither of
+    which is advertised through ``clientCapabilities``. It has no handlers for
+    filesystem, terminal, elicitation, or session-config requests. Known keys
+    are therefore stripped even when supplied by an embedding caller. Unknown
+    top-level keys could advertise extension methods and are rejected.
+    """
+    if capabilities is None:
+        return {}
+    if not isinstance(capabilities, Mapping):
+        raise ValueError("client_capabilities must be a mapping or None")
+    known = {"fs", "terminal", "session", "elicitation", "_meta"}
+    if any(not isinstance(key, str) or key not in known for key in capabilities):
+        raise ValueError(
+            "ACP runtime cannot advertise unsupported client capabilities"
+        )
+    return {}
+
+
+def _raise_for_binding_rejection(outcome: object) -> None:
+    """Make every stale durable-binding outcome terminal and public-safe."""
+    if outcome is None:
+        return
+    reason = getattr(outcome, "ignored_reason", None)
+    event = getattr(outcome, "event", None)
+    turn = getattr(outcome, "turn", None)
+    event_status = getattr(event, "status", None)
+    turn_stale = getattr(turn, "stale_binding", False)
+    if (
+        reason in {"stale_binding", "binding_changed"}
+        or event_status == "binding_changed"
+        or turn_stale is True
+    ):
+        raise AcpRuntimeBindingError("ACP worker binding is no longer current")
+
+
 __all__ = [
     "AcpRuntime",
+    "AcpRuntimeBindingError",
     "AcpRuntimeClient",
     "AcpRuntimeError",
     "AcpRuntimeProtocolError",
