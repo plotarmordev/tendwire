@@ -145,7 +145,7 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 23
+STORE_SCHEMA_VERSION = 24
 CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 _LEGACY_TURN_CLAIM_HARD_TTL_SECONDS = 86_400
 TURN_CHANGE_RETENTION_DAYS = 7
@@ -1599,7 +1599,7 @@ CREATE TABLE IF NOT EXISTS agent_events (
         THEN json_type(private_payload_json) = 'object' ELSE 0 END
     ),
     CHECK (
-        length(CAST(private_payload_json AS BLOB)) <= 65536
+        length(CAST(private_payload_json AS BLOB)) <= 16777216
     ),
     CHECK (
         CASE WHEN json_valid(public_payload_json)
@@ -1655,6 +1655,27 @@ CREATE_AGENT_EVENT_INDEXES = (
         "idx_agent_events_source_sequence_identity "
         "ON agent_events(host_id, source, source_session_id, source_sequence) "
         "WHERE source_event_id IS NULL"
+    ),
+)
+
+CREATE_AGENT_EVENT_TOMBSTONES_TABLE = """
+CREATE TABLE IF NOT EXISTS agent_event_tombstones (
+    host_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    replay_fingerprint TEXT NOT NULL CHECK (length(replay_fingerprint) = 64),
+    retired_at TEXT NOT NULL CHECK (length(retired_at) BETWEEN 20 AND 40),
+    PRIMARY KEY (host_id, event_id),
+    CHECK (length(host_id) BETWEEN 1 AND 2048),
+    CHECK (instr(host_id, char(0)) = 0),
+    CHECK (length(event_id) = 64)
+);
+"""
+
+CREATE_AGENT_EVENT_TOMBSTONE_INDEXES = (
+    (
+        "CREATE INDEX IF NOT EXISTS idx_agent_event_tombstones_host_sequence "
+        "ON agent_event_tombstones(host_id, sequence)"
     ),
 )
 
@@ -13379,6 +13400,35 @@ def _migrate_v22_to_v23_conn(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+def _migrate_v23_to_v24_conn(conn: sqlite3.Connection) -> None:
+    """Raise private event bounds and add replay-preserving retention tombstones."""
+    conn.execute("ALTER TABLE agent_events RENAME TO agent_events_v23")
+    conn.execute(CREATE_AGENT_EVENTS_TABLE)
+    conn.execute(
+        """
+        INSERT INTO agent_events (
+            sequence, host_id, event_id, kind, source, worker_id, visibility,
+            source_session_id, source_turn_id, source_item_id,
+            source_message_id, source_event_id, source_sequence, observed_at,
+            payload_fingerprint, private_payload_json, public_payload_json
+        )
+        SELECT
+            sequence, host_id, event_id, kind, source, worker_id, visibility,
+            source_session_id, source_turn_id, source_item_id,
+            source_message_id, source_event_id, source_sequence, observed_at,
+            payload_fingerprint, private_payload_json, public_payload_json
+        FROM agent_events_v23
+        ORDER BY sequence
+        """
+    )
+    conn.execute("DROP TABLE agent_events_v23")
+    for statement in CREATE_AGENT_EVENT_INDEXES:
+        conn.execute(statement)
+    conn.execute(CREATE_AGENT_EVENT_TOMBSTONES_TABLE)
+    for statement in CREATE_AGENT_EVENT_TOMBSTONE_INDEXES:
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -13403,6 +13453,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(20, 21, _migrate_v20_to_v21_conn),
     Migration(21, 22, _migrate_v21_to_v22_conn),
     Migration(22, 23, _migrate_v22_to_v23_conn),
+    Migration(23, 24, _migrate_v23_to_v24_conn),
 )
 
 
@@ -13457,6 +13508,7 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         conn.execute(CREATE_HERDR_TURN_WATERMARKS_TABLE)
         conn.execute(CREATE_HERDR_TURN_COMPLETIONS_TABLE)
         conn.execute(CREATE_AGENT_EVENTS_TABLE)
+        conn.execute(CREATE_AGENT_EVENT_TOMBSTONES_TABLE)
         for statement in CREATE_COMMAND_RECEIPT_INDEXES:
             conn.execute(statement)
         for statement in CREATE_WORKER_BINDING_INDEXES:
@@ -13479,6 +13531,8 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         for statement in CREATE_HERDR_TURN_INDEXES:
             conn.execute(statement)
         for statement in CREATE_AGENT_EVENT_INDEXES:
+            conn.execute(statement)
+        for statement in CREATE_AGENT_EVENT_TOMBSTONE_INDEXES:
             conn.execute(statement)
         for statement in CREATE_ATTENTION_LIFECYCLE_INDEXES:
             conn.execute(statement)
@@ -13689,6 +13743,28 @@ def _agent_event_conflicts(existing: StoredAgentEvent, incoming: AgentEvent) -> 
     )
 
 
+def _agent_event_replay_fingerprint(event: AgentEvent) -> str:
+    """Fingerprint the replay contract while excluding source observation time."""
+    contract = {
+        "event_id": event.event_id,
+        "kind": event.kind,
+        "source": event.source,
+        "worker_id": event.worker_id,
+        "visibility": event.visibility,
+        "source_session_id": event.source_session_id,
+        "source_turn_id": event.source_turn_id,
+        "source_item_id": event.source_item_id,
+        "source_message_id": event.source_message_id,
+        "source_event_id": event.source_event_id,
+        "source_sequence": event.source_sequence,
+        "payload_fingerprint": event.payload_fingerprint,
+        "public_payload_fingerprint": hashlib.sha256(
+            _canonical_json(event.public_payload).encode("utf-8")
+        ).hexdigest(),
+    }
+    return hashlib.sha256(_canonical_json(contract).encode("utf-8")).hexdigest()
+
+
 def _canonical_agent_event_for_append(event: AgentEvent) -> AgentEvent:
     if not isinstance(event, AgentEvent):
         raise ValueError("event must be an AgentEvent")
@@ -13716,6 +13792,22 @@ def _append_agent_event_conn(
     host_id: str,
     event: AgentEvent,
 ) -> AppendAgentEventResult:
+    tombstone = conn.execute(
+        """
+        SELECT sequence, replay_fingerprint
+        FROM agent_event_tombstones
+        WHERE host_id = ? AND event_id = ?
+        """,
+        (host_id, event.event_id),
+    ).fetchone()
+    if tombstone is not None:
+        if str(tombstone[1]) != _agent_event_replay_fingerprint(event):
+            raise AgentEventIdentityConflict(event.event_id)
+        return AppendAgentEventResult(
+            sequence=int(tombstone[0]),
+            event_id=event.event_id,
+            inserted=False,
+        )
     private_json = _canonical_json(event.payload)
     public_json = _canonical_json(event.public_payload)
     cursor = conn.execute(
@@ -17256,6 +17348,115 @@ def cleanup_event_retention(
     }))
 
 
+def cleanup_agent_event_retention(
+    db_path: Path,
+    host_id: str,
+    *,
+    retention_days: int,
+    now: str | None = None,
+    dry_run: bool = False,
+    batch_size: int = 100,
+) -> dict[str, Any]:
+    """Retire private event payloads while retaining compact replay identities."""
+    days = max(1, int(retention_days))
+    bounded_batch = max(1, min(int(batch_size), 1_000))
+    cutoff_at = _utc_cutoff(retention_days=days, now=now)
+    base = {
+        "schema_version": 1,
+        "host_id": str(host_id),
+        "dry_run": bool(dry_run),
+        "retention_days": days,
+        "cutoff_at": cutoff_at,
+        "batch_size": bounded_batch,
+    }
+    if not _sqlite_store_exists(db_path):
+        return dict(sanitize_public_value({
+            **base,
+            "ok": False,
+            "status": "store_unavailable",
+            "examined": 0,
+            "deleted": 0,
+            "tombstoned": 0,
+            "remaining_candidates": False,
+        }))
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        # Retention is a privacy boundary. Overwrite retired cells in the main
+        # database where SQLite can do so; WAL files and backups retain their
+        # independent operator-managed lifecycle.
+        conn.execute("PRAGMA secure_delete=ON")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                _AGENT_EVENT_SELECT
+                + " WHERE host_id = ? AND observed_at < ?"
+                + " ORDER BY observed_at, sequence LIMIT ?",
+                (str(host_id), cutoff_at, bounded_batch + 1),
+            ).fetchall()
+            candidates = rows[:bounded_batch]
+            deleted = 0
+            if candidates and not dry_run:
+                retired_at = utc_timestamp()
+                for row in candidates:
+                    stored = _agent_event_from_row(row)
+                    conn.execute(
+                        """
+                        INSERT INTO agent_event_tombstones (
+                            host_id, event_id, sequence,
+                            replay_fingerprint, retired_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            stored.host_id,
+                            stored.event.event_id,
+                            stored.sequence,
+                            _agent_event_replay_fingerprint(stored.event),
+                            retired_at,
+                        ),
+                    )
+                sequences = [int(row[0]) for row in candidates]
+                placeholders = ",".join("?" for _ in sequences)
+                deleted = int(
+                    conn.execute(
+                        f"DELETE FROM agent_events WHERE host_id = ? "
+                        f"AND sequence IN ({placeholders})",
+                        (str(host_id), *sequences),
+                    ).rowcount
+                    or 0
+                )
+                if deleted != len(candidates):
+                    raise StoreSchemaError("agent_event_retention_delete_mismatch")
+            if dry_run:
+                remaining = len(rows) > bounded_batch
+                conn.rollback()
+            else:
+                remaining = bool(
+                    conn.execute(
+                        """
+                        SELECT 1 FROM agent_events
+                        WHERE host_id = ? AND observed_at < ?
+                        LIMIT 1
+                        """,
+                        (str(host_id), cutoff_at),
+                    ).fetchone()
+                )
+                conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    examined = len(candidates)
+    retired = examined if dry_run else deleted
+    return dict(sanitize_public_value({
+        **base,
+        "ok": True,
+        "status": "ok",
+        "examined": examined,
+        "deleted": retired,
+        "tombstoned": retired,
+        "remaining_candidates": remaining,
+    }))
+
+
 def _turn_content_retention_candidates_conn(
     conn: sqlite3.Connection,
     *,
@@ -18765,6 +18966,14 @@ def run_store_maintenance(
         dry_run=dry_run,
         batch_size=event_batch_size,
     )
+    agent_events = cleanup_agent_event_retention(
+        db_path,
+        host_id,
+        retention_days=retention_days,
+        now=now,
+        dry_run=dry_run,
+        batch_size=event_batch_size,
+    )
     snapshots = cleanup_snapshot_retention(
         db_path,
         retention_days=snapshot_retention_days,
@@ -18835,6 +19044,7 @@ def run_store_maintenance(
     )
     ok = (
         bool(retention.get("ok"))
+        and bool(agent_events.get("ok"))
         and bool(snapshots.get("ok"))
         and bool(outbox.get("ok"))
         and bool(final_retention.get("ok"))
@@ -18858,6 +19068,22 @@ def run_store_maintenance(
             "remaining_candidates": bool(
                 retention.get("remaining_candidates")
             ),
+        },
+        "agent_events": {
+            "retention_days": int(
+                agent_events.get("retention_days") or retention_days
+            ),
+            "cutoff_at": agent_events.get("cutoff_at"),
+            "batch_size": int(
+                agent_events.get("batch_size") or event_batch_size
+            ),
+            "examined": int(agent_events.get("examined") or 0),
+            "deleted": int(agent_events.get("deleted") or 0),
+            "tombstoned": int(agent_events.get("tombstoned") or 0),
+            "remaining_candidates": bool(
+                agent_events.get("remaining_candidates")
+            ),
+            "replay_identity_retained": True,
         },
         "snapshots": {
             "scope": "database",

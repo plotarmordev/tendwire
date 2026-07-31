@@ -46,7 +46,7 @@ def test_acp_event_source_defaults_to_preferred_with_private_summaries(
 
     config = load_config()
 
-    assert config.agent_event_source == DEFAULT_AGENT_EVENT_SOURCE == "acp_preferred"
+    assert config.agent_event_source == DEFAULT_AGENT_EVENT_SOURCE == "legacy"
     assert config.acp_thought_policy == DEFAULT_ACP_THOUGHT_POLICY == "private_summary"
     assert config.acp_request_timeout_seconds == DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS == 30.0
     assert config.acp_shutdown_timeout_seconds == DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS == 5.0

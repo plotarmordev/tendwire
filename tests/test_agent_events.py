@@ -490,6 +490,57 @@ def test_database_constraints_and_indexes_cover_public_and_source_identity(
             )
 
 
+def test_retention_removes_private_payload_but_preserves_replay_identity(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "store.db"
+    old = replace(
+        _message_event(sequence=1, text="private historical payload", visibility="private"),
+        observed_at="2026-06-01T00:00:00+00:00",
+    )
+    recent = replace(
+        _message_event(sequence=2, text="recent", visibility="private"),
+        observed_at="2026-07-30T00:00:00+00:00",
+    )
+    inserted = store_sqlite.append_agent_event(db_path, "host-1", old)
+    store_sqlite.append_agent_event(db_path, "host-1", recent)
+
+    result = store_sqlite.cleanup_agent_event_retention(
+        db_path,
+        "host-1",
+        retention_days=7,
+        now="2026-07-31T00:00:00+00:00",
+    )
+
+    assert result["deleted"] == result["tombstoned"] == 1
+    assert [item.event.payload["text"] for item in store_sqlite.list_agent_events(db_path, "host-1")] == ["recent"]
+    with sqlite3.connect(db_path) as conn:
+        tombstone = conn.execute(
+            "SELECT sequence, length(replay_fingerprint) "
+            "FROM agent_event_tombstones WHERE host_id = ? AND event_id = ?",
+            ("host-1", old.event_id),
+        ).fetchone()
+        encoded = "\n".join(conn.iterdump())
+    assert tombstone == (inserted.sequence, 64)
+    assert "private historical payload" not in encoded
+
+    replay = store_sqlite.append_agent_event(db_path, "host-1", old)
+    assert replay.inserted is False
+    assert replay.sequence == inserted.sequence
+    with pytest.raises(AgentEventIdentityConflict):
+        store_sqlite.append_agent_event(
+            db_path,
+            "host-1",
+            _message_event(sequence=1, text="changed", visibility="private"),
+        )
+
+
+def test_journal_accepts_acp_sized_private_text(tmp_path: Path) -> None:
+    event = _message_event(sequence=1, text="x" * (64 * 1024), visibility="private")
+    result = store_sqlite.append_agent_event(tmp_path / "store.db", "host-1", event)
+    assert result.inserted is True
+
+
 @pytest.mark.parametrize("source_version", range(store_sqlite.STORE_SCHEMA_VERSION))
 def test_agent_event_schema_migrates_from_every_prior_version(
     tmp_path: Path,
@@ -527,7 +578,7 @@ def test_v21_migration_is_idempotent_and_preserves_existing_store(
     store_sqlite.init_store(db_path)
     store_sqlite.init_store(db_path)
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone() == (23,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (24,)
         columns = {
             str(row[1]) for row in conn.execute("PRAGMA table_info(agent_events)")
         }
@@ -588,7 +639,7 @@ def test_v22_migration_rekeys_legacy_event_identity_without_losing_sequence(
             "SELECT sequence, event_id FROM agent_events"
         ).fetchone()
         assert row == (19, event.event_id)
-        assert conn.execute("PRAGMA user_version").fetchone() == (23,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (24,)
 
     replay = store_sqlite.append_agent_event(db_path, "host-1", event)
     assert replay.inserted is False

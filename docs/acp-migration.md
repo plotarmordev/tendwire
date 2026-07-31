@@ -1,7 +1,8 @@
 # ACP primary-event migration
 
-This document defines the migration from backend-specific transcript readers to
-Agent Client Protocol (ACP) as Tendwire's preferred semantic event source.
+This document defines the experimental migration from backend-specific
+transcript readers to Agent Client Protocol (ACP). ACP is not yet Tendwire's
+default or a production-wired semantic authority.
 Herdr remains authoritative for workspace, pane, worker identity, process
 liveness, and command routing until the ACP control path is proven separately.
 Tendwire remains authoritative for persistence, reconciliation, public safety,
@@ -12,16 +13,21 @@ command receipts, and connector delivery.
 `TENDWIRE_AGENT_EVENT_SOURCE` controls projection precedence:
 
 - `legacy`: use the existing Herdr/Codex/OMP turn readers only.
-- `acp_shadow`: ingest ACP events durably, compare them with legacy turns, and
-  keep legacy turns authoritative.
-- `acp_preferred`: use ACP for an authenticated, healthy ACP-bound worker and
-  fall back to the legacy reader for every other worker.
+- `acp_shadow`: with an explicitly supplied ACP runtime, ingest ACP events
+  durably without projecting them; legacy turns remain authoritative. Automated
+  comparison is not implemented yet.
+- `acp_preferred`: an experimental integration surface for future per-worker
+  ACP authority and legacy fallback. The stock daemon does not discover or
+  construct an ACP runtime.
 - `acp_required`: use ACP only and fail closed when the binding or stream is not
-  healthy. This mode is intended for conformance testing, not initial rollout.
+  healthy. The daemon does not start its legacy turn scheduler in this mode.
+  This mode requires an explicitly supplied healthy authority runtime and is
+  intended for conformance testing, not rollout.
 
-The default is `acp_preferred`. The default does not invent an ACP session or
-silently replace a worker: without a proven binding, legacy observation remains
-authoritative.
+The default is `legacy`. Selecting an ACP mode does not discover an adapter,
+invent an ACP session, or bind a worker. Until a per-worker authority
+coordinator exists, operators must not interpret `acp_preferred` as proof that
+ACP is authoritative.
 
 ## Authority split
 
@@ -30,7 +36,7 @@ authoritative.
 | Workspace and logical pane identity | Herdr |
 | Public stable worker identity | Tendwire's authenticated Herdr projection |
 | ACP session and message identity | ACP agent, stored privately by Tendwire |
-| Messages, thoughts, tools, plans, and usage | ACP when preferred and healthy |
+| Messages, thoughts, tools, plans, and usage | Future ACP authority coordinator; currently experimental |
 | Turn finality and connector eligibility | Tendwire durable projection |
 | Telegram presentation and delivery state | Herdres |
 | Command idempotency and uncertain outcomes | Tendwire command receipts |
@@ -91,10 +97,12 @@ The boundary has four rules:
 - verify adapter releases with black-box ACP compatibility fixtures before
   promotion, while keeping the previously proven executable for rollback.
 
-An adapter upgrade therefore restarts only its owned process/session; it does
-not require a Tendwire rebase. A session may resume when the new adapter
-advertises that capability. Otherwise Tendwire opens a new transport generation
-and reconciles it through the durable semantic journal.
+The wire-process boundary is designed so an adapter upgrade does not require a
+Tendwire rebase. The current initialization-only probe is not a promotion gate:
+it does not authenticate, create/load a session, prompt, validate updates,
+exercise permissions/cancellation, or pin an executable digest. Stateful
+conformance fixtures and an immutable rollback manifest are still required.
+Session resume/replay reconciliation is likewise incomplete.
 
 ## Runtime lifecycle
 
@@ -104,6 +112,11 @@ shutdown. Tendwire must not claim an ACP worker healthy until initialization,
 capability negotiation, session creation/load/resume, and private worker binding
 all succeed.
 
+The stock daemon currently has no production ACP runtime factory or multi-worker
+supervisor. Herdr must first provide authenticated per-worker launch/session
+metadata, and Tendwire must add per-worker health, authority, reconnect, and
+durable projection recovery before ACP can become the default.
+
 Disconnect handling is conservative:
 
 1. Stop accepting events from the disconnected generation.
@@ -112,12 +125,30 @@ Disconnect handling is conservative:
 4. Reinitialize and rebind before accepting ACP events again.
 5. Reconcile replayed messages and tool calls by producer identity.
 
+These disconnect steps are requirements, not a description of the current
+implementation.
+
+## Retention
+
+`event_retention_days` also bounds raw structured ACP journal payloads. Online
+maintenance replaces expired payload rows with compact identity tombstones in
+bounded batches. A tombstone retains the original sequence and a replay-contract
+fingerprint, allowing exact retries to remain idempotent and conflicting reuse
+to fail closed without retaining messages, thoughts, raw tool input/output, or
+other source payloads. Tombstones are intentionally not deleted automatically:
+removing them would make a late replay indistinguishable from a new event.
+SQLite secure deletion is enabled for this bounded cleanup transaction, but WAL
+files, filesystem snapshots, and backups retain their own operator-managed
+lifecycle and are not a cryptographic erasure guarantee.
+
 ## Cross-repository requirements
 
 Herdr needs an ACP-aware launch or proxy surface that exposes enough private
 metadata for Tendwire to bind an ACP session to an existing logical pane. The
 binding must survive terminal/session churn without making ACP identity a
-public continuity input.
+public continuity input. It must also identify adapter executable/version,
+session-open mode, working directory, and binding generation without exposing
+those values on public APIs.
 
 Herdres needs optional presentations for sanitized tool and plan progress. It
 does not ingest ACP directly: it continues polling Tendwire's neutral outbox so
@@ -126,7 +157,9 @@ the agent protocol.
 
 ## Rollout gates
 
-Promotion proceeds `legacy` -> `acp_shadow` -> `acp_preferred`. The following
+Promotion remains blocked at the default `legacy` posture. When the missing
+runtime and Herdr prerequisites exist, it may proceed `legacy` -> `acp_shadow`
+-> `acp_preferred`. The following
 must pass before `acp_required` is considered:
 
 - no missing or duplicated user/final messages across adapter restarts;

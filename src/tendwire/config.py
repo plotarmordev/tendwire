@@ -21,7 +21,7 @@ AGENT_EVENT_SOURCES = frozenset(
 )
 ACP_THOUGHT_POLICIES = frozenset({"disabled", "private_summary", "private_all"})
 DEFAULT_TURN_MODEL = "observed"
-DEFAULT_AGENT_EVENT_SOURCE = "acp_preferred"
+DEFAULT_AGENT_EVENT_SOURCE = "legacy"
 DEFAULT_ACP_THOUGHT_POLICY = "private_summary"
 DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS = 30.0
 DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS = 5.0

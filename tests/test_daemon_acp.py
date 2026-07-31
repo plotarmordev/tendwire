@@ -238,9 +238,6 @@ def test_required_acp_starts_before_socket_and_exposes_only_redacted_health(
             "observe",
             "acp_factory",
             "acp_start",
-            "scheduler_factory",
-            "scheduler_start",
-            "scheduler_request",
         ]
         assert stat.S_ISSOCK(os.lstat(socket_path).st_mode)
         health = daemon.get_health()
@@ -276,10 +273,9 @@ def test_required_acp_starts_before_socket_and_exposes_only_redacted_health(
     finally:
         daemon.stop()
 
-    assert calls[-3:] == [
+    assert calls[-2:] == [
         "acp_stop:1.25",
         "acp_join:1.25",
-        "scheduler_stop:6.0",
     ]
 
 
@@ -372,14 +368,12 @@ def test_optional_acp_start_failure_is_cleaned_up_before_legacy_fallback(
         daemon.stop()
 
 
-def test_scheduler_start_failure_also_stops_and_joins_acp(tmp_path: Path) -> None:
+def test_required_acp_never_constructs_legacy_scheduler(tmp_path: Path) -> None:
     calls: list[str] = []
     runtime = _Runtime(calls)
 
-    class FailingScheduler(_Scheduler):
-        def start(self) -> None:
-            self.calls.append("scheduler_start")
-            raise RuntimeError("sentinel scheduler failure")
+    def forbidden_scheduler(_config: Config) -> _Scheduler:
+        raise AssertionError("acp_required must never construct legacy ingestion")
 
     daemon = TendwireDaemon(
         _config(tmp_path, "acp_required"),
@@ -387,17 +381,14 @@ def test_scheduler_start_failure_also_stops_and_joins_acp(tmp_path: Path) -> Non
             tmp_path,
             calls,
             acp_runtime_factory=lambda _config, _stop_event: runtime,
-            scheduler_factory=lambda _config: FailingScheduler(calls),
+            scheduler_factory=forbidden_scheduler,
         ),
     )
 
-    with pytest.raises(RuntimeError, match="sentinel scheduler failure"):
-        daemon.start()
+    daemon.start()
+    try:
+        assert calls == ["init_store", "observe", "acp_start"]
+    finally:
+        daemon.stop()
 
-    assert calls[-3:] == [
-        "scheduler_stop:6.0",
-        "acp_stop:1.25",
-        "acp_join:1.25",
-    ]
-    assert daemon._acp_runtime is None
-    assert not os.path.lexists(tmp_path / "daemon.sock")
+    assert calls[-2:] == ["acp_stop:1.25", "acp_join:1.25"]

@@ -553,7 +553,7 @@ variables:
 | `turn_refresh_interval_seconds` | `TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS` | `2.0` | finite positive float |
 | `turn_refresh_workers` | `TENDWIRE_TURN_REFRESH_WORKERS` | `4` | integer from 1 through 32 and no greater than `max_workers` |
 | `turn_model` | `TENDWIRE_TURN_MODEL` | `observed` | `observed`; `legacy`, `dual`, and `shadow` are deprecated aliases with identical observed behavior |
-| `agent_event_source` | `TENDWIRE_AGENT_EVENT_SOURCE` | `acp_preferred` | `legacy`, `acp_shadow`, `acp_preferred`, or `acp_required` |
+| `agent_event_source` | `TENDWIRE_AGENT_EVENT_SOURCE` | `legacy` | `legacy`, `acp_shadow`, `acp_preferred`, or `acp_required`; ACP modes are experimental |
 | `acp_thought_policy` | `TENDWIRE_ACP_THOUGHT_POLICY` | `private_summary` | `disabled`, `private_summary`, or `private_all`; never a public-delivery grant |
 | `acp_request_timeout_seconds` | `TENDWIRE_ACP_REQUEST_TIMEOUT_SECONDS` | `30.0` | finite positive float |
 | `acp_shutdown_timeout_seconds` | `TENDWIRE_ACP_SHUTDOWN_TIMEOUT_SECONDS` | `5.0` | finite positive float |
@@ -570,13 +570,22 @@ snapshot/projections instead of publishing a truncated authoritative snapshot.
 Incremental events that would add workers over the cap are ignored with the
 same public-safe degraded evidence.
 
-`acp_preferred` means ACP is the primary semantic source only for workers with
-an authenticated ACP session binding; workers without one continue through the
-existing Herdr turn adapters. `acp_shadow` persists and compares ACP events but
-does not project them into turns. `acp_required` fails closed for an unbound or
-unhealthy ACP worker. None of these modes makes agent thoughts public: thought
-events remain private diagnostic data unless a separate, explicit sanitized
-projection is introduced.
+The stock daemon currently defaults to `legacy`. ACP runtime discovery,
+per-worker authority selection, and automatic reconnect are not production
+wired yet; ACP modes are integration/test surfaces that require an explicitly
+supplied runtime factory. `acp_shadow` persists ACP events without projecting
+them, but no automated shadow comparator is implemented. `acp_preferred` must
+not be treated as a production authority promise until that coordinator exists.
+`acp_required` fails startup without an explicit healthy runtime and never
+starts the legacy turn scheduler. None of these modes makes agent thoughts
+public: thought events remain private diagnostic data unless a separate,
+explicit sanitized projection is introduced.
+
+Store maintenance retires expired structured agent-event payloads in bounded
+batches using `event_retention_days`. Compact identity tombstones remain so a
+replayed source event cannot be reinserted or silently change content after its
+private payload has expired. Tombstones intentionally retain hashes and opaque
+identity only; they are not a recoverable copy of the removed payload.
 
 Snapshot history defaults are sized for a five-minute observation rhythm:
 $14 \times 24 \times 12 = 4032$ observations, while the 4096-row count

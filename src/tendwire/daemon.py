@@ -604,8 +604,10 @@ class TendwireDaemon:
 
             self._start_acp_runtime()
 
-            scheduler = self.hooks.turn_scheduler_factory(self.config)
-            self._turn_scheduler = scheduler
+            scheduler = None
+            if self.config.agent_event_source != "acp_required":
+                scheduler = self.hooks.turn_scheduler_factory(self.config)
+                self._turn_scheduler = scheduler
 
             api = TendwireDaemonAPI(
                 get_snapshot=self.get_snapshot,
@@ -639,10 +641,11 @@ class TendwireDaemon:
                 if backend is not None
                 else None
             )
-            if callable(callback_setter):
+            if callable(callback_setter) and scheduler is not None:
                 callback_setter(scheduler.request_refresh)
-            scheduler.start()
-            scheduler.request_refresh()
+            if scheduler is not None:
+                scheduler.start()
+                scheduler.request_refresh()
         except Exception:
             self.stop_event.set()
             backend = self._event_backend
