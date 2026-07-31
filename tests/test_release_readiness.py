@@ -286,6 +286,17 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
             "deleted": 0,
             "remaining_candidates": False,
         },
+        "agent_events": {
+            "host_id": None,
+            "retention_days": 36500,
+            "cutoff_at": "1926-02-04T00:00:00+00:00",
+            "batch_size": 5,
+            "examined": 0,
+            "deleted": 0,
+            "tombstoned": 0,
+            "remaining_candidates": False,
+            "replay_identity_retained": True,
+        },
         "final_retention": {
             "examined": 0,
             "deleted": 0,

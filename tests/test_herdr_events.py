@@ -1484,7 +1484,7 @@ def test_idless_blocked_event_persists_and_lists_decision(
         binding = next(iter(backend._bindings.values()))
         refreshes.append(
             herdr_turns.refresh_turn_binding(
-                backend.config, binding, adapter_timeout_seconds=1
+                backend.config, binding, adapter_timeout_seconds=2
             )
         )
 
@@ -1527,7 +1527,7 @@ def test_reconcile_fallback_refreshes_and_lists_decision_without_status_event(
         binding = next(iter(backend._bindings.values()))
         refreshes.append(
             herdr_turns.refresh_turn_binding(
-                backend.config, binding, adapter_timeout_seconds=1
+                backend.config, binding, adapter_timeout_seconds=2
             )
         )
 
