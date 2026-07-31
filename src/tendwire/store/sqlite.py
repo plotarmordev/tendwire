@@ -145,7 +145,7 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 24
+STORE_SCHEMA_VERSION = 25
 CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 _LEGACY_TURN_CLAIM_HARD_TTL_SECONDS = 86_400
 TURN_CHANGE_RETENTION_DAYS = 7
@@ -1622,7 +1622,11 @@ CREATE TABLE IF NOT EXISTS agent_events (
         source_event_id IS NOT NULL
         OR (source_session_id IS NOT NULL AND source_sequence IS NOT NULL)
     ),
-    CHECK (kind NOT IN ('thought', 'extension') OR visibility = 'private')
+    CHECK (
+        kind NOT IN (
+            'thought', 'tool_call', 'tool_call_update', 'plan', 'extension'
+        ) OR visibility = 'private'
+    )
 );
 """
 
@@ -13437,6 +13441,42 @@ def _migrate_v23_to_v24_conn(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+def _migrate_v24_to_v25_conn(conn: sqlite3.Connection) -> None:
+    """Make thought, tool, plan, and extension journal rows private-only."""
+    conn.execute("ALTER TABLE agent_events RENAME TO agent_events_v24")
+    conn.execute(CREATE_AGENT_EVENTS_TABLE)
+    conn.execute(
+        """
+        INSERT INTO agent_events (
+            sequence, host_id, event_id, kind, source, worker_id, visibility,
+            source_session_id, source_turn_id, source_item_id,
+            source_message_id, source_event_id, source_sequence, observed_at,
+            payload_fingerprint, private_payload_json, public_payload_json
+        )
+        SELECT
+            sequence, host_id, event_id, kind, source, worker_id,
+            CASE
+                WHEN kind IN ('thought', 'tool_call', 'tool_call_update', 'plan', 'extension')
+                THEN 'private'
+                ELSE visibility
+            END,
+            source_session_id, source_turn_id, source_item_id,
+            source_message_id, source_event_id, source_sequence, observed_at,
+            payload_fingerprint, private_payload_json,
+            CASE
+                WHEN kind IN ('thought', 'tool_call', 'tool_call_update', 'plan', 'extension')
+                THEN '{}'
+                ELSE public_payload_json
+            END
+        FROM agent_events_v24
+        ORDER BY sequence
+        """
+    )
+    conn.execute("DROP TABLE agent_events_v24")
+    for statement in CREATE_AGENT_EVENT_INDEXES:
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -13462,6 +13502,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(21, 22, _migrate_v21_to_v22_conn),
     Migration(22, 23, _migrate_v22_to_v23_conn),
     Migration(23, 24, _migrate_v23_to_v24_conn),
+    Migration(24, 25, _migrate_v24_to_v25_conn),
 )
 
 

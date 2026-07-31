@@ -131,7 +131,7 @@ def test_messages_are_journaled_privately_and_projected_without_thoughts(
             "agent_thought_chunk",
             messageId="reasoning-1",
             content={"type": "text", "text": "private reasoning"},
-            _meta={"tendwire": {"thought_kind": "summary"}},
+            _meta={"tendwire.dev/thought_kind": "summary"},
         )
     )
     ingestor.ingest_update(
@@ -146,7 +146,6 @@ def test_messages_are_journaled_privately_and_projected_without_thoughts(
     assert turn_id.startswith("acpt_")
     assert [event.kind for event in events] == [
         "user_message",
-        "thought",
         "agent_message",
         "extension",
     ]
@@ -667,7 +666,7 @@ def test_producer_turn_identity_survives_transport_recreation(tmp_path: Path) ->
     assert identities[0] == identities[1]
 
 
-def test_private_summary_policy_retains_display_chunks_but_rejects_marked_raw_thoughts(
+def test_private_summary_requires_exact_trusted_marker_and_rejects_conflicts(
     tmp_path: Path,
 ) -> None:
     events: list[AgentEvent] = []
@@ -682,7 +681,7 @@ def test_private_summary_policy_retains_display_chunks_but_rejects_marked_raw_th
         return _appended(len(events), event)
 
     ingestor = AcpSessionIngestor(
-        _config(tmp_path / "events.db"),
+        _config(tmp_path / "events.db", acp_thought_policy="private_summary"),
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
@@ -701,19 +700,39 @@ def test_private_summary_policy_retains_display_chunks_but_rejects_marked_raw_th
             _meta={"tendwire": {"thought_kind": "raw"}},
         )
     )
+    unknown = ingestor.ingest_update(
+        _update(
+            "agent_thought_chunk",
+            content={"type": "text", "text": "unknown secret"},
+            _meta={"tendwire.dev/thought_kind": "SUMMARY"},
+        )
+    )
+    conflicting = ingestor.ingest_update(
+        _update(
+            "agent_thought_chunk",
+            content={
+                "type": "text",
+                "text": "conflicting secret",
+                "_meta": {"reasoning_kind": "raw"},
+            },
+            _meta={"tendwire.dev/thought_kind": "summary"},
+        )
+    )
     summary = ingestor.ingest_update(
         _update(
             "agent_thought_chunk",
             messageId="summary-1",
             content={"type": "text", "text": "readable summary"},
-            _meta={"tendwire": {"thought_kind": "summary"}},
+            _meta={"tendwire.dev/thought_kind": "summary"},
         )
     )
 
-    assert unclassified.event is not None
+    assert unclassified.ignored_reason == "thought_policy_requires_summary"
     assert raw.ignored_reason == "thought_policy_requires_summary"
+    assert unknown.ignored_reason == "thought_policy_requires_summary"
+    assert conflicting.ignored_reason == "thought_policy_requires_summary"
     assert summary.event is not None
-    assert len(events) == 2
+    assert len(events) == 1
     assert all(event.visibility == "private" for event in events)
     assert all(event.public_payload == {} for event in events)
     assert "raw secret" not in repr(events)

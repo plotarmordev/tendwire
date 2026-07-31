@@ -528,8 +528,9 @@ _TURN_SCOPED_UPDATES = frozenset(
         "plan",
     }
 )
-_THOUGHT_RAW_LABELS = frozenset(
-    {"raw", "reasoning", "raw_reasoning", "raw-reasoning", "chain_of_thought"}
+_TRUSTED_THOUGHT_SUMMARY_KEY = "tendwire.dev/thought_kind"
+_LEGACY_THOUGHT_CLASSIFICATION_KEYS = frozenset(
+    {"thought_kind", "thoughtKind", "reasoning_kind", "reasoningKind"}
 )
 
 
@@ -568,23 +569,35 @@ def _thought_classification(value: Mapping[str, Any]) -> str | None:
     update = _session_update(value)
     if update is None or update.get("sessionUpdate") != "agent_thought_chunk":
         return None
-    candidates: list[Mapping[str, Any]] = []
+    update_meta = update.get("_meta")
+    trusted = (
+        update_meta.get(_TRUSTED_THOUGHT_SUMMARY_KEY)
+        if isinstance(update_meta, Mapping)
+        else None
+    )
+    if trusted != "summary":
+        return "unclassified" if trusted is None else "unknown"
+
+    # The exact update-level marker is a Tendwire adapter convention, not an
+    # ACP classification guarantee. Contradictory legacy or content metadata
+    # therefore fails closed even when the trusted marker says "summary".
     for container in (update, update.get("content")):
         if not isinstance(container, Mapping):
             continue
         meta = container.get("_meta")
         if not isinstance(meta, Mapping):
             continue
-        candidates.append(meta)
-        tendwire = meta.get("tendwire")
-        if isinstance(tendwire, Mapping):
-            candidates.insert(0, tendwire)
-    for meta in candidates:
-        for key in ("thought_kind", "thoughtKind", "reasoning_kind", "reasoningKind"):
-            label = meta.get(key)
-            if isinstance(label, str) and label.strip():
-                return label.strip().lower()
-    return "unclassified"
+        marker = meta.get(_TRUSTED_THOUGHT_SUMMARY_KEY)
+        if marker is not None and marker != "summary":
+            return "conflicting"
+        if any(key in meta for key in _LEGACY_THOUGHT_CLASSIFICATION_KEYS):
+            return "conflicting"
+        legacy_namespace = meta.get("tendwire")
+        if isinstance(legacy_namespace, Mapping) and any(
+            key in legacy_namespace for key in _LEGACY_THOUGHT_CLASSIFICATION_KEYS
+        ):
+            return "conflicting"
+    return "summary"
 
 
 def _thought_rejection_reason(
@@ -597,7 +610,7 @@ def _thought_rejection_reason(
         return None
     if policy == "disabled":
         return "thought_policy_disabled"
-    if policy == "private_summary" and classification in _THOUGHT_RAW_LABELS:
+    if policy == "private_summary" and classification != "summary":
         return "thought_policy_requires_summary"
     return None
 

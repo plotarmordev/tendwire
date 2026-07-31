@@ -70,15 +70,20 @@ sanitizing projection and must not reuse raw ACP payloads.
 `TENDWIRE_ACP_THOUGHT_POLICY` has three values:
 
 - `disabled`: discard thought chunks before persistence.
-- `private_summary`: retain readable reasoning summaries privately and discard
-  raw-reasoning chunks.
+- `private_summary`: retain a chunk privately only when a trusted adapter sets
+  the exact update-level marker
+  `_meta["tendwire.dev/thought_kind"] = "summary"`; unclassified, unknown,
+  contradictory, and raw chunks are discarded.
 - `private_all`: retain every thought chunk privately for explicit local
   diagnostics.
 
-The default is `private_summary`. No thought policy grants connector delivery.
-Herdres must never receive a raw thought event. A future public summary feature
-requires a separate schema, sanitizer, explicit operator opt-in, and tests that
-prove raw reasoning cannot cross the boundary.
+The default is `disabled`. Stable ACP v1 does not define a raw-versus-summary
+classification. The `private_summary` marker is only a Tendwire adapter
+convention and is not an ACP guarantee; enable it only for a trusted adapter.
+No thought policy grants connector delivery. Herdres must never receive a raw
+thought event. A future public summary feature requires a separate schema,
+sanitizer, explicit operator opt-in, and tests that prove raw reasoning cannot
+cross the boundary.
 
 ## Upstream upgrade boundary
 

@@ -46,6 +46,9 @@ AGENT_EVENT_KINDS = frozenset(
     }
 )
 AGENT_EVENT_VISIBILITIES = frozenset({"private", "public"})
+AGENT_EVENT_PRIVATE_KINDS = frozenset(
+    {"thought", "tool_call", "tool_call_update", "plan", "extension"}
+)
 AGENT_EVENT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
 AGENT_EVENT_MAX_PUBLIC_PAYLOAD_BYTES = 64 * 1024
 AGENT_EVENT_MAX_TEXT_CHARS = 4 * 1024 * 1024
@@ -290,10 +293,11 @@ def agent_event(
     normalized_visibility = str(visibility).strip().lower()
     if normalized_visibility not in AGENT_EVENT_VISIBILITIES:
         raise ValueError("visibility must be private or public")
-    if normalized_kind == "thought" and normalized_visibility != "private":
-        raise ValueError("thought events must remain private")
-    if normalized_kind == "extension" and normalized_visibility != "private":
-        raise ValueError("extension events must remain private")
+    if (
+        normalized_kind in AGENT_EVENT_PRIVATE_KINDS
+        and normalized_visibility != "private"
+    ):
+        raise ValueError(f"{normalized_kind} events must remain private")
     normalized_source = normalize_agent_event_identifier(
         source, "source", required=True
     )

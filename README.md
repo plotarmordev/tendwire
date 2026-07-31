@@ -554,7 +554,7 @@ variables:
 | `turn_refresh_workers` | `TENDWIRE_TURN_REFRESH_WORKERS` | `4` | integer from 1 through 32 and no greater than `max_workers` |
 | `turn_model` | `TENDWIRE_TURN_MODEL` | `observed` | `observed`; `legacy`, `dual`, and `shadow` are deprecated aliases with identical observed behavior |
 | `agent_event_source` | `TENDWIRE_AGENT_EVENT_SOURCE` | `legacy` | `legacy`, `acp_shadow`, `acp_preferred`, or `acp_required`; ACP modes are experimental |
-| `acp_thought_policy` | `TENDWIRE_ACP_THOUGHT_POLICY` | `private_summary` | `disabled`, `private_summary`, or `private_all`; never a public-delivery grant |
+| `acp_thought_policy` | `TENDWIRE_ACP_THOUGHT_POLICY` | `disabled` | `disabled`, `private_summary`, or `private_all`; never a public-delivery grant |
 | `acp_request_timeout_seconds` | `TENDWIRE_ACP_REQUEST_TIMEOUT_SECONDS` | `30.0` | finite positive float |
 | `acp_shutdown_timeout_seconds` | `TENDWIRE_ACP_SHUTDOWN_TIMEOUT_SECONDS` | `5.0` | finite positive float |
 | `acp_max_frame_bytes` | `TENDWIRE_ACP_MAX_FRAME_BYTES` | `8388608` | integer from 1 through 67108864 |
