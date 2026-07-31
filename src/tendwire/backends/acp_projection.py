@@ -86,6 +86,7 @@ _PERMISSION_KINDS: Final[frozenset[str]] = frozenset(
 _CONTENT_TYPES: Final[frozenset[str]] = frozenset(
     {"text", "image", "audio", "resource_link", "resource"}
 )
+_ANNOTATION_ROLES: Final[frozenset[str]] = frozenset({"assistant", "user"})
 
 
 class AcpProjectionError(ValueError):
@@ -151,6 +152,7 @@ class AcpEventProjector:
         max_plan_entries: int = 4096,
         max_text_chars_per_message: int = 4 * 1024 * 1024,
         max_event_bytes: int = 8 * 1024 * 1024,
+        max_json_depth: int = 128,
         max_session_state_bytes: int = 8 * 1024 * 1024,
         max_total_state_bytes: int = 128 * 1024 * 1024,
     ) -> None:
@@ -163,6 +165,7 @@ class AcpEventProjector:
             "max_plan_entries": max_plan_entries,
             "max_text_chars_per_message": max_text_chars_per_message,
             "max_event_bytes": max_event_bytes,
+            "max_json_depth": max_json_depth,
             "max_session_state_bytes": max_session_state_bytes,
             "max_total_state_bytes": max_total_state_bytes,
         }
@@ -178,6 +181,7 @@ class AcpEventProjector:
         self._max_plan_entries = max_plan_entries
         self._max_text_chars_per_message = max_text_chars_per_message
         self._max_event_bytes = max_event_bytes
+        self._max_json_depth = max_json_depth
         self._max_session_state_bytes = max_session_state_bytes
         self._max_total_state_bytes = max_total_state_bytes
 
@@ -212,9 +216,9 @@ class AcpEventProjector:
             {"update": update, "_meta": params.get("_meta")},
             label="ACP session update",
             max_bytes=self._max_event_bytes,
+            max_depth=self._max_json_depth,
         )
-        _extension_metadata(params)
-        _validate_supported_update(update_name, update)
+        update = _normalized_supported_update(update_name, update)
         state, _is_new_session = self._pending_session(session_id)
         explicit_id = _explicit_source_event_id(source_event_id)
         replay_digest = _event_digest(kind, update)
@@ -262,6 +266,10 @@ class AcpEventProjector:
             if active is not None and not active.explicit:
                 state.active_message = None
         if explicit_id is not None:
+            self._reserve_state(
+                state,
+                len(explicit_id.encode("utf-8")) + len(replay_digest.encode("ascii")),
+            )
             state.seen_source_events[explicit_id] = replay_digest
         state.replaced_state = None
         self._sessions[session_id] = state
@@ -300,9 +308,11 @@ class AcpEventProjector:
             params,
             label="ACP permission request",
             max_bytes=self._max_event_bytes,
+            max_depth=self._max_json_depth,
         )
-        _extension_metadata(params)
-        _validate_tool_update(tool_call, label="ACP permission toolCall")
+        tool_call = _normalized_tool_update(
+            tool_call, label="ACP permission toolCall"
+        )
         state, _is_new_session = self._pending_session(session_id)
         explicit_id = _explicit_source_event_id(source_event_id)
         options = params.get("options")
@@ -355,6 +365,10 @@ class AcpEventProjector:
             if active is not None and not active.explicit:
                 state.active_message = None
         if explicit_id is not None:
+            self._reserve_state(
+                state,
+                len(explicit_id.encode("utf-8")) + len(replay_digest.encode("ascii")),
+            )
             state.seen_source_events[explicit_id] = replay_digest
         state.replaced_state = None
         self._sessions[session_id] = state
@@ -529,9 +543,10 @@ class AcpEventProjector:
             raise AcpProjectionError("ACP messageId was reused after a message boundary")
         text_delta = content.get("text") if content.get("type") == "text" else None
         text_delta = text_delta if isinstance(text_delta, str) else ""
+        public_text_delta = text_delta if _content_is_user_visible(content) else ""
         content_copy = _content_payload(content)
         previous_text = assembly.text if assembly is not None else ""
-        assembled_text = previous_text + text_delta
+        assembled_text = previous_text + public_text_delta
         if len(assembled_text) > self._max_text_chars_per_message:
             raise AcpProjectionError("ACP assembled message text limit exceeded")
         if assembly is None:
@@ -539,7 +554,8 @@ class AcpEventProjector:
                 raise AcpProjectionError("ACP message assembly limit exceeded")
             self._reserve_state(
                 state,
-                len(message_id.encode("utf-8")) + len(text_delta.encode("utf-8")),
+                len(message_id.encode("utf-8"))
+                + len(public_text_delta.encode("utf-8")),
             )
             assembly = _MessageAssembly(
                 message_id=message_id,
@@ -550,7 +566,7 @@ class AcpEventProjector:
             if not explicit:
                 state.implicit_message_ordinals[kind] = int(message_id.rsplit("-", 1)[1])
         else:
-            self._reserve_state(state, len(text_delta.encode("utf-8")))
+            self._reserve_state(state, len(public_text_delta.encode("utf-8")))
             assembly.text = assembled_text
         state.active_message = (kind, message_id)
         return {
@@ -760,13 +776,23 @@ def _content_payload(content: Mapping[str, Any]) -> dict[str, Any]:
     return deepcopy(dict(content))
 
 
+def _content_is_user_visible(content: Mapping[str, Any]) -> bool:
+    annotations = content.get("annotations")
+    if not isinstance(annotations, Mapping) or "audience" not in annotations:
+        return True
+    audience = annotations.get("audience")
+    if audience is None:
+        return True
+    return isinstance(audience, list) and "user" in audience
+
+
 def _extension_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
     meta = value.get("_meta")
-    if meta is None:
+    if meta is None or not isinstance(meta, Mapping) or any(
+        not isinstance(key, str) for key in meta
+    ):
         return {}
-    if not isinstance(meta, Mapping) or any(not isinstance(key, str) for key in meta):
-        raise AcpProjectionError("ACP _meta must be an object with string keys")
-    return deepcopy(dict(meta))
+    return _safe_deepcopy(dict(meta), label="ACP _meta")
 
 
 def _scoped_metadata(**values: Mapping[str, Any]) -> dict[str, Any]:
@@ -779,188 +805,272 @@ def _scoped_metadata(**values: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalized_supported_update(
+    update_name: str, update: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Apply ACP v1's tolerant decoding rules to optional/list fields."""
+
+    normalized = _safe_deepcopy(dict(update), label="ACP session update")
+    _salvage_meta(normalized)
+    if update_name in {
+        "user_message_chunk",
+        "agent_message_chunk",
+        "agent_thought_chunk",
+    }:
+        content = normalized.get("content")
+        if not isinstance(content, Mapping):
+            raise AcpProjectionError("ACP message update is missing object content")
+        normalized["content"] = _normalized_content_block(
+            content, label="ACP message content"
+        )
+        if "messageId" in normalized and normalized["messageId"] is not None:
+            _identifier(normalized["messageId"], "messageId")
+    elif update_name == "tool_call":
+        normalized = _normalized_tool_call(normalized)
+    elif update_name == "tool_call_update":
+        normalized = _normalized_tool_update(normalized)
+    elif update_name == "plan":
+        if "entries" not in normalized:
+            raise AcpProjectionError("ACP plan update entries must be an array")
+        entries = normalized["entries"]
+        if not isinstance(entries, list):
+            normalized["entries"] = []
+        else:
+            accepted: list[dict[str, Any]] = []
+            for entry in entries:
+                try:
+                    accepted.append(_normalized_plan_entry(entry))
+                except AcpProjectionError:
+                    continue
+            normalized["entries"] = accepted
+    elif update_name == "usage_update":
+        _validate_usage(normalized)
+        if normalized.get("cost") is not None:
+            try:
+                cost = normalized["cost"]
+                if not isinstance(cost, Mapping):
+                    raise AcpProjectionError("ACP usage cost must be an object or null")
+                cost_copy = _safe_deepcopy(dict(cost), label="ACP usage cost")
+                _salvage_meta(cost_copy)
+                _validate_cost(cost_copy)
+                normalized["cost"] = cost_copy
+            except (AcpProjectionError, OverflowError):
+                normalized.pop("cost", None)
+    elif update_name == "session_info_update":
+        for key in ("title", "updatedAt"):
+            if key in normalized and normalized[key] is not None and not isinstance(
+                normalized[key], str
+            ):
+                normalized.pop(key)
+    return normalized
+
+
+def _salvage_meta(value: dict[str, Any]) -> None:
+    meta = value.get("_meta")
+    if meta is not None and (
+        not isinstance(meta, Mapping) or any(not isinstance(key, str) for key in meta)
+    ):
+        value.pop("_meta", None)
+
+
+def _normalized_annotations(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    normalized = _safe_deepcopy(dict(value), label="ACP annotations")
+    _salvage_meta(normalized)
+    audience = normalized.get("audience")
+    if isinstance(audience, list):
+        normalized["audience"] = [item for item in audience if item in _ANNOTATION_ROLES]
+    elif audience is not None:
+        normalized.pop("audience", None)
+    if normalized.get("lastModified") is not None and not isinstance(
+        normalized.get("lastModified"), str
+    ):
+        normalized.pop("lastModified", None)
+    priority = normalized.get("priority")
+    if priority is not None and not _is_finite_number(priority):
+        normalized.pop("priority", None)
+    return normalized
+
+
+def _normalized_content_block(
+    content: Mapping[str, Any], *, label: str
+) -> dict[str, Any]:
+    normalized = _safe_deepcopy(dict(content), label=label)
+    content_type = normalized.get("type")
+    if content_type not in _CONTENT_TYPES:
+        raise AcpProjectionError(f"{label} has unsupported type")
+    _salvage_meta(normalized)
+    annotations = _normalized_annotations(normalized.get("annotations"))
+    if annotations is None:
+        normalized.pop("annotations", None)
+    else:
+        normalized["annotations"] = annotations
+    if content_type == "text":
+        _required_text(normalized, "text", label=label)
+    elif content_type in {"image", "audio"}:
+        _required_text(normalized, "data", label=label)
+        _required_text(normalized, "mimeType", label=label)
+        if content_type == "image" and normalized.get("uri") is not None and not isinstance(
+            normalized.get("uri"), str
+        ):
+            normalized.pop("uri", None)
+    elif content_type == "resource_link":
+        _required_text(normalized, "name", label=label)
+        _required_text(normalized, "uri", label=label)
+        for key in ("description", "mimeType", "title"):
+            if normalized.get(key) is not None and not isinstance(normalized.get(key), str):
+                normalized.pop(key, None)
+        size = normalized.get("size")
+        if size is not None and (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or not -(2**63) <= size <= 2**63 - 1
+        ):
+            normalized.pop("size", None)
+    else:
+        resource = normalized.get("resource")
+        if not isinstance(resource, Mapping):
+            raise AcpProjectionError(f"{label} resource must be an object")
+        resource_copy = _safe_deepcopy(dict(resource), label=f"{label} resource")
+        _salvage_meta(resource_copy)
+        _required_text(resource_copy, "uri", label=f"{label} resource")
+        has_text = "text" in resource_copy
+        has_blob = "blob" in resource_copy
+        if has_text == has_blob:
+            raise AcpProjectionError(
+                f"{label} resource must contain exactly one of text or blob"
+            )
+        _required_text(
+            resource_copy,
+            "text" if has_text else "blob",
+            label=f"{label} resource",
+        )
+        if resource_copy.get("mimeType") is not None and not isinstance(
+            resource_copy.get("mimeType"), str
+        ):
+            resource_copy.pop("mimeType", None)
+        normalized["resource"] = resource_copy
+    return normalized
+
+
 def _permission_options(options: list[Any]) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     seen: set[str] = set()
     for option in options:
         if not isinstance(option, Mapping):
             raise AcpProjectionError("ACP permission request option must be an object")
-        option_id = _required_string(option, "optionId")
-        _required_string(option, "name")
-        kind = _required_string(option, "kind")
+        option_copy = _safe_deepcopy(dict(option), label="ACP permission option")
+        _salvage_meta(option_copy)
+        option_id = _required_string(option_copy, "optionId")
+        _required_string(option_copy, "name")
+        kind = _required_string(option_copy, "kind")
         if kind not in _PERMISSION_KINDS:
             raise AcpProjectionError("ACP permission option has invalid kind")
-        _extension_metadata(option)
         if option_id in seen:
             raise AcpProjectionError("ACP permission option IDs must be unique")
         seen.add(option_id)
-        normalized.append(deepcopy(dict(option)))
+        normalized.append(option_copy)
     return normalized
 
 
-def _validate_supported_update(update_name: str, update: Mapping[str, Any]) -> None:
-    _extension_metadata(update)
-    if update_name in {
-        "user_message_chunk",
-        "agent_message_chunk",
-        "agent_thought_chunk",
-    }:
-        content = update.get("content")
-        if not isinstance(content, Mapping):
-            raise AcpProjectionError("ACP message update is missing object content")
-        _validate_content_block(content, label="ACP message content")
-        if "messageId" in update and update["messageId"] is not None:
-            _identifier(update["messageId"], "messageId")
-        return
-    if update_name == "tool_call":
-        _validate_tool_call(update)
-        return
-    if update_name == "tool_call_update":
-        _validate_tool_update(update)
-        return
-    if update_name == "plan":
-        entries = update.get("entries")
-        if not isinstance(entries, list):
-            raise AcpProjectionError("ACP plan update entries must be an array")
-        for entry in entries:
-            _normalized_plan_entry(entry)
-        return
-    if update_name == "usage_update":
-        _validate_usage(update)
-        return
-    if update_name == "session_info_update":
-        for key in ("title", "updatedAt"):
-            if key in update and update[key] is not None and not isinstance(update[key], str):
-                raise AcpProjectionError(f"ACP session info {key} must be text or null")
-
-
-def _validate_content_block(content: Mapping[str, Any], *, label: str) -> None:
-    content_type = content.get("type")
-    if content_type not in _CONTENT_TYPES:
-        raise AcpProjectionError(f"{label} has unsupported type")
-    _extension_metadata(content)
-    if content_type == "text":
-        _required_text(content, "text", label=label)
-    elif content_type in {"image", "audio"}:
-        _required_text(content, "data", label=label)
-        _required_text(content, "mimeType", label=label)
-        if content_type == "image":
-            _optional_text(content, "uri", label=label)
-    elif content_type == "resource_link":
-        _required_text(content, "name", label=label)
-        _required_text(content, "uri", label=label)
-        for key in ("description", "mimeType", "title"):
-            _optional_text(content, key, label=label)
-        if "size" in content and content["size"] is not None:
-            size = content["size"]
-            if (
-                isinstance(size, bool)
-                or not isinstance(size, int)
-                or not -(2**63) <= size <= 2**63 - 1
-            ):
-                raise AcpProjectionError(f"{label} size must be an integer or null")
-    else:
-        resource = content.get("resource")
-        if not isinstance(resource, Mapping):
-            raise AcpProjectionError(f"{label} resource must be an object")
-        _extension_metadata(resource)
-        _required_text(resource, "uri", label=f"{label} resource")
-        has_text = "text" in resource
-        has_blob = "blob" in resource
-        if has_text == has_blob:
-            raise AcpProjectionError(
-                f"{label} resource must contain exactly one of text or blob"
-            )
-        _required_text(
-            resource,
-            "text" if has_text else "blob",
-            label=f"{label} resource",
-        )
-        _optional_text(resource, "mimeType", label=f"{label} resource")
-    annotations = content.get("annotations")
-    if annotations is not None and not isinstance(annotations, Mapping):
-        raise AcpProjectionError(f"{label} annotations must be an object or null")
-
-
-def _validate_tool_call(update: Mapping[str, Any]) -> None:
-    _required_string(update, "toolCallId")
-    if not isinstance(update.get("title"), str):
+def _normalized_tool_call(update: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = _safe_deepcopy(dict(update), label="ACP tool call")
+    _required_string(normalized, "toolCallId")
+    if not isinstance(normalized.get("title"), str):
         raise AcpProjectionError("ACP tool_call is missing string title")
-    _validate_tool_fields(update, creation=True)
+    _salvage_tool_fields(normalized, creation=True, label="ACP tool call")
+    return normalized
 
 
-def _validate_tool_update(
+def _normalized_tool_update(
     update: Mapping[str, Any], *, label: str = "ACP tool_call_update"
-) -> None:
-    _required_string(update, "toolCallId")
-    _validate_tool_fields(update, creation=False, label=label)
+) -> dict[str, Any]:
+    normalized = _safe_deepcopy(dict(update), label=label)
+    _required_string(normalized, "toolCallId")
+    _salvage_tool_fields(normalized, creation=False, label=label)
+    return normalized
 
 
-def _validate_tool_fields(
-    update: Mapping[str, Any],
-    *,
-    creation: bool,
-    label: str = "ACP tool call",
+def _salvage_tool_fields(
+    update: dict[str, Any], *, creation: bool, label: str
 ) -> None:
-    _extension_metadata(update)
+    _salvage_meta(update)
     kind = update.get("kind")
     if kind is not None and (not isinstance(kind, str) or kind not in _TOOL_KINDS):
-        raise AcpProjectionError(f"{label} has invalid kind")
+        update.pop("kind", None)
     status = update.get("status")
     if status is not None and (
         not isinstance(status, str) or status not in _TOOL_STATUSES
     ):
-        raise AcpProjectionError(f"{label} has invalid status")
-    if "title" in update and not creation:
-        title = update["title"]
-        if title is not None and not isinstance(title, str):
-            raise AcpProjectionError(f"{label} title must be text or null")
-    for key in ("content", "locations"):
+        update.pop("status", None)
+    if not creation and update.get("title") is not None and not isinstance(
+        update.get("title"), str
+    ):
+        update.pop("title", None)
+    for key, normalizer in (
+        ("content", _normalized_tool_content),
+        ("locations", _normalized_tool_location),
+    ):
         value = update.get(key)
-        if value is not None and not isinstance(value, list):
-            raise AcpProjectionError(f"{label} {key} must be an array or null")
-    if isinstance(update.get("content"), list):
-        for item in update["content"]:
-            _validate_tool_content(item)
-    if isinstance(update.get("locations"), list):
-        for location in update["locations"]:
-            _validate_tool_location(location)
+        if not isinstance(value, list):
+            if value is not None:
+                update.pop(key, None)
+            continue
+        accepted: list[dict[str, Any]] = []
+        for item in value:
+            try:
+                accepted.append(normalizer(item))
+            except AcpProjectionError:
+                continue
+        update[key] = accepted
 
 
-def _validate_tool_content(value: Any) -> None:
+def _normalized_tool_content(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise AcpProjectionError("ACP tool content item must be an object")
-    _extension_metadata(value)
-    item_type = value.get("type")
+    normalized = _safe_deepcopy(dict(value), label="ACP tool content item")
+    _salvage_meta(normalized)
+    item_type = normalized.get("type")
     if item_type == "content":
-        content = value.get("content")
+        content = normalized.get("content")
         if not isinstance(content, Mapping):
             raise AcpProjectionError("ACP tool content is missing content block")
-        _validate_content_block(content, label="ACP tool content block")
+        normalized["content"] = _normalized_content_block(
+            content, label="ACP tool content block"
+        )
     elif item_type == "diff":
-        path = _required_text(value, "path", label="ACP tool diff")
+        path = _required_text(normalized, "path", label="ACP tool diff")
         if not os.path.isabs(path):
             raise AcpProjectionError("ACP tool diff path must be absolute")
-        _required_text(value, "newText", label="ACP tool diff")
-        _optional_text(value, "oldText", label="ACP tool diff")
+        _required_text(normalized, "newText", label="ACP tool diff")
+        if normalized.get("oldText") is not None and not isinstance(
+            normalized.get("oldText"), str
+        ):
+            normalized.pop("oldText", None)
     elif item_type == "terminal":
-        _required_string(value, "terminalId")
+        _required_string(normalized, "terminalId")
     else:
         raise AcpProjectionError("ACP tool content item has unsupported type")
+    return normalized
 
 
-def _validate_tool_location(value: Any) -> None:
+def _normalized_tool_location(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise AcpProjectionError("ACP tool location must be an object")
-    _extension_metadata(value)
-    path = _required_text(value, "path", label="ACP tool location")
+    normalized = _safe_deepcopy(dict(value), label="ACP tool location")
+    _salvage_meta(normalized)
+    path = _required_text(normalized, "path", label="ACP tool location")
     if not os.path.isabs(path):
         raise AcpProjectionError("ACP tool location path must be absolute")
-    line = value.get("line")
+    line = normalized.get("line")
     if line is not None and (
-        isinstance(line, bool) or not isinstance(line, int) or not 0 <= line <= 2**32 - 1
+        isinstance(line, bool)
+        or not isinstance(line, int)
+        or not 0 <= line <= 2**32 - 1
     ):
-        raise AcpProjectionError("ACP tool location line must be a u32 or null")
+        normalized.pop("line", None)
+    return normalized
 
 
 def _normalized_plan_entry(value: Any) -> dict[str, Any]:
@@ -991,21 +1101,26 @@ def _validate_usage(update: Mapping[str, Any]) -> None:
             or not 0 <= value <= 2**64 - 1
         ):
             raise AcpProjectionError(f"ACP usage {key} must be a u64")
-    cost = update.get("cost")
-    if cost is None:
-        return
+
+
+def _validate_cost(cost: Any) -> None:
     if not isinstance(cost, Mapping):
         raise AcpProjectionError("ACP usage cost must be an object or null")
     amount = cost.get("amount")
-    if (
-        isinstance(amount, bool)
-        or not isinstance(amount, (int, float))
-        or not math.isfinite(float(amount))
-    ):
+    if not _is_finite_number(amount):
         raise AcpProjectionError("ACP usage cost amount must be a finite number")
     if not isinstance(cost.get("currency"), str):
         raise AcpProjectionError("ACP usage cost currency must be text")
     _extension_metadata(cost)
+
+
+def _is_finite_number(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (ValueError, OverflowError):
+        return False
 
 
 def _required_text(value: Mapping[str, Any], key: str, *, label: str) -> str:
@@ -1015,12 +1130,10 @@ def _required_text(value: Mapping[str, Any], key: str, *, label: str) -> str:
     return item
 
 
-def _optional_text(value: Mapping[str, Any], key: str, *, label: str) -> None:
-    if key in value and value[key] is not None and not isinstance(value[key], str):
-        raise AcpProjectionError(f"{label} {key} must be text or null")
-
-
-def _bounded_json(value: Any, *, label: str, max_bytes: int) -> bytes:
+def _bounded_json(
+    value: Any, *, label: str, max_bytes: int, max_depth: int
+) -> bytes:
+    _validate_json_depth(value, label=label, max_depth=max_depth)
     try:
         encoded = json.dumps(
             value,
@@ -1034,6 +1147,30 @@ def _bounded_json(value: Any, *, label: str, max_bytes: int) -> bytes:
     if len(encoded) > max_bytes:
         raise AcpProjectionError(f"{label} exceeds the size limit")
     return encoded
+
+
+def _validate_json_depth(value: Any, *, label: str, max_depth: int) -> None:
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    visited: set[int] = set()
+    while stack:
+        item, depth = stack.pop()
+        if depth > max_depth:
+            raise AcpProjectionError(f"{label} exceeds the nesting limit")
+        if not isinstance(item, (Mapping, list, tuple)):
+            continue
+        identity = id(item)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        children = item.values() if isinstance(item, Mapping) else item
+        stack.extend((child, depth + 1) for child in children)
+
+
+def _safe_deepcopy(value: Any, *, label: str) -> Any:
+    try:
+        return deepcopy(value)
+    except (TypeError, ValueError, RecursionError, OverflowError) as exc:
+        raise AcpProjectionError(f"{label} could not be copied safely") from exc
 
 
 def _json_size(value: Any) -> int:

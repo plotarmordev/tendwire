@@ -97,6 +97,41 @@ def test_non_text_content_is_preserved_without_becoming_turn_text() -> None:
     assert projector.project_turn_content("session-1")["assistant_stream_text"] == ""
 
 
+def test_assistant_only_text_stays_in_private_event_but_not_legacy_turn() -> None:
+    projector = AcpEventProjector()
+    private = projector.normalize_session_update(
+        _update(
+            "agent_message_chunk",
+            messageId="private-1",
+            content={
+                "type": "text",
+                "text": "assistant-only context",
+                "annotations": {"audience": ["assistant"]},
+            },
+        )
+    )
+    public = projector.normalize_session_update(
+        _update(
+            "agent_message_chunk",
+            messageId="public-1",
+            content={
+                "type": "text",
+                "text": "safe answer",
+                "annotations": {"audience": ["user", "invalid-role"]},
+            },
+        )
+    )
+
+    assert private is not None
+    assert private["payload"]["content"]["text"] == "assistant-only context"
+    assert private["payload"]["assembled_text"] == ""
+    assert public is not None
+    assert public["payload"]["content"]["annotations"]["audience"] == ["user"]
+    assert projector.project_turn_content("session-1")["assistant_stream_text"] == (
+        "safe answer"
+    )
+
+
 def test_user_and_agent_text_remain_separate_and_reset_starts_new_turn() -> None:
     projector = AcpEventProjector()
     projector.normalize_session_update(
@@ -302,22 +337,8 @@ def test_official_v1_tool_shapes_are_validated_and_preserved() -> None:
         (_update("agent_message_chunk", content={"type": "text"}), "string text"),
         (_update("agent_message_chunk", content={"type": "future"}), "unsupported type"),
         (_update("tool_call", toolCallId="tool-1"), "string title"),
-        (
-            _update(
-                "tool_call",
-                toolCallId="tool-1",
-                title="Bad status",
-                status="cancelled",
-            ),
-            "invalid status",
-        ),
-        (
-            _update("plan", entries=[{"content": "missing fields"}]),
-            "invalid priority",
-        ),
         (_update("usage_update", used=1), "usage size"),
         (_update("usage_update", used=True, size=10), "usage used"),
-        (_update("session_info_update", title=7), "title must be text"),
     ],
 )
 def test_malformed_supported_v1_updates_fail_without_allocating_state(
@@ -349,6 +370,56 @@ def test_usage_update_is_a_complete_snapshot_and_omission_clears_cost() -> None:
         "used": 7,
         "size": 100,
     }
+
+
+def test_optional_fields_default_and_invalid_collection_items_are_skipped() -> None:
+    projector = AcpEventProjector()
+    tool = projector.normalize_session_update(
+        _update(
+            "tool_call",
+            toolCallId="tool-1",
+            title="Forward compatible",
+            kind="future_kind",
+            status="cancelled",
+            content=[
+                {"type": "future"},
+                {"type": "content", "content": {"type": "text", "text": "ok"}},
+            ],
+            locations=[{"path": "/valid"}, {"path": 7}],
+            _meta="invalid optional metadata",
+        )
+    )
+    plan = projector.normalize_session_update(
+        _update(
+            "plan",
+            entries=[
+                {"content": "keep", "priority": "high", "status": "pending"},
+                {"content": "skip", "priority": "future", "status": "pending"},
+            ],
+        )
+    )
+    info = projector.normalize_session_update(
+        _update("session_info_update", title=7, updatedAt="valid")
+    )
+    usage = projector.normalize_session_update(
+        _update(
+            "usage_update",
+            used=1,
+            size=2,
+            cost={"amount": 10**400, "currency": "USD"},
+        )
+    )
+
+    assert tool is not None
+    assert tool["payload"]["snapshot"]["kind"] == "other"
+    assert tool["payload"]["snapshot"]["status"] == "pending"
+    assert len(tool["payload"]["snapshot"]["content"]) == 1
+    assert tool["payload"]["snapshot"]["locations"] == [{"path": "/valid"}]
+    assert plan is not None and plan["payload"]["entries"] == [
+        {"content": "keep", "priority": "high", "status": "pending"}
+    ]
+    assert info is not None and info["payload"] == {"updatedAt": "valid"}
+    assert usage is not None and usage["payload"] == {"used": 1, "size": 2}
 
 
 def test_implicit_v1_message_is_split_after_an_update_type_boundary() -> None:
@@ -622,11 +693,11 @@ def test_plan_is_a_validated_full_replacement() -> None:
     assert replacement["payload"]["entries"] == [
         {"content": "new", "priority": "high", "status": "completed"}
     ]
+    defaulted = projector.normalize_session_update(_update("plan", entries="bad"))
+    assert defaulted is not None and defaulted["payload"]["entries"] == []
     with pytest.raises(AcpProjectionError, match="entries must be an array"):
-        projector.normalize_session_update(_update("plan", entries="bad"))
-    assert projector.session_snapshot("session-1")["plan"] == [
-        {"content": "new", "priority": "high", "status": "completed"}
-    ]
+        projector.normalize_session_update(_update("plan"))
+    assert projector.session_snapshot("session-1")["plan"] == []
 
 
 def test_completion_is_not_reopened_by_session_updates_and_requires_reset() -> None:
@@ -717,6 +788,39 @@ def test_failed_or_oversized_input_does_not_allocate_or_mutate_session() -> None
         }
     )
     assert accepted is not None and accepted["sequence"] == 1
+
+
+def test_deep_json_is_rejected_as_a_projection_error_before_copying() -> None:
+    nested: object = "leaf"
+    for _ in range(130):
+        nested = {"next": nested}
+    projector = AcpEventProjector(max_json_depth=64)
+
+    with pytest.raises(AcpProjectionError, match="nesting limit"):
+        projector.normalize_session_update(
+            _update(
+                "agent_message_chunk",
+                content={
+                    "type": "text",
+                    "text": "safe",
+                    "_meta": {"nested": nested},
+                },
+            )
+        )
+    assert projector.session_snapshot("session-1") is None
+
+
+def test_replay_index_bytes_count_toward_retained_state_limit() -> None:
+    projector = AcpEventProjector(
+        max_session_state_bytes=100,
+        max_total_state_bytes=100,
+    )
+    with pytest.raises(AcpProjectionError, match="retained session state"):
+        projector.normalize_session_update(
+            _update("session_info_update"),
+            source_event_id="x" * 50,
+        )
+    assert projector.session_snapshot("session-1") is None
 
 
 def test_aggregate_retained_session_state_has_a_hard_budget() -> None:
