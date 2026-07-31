@@ -41,15 +41,22 @@ class FakeClient:
         self.permission_responses: list[tuple[object, str | None, bool]] = []
         self.prompt_result: object = PromptResult(StopReason.END_TURN, {})
         self.prompt_failure: BaseException | None = None
+        self.initialize_failure: BaseException | None = None
+        self.new_session_result: SessionResult | None = None
         self.closed = False
+        self.close_calls = 0
 
     def initialize(self, **kwargs: Any) -> object:
         self.calls.append(("initialize", (), kwargs))
+        if self.initialize_failure is not None:
+            raise self.initialize_failure
         return object()
 
     def new_session(self, cwd: Path, **kwargs: Any) -> SessionResult:
         self.calls.append(("new", (cwd,), kwargs))
-        return SessionResult("session-private", None, (), {})
+        return self.new_session_result or SessionResult(
+            "session-private", None, (), {}
+        )
 
     def load_session(
         self, session_id: str, cwd: Path, **kwargs: Any
@@ -102,6 +109,7 @@ class FakeClient:
         self.permission_responses.append((request_id, option_id, cancelled))
 
     def close(self) -> None:
+        self.close_calls += 1
         self.closed = True
         self.updates.put(_END)
         self.permissions.put(_END)
@@ -115,6 +123,7 @@ class FakeIngestor:
         self.permissions: list[tuple[object, str | None]] = []
         self.completions = 0
         self.update_failure: BaseException | None = None
+        self.permission_failure: BaseException | None = None
 
     def start_turn(self, *, producer_turn_id: str | None = None) -> str:
         self.started.append(producer_turn_id)
@@ -128,13 +137,15 @@ class FakeIngestor:
     def ingest_permission_request(
         self, raw: object, *, source_event_id: str | None = None
     ) -> None:
+        if self.permission_failure is not None:
+            raise self.permission_failure
         self.permissions.append((raw, source_event_id))
 
     def mark_prompt_complete(self) -> None:
         self.completions += 1
 
 
-def binding() -> WorkerBinding:
+def binding(session_id: str = "session-private") -> WorkerBinding:
     return WorkerBinding(
         host_id="host-a",
         worker_id="worker-public",
@@ -143,7 +154,7 @@ def binding() -> WorkerBinding:
         target_kind="pane_id",
         target_value="pane-private-secret",
         turn_target_kind="acp_session_id",
-        turn_target_value="session-private",
+        turn_target_value=session_id,
         private_fingerprint="binding-private-secret",
     )
 
@@ -270,7 +281,7 @@ def test_load_and_resume_use_requested_session(
     service = AcpRuntime(
         client,  # type: ignore[arg-type]
         config=Config(host_id="host-a", db_path=tmp_path / "events.db"),
-        binding=binding(),
+        binding=binding("existing-private"),
         cwd=tmp_path,
         session_mode=mode,
         session_id="existing-private",
@@ -283,6 +294,35 @@ def test_load_and_resume_use_requested_session(
         assert client.calls[1][1][0] == "existing-private"
     finally:
         service.stop()
+
+
+def test_start_rejects_unbound_session_and_closes_adapter(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.new_session_result = SessionResult("other-private", None, (), {})
+    service = runtime(tmp_path, client)
+
+    with pytest.raises(AcpRuntimeProtocolError, match="bound session"):
+        service.start()
+
+    assert client.closed
+    assert client.close_calls == 1
+    assert service.join(timeout=0.1)
+    assert service.status().state is RuntimeState.FAILED
+
+
+def test_initialize_failure_is_cleaned_up_without_caller_stop(tmp_path: Path) -> None:
+    client = FakeClient()
+    failure = OSError("initialize failed")
+    client.initialize_failure = failure
+    service = runtime(tmp_path, client)
+
+    with pytest.raises(OSError) as raised:
+        service.start()
+
+    assert raised.value is failure
+    assert client.closed
+    assert client.close_calls == 1
+    assert service.status().failure_type == "OSError"
 
 
 def test_background_consumers_ingest_losslessly_and_permissions_fail_closed(
@@ -298,7 +338,10 @@ def test_background_consumers_ingest_losslessly_and_permissions_fail_closed(
         wait_until(lambda: service.status().updates_ingested == 1)
 
         assert len(ingestor.updates) == 1
-        assert ingestor.permissions[0][1] == "permission:7"
+        permission_event_id = ingestor.permissions[0][1]
+        assert permission_event_id is not None
+        assert permission_event_id.startswith("permission:")
+        assert permission_event_id != "permission:7"
         assert client.permission_responses == [(7, None, True)]
         assert service.status().permissions_cancelled == 1
     finally:
@@ -349,6 +392,46 @@ def test_callback_failure_cancels_permission_before_propagating(tmp_path: Path) 
     assert raised.value is callback_failure
 
 
+def test_permission_ingestion_failure_cancels_before_runtime_fails(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    ingestor = FakeIngestor()
+    failure = OSError("journal unavailable")
+    ingestor.permission_failure = failure
+    service = runtime(tmp_path, client, ingestor).start()
+    client.permissions.put(permission())
+    wait_until(lambda: service.status().state is RuntimeState.FAILED)
+
+    assert client.permission_responses == [(7, None, True)]
+    assert service.status().permissions_cancelled == 1
+    assert service.status().permissions_ingested == 0
+    with pytest.raises(OSError) as raised:
+        service.stop()
+    assert raised.value is failure
+
+
+def test_permission_source_identity_distinguishes_jsonrpc_id_types(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    ingestor = FakeIngestor()
+    service = runtime(tmp_path, client, ingestor).start()
+    try:
+        client.permissions.put(permission(1))
+        client.permissions.put(permission("1"))
+        wait_until(lambda: service.status().permissions_ingested == 2)
+
+        source_ids = [source_id for _raw, source_id in ingestor.permissions]
+        assert len(set(source_ids)) == 2
+        assert all(
+            source_id is not None and source_id.startswith("permission:")
+            for source_id in source_ids
+        )
+    finally:
+        service.stop()
+
+
 def test_prompt_finalizes_only_after_valid_response_and_update_drain(
     tmp_path: Path,
 ) -> None:
@@ -368,6 +451,118 @@ def test_prompt_finalizes_only_after_valid_response_and_update_drain(
         assert status.prompts_completed == 1
         assert status.prompts_failed == 0
     finally:
+        service.stop()
+
+
+def test_prompt_finality_waits_for_permission_resolution(tmp_path: Path) -> None:
+    client = FakeClient()
+    ingestor = FakeIngestor()
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+
+    def decide(_request: PermissionRequest) -> str:
+        callback_entered.set()
+        assert release_callback.wait(timeout=1)
+        return "allow-once"
+
+    service = runtime(
+        tmp_path,
+        client,
+        ingestor,
+        permission_callback=decide,
+    ).start()
+    result: list[PromptResult] = []
+    failure: list[BaseException] = []
+
+    def run_prompt() -> None:
+        try:
+            result.append(service.prompt("question", drain_timeout=0.5))
+        except BaseException as exc:
+            failure.append(exc)
+
+    try:
+        client.permissions.put(permission())
+        assert callback_entered.wait(timeout=1)
+        prompt_thread = threading.Thread(target=run_prompt)
+        prompt_thread.start()
+        time.sleep(0.04)
+        assert prompt_thread.is_alive()
+        assert ingestor.completions == 0
+
+        release_callback.set()
+        prompt_thread.join(timeout=1)
+        assert not prompt_thread.is_alive()
+        assert failure == []
+        assert len(result) == 1
+        assert ingestor.completions == 1
+        assert client.permission_responses == [(7, "allow-once", False)]
+    finally:
+        release_callback.set()
+        service.stop()
+
+
+def test_cross_kind_ingestion_cannot_overtake_an_active_update(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    update_entered = threading.Event()
+    release_update = threading.Event()
+    order: list[str] = []
+
+    class OrderedIngestor(FakeIngestor):
+        def ingest_update(self, raw: object) -> None:
+            order.append("update-start")
+            update_entered.set()
+            assert release_update.wait(timeout=1)
+            super().ingest_update(raw)
+            order.append("update-end")
+
+        def ingest_permission_request(
+            self, raw: object, *, source_event_id: str | None = None
+        ) -> None:
+            order.append("permission")
+            super().ingest_permission_request(
+                raw,
+                source_event_id=source_event_id,
+            )
+
+    service = runtime(tmp_path, client, OrderedIngestor()).start()
+    try:
+        client.updates.put(update())
+        assert update_entered.wait(timeout=1)
+        client.permissions.put(permission())
+        time.sleep(0.04)
+        assert order == ["update-start"]
+
+        release_update.set()
+        wait_until(lambda: service.status().permissions_ingested == 1)
+        assert order == ["update-start", "update-end", "permission"]
+    finally:
+        release_update.set()
+        service.stop()
+
+
+def test_prompt_transport_failure_cancels_and_makes_runtime_terminal(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    failure = AcpRequestTimeoutError("prompt timed out")
+    client.prompt_failure = failure
+    ingestor = FakeIngestor()
+    service = runtime(tmp_path, client, ingestor).start()
+
+    with pytest.raises(AcpRequestTimeoutError) as raised:
+        service.prompt("question")
+
+    assert raised.value is failure
+    assert ingestor.started == [None]
+    assert ingestor.completions == 0
+    assert ("cancel", ("session-private",), {}) in client.calls
+    assert service.status().cancellation_requests == 1
+    assert service.status().state is RuntimeState.FAILED
+    with pytest.raises(AcpRequestTimeoutError):
+        service.prompt("unsafe retry")
+    with pytest.raises(AcpRequestTimeoutError):
         service.stop()
 
 
@@ -425,6 +620,29 @@ def test_cancel_targets_bound_session_and_stop_joins_consumers(tmp_path: Path) -
     assert service.status().state is RuntimeState.STOPPED
 
 
+def test_concurrent_stop_closes_adapter_exactly_once(tmp_path: Path) -> None:
+    client = FakeClient()
+    service = runtime(tmp_path, client).start()
+    failures: list[BaseException] = []
+
+    def stop() -> None:
+        try:
+            service.stop()
+        except BaseException as exc:
+            failures.append(exc)
+
+    callers = [threading.Thread(target=stop) for _ in range(2)]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(timeout=1)
+
+    assert failures == []
+    assert all(not caller.is_alive() for caller in callers)
+    assert client.close_calls == 1
+    assert service.status().state is RuntimeState.STOPPED
+
+
 def test_stop_deadline_is_bounded_even_when_client_close_hangs(tmp_path: Path) -> None:
     client = FakeClient()
     release_close = threading.Event()
@@ -441,3 +659,43 @@ def test_stop_deadline_is_bounded_even_when_client_close_hangs(tmp_path: Path) -
         assert time.monotonic() - started < 0.25
     finally:
         release_close.set()
+
+
+def test_concurrent_stop_wait_for_lifecycle_is_also_deadline_bounded(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    close_entered = threading.Event()
+    release_close = threading.Event()
+    original_close = client.close
+
+    def hanging_close() -> None:
+        close_entered.set()
+        release_close.wait(timeout=1)
+        original_close()
+
+    client.close = hanging_close  # type: ignore[method-assign]
+    service = runtime(tmp_path, client).start()
+    first_failures: list[BaseException] = []
+
+    def first_stop() -> None:
+        try:
+            service.stop(timeout=0.2)
+        except BaseException as exc:
+            first_failures.append(exc)
+
+    caller = threading.Thread(target=first_stop)
+    caller.start()
+    assert close_entered.wait(timeout=1)
+    started = time.monotonic()
+    try:
+        with pytest.raises(AcpRuntimeStopTimeout, match="lifecycle"):
+            service.stop(timeout=0.03)
+        assert time.monotonic() - started < 0.15
+    finally:
+        release_close.set()
+        caller.join(timeout=1)
+
+    assert len(first_failures) == 1
+    assert isinstance(first_failures[0], AcpRuntimeStopTimeout)
+    assert client.close_calls == 1

@@ -15,13 +15,18 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from ..config import Config
-from ..core.models import WorkerBinding
-from .acp_client import AcpClient
+from ..core.models import WorkerBinding, stable_fingerprint
 from .acp_ingestion import AcpSessionIngestor
-from .acp_protocol import PermissionRequest, PromptResult, SessionResult
+from .acp_protocol import (
+    PermissionRequest,
+    PromptResult,
+    RequestId,
+    SessionResult,
+    SessionUpdate,
+)
 
 
 class AcpRuntimeError(RuntimeError):
@@ -81,6 +86,66 @@ PermissionCallback = Callable[[PermissionRequest], str | None]
 IngestorFactory = Callable[..., AcpSessionIngestor]
 
 
+class AcpRuntimeClient(Protocol):
+    """Adapter-neutral client surface required by :class:`AcpRuntime`."""
+
+    def initialize(
+        self,
+        *,
+        client_capabilities: Mapping[str, Any] | None = None,
+    ) -> object: ...
+
+    def new_session(
+        self,
+        cwd: Path,
+        *,
+        mcp_servers: Sequence[Mapping[str, Any]] = (),
+        additional_directories: Sequence[Path] = (),
+    ) -> SessionResult: ...
+
+    def load_session(
+        self,
+        session_id: str,
+        cwd: Path,
+        *,
+        mcp_servers: Sequence[Mapping[str, Any]] = (),
+        additional_directories: Sequence[Path] = (),
+    ) -> SessionResult: ...
+
+    def resume_session(
+        self,
+        session_id: str,
+        cwd: Path,
+        *,
+        mcp_servers: Sequence[Mapping[str, Any]] = (),
+        additional_directories: Sequence[Path] = (),
+    ) -> SessionResult: ...
+
+    def prompt(
+        self,
+        session_id: str,
+        prompt: str | Sequence[Mapping[str, Any]],
+        *,
+        timeout: float | None = None,
+    ) -> PromptResult: ...
+
+    def cancel(self, session_id: str) -> None: ...
+
+    def next_update(self, *, timeout: float) -> SessionUpdate: ...
+
+    def next_permission_request(self, *, timeout: float) -> PermissionRequest: ...
+
+    def respond_permission(
+        self,
+        request_id: RequestId,
+        *,
+        option_id: str | None = None,
+        cancelled: bool = False,
+    ) -> None: ...
+
+    def close(self) -> None: ...
+
+
 class AcpRuntime:
     """Run and durably ingest exactly one ACP session for one worker binding.
 
@@ -91,7 +156,7 @@ class AcpRuntime:
 
     def __init__(
         self,
-        client: AcpClient,
+        client: AcpRuntimeClient,
         *,
         config: Config,
         binding: WorkerBinding,
@@ -120,6 +185,13 @@ class AcpRuntime:
             raise ValueError("ACP runtime binding host does not match configuration")
         if not binding.private_fingerprint:
             raise ValueError("ACP runtime requires an authenticated private binding")
+        if binding.turn_target_kind != "acp_session_id":
+            raise ValueError("ACP runtime requires an ACP session worker binding")
+        if (
+            mode is not SessionOpenMode.NEW
+            and binding.turn_target_value != session_id
+        ):
+            raise ValueError("ACP runtime session does not match the worker binding")
         resolved_cwd = Path(cwd)
         if not resolved_cwd.is_absolute():
             raise ValueError("ACP runtime cwd must be absolute")
@@ -147,12 +219,16 @@ class AcpRuntime:
         self._ingestor: AcpSessionIngestor | None = None
         self._failure: BaseException | None = None
         self._state_lock = threading.RLock()
+        self._lifecycle_lock = threading.Lock()
         self._ingest_lock = threading.Lock()
         self._prompt_lock = threading.Lock()
         self._idle_condition = threading.Condition(self._state_lock)
         self._stop_event = threading.Event()
         self._threads: tuple[threading.Thread, ...] = ()
         self._update_idle_epoch = 0
+        self._permission_idle_epoch = 0
+        self._close_thread: threading.Thread | None = None
+        self._close_failures: list[BaseException] = []
 
         self._updates_ingested = 0
         self._permissions_ingested = 0
@@ -177,43 +253,61 @@ class AcpRuntime:
     def start(self) -> "AcpRuntime":
         """Initialize capabilities, open one session, and start consumers."""
 
-        with self._state_lock:
-            if self._state is RuntimeState.RUNNING:
-                return self
-            if self._state is not RuntimeState.NEW:
-                raise AcpRuntimeStateError(
-                    f"cannot start ACP runtime in state {self._state.value}"
-                )
-            self._state = RuntimeState.STARTING
-        try:
-            self._client.initialize(client_capabilities=self._client_capabilities)
-            session = self._open_session()
-            if not isinstance(session, SessionResult) or not session.session_id:
-                raise AcpRuntimeProtocolError(
-                    "ACP session setup returned an invalid response"
-                )
-            self._session_id = session.session_id
-            self._ingestor = self._make_ingestor(session.session_id)
-            threads = (
-                threading.Thread(
-                    target=self._consume_updates,
-                    name="tendwire-acp-updates",
-                    daemon=True,
-                ),
-                threading.Thread(
-                    target=self._consume_permissions,
-                    name="tendwire-acp-permissions",
-                    daemon=True,
-                ),
-            )
-            self._threads = threads
+        with self._lifecycle_lock:
             with self._state_lock:
-                self._state = RuntimeState.RUNNING
-            for thread in threads:
-                thread.start()
-        except BaseException as exc:
-            self._record_failure(exc)
-            raise
+                if self._state is RuntimeState.RUNNING:
+                    return self
+                if self._state is not RuntimeState.NEW:
+                    raise AcpRuntimeStateError(
+                        f"cannot start ACP runtime in state {self._state.value}"
+                    )
+                self._state = RuntimeState.STARTING
+            try:
+                self._client.initialize(client_capabilities=self._client_capabilities)
+                session = self._open_session()
+                if not isinstance(session, SessionResult) or not session.session_id:
+                    raise AcpRuntimeProtocolError(
+                        "ACP session setup returned an invalid response"
+                    )
+                if session.session_id != self._binding.turn_target_value:
+                    raise AcpRuntimeProtocolError(
+                        "ACP session setup did not return the bound session"
+                    )
+                if (
+                    self._requested_session_id is not None
+                    and session.session_id != self._requested_session_id
+                ):
+                    raise AcpRuntimeProtocolError(
+                        "ACP session setup returned an unexpected session"
+                    )
+                self._session_id = session.session_id
+                self._ingestor = self._make_ingestor(session.session_id)
+                threads = (
+                    threading.Thread(
+                        target=self._consume_updates,
+                        name="tendwire-acp-updates",
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=self._consume_permissions,
+                        name="tendwire-acp-permissions",
+                        daemon=True,
+                    ),
+                )
+                self._threads = threads
+                for thread in threads:
+                    thread.start()
+                with self._state_lock:
+                    if self._failure is not None:
+                        raise self._failure
+                    self._state = RuntimeState.RUNNING
+            except BaseException as exc:
+                self._record_failure(exc)
+                # ``__enter__`` is never completed when start fails, so no
+                # caller cleanup can be assumed. Bound shutdown prevents an
+                # initialized adapter or a partially started consumer leaking.
+                self._shutdown_transport(self._stop_timeout)
+                raise
         return self
 
     def prompt(
@@ -243,9 +337,18 @@ class AcpRuntime:
                 raise
             try:
                 result = self._client.prompt(session_id, prompt, timeout=timeout)
-            except BaseException:
+            except BaseException as exc:
                 with self._state_lock:
                     self._prompts_failed += 1
+                # Once a turn has been opened locally, a timed-out or failed
+                # prompt cannot be retried safely: late updates would otherwise
+                # be attributed to the next turn. Best-effort cancellation
+                # contains the remote work and the runtime becomes terminal.
+                try:
+                    self._cancel_session(session_id)
+                except BaseException:
+                    pass
+                self._record_failure(exc)
                 raise
             if not isinstance(result, PromptResult):
                 error = AcpRuntimeProtocolError(
@@ -278,9 +381,7 @@ class AcpRuntime:
 
         self.raise_if_failed()
         session_id, _ = self._running_components()
-        self._client.cancel(session_id)
-        with self._state_lock:
-            self._cancellation_requests += 1
+        self._cancel_session(session_id)
 
     def status(self) -> AcpRuntimeStatus:
         """Return redacted health and counters safe for a public status API."""
@@ -319,11 +420,13 @@ class AcpRuntime:
             raise ValueError("join timeout must be positive")
         deadline = time.monotonic() + wait_limit
         for thread in self._threads:
-            if thread is threading.current_thread():
+            if thread is threading.current_thread() or thread.ident is None:
                 continue
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         return all(
-            thread is threading.current_thread() or not thread.is_alive()
+            thread is threading.current_thread()
+            or thread.ident is None
+            or not thread.is_alive()
             for thread in self._threads
         )
 
@@ -333,52 +436,76 @@ class AcpRuntime:
         wait_limit = self._stop_timeout if timeout is None else float(timeout)
         if wait_limit <= 0:
             raise ValueError("stop timeout must be positive")
-        with self._state_lock:
-            if self._state is RuntimeState.STOPPED:
-                return
-            if self._state is RuntimeState.NEW:
-                self._state = RuntimeState.STOPPED
-                return
-            if self._state is not RuntimeState.FAILED:
-                self._state = RuntimeState.STOPPING
-        self._stop_event.set()
-        close_failures: list[BaseException] = []
-
-        def close_client() -> None:
-            try:
-                self._client.close()
-            except BaseException as exc:
-                close_failures.append(exc)
-
-        closer = threading.Thread(
-            target=close_client,
-            name="tendwire-acp-close",
-            daemon=True,
-        )
         deadline = time.monotonic() + wait_limit
-        closer.start()
-        closer.join(timeout=max(0.0, deadline - time.monotonic()))
-        remaining = max(0.0, deadline - time.monotonic())
-        joined = (
-            self.join(timeout=remaining)
-            if remaining > 0
-            else all(not thread.is_alive() for thread in self._threads)
-        )
-        if closer.is_alive() or not joined:
+        if not self._lifecycle_lock.acquire(timeout=wait_limit):
             error = AcpRuntimeStopTimeout(
-                "ACP runtime did not stop within the configured deadline"
+                "ACP runtime lifecycle did not stop within the configured deadline"
             )
             self._record_failure(error)
             raise error
-        if close_failures:
-            self._record_failure(close_failures[0])
-            raise close_failures[0]
-        with self._state_lock:
-            if self._failure is None:
-                self._state = RuntimeState.STOPPED
-            failure = self._failure
-        if failure is not None:
-            raise failure
+        try:
+            with self._idle_condition:
+                if self._state is RuntimeState.STOPPED:
+                    return
+                if self._state is RuntimeState.NEW:
+                    self._state = RuntimeState.STOPPED
+                    return
+                if self._state is not RuntimeState.FAILED:
+                    self._state = RuntimeState.STOPPING
+                self._stop_event.set()
+                self._idle_condition.notify_all()
+
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0 or not self._shutdown_transport(remaining):
+                error = AcpRuntimeStopTimeout(
+                    "ACP runtime did not stop within the configured deadline"
+                )
+                self._record_failure(error)
+                raise error
+
+            with self._state_lock:
+                failure = self._failure
+            if self._close_failures and failure is None:
+                failure = self._close_failures[0]
+                self._record_failure(failure)
+            with self._state_lock:
+                if failure is None:
+                    self._state = RuntimeState.STOPPED
+            if failure is not None:
+                raise failure
+        finally:
+            self._lifecycle_lock.release()
+
+    def _shutdown_transport(self, timeout: float) -> bool:
+        """Start adapter close at most once and join all supervised work."""
+
+        if self._close_thread is None:
+
+            def close_client() -> None:
+                try:
+                    self._client.close()
+                except BaseException as exc:
+                    self._close_failures.append(exc)
+
+            self._close_thread = threading.Thread(
+                target=close_client,
+                name="tendwire-acp-close",
+                daemon=True,
+            )
+            self._close_thread.start()
+
+        deadline = time.monotonic() + timeout
+        self._close_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        remaining = max(0.0, deadline - time.monotonic())
+        consumers_joined = (
+            self.join(timeout=remaining)
+            if remaining > 0
+            else all(
+                thread.ident is None or not thread.is_alive()
+                for thread in self._threads
+            )
+        )
+        return not self._close_thread.is_alive() and consumers_joined
 
     def _open_session(self) -> SessionResult:
         options = {
@@ -442,61 +569,92 @@ class AcpRuntime:
                         timeout=self._poll_timeout
                     )
                 except TimeoutError:
+                    with self._idle_condition:
+                        self._permission_idle_epoch += 1
+                        self._idle_condition.notify_all()
                     if self._stop_event.is_set():
                         return
                     continue
-                if request.session_id != self._session_id:
-                    raise AcpRuntimeProtocolError(
-                        "ACP permission belongs to a different session"
-                    )
-                ingestor = self._require_ingestor()
-                with self._ingest_lock:
-                    ingestor.ingest_permission_request(
-                        request.raw,
-                        source_event_id=f"permission:{request.request_id}",
-                    )
-                with self._state_lock:
-                    self._permissions_ingested += 1
-
-                selected: str | None = None
-                callback_failure: BaseException | None = None
-                if self._permission_callback is not None:
-                    try:
-                        candidate = self._permission_callback(request)
-                        if candidate is not None and candidate in {
-                            option.option_id for option in request.options
-                        }:
-                            selected = candidate
-                        elif candidate is not None:
-                            with self._state_lock:
-                                self._invalid_permission_selections += 1
-                    except BaseException as exc:
-                        callback_failure = exc
-                if selected is None:
-                    self._client.respond_permission(
-                        request.request_id,
-                        cancelled=True,
-                    )
-                    with self._state_lock:
-                        self._permissions_cancelled += 1
-                else:
-                    self._client.respond_permission(
-                        request.request_id,
-                        option_id=selected,
-                    )
-                    with self._state_lock:
-                        self._permissions_selected += 1
-                if callback_failure is not None:
-                    raise callback_failure
+                self._handle_permission(request)
         except BaseException as exc:
             if not self._stop_event.is_set():
                 self._record_failure(exc)
 
+    def _handle_permission(self, request: PermissionRequest) -> None:
+        """Journal then resolve one permission, failing closed before response."""
+
+        response_attempted = False
+        try:
+            if request.session_id != self._session_id:
+                raise AcpRuntimeProtocolError(
+                    "ACP permission belongs to a different session"
+                )
+            ingestor = self._require_ingestor()
+            with self._ingest_lock:
+                ingestor.ingest_permission_request(
+                    request.raw,
+                    source_event_id=_permission_source_event_id(request.request_id),
+                )
+            with self._state_lock:
+                self._permissions_ingested += 1
+
+            selected: str | None = None
+            callback_failure: BaseException | None = None
+            if self._permission_callback is not None:
+                try:
+                    candidate = self._permission_callback(request)
+                    if candidate is not None and candidate in {
+                        option.option_id for option in request.options
+                    }:
+                        selected = candidate
+                    elif candidate is not None:
+                        with self._state_lock:
+                            self._invalid_permission_selections += 1
+                except BaseException as exc:
+                    callback_failure = exc
+            response_attempted = True
+            if selected is None:
+                self._client.respond_permission(
+                    request.request_id,
+                    cancelled=True,
+                )
+                with self._state_lock:
+                    self._permissions_cancelled += 1
+            else:
+                self._client.respond_permission(
+                    request.request_id,
+                    option_id=selected,
+                )
+                with self._state_lock:
+                    self._permissions_selected += 1
+            if callback_failure is not None:
+                raise callback_failure
+        except BaseException:
+            if not response_attempted:
+                # No response bytes have been attempted yet, so cancellation
+                # is safe. Never retry after respond_permission itself fails:
+                # a partial JSON-RPC frame may already have reached the agent.
+                try:
+                    self._client.respond_permission(
+                        request.request_id,
+                        cancelled=True,
+                    )
+                except BaseException:
+                    pass
+                else:
+                    with self._state_lock:
+                        self._permissions_cancelled += 1
+            raise
+
     def _wait_for_post_response_idle(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         with self._idle_condition:
-            epoch = self._update_idle_epoch
-            while self._update_idle_epoch <= epoch:
+            update_epoch = self._update_idle_epoch
+            permission_epoch = self._permission_idle_epoch
+            while (
+                self._update_idle_epoch <= update_epoch
+                or self._permission_idle_epoch <= permission_epoch
+            ):
                 if self._failure is not None:
                     raise self._failure
                 if self._state is not RuntimeState.RUNNING:
@@ -528,6 +686,11 @@ class AcpRuntime:
             raise AcpRuntimeStateError("ACP runtime has no ingestor")
         return ingestor
 
+    def _cancel_session(self, session_id: str) -> None:
+        self._client.cancel(session_id)
+        with self._state_lock:
+            self._cancellation_requests += 1
+
     def _record_failure(self, failure: BaseException) -> None:
         with self._idle_condition:
             if self._failure is None:
@@ -537,8 +700,15 @@ class AcpRuntime:
             self._idle_condition.notify_all()
 
 
+def _permission_source_event_id(request_id: RequestId) -> str:
+    """Return a bounded opaque ID while preserving JSON-RPC ID types."""
+
+    return f"permission:{stable_fingerprint({'request_id': request_id})}"
+
+
 __all__ = [
     "AcpRuntime",
+    "AcpRuntimeClient",
     "AcpRuntimeError",
     "AcpRuntimeProtocolError",
     "AcpRuntimeStateError",
