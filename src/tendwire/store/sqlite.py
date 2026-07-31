@@ -500,6 +500,14 @@ class TurnRefreshApplyResult:
 
 
 @dataclass(frozen=True)
+class AppendProjectedAgentEventResult:
+    """One binding-fenced journal append and optional turn projection outcome."""
+
+    event: AppendBoundAgentEventResult
+    turn: TurnRefreshApplyResult | None = None
+
+
+@dataclass(frozen=True)
 class HerdrTurnWatermark:
     """Durable replay position and retained completeness-break evidence."""
 
@@ -23123,6 +23131,126 @@ def _begin_turn_refresh_transaction(
             message = str(exc).lower()
             if "locked" not in message and "busy" not in message:
                 raise
+
+
+def append_agent_event_and_apply_turn_for_binding(
+    db_path: Path | str,
+    host_id: str,
+    event: AgentEvent,
+    *,
+    expected_binding: WorkerBinding,
+    content: Mapping[str, Any] | None = None,
+    observed_at: str | None = None,
+    turn_model: str = DEFAULT_TURN_MODEL,
+    _fault_inject: Callable[[str], None] | None = None,
+) -> AppendProjectedAgentEventResult:
+    """Atomically journal an agent event and apply its text-only turn projection.
+
+    A replay still runs the idempotent projection merge. This lets a retry
+    repair a projection that was independently removed without duplicating the
+    journal event or its revision-keyed connector delivery. Retention
+    tombstones participate in the same replay contract as live event rows.
+    """
+
+    normalized_host = normalize_agent_event_identifier(
+        host_id, "host_id", required=True
+    )
+    _canonical_agent_event_for_append(event)
+    if not isinstance(expected_binding, WorkerBinding):
+        raise ValueError("expected_binding must be a WorkerBinding")
+    if content is not None:
+        if not isinstance(content, Mapping):
+            raise ValueError("content must be a mapping or None")
+        if not str(content.get("source_turn_id") or "").strip():
+            raise ValueError("projected agent content requires source_turn_id")
+    normalized_turn_model = str(turn_model or "").strip().lower()
+    if normalized_turn_model not in TURN_MODELS:
+        allowed = ", ".join(sorted(TURN_MODELS))
+        raise ValueError(f"turn_model must be one of: {allowed}")
+    if _fault_inject is not None and not callable(_fault_inject):
+        raise TypeError("_fault_inject must be callable or None")
+    current_time, _ = _pending_observed_time(observed_at or event.observed_at)
+    rearm_key: tuple[str, str] | None = None
+
+    def fault(boundary: str) -> None:
+        if _fault_inject is not None:
+            _fault_inject(boundary)
+
+    with _connect(db_path, prepare=True, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not _agent_event_binding_matches_conn(
+                conn,
+                normalized_host or "",
+                event.worker_id,
+                expected_binding,
+            ):
+                conn.rollback()
+                return AppendProjectedAgentEventResult(
+                    event=AppendBoundAgentEventResult(
+                        status="binding_changed",
+                        event_id=event.event_id,
+                    )
+                )
+            fault("after_binding_check")
+            appended = _append_agent_event_conn(
+                conn,
+                normalized_host or "",
+                event,
+            )
+            fault("after_event_append")
+            turn: TurnRefreshApplyResult | None = None
+            if content is not None:
+                worker_exists = conn.execute(
+                    "SELECT 1 FROM workers WHERE host_id = ? AND worker_id = ?",
+                    (normalized_host or "", event.worker_id),
+                ).fetchone()
+                if worker_exists is None:
+                    raise StoreSchemaError("agent_event_projection_worker_missing")
+                merge_result = _merge_turn_content_conn(
+                    conn,
+                    normalized_host or "",
+                    event.worker_id,
+                    content,
+                    observed_at=current_time,
+                    turn_model=normalized_turn_model,
+                )
+                rearm_key = (
+                    merge_result.submission_link_rearm
+                    or merge_result.submission_link
+                )
+                if merge_result.submission_link is not None:
+                    owner_key, fingerprint = merge_result.submission_link
+                    settle_submission_links_conn(
+                        conn,
+                        normalized_host or "",
+                        owner_key,
+                        fingerprint,
+                        now=current_time,
+                    )
+                turn = TurnRefreshApplyResult(merge_result.updated, False)
+            fault("after_turn_projection")
+            fault("before_commit")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    if rearm_key is not None:
+        _rearm_submission_link_component(
+            db_path,
+            normalized_host or "",
+            rearm_key[0],
+            rearm_key[1],
+        )
+    return AppendProjectedAgentEventResult(
+        event=AppendBoundAgentEventResult(
+            status="inserted" if appended.inserted else "replayed",
+            event_id=appended.event_id,
+            sequence=appended.sequence,
+        ),
+        turn=turn,
+    )
 
 
 def apply_turn_refresh(

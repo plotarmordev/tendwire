@@ -18,15 +18,14 @@ from ..core.agent_events import AgentEvent, agent_event
 from ..core.models import WorkerBinding, stable_fingerprint
 from ..store.sqlite import (
     AppendBoundAgentEventResult,
+    AppendProjectedAgentEventResult,
     TurnRefreshApplyResult,
-    append_agent_event_for_binding,
-    apply_turn_refresh,
+    append_agent_event_and_apply_turn_for_binding,
 )
 from .acp_projection import AcpEventProjector, AcpProjectionCheckpoint
 
 
-AppendEvent = Callable[..., AppendBoundAgentEventResult]
-ApplyTurn = Callable[..., TurnRefreshApplyResult]
+PersistEvent = Callable[..., AppendProjectedAgentEventResult]
 
 
 @dataclass(frozen=True)
@@ -56,8 +55,7 @@ class AcpSessionIngestor:
         stream_generation: str,
         binding: WorkerBinding,
         projector: AcpEventProjector | None = None,
-        append_event: AppendEvent = append_agent_event_for_binding,
-        apply_turn: ApplyTurn = apply_turn_refresh,
+        persist_event: PersistEvent = append_agent_event_and_apply_turn_for_binding,
     ) -> None:
         if config.db_path is None:
             raise ValueError("ACP ingestion requires a sqlite db path")
@@ -81,8 +79,7 @@ class AcpSessionIngestor:
         self.stream_generation = stream_generation.strip()
         self.binding = binding
         self.projector = projector or AcpEventProjector()
-        self._append_event = append_event
-        self._apply_turn = apply_turn
+        self._persist_event = persist_event
         self._turn_ordinal = 0
         self._source_turn_id: str | None = None
         self._turn_complete = False
@@ -211,23 +208,65 @@ class AcpSessionIngestor:
         )
 
     def mark_prompt_complete(self) -> AcpIngestionResult:
-        """Finalize the current text projection after ``session/prompt`` returns."""
+        """Durably finalize the current turn after ``session/prompt`` returns."""
 
         if self._source_turn_id is None:
             return AcpIngestionResult(None, ignored_reason="no_active_turn")
         if self._turn_complete:
             return AcpIngestionResult(None, ignored_reason="turn_already_complete")
-        content = self.projector.mark_turn_complete(self.session_id)
-        content["source_turn_id"] = self._source_turn_id
-        if self.config.agent_event_source == "acp_shadow":
-            self._turn_complete = True
-            return AcpIngestionResult("agent_message")
-        turn = self._project_turn(content)
+        checkpoint = self.projector.checkpoint_session(self.session_id)
+        prior_turn_state = self._turn_state()
+        try:
+            content = self.projector.mark_turn_complete(self.session_id)
+            content["source_turn_id"] = self._source_turn_id
+            marker = agent_event(
+                kind="extension",
+                source="acp",
+                worker_id=self.binding.worker_id,
+                payload={
+                    "schema_version": 1,
+                    "extension": "tendwire.acp.prompt_completion",
+                    "complete": True,
+                    "projection": content,
+                },
+                source_session_id=self.session_id,
+                source_turn_id=self._source_turn_id,
+                source_event_id=f"prompt-complete:{self._source_turn_id}",
+                visibility="private",
+            )
+            persisted = self._persist_event(
+                Path(self.config.db_path),
+                self.config.host_id,
+                marker,
+                expected_binding=self.binding,
+                content=(
+                    None
+                    if self.config.agent_event_source == "acp_shadow"
+                    else content
+                ),
+                observed_at=marker.observed_at,
+                turn_model=self.config.turn_model,
+            )
+        except BaseException:
+            self._restore_speculation(checkpoint, prior_turn_state)
+            raise
+        if persisted.event.status == "binding_changed":
+            self._restore_speculation(checkpoint, prior_turn_state)
+            return AcpIngestionResult(
+                "extension",
+                event=persisted.event,
+                ignored_reason="stale_binding",
+            )
         self._turn_complete = True
         return AcpIngestionResult(
-            "agent_message",
-            turn=turn,
-            ignored_reason="stale_binding" if turn.stale_binding else None,
+            "extension",
+            event=persisted.event,
+            turn=persisted.turn,
+            ignored_reason=(
+                "duplicate_event"
+                if persisted.event.status == "replayed"
+                else None
+            ),
         )
 
     def _accept(
@@ -269,28 +308,35 @@ class AcpSessionIngestor:
                 # connector views require a separate explicit sanitizing projection.
                 visibility="private",
             )
-            appended = self._append_event(
+            projection: Mapping[str, Any] | None = None
+            if (
+                kind in {"user_message", "agent_message"}
+                and self.config.agent_event_source != "acp_shadow"
+            ):
+                content = self.projector.project_turn_content(self.session_id)
+                if self._source_turn_id is not None:
+                    content["source_turn_id"] = self._source_turn_id
+                projection = content
+            persisted = self._persist_event(
                 Path(self.config.db_path),
                 self.config.host_id,
                 event,
                 expected_binding=self.binding,
+                content=projection,
+                observed_at=event.observed_at,
+                turn_model=self.config.turn_model,
             )
         except BaseException:
             self._restore_speculation(checkpoint, prior_turn_state)
             raise
-        if appended.status != "inserted":
+        appended = persisted.event
+        # A durable replay on a newly constructed ingestor is also the
+        # reconstruction path for its in-memory projector.  Keep that state so
+        # prompt completion can finalize the recovered text.  Only a stale
+        # binding invalidates the speculative normalization.
+        if appended.status == "binding_changed":
             self._restore_speculation(checkpoint, prior_turn_state)
-
-        turn: TurnRefreshApplyResult | None = None
-        if (
-            kind in {"user_message", "agent_message"}
-            and self.config.agent_event_source != "acp_shadow"
-            and appended.status == "inserted"
-        ):
-            content = self.projector.project_turn_content(self.session_id)
-            if self._source_turn_id is not None:
-                content["source_turn_id"] = self._source_turn_id
-            turn = self._project_turn(content)
+        turn = persisted.turn
         return AcpIngestionResult(
             kind,
             event=appended,
@@ -315,18 +361,6 @@ class AcpSessionIngestor:
     ) -> None:
         self.projector.restore_session(checkpoint)
         self._turn_ordinal, self._source_turn_id, self._turn_complete = prior_turn_state
-
-    def _project_turn(self, content: Mapping[str, Any]) -> TurnRefreshApplyResult:
-        return self._apply_turn(
-            Path(self.config.db_path),
-            self.config.host_id,
-            self.binding.worker_id,
-            content,
-            expected_binding=self.binding,
-            pending_stale_grace_seconds=self.config.pending_stale_grace_seconds,
-            turn_model=self.config.turn_model,
-        )
-
 
 def _source_message_id(kind: str, payload: Mapping[str, Any]) -> str | None:
     if kind not in {"user_message", "agent_message", "thought"}:

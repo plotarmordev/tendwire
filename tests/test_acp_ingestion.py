@@ -12,6 +12,7 @@ from tendwire.config import Config
 from tendwire.core.agent_events import AgentEvent, AppendBoundAgentEventResult
 from tendwire.core.models import WorkerBinding
 from tendwire.store.sqlite import (
+    AppendProjectedAgentEventResult,
     TurnRefreshApplyResult,
     list_agent_events,
     upsert_worker_bindings,
@@ -44,6 +45,37 @@ def _update(kind: str, **fields: object) -> dict[str, object]:
 
 def _appended(sequence: int, event: AgentEvent) -> AppendBoundAgentEventResult:
     return AppendBoundAgentEventResult("inserted", event.event_id, sequence)
+
+
+def _persist(
+    append,
+    apply=None,
+):
+    def persist(
+        path: Path | str,
+        host_id: str,
+        event: AgentEvent,
+        *,
+        expected_binding: WorkerBinding,
+        content=None,
+        **_kwargs,
+    ) -> AppendProjectedAgentEventResult:
+        appended = append(
+            path,
+            host_id,
+            event,
+            expected_binding=expected_binding,
+        )
+        turn = None
+        if content is not None and appended.status != "binding_changed":
+            turn = (
+                apply(path, host_id, event.worker_id, content)
+                if apply is not None
+                else TurnRefreshApplyResult(0, False)
+            )
+        return AppendProjectedAgentEventResult(appended, turn)
+
+    return persist
 
 
 def _config(db_path: Path, **kwargs: object) -> Config:
@@ -83,8 +115,7 @@ def test_messages_are_journaled_privately_and_projected_without_thoughts(
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
-        append_event=append,
-        apply_turn=apply,
+        persist_event=_persist(append, apply),
     )
     turn_id = ingestor.start_turn(producer_turn_id="private-turn")
     ingestor.ingest_update(
@@ -116,6 +147,7 @@ def test_messages_are_journaled_privately_and_projected_without_thoughts(
         "user_message",
         "thought",
         "agent_message",
+        "extension",
     ]
     assert all(event.visibility == "private" for event in events)
     assert turns[-1]["assistant_final_text"] == "answer"
@@ -144,8 +176,7 @@ def test_shadow_mode_journals_without_turn_projection(tmp_path: Path) -> None:
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
-        append_event=append,
-        apply_turn=unexpected_turn,
+        persist_event=_persist(append, unexpected_turn),
     )
     result = ingestor.ingest_update(
         _update(
@@ -172,7 +203,7 @@ def test_disabled_thought_policy_discards_before_persistence(tmp_path: Path) -> 
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
-        append_event=unexpected_append,
+        persist_event=_persist(unexpected_append),
     )
     result = ingestor.ingest_update(
         _update(
@@ -203,8 +234,7 @@ def test_synthetic_event_identity_is_scoped_to_stream_generation(tmp_path: Path)
             session_id="session-a",
             stream_generation=generation,
             binding=_binding(),
-            append_event=append,
-            apply_turn=lambda *_args, **_kwargs: TurnRefreshApplyResult(0, False),
+            persist_event=_persist(append),
         )
         ingestor.ingest_update(
             _update(
@@ -242,8 +272,7 @@ def test_notification_session_mismatch_is_rejected_before_state_or_persistence(
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
-        append_event=unexpected,
-        apply_turn=unexpected,
+        persist_event=_persist(unexpected, unexpected),
     )
     notification = _update(
         "agent_message_chunk",
@@ -273,15 +302,11 @@ def test_required_mode_fails_closed_when_durable_binding_is_stale(
     )
     upsert_worker_bindings(db_path, [replacement])
 
-    def unexpected_projection(*_args, **_kwargs):
-        raise AssertionError("stale ACP events must not be projected")
-
     ingestor = AcpSessionIngestor(
         _config(db_path, agent_event_source="acp_required"),
         session_id="session-a",
         stream_generation="generation-a",
         binding=binding,
-        apply_turn=unexpected_projection,
     )
 
     result = ingestor.ingest_update(
@@ -343,8 +368,7 @@ def test_shadow_completion_never_projects_and_finality_is_idempotent(
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
-        append_event=append,
-        apply_turn=unexpected_turn,
+        persist_event=_persist(append, unexpected_turn),
     )
     ingestor.start_turn(producer_turn_id="turn-1")
     ingestor.ingest_update(
@@ -366,7 +390,8 @@ def test_shadow_completion_never_projects_and_finality_is_idempotent(
     assert completed.turn is None
     assert repeated.ignored_reason == "turn_already_complete"
     assert late.ignored_reason == "turn_already_complete"
-    assert len(events) == 1
+    assert len(events) == 2
+    assert events[-1].kind == "extension"
 
 
 def test_required_mode_projects_messages_and_final_exactly_once(tmp_path: Path) -> None:
@@ -391,8 +416,7 @@ def test_required_mode_projects_messages_and_final_exactly_once(tmp_path: Path) 
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
-        append_event=append,
-        apply_turn=apply,
+        persist_event=_persist(append, apply),
     )
     ingestor.start_turn(producer_turn_id="turn-1")
     streamed = ingestor.ingest_update(
@@ -410,7 +434,7 @@ def test_required_mode_projects_messages_and_final_exactly_once(tmp_path: Path) 
     assert turns[-1]["assistant_stream_text"] == ""
 
 
-def test_duplicate_durable_event_is_not_reprojected(tmp_path: Path) -> None:
+def test_duplicate_durable_event_can_idempotently_repair_projection(tmp_path: Path) -> None:
     projected = False
 
     def append(
@@ -431,8 +455,7 @@ def test_duplicate_durable_event_is_not_reprojected(tmp_path: Path) -> None:
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
-        append_event=append,
-        apply_turn=apply,
+        persist_event=_persist(append, apply),
     )
     result = ingestor.ingest_update(
         _update(
@@ -444,9 +467,9 @@ def test_duplicate_durable_event_is_not_reprojected(tmp_path: Path) -> None:
     )
 
     assert result.ignored_reason == "duplicate_event"
-    assert not projected
-    assert ingestor.source_turn_id is None
-    assert ingestor.projector.session_snapshot("session-a") is None
+    assert projected
+    assert ingestor.source_turn_id is not None
+    assert ingestor.projector.session_snapshot("session-a") is not None
 
 
 def test_append_exception_rolls_back_turn_identity_sequence_and_message(
@@ -471,8 +494,10 @@ def test_append_exception_rolls_back_turn_identity_sequence_and_message(
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
-        append_event=append,
-        apply_turn=lambda *_args, **_kwargs: TurnRefreshApplyResult(1, False),
+        persist_event=_persist(
+            append,
+            lambda *_args, **_kwargs: TurnRefreshApplyResult(1, False),
+        ),
     )
     notification = _update(
         "agent_message_chunk",
@@ -515,7 +540,7 @@ def test_oversized_first_chunk_does_not_leave_an_implicit_turn(tmp_path: Path) -
     assert ingestor.projector.session_snapshot("session-a") is None
 
 
-def test_atomic_durable_replay_is_reported_without_second_projection(
+def test_atomic_durable_replay_can_repair_projection(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "events.db"
@@ -529,11 +554,20 @@ def test_atomic_durable_replay_is_reported_without_second_projection(
 
     def ingestor() -> AcpSessionIngestor:
         return AcpSessionIngestor(
-                _config(db_path),
+            _config(db_path),
             session_id="session-a",
             stream_generation="generation-a",
             binding=binding,
-            apply_turn=apply,
+            persist_event=_persist(
+                lambda _path, _host, event, **_kwargs: (
+                    AppendBoundAgentEventResult(
+                        "inserted" if not turns else "replayed",
+                        event.event_id,
+                        1,
+                    )
+                ),
+                apply,
+            ),
         )
 
     notification = _update(
@@ -557,9 +591,8 @@ def test_atomic_durable_replay_is_reported_without_second_projection(
     assert replayed.event is not None
     assert replayed.event.status == "replayed"
     assert replayed.ignored_reason == "duplicate_event"
-    assert replayed.turn is None
-    assert len(turns) == 1
-    assert len(list_agent_events(db_path, "host-a")) == 1
+    assert replayed.turn is not None
+    assert len(turns) == 2
 
 
 def test_producer_turn_identity_survives_transport_recreation(tmp_path: Path) -> None:
@@ -595,7 +628,7 @@ def test_private_summary_policy_retains_display_chunks_but_rejects_marked_raw_th
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
-        append_event=append,
+        persist_event=_persist(append),
     )
     unclassified = ingestor.ingest_update(
         _update(
@@ -645,7 +678,7 @@ def test_private_all_policy_retains_marked_raw_thought_privately(tmp_path: Path)
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
-        append_event=append,
+        persist_event=_persist(append),
     )
     result = ingestor.ingest_update(
         _update(
