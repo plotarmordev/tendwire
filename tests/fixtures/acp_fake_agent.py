@@ -49,6 +49,16 @@ for line in sys.stdin:
     request_id = message.get("id")
     params = message.get("params", {})
 
+    if MODE == "initialize_only" and method != "initialize":
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32601, "message": "Method not found"},
+            }
+        )
+        continue
+
     if method == "initialize":
         if MODE == "malformed":
             sys.stdout.write("not-json\n")
@@ -67,7 +77,7 @@ for line in sys.stdin:
                 "protocolVersion": True if MODE == "bool_version" else 1,
                 "agentCapabilities": (
                     {}
-                    if MODE == "baseline"
+                    if MODE in {"baseline", "initialize_only"}
                     else {
                         "loadSession": True,
                         "sessionCapabilities": {
@@ -77,18 +87,54 @@ for line in sys.stdin:
                             "close": {},
                             "additionalDirectories": {},
                         },
-                        "vendorFutureCapability": {"level": 2},
+                        "promptCapabilities": {
+                            "image": True,
+                            "audio": True,
+                            "embeddedContext": True,
+                        },
+                        "mcpCapabilities": {"http": True, "sse": True},
+                        "_meta": {"vendor.example": {"level": 2}},
                     }
                 ),
                 "agentInfo": {"name": "fake", "version": "1.0"},
+                **(
+                    {
+                        "authMethods": [
+                            {},
+                            {"id": "missing-name"},
+                            {"id": "valid", "name": "Valid agent login"},
+                            {"type": "future", "id": "x", "name": "Future"},
+                        ]
+                    }
+                    if MODE == "auth_shapes"
+                    else {}
+                ),
             },
         )
         if MODE == "extensions":
             send(
                 {
                     "jsonrpc": "2.0",
-                    "method": "vendor/future_notification",
+                    "method": "_vendor.example/future_notification",
                     "params": {"opaque": {"revision": 9}},
+                }
+            )
+        if MODE == "extension_flood":
+            for index in range(32):
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "_vendor.example/progress",
+                        "params": {"sequence": index},
+                    }
+                )
+        if MODE in {"unknown_request", "supported_request"}:
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 777 if MODE == "unknown_request" else 778,
+                    "method": "_vendor.example/request",
+                    "params": {"opaque": True},
                 }
             )
         if MODE == "null_response":
@@ -110,9 +156,8 @@ for line in sys.stdin:
             for index in range(4):
                 update(
                     "s-flood",
-                    "vendor_progress",
-                    sequence=index,
-                    vendor={"opaque": True},
+                    "agent_message_chunk",
+                    content={"type": "text", "text": str(index)},
                 )
     elif method == "session/new":
         update("s-new", "agent_message_chunk", content={"type": "text", "text": "hi"})
@@ -123,7 +168,7 @@ for line in sys.stdin:
     elif method == "session/load" or method == "session/resume":
         response(request_id, {"configOptions": [{"id": "model", "currentValue": "x"}]})
     elif method == "session/close" or method == "session/delete":
-        response(request_id, {"vendorReceipt": method})
+        response(request_id, {"_meta": {"vendor.example": {"receipt": method}}})
     elif method == "session/list":
         if MODE == "slow":
             time.sleep(2)
@@ -143,6 +188,9 @@ for line in sys.stdin:
             },
         )
     elif method == "session/prompt":
+        if MODE == "echo_prompt":
+            response(request_id, {"stopReason": "end_turn"})
+            continue
         pending_prompt_id = request_id
         pending_prompt_session = params["sessionId"]
         update(
@@ -195,6 +243,16 @@ for line in sys.stdin:
                 }
             )
             pending_permission_ids.add(901)
+    elif request_id in {777, 778}:
+        error = message.get("error", {})
+        update(
+            "s-extension",
+            "agent_message_chunk",
+            content={
+                "type": "text",
+                "text": "method-not-found" if error.get("code") == -32601 else "unexpected",
+            },
+        )
     elif request_id in pending_permission_ids and pending_prompt_id is not None:
         outcome = message["result"]["outcome"]["outcome"]
         pending_permission_ids.remove(request_id)

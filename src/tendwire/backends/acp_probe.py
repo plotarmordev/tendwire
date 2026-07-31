@@ -38,7 +38,8 @@ from .acp_protocol import (
     InitializeResult,
 )
 
-PROBE_SCHEMA_VERSION = 1
+PROBE_SCHEMA_VERSION = 2
+PROBE_SCOPE = "initialize"
 DEFAULT_PROBE_TIMEOUT_SECONDS = 5.0
 DEFAULT_PROBE_CLOSE_TIMEOUT_SECONDS = 1.0
 MAX_PROBE_TIMEOUT_SECONDS = 30.0
@@ -48,11 +49,7 @@ PROBE_MAX_PENDING_EVENTS = 16
 PROBE_STDERR_LIMIT_BYTES = 4096
 _MAX_REPORTED_COUNT = 1000
 
-_CAPABILITY_KEYS = (
-    "session_new",
-    "session_prompt",
-    "session_cancel",
-    "session_update",
+_ADVERTISED_CAPABILITY_KEYS = (
     "session_load",
     "session_list",
     "session_delete",
@@ -66,27 +63,6 @@ _CAPABILITY_KEYS = (
     "mcp_sse",
     "auth_logout",
 )
-_KNOWN_TOP_LEVEL_CAPABILITIES = {
-    "loadSession",
-    "promptCapabilities",
-    "mcpCapabilities",
-    "sessionCapabilities",
-    "auth",
-    "_meta",
-}
-_KNOWN_NESTED_CAPABILITIES = {
-    "promptCapabilities": {"image", "audio", "embeddedContext", "_meta"},
-    "mcpCapabilities": {"http", "sse", "_meta"},
-    "sessionCapabilities": {
-        "list",
-        "delete",
-        "additionalDirectories",
-        "resume",
-        "close",
-        "_meta",
-    },
-    "auth": {"logout", "_meta"},
-}
 
 
 class ProbeFailure(str, Enum):
@@ -106,9 +82,9 @@ class ProbeFailure(str, Enum):
 class AcpAdapterProbeReport:
     """Fixed-shape, bounded result that contains no adapter-controlled text."""
 
-    compatible: bool
+    initialization_compatible: bool
     protocol_version: int | None
-    capabilities: Mapping[str, bool]
+    advertised_capabilities: Mapping[str, bool]
     authentication_method_count: int
     authentication_method_count_capped: bool
     extension_capability_count: int
@@ -120,11 +96,12 @@ class AcpAdapterProbeReport:
     def to_payload(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
-            "compatible": self.compatible,
+            "probe_scope": PROBE_SCOPE,
+            "initialization_compatible": self.initialization_compatible,
             "protocol_version": self.protocol_version,
-            "capabilities": {
-                key: bool(self.capabilities.get(key, False))
-                for key in _CAPABILITY_KEYS
+            "advertised_capabilities": {
+                key: bool(self.advertised_capabilities.get(key, False))
+                for key in _ADVERTISED_CAPABILITY_KEYS
             },
             "authentication": {
                 "method_count": self.authentication_method_count,
@@ -151,8 +128,8 @@ def probe_adapter(
 
     A new subprocess and initialization exchange are used for every call.  No
     session is created and no adapter source package is imported.  All expected
-    failures become a fixed-category incompatible report; no raw diagnostic text
-    crosses this black-box boundary.
+    failures become a fixed-category initialization-incompatible report; no raw
+    diagnostic text crosses this black-box boundary.
     """
 
     try:
@@ -205,19 +182,22 @@ def probe_adapter(
         return _failure_report(failure or ProbeFailure.INTERNAL, process_reaped)
 
     capabilities = _capability_summary(initialized)
-    auth_count, auth_capped = _bounded_count(len(initialized.auth_methods))
+    auth_count, auth_capped = _bounded_count(
+        sum(_valid_stable_auth_method(item) for item in initialized.auth_methods)
+    )
     extension_count, extension_capped = _bounded_count(
         _extension_capability_count(initialized.capabilities.raw)
     )
-    compatible = (
+    initialization_compatible = (
         failure is None
         and process_reaped
         and initialized.protocol_version == ACP_PROTOCOL_VERSION
+        and client.failure is None
     )
     return AcpAdapterProbeReport(
-        compatible=compatible,
+        initialization_compatible=initialization_compatible,
         protocol_version=initialized.protocol_version,
-        capabilities=MappingProxyType(capabilities),
+        advertised_capabilities=MappingProxyType(capabilities),
         authentication_method_count=auth_count,
         authentication_method_count_capped=auth_capped,
         extension_capability_count=extension_count,
@@ -232,13 +212,7 @@ def _capability_summary(initialized: InitializeResult) -> dict[str, bool]:
     prompt = _mapping(raw.get("promptCapabilities"))
     mcp = _mapping(raw.get("mcpCapabilities"))
     session = _mapping(raw.get("sessionCapabilities"))
-    auth = _mapping(raw.get("auth"))
     return {
-        # ACP v1 baseline methods are guaranteed by a successful negotiation.
-        "session_new": True,
-        "session_prompt": True,
-        "session_cancel": True,
-        "session_update": True,
         "session_load": initialized.capabilities.load_session,
         "session_list": initialized.capabilities.session_list,
         "session_delete": initialized.capabilities.session_delete,
@@ -250,17 +224,36 @@ def _capability_summary(initialized: InitializeResult) -> dict[str, bool]:
         "prompt_embedded_context": prompt.get("embeddedContext") is True,
         "mcp_http": mcp.get("http") is True,
         "mcp_sse": mcp.get("sse") is True,
-        "auth_logout": isinstance(auth.get("logout"), Mapping),
+        "auth_logout": initialized.capabilities.auth_logout,
     }
 
 
 def _extension_capability_count(raw: Mapping[str, Any]) -> int:
-    count = sum(key not in _KNOWN_TOP_LEVEL_CAPABILITIES for key in raw)
-    for section, known_keys in _KNOWN_NESTED_CAPABILITIES.items():
-        nested = raw.get(section)
-        if isinstance(nested, Mapping):
-            count += sum(key not in known_keys for key in nested)
+    """Count extension namespaces only where ACP v1 permits them: `_meta`."""
+    count = _meta_entry_count(raw)
+    for section in ("promptCapabilities", "mcpCapabilities", "sessionCapabilities", "auth"):
+        nested = _mapping(raw.get(section))
+        count += _meta_entry_count(nested)
+    session = _mapping(raw.get("sessionCapabilities"))
+    for capability in ("list", "delete", "additionalDirectories", "resume", "close"):
+        count += _meta_entry_count(_mapping(session.get(capability)))
+    auth = _mapping(raw.get("auth"))
+    count += _meta_entry_count(_mapping(auth.get("logout")))
     return count
+
+
+def _meta_entry_count(value: Mapping[str, Any]) -> int:
+    meta = value.get("_meta")
+    return len(meta) if isinstance(meta, Mapping) else 0
+
+
+def _valid_stable_auth_method(value: Mapping[str, Any]) -> bool:
+    method_type = value.get("type", "agent")
+    return (
+        method_type == "agent"
+        and isinstance(value.get("id"), str)
+        and isinstance(value.get("name"), str)
+    )
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -276,9 +269,11 @@ def _failure_report(
     process_reaped: bool = True,
 ) -> AcpAdapterProbeReport:
     return AcpAdapterProbeReport(
-        compatible=False,
+        initialization_compatible=False,
         protocol_version=None,
-        capabilities=MappingProxyType({key: False for key in _CAPABILITY_KEYS}),
+        advertised_capabilities=MappingProxyType(
+            {key: False for key in _ADVERTISED_CAPABILITY_KEYS}
+        ),
         authentication_method_count=0,
         authentication_method_count_capped=False,
         extension_capability_count=0,
@@ -358,7 +353,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     sys.stdout.write(json.dumps(report.to_payload(), sort_keys=True, separators=(",", ":")))
     sys.stdout.write("\n")
-    return 0 if report.compatible else 1
+    return 0 if report.initialization_compatible else 1
 
 
 if __name__ == "__main__":

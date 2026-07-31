@@ -112,7 +112,14 @@ def test_capability_presence_uses_acp_object_semantics() -> None:
                 "close": {},
                 "additionalDirectories": {},
             },
-            "vendorFutureCapability": {"revision": 3},
+            "promptCapabilities": {
+                "image": True,
+                "audio": True,
+                "embeddedContext": True,
+            },
+            "mcpCapabilities": {"http": True, "sse": True},
+            "auth": {"logout": {}},
+            "_meta": {"vendor.example": {"revision": 3}},
         }
     )
     assert capabilities.load_session
@@ -121,16 +128,22 @@ def test_capability_presence_uses_acp_object_semantics() -> None:
     assert capabilities.session_close
     assert capabilities.session_delete
     assert capabilities.additional_directories
-    assert capabilities.raw["vendorFutureCapability"] == {"revision": 3}
+    assert capabilities.prompt_image
+    assert capabilities.prompt_audio
+    assert capabilities.prompt_embedded_context
+    assert capabilities.mcp_http
+    assert capabilities.mcp_sse
+    assert capabilities.auth_logout
+    assert capabilities.raw["_meta"] == {"vendor.example": {"revision": 3}}
 
 
 def test_request_ids_follow_acp_json_rpc_domain() -> None:
     assert isinstance(
-        validate_envelope({"jsonrpc": "2.0", "id": "", "method": "vendor/x"}),
+        validate_envelope({"jsonrpc": "2.0", "id": "", "method": "_vendor.example/x"}),
         JsonRpcRequest,
     )
     null_request = validate_envelope(
-        {"jsonrpc": "2.0", "id": None, "method": "vendor/x"}
+        {"jsonrpc": "2.0", "id": None, "method": "_vendor.example/x"}
     )
     assert isinstance(null_request, JsonRpcRequest)
     assert null_request.request_id is None
@@ -143,7 +156,7 @@ def test_request_ids_follow_acp_json_rpc_domain() -> None:
     for invalid_id in (True, 2**63, -(2**63) - 1, 1.5):
         with pytest.raises(AcpEnvelopeError):
             validate_envelope(
-                {"jsonrpc": "2.0", "id": invalid_id, "method": "vendor/x"}
+                {"jsonrpc": "2.0", "id": invalid_id, "method": "_vendor.example/x"}
             )
 
 
@@ -162,6 +175,43 @@ def test_permission_option_ids_must_be_unambiguous() -> None:
     )
     with pytest.raises(AcpEnvelopeError, match="unique"):
         parse_permission_request(request)
+
+
+def test_permission_request_matches_stable_v1_required_fields_and_enum() -> None:
+    empty_options = JsonRpcRequest(
+        42,
+        "session/request_permission",
+        {"sessionId": "s1", "toolCall": {"toolCallId": "tool-1"}, "options": []},
+    )
+    assert parse_permission_request(empty_options).options == ()
+
+    missing_tool_call_id = JsonRpcRequest(
+        43,
+        "session/request_permission",
+        {
+            "sessionId": "s1",
+            "toolCall": {},
+            "options": [
+                {"optionId": "allow", "name": "Allow", "kind": "allow_once"}
+            ],
+        },
+    )
+    with pytest.raises(AcpEnvelopeError, match="toolCallId"):
+        parse_permission_request(missing_tool_call_id)
+
+    unknown_kind = JsonRpcRequest(
+        44,
+        "session/request_permission",
+        {
+            "sessionId": "s1",
+            "toolCall": {"toolCallId": "tool-1"},
+            "options": [
+                {"optionId": "future", "name": "Future", "kind": "future_kind"}
+            ],
+        },
+    )
+    with pytest.raises(AcpEnvelopeError, match="ACP v1"):
+        parse_permission_request(unknown_kind)
 
 
 def test_unknown_update_and_nested_extension_payload_are_preserved() -> None:

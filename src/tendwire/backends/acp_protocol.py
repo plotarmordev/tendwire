@@ -170,8 +170,41 @@ class AgentCapabilities:
             self._session_capabilities().get("additionalDirectories")
         )
 
+    @property
+    def prompt_image(self) -> bool:
+        return self._prompt_capabilities().get("image") is True
+
+    @property
+    def prompt_audio(self) -> bool:
+        return self._prompt_capabilities().get("audio") is True
+
+    @property
+    def prompt_embedded_context(self) -> bool:
+        return self._prompt_capabilities().get("embeddedContext") is True
+
+    @property
+    def mcp_http(self) -> bool:
+        return self._mcp_capabilities().get("http") is True
+
+    @property
+    def mcp_sse(self) -> bool:
+        return self._mcp_capabilities().get("sse") is True
+
+    @property
+    def auth_logout(self) -> bool:
+        auth = self.raw.get("auth")
+        return isinstance(auth, Mapping) and _is_capability_object(auth.get("logout"))
+
     def _session_capabilities(self) -> Mapping[str, Any]:
         value = self.raw.get("sessionCapabilities")
+        return value if isinstance(value, Mapping) else {}
+
+    def _prompt_capabilities(self) -> Mapping[str, Any]:
+        value = self.raw.get("promptCapabilities")
+        return value if isinstance(value, Mapping) else {}
+
+    def _mcp_capabilities(self) -> Mapping[str, Any]:
+        value = self.raw.get("mcpCapabilities")
         return value if isinstance(value, Mapping) else {}
 
 
@@ -481,9 +514,10 @@ def parse_permission_request(request: JsonRpcRequest) -> PermissionRequest:
     tool_call = params.get("toolCall")
     if not isinstance(tool_call, Mapping):
         raise AcpEnvelopeError("permission request toolCall must be an object")
+    _required_string(tool_call, "toolCallId")
     raw_options = params.get("options")
-    if not isinstance(raw_options, list) or not raw_options:
-        raise AcpEnvelopeError("permission request options must be a non-empty array")
+    if not isinstance(raw_options, list):
+        raise AcpEnvelopeError("permission request options must be an array")
     options: list[PermissionOption] = []
     seen_option_ids: set[str] = set()
     for raw in raw_options:
@@ -497,8 +531,8 @@ def parse_permission_request(request: JsonRpcRequest) -> PermissionRequest:
         kind_value = _required_string(raw, "kind")
         try:
             kind: PermissionOptionKind | str = PermissionOptionKind(kind_value)
-        except ValueError:
-            kind = kind_value
+        except ValueError as exc:
+            raise AcpEnvelopeError("permission option kind is not valid ACP v1") from exc
         options.append(
             PermissionOption(
                 option_id=option_id,

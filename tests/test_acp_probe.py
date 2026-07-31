@@ -12,6 +12,7 @@ from tendwire.backends.acp_probe import (
     MAX_PROBE_CLOSE_TIMEOUT_SECONDS,
     MAX_PROBE_TIMEOUT_SECONDS,
     ProbeFailure,
+    _extension_capability_count,
     main,
     probe_adapter,
 )
@@ -30,15 +31,15 @@ def test_probe_negotiates_fresh_stable_v1_capabilities_and_reaps_process() -> No
 
     for report in (first, second):
         payload = report.to_payload()
-        assert payload["schema_version"] == 1
-        assert payload["compatible"] is True
+        assert payload["schema_version"] == 2
+        assert payload["probe_scope"] == "initialize"
+        assert payload["initialization_compatible"] is True
         assert payload["protocol_version"] == 1
         assert payload["process_reaped"] is True
         assert payload["failure"] is None
-        assert payload["capabilities"]["session_new"] is True
-        assert payload["capabilities"]["session_load"] is True
-        assert payload["capabilities"]["session_close"] is True
-        assert payload["capabilities"]["session_delete"] is True
+        assert payload["advertised_capabilities"]["session_load"] is True
+        assert payload["advertised_capabilities"]["session_close"] is True
+        assert payload["advertised_capabilities"]["session_delete"] is True
         assert payload["extensions"] == {
             "capability_count": 1,
             "capability_count_capped": False,
@@ -47,11 +48,24 @@ def test_probe_negotiates_fresh_stable_v1_capabilities_and_reaps_process() -> No
 
 def test_baseline_adapter_reports_only_baseline_capabilities() -> None:
     payload = probe_adapter(adapter_argv("baseline")).to_payload()
-    assert payload["compatible"] is True
-    assert payload["capabilities"]["session_prompt"] is True
-    assert payload["capabilities"]["session_load"] is False
-    assert payload["capabilities"]["session_list"] is False
+    assert payload["initialization_compatible"] is True
+    assert "session_prompt" not in payload["advertised_capabilities"]
+    assert "session_new" not in payload["advertised_capabilities"]
+    assert payload["advertised_capabilities"]["session_load"] is False
+    assert payload["advertised_capabilities"]["session_list"] is False
     assert payload["extensions"]["capability_count"] == 0
+
+
+def test_initialize_only_agent_does_not_gain_untested_baseline_claims() -> None:
+    payload = probe_adapter(adapter_argv("initialize_only")).to_payload()
+    assert payload["initialization_compatible"] is True
+    assert payload["probe_scope"] == "initialize"
+    assert not {
+        "session_new",
+        "session_prompt",
+        "session_cancel",
+        "session_update",
+    }.intersection(payload["advertised_capabilities"])
 
 
 @pytest.mark.parametrize(
@@ -73,17 +87,17 @@ def test_probe_fails_closed_with_fixed_failure_categories(
         timeout_seconds=timeout,
         close_timeout_seconds=0.05,
     )
-    assert report.compatible is False
+    assert report.initialization_compatible is False
     assert report.failure is failure
     assert report.process_reaped is True
-    assert not any(report.capabilities.values())
+    assert not any(report.advertised_capabilities.values())
 
 
 def test_missing_executable_does_not_expose_argv_or_exception_text() -> None:
     secret = "TOP_SECRET_ADAPTER_ARGUMENT"
     payload = probe_adapter(["/definitely/not/an/acp-adapter", secret]).to_payload()
     encoded = json.dumps(payload)
-    assert payload["compatible"] is False
+    assert payload["initialization_compatible"] is False
     assert payload["failure"] == ProbeFailure.LAUNCH_FAILED.value
     assert secret not in encoded
     assert "/definitely/not" not in encoded
@@ -94,8 +108,8 @@ def test_report_never_exposes_agent_or_extension_controlled_text() -> None:
     encoded = json.dumps(payload)
     assert len(encoded.encode("utf-8")) < 2048
     assert "fake" not in encoded
-    assert "vendorFutureCapability" not in encoded
-    assert "vendor/future_notification" not in encoded
+    assert "vendor.example" not in encoded
+    assert "_vendor.example/future_notification" not in encoded
     assert "level" not in encoded
     assert payload["extensions"]["capability_count"] == 1
 
@@ -117,7 +131,7 @@ def test_stubborn_adapter_is_reaped_without_becoming_source_dependency() -> None
         timeout_seconds=1,
         close_timeout_seconds=0.05,
     )
-    assert report.compatible is True
+    assert report.initialization_compatible is True
     assert report.process_reaped is True
 
 
@@ -127,7 +141,7 @@ def test_module_cli_outputs_one_bounded_json_object(capsys: pytest.CaptureFixtur
     payload = json.loads(captured.out)
     assert exit_code == 0
     assert captured.err == ""
-    assert payload["compatible"] is True
+    assert payload["initialization_compatible"] is True
     assert len(captured.out.encode("utf-8")) < 2048
 
 
@@ -155,5 +169,30 @@ def test_module_runs_as_black_box_without_importing_adapter_source() -> None:
     payload = json.loads(completed.stdout)
     assert completed.returncode == 0
     assert completed.stderr == ""
-    assert payload["compatible"] is True
+    assert payload["initialization_compatible"] is True
     assert payload["process_reaped"] is True
+
+
+def test_extension_count_uses_only_spec_reserved_meta_locations() -> None:
+    assert (
+        _extension_capability_count(
+            {
+                "_meta": {"vendor.one": {}},
+                "promptCapabilities": {"_meta": {"vendor.two": {}}},
+                "sessionCapabilities": {
+                    "list": {"_meta": {"vendor.three": {}}}
+                },
+            }
+        )
+        == 3
+    )
+    assert _extension_capability_count({"forbiddenRootExtension": {}}) == 0
+
+
+def test_authentication_count_skips_invalid_stable_schema_items() -> None:
+    payload = probe_adapter(adapter_argv("auth_shapes")).to_payload()
+    assert payload["initialization_compatible"] is True
+    assert payload["authentication"] == {
+        "method_count": 1,
+        "method_count_capped": False,
+    }

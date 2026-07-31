@@ -146,6 +146,8 @@ class AcpClient:
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         max_pending_events: int = _DEFAULT_QUEUE_SIZE,
         stderr_limit_bytes: int = _DEFAULT_STDERR_LIMIT,
+        supported_extension_notifications: Sequence[str] = (),
+        supported_extension_requests: Sequence[str] = (),
     ) -> None:
         command = tuple(os.fspath(item) for item in argv)
         if not command or any(
@@ -167,6 +169,14 @@ class AcpClient:
         self.max_frame_bytes = max_frame_bytes
         self.max_pending_events = max_pending_events
         self.stderr_limit_bytes = stderr_limit_bytes
+        self.supported_extension_notifications = _extension_method_set(
+            supported_extension_notifications,
+            "supported_extension_notifications",
+        )
+        self.supported_extension_requests = _extension_method_set(
+            supported_extension_requests,
+            "supported_extension_requests",
+        )
 
         self._state = ClientState.NEW
         self._process: subprocess.Popen[bytes] | None = None
@@ -346,6 +356,13 @@ class AcpClient:
                     f"agent selected unsupported ACP protocol version {version!r}"
                 )
                 self._set_failed(failure)
+                # ACP v1 says clients should close a connection after an
+                # unsupported selection.  Do the bounded cleanup here so direct
+                # callers cannot accidentally leave the adapter process alive.
+                try:
+                    self.close()
+                except BaseException:
+                    pass
                 raise failure
             capabilities_value = raw.get("agentCapabilities", {})
             if not isinstance(capabilities_value, Mapping):
@@ -568,9 +585,12 @@ class AcpClient:
             content = list(prompt)
         if not content:
             raise ValueError("prompt must contain at least one content block")
-        for block in content:
-            if not isinstance(block, Mapping) or not isinstance(block.get("type"), str):
-                raise ValueError("each prompt content block must have a string type")
+        self._require_initialized()
+        assert self.capabilities is not None
+        content = [
+            _validated_prompt_content_block(block, self.capabilities)
+            for block in content
+        ]
         session_id = _nonempty(session_id, "session_id")
         with self._permission_lock:
             if self._active_prompts.get(session_id, 0) == 0:
@@ -801,7 +821,7 @@ class AcpClient:
         self._require_initialized()
         params: dict[str, Any] = {
             "cwd": _absolute_path(cwd, "cwd"),
-            "mcpServers": [dict(server) for server in mcp_servers],
+            "mcpServers": [self._validated_mcp_server(server) for server in mcp_servers],
         }
         directories = [
             _absolute_path(directory, "additional directory")
@@ -811,6 +831,10 @@ class AcpClient:
             self._require_capability("additionalDirectories")
             params["additionalDirectories"] = directories
         return params
+
+    def _validated_mcp_server(self, server: Mapping[str, Any]) -> dict[str, Any]:
+        assert self.capabilities is not None
+        return _validated_mcp_server(server, self.capabilities)
 
     def _require_capability(self, name: str) -> None:
         self._require_initialized()
@@ -994,11 +1018,14 @@ class AcpClient:
         if isinstance(message, JsonRpcNotification):
             if message.method == "session/update":
                 self._put_lossless(self._updates, parse_session_update(message.params))
-            else:
+            elif message.method in self.supported_extension_notifications:
                 self._put_lossless(
                     self._notifications,
                     RawNotification(message.method, message.params),
                 )
+            # ACP extension notifications are one-way and unrecognized ones
+            # should be ignored.  Protocol-level $/ notifications are also
+            # explicitly optional, so they take the same bounded path.
             return
 
         if message.method == "session/request_permission":
@@ -1029,10 +1056,18 @@ class AcpClient:
                 )
             else:
                 self._put_lossless(self._permissions, parsed)
-        else:
+        elif message.method in self.supported_extension_requests:
             self._put_lossless(
                 self._inbound_requests,
                 InboundRequest(message.request_id, message.method, message.params),
+            )
+        else:
+            self._write(
+                error_envelope(
+                    message.request_id,
+                    _METHOD_NOT_FOUND,
+                    "Method not found",
+                )
             )
 
     def _put_lossless(self, target: queue.Queue[Any], value: Any) -> None:
@@ -1155,6 +1190,226 @@ def _absolute_path(value: str | os.PathLike[str], name: str) -> str:
     if not Path(result).is_absolute():
         raise ValueError(f"{name} must be an absolute path")
     return result
+
+
+def _extension_method_set(values: Sequence[str], name: str) -> frozenset[str]:
+    if isinstance(values, str):
+        raise ValueError(f"{name} must be a sequence of extension method names")
+    result: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value.startswith("_") or len(value) == 1:
+            raise ValueError(f"{name} entries must be ACP methods starting with '_'")
+        result.add(value)
+    return frozenset(result)
+
+
+def _validated_prompt_content_block(
+    value: Mapping[str, Any],
+    capabilities: AgentCapabilities,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("each prompt content block must be an object")
+    kind = value.get("type")
+    if kind == "text":
+        _reject_unknown_fields(value, {"type", "text", "annotations", "_meta"}, "text content")
+        _string_field(value, "text", "text content")
+    elif kind == "image":
+        if not capabilities.prompt_image:
+            raise AcpCapabilityError("agent did not advertise prompt image capability")
+        _reject_unknown_fields(
+            value,
+            {"type", "data", "mimeType", "uri", "annotations", "_meta"},
+            "image content",
+        )
+        _string_field(value, "data", "image content")
+        _string_field(value, "mimeType", "image content")
+        _optional_string_field(value, "uri", "image content")
+    elif kind == "audio":
+        if not capabilities.prompt_audio:
+            raise AcpCapabilityError("agent did not advertise prompt audio capability")
+        _reject_unknown_fields(
+            value,
+            {"type", "data", "mimeType", "annotations", "_meta"},
+            "audio content",
+        )
+        _string_field(value, "data", "audio content")
+        _string_field(value, "mimeType", "audio content")
+    elif kind == "resource_link":
+        _reject_unknown_fields(
+            value,
+            {
+                "type",
+                "name",
+                "uri",
+                "description",
+                "mimeType",
+                "size",
+                "title",
+                "annotations",
+                "_meta",
+            },
+            "resource link",
+        )
+        _string_field(value, "name", "resource link")
+        _string_field(value, "uri", "resource link")
+        for field in ("description", "mimeType", "title"):
+            _optional_string_field(value, field, "resource link")
+        size = value.get("size")
+        if size is not None and (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or not -(2**63) <= size <= 2**63 - 1
+        ):
+            raise ValueError("resource link.size must be a signed 64-bit integer")
+    elif kind == "resource":
+        if not capabilities.prompt_embedded_context:
+            raise AcpCapabilityError(
+                "agent did not advertise prompt embeddedContext capability"
+            )
+        _reject_unknown_fields(
+            value,
+            {"type", "resource", "annotations", "_meta"},
+            "embedded resource",
+        )
+        resource = value.get("resource")
+        if not isinstance(resource, Mapping):
+            raise ValueError("embedded resource.resource must be an object")
+        _string_field(resource, "uri", "embedded resource payload")
+        _optional_string_field(resource, "mimeType", "embedded resource payload")
+        has_text = "text" in resource
+        has_blob = "blob" in resource
+        if has_text == has_blob:
+            raise ValueError(
+                "embedded resource payload must contain exactly one of text or blob"
+            )
+        payload_field = "text" if has_text else "blob"
+        _string_field(resource, payload_field, "embedded resource payload")
+        _reject_unknown_fields(
+            resource,
+            {"uri", "mimeType", payload_field, "_meta"},
+            "embedded resource payload",
+        )
+        _optional_mapping_field(resource, "_meta", "embedded resource payload")
+    else:
+        raise ValueError("prompt content block type is not valid ACP v1")
+
+    _optional_mapping_field(value, "annotations", f"{kind} content")
+    _optional_mapping_field(value, "_meta", f"{kind} content")
+    return dict(value)
+
+
+def _validated_mcp_server(
+    value: Mapping[str, Any],
+    capabilities: AgentCapabilities,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("each MCP server must be an object")
+    transport = value.get("type")
+    if transport is None:
+        _reject_unknown_fields(
+            value,
+            {"name", "command", "args", "env", "_meta"},
+            "stdio MCP server",
+        )
+        name = _string_field(value, "name", "stdio MCP server")
+        command = _absolute_path(
+            _string_field(value, "command", "stdio MCP server"),
+            "stdio MCP server.command",
+        )
+        args = _string_array_field(value, "args", "stdio MCP server")
+        env = _name_value_array_field(value, "env", "stdio MCP server")
+        result: dict[str, Any] = {
+            "name": name,
+            "command": command,
+            "args": args,
+            "env": env,
+        }
+    elif transport in {"http", "sse"}:
+        if transport == "http" and not capabilities.mcp_http:
+            raise AcpCapabilityError("agent did not advertise MCP HTTP capability")
+        if transport == "sse" and not capabilities.mcp_sse:
+            raise AcpCapabilityError("agent did not advertise MCP SSE capability")
+        _reject_unknown_fields(
+            value,
+            {"type", "name", "url", "headers", "_meta"},
+            f"{transport} MCP server",
+        )
+        result = {
+            "type": transport,
+            "name": _string_field(value, "name", f"{transport} MCP server"),
+            "url": _string_field(value, "url", f"{transport} MCP server"),
+            "headers": _name_value_array_field(
+                value,
+                "headers",
+                f"{transport} MCP server",
+            ),
+        }
+    else:
+        raise ValueError("MCP server type is not valid stable ACP v1")
+    meta = _optional_mapping_field(value, "_meta", "MCP server")
+    if meta is not None:
+        result["_meta"] = dict(meta)
+    return result
+
+
+def _reject_unknown_fields(
+    value: Mapping[str, Any], allowed: set[str], label: str
+) -> None:
+    if any(key not in allowed for key in value):
+        raise ValueError(f"{label} contains fields outside the ACP v1 schema")
+
+
+def _string_field(value: Mapping[str, Any], field: str, label: str) -> str:
+    result = value.get(field)
+    if not isinstance(result, str):
+        raise ValueError(f"{label}.{field} must be a string")
+    return result
+
+
+def _optional_string_field(value: Mapping[str, Any], field: str, label: str) -> None:
+    result = value.get(field)
+    if result is not None and not isinstance(result, str):
+        raise ValueError(f"{label}.{field} must be a string or null")
+
+
+def _optional_mapping_field(
+    value: Mapping[str, Any], field: str, label: str
+) -> Mapping[str, Any] | None:
+    result = value.get(field)
+    if result is not None and not isinstance(result, Mapping):
+        raise ValueError(f"{label}.{field} must be an object or null")
+    return result
+
+
+def _string_array_field(
+    value: Mapping[str, Any], field: str, label: str
+) -> list[str]:
+    result = value.get(field)
+    if not isinstance(result, list) or any(not isinstance(item, str) for item in result):
+        raise ValueError(f"{label}.{field} must be an array of strings")
+    return list(result)
+
+
+def _name_value_array_field(
+    value: Mapping[str, Any], field: str, label: str
+) -> list[dict[str, Any]]:
+    result = value.get(field)
+    if not isinstance(result, list):
+        raise ValueError(f"{label}.{field} must be an array")
+    normalized: list[dict[str, Any]] = []
+    for item in result:
+        if not isinstance(item, Mapping):
+            raise ValueError(f"{label}.{field} entries must be objects")
+        _reject_unknown_fields(item, {"name", "value", "_meta"}, f"{label}.{field} entry")
+        normalized_item: dict[str, Any] = {
+            "name": _string_field(item, "name", f"{label}.{field} entry"),
+            "value": _string_field(item, "value", f"{label}.{field} entry"),
+        }
+        meta = _optional_mapping_field(item, "_meta", f"{label}.{field} entry")
+        if meta is not None:
+            normalized_item["_meta"] = dict(meta)
+        normalized.append(normalized_item)
+    return normalized
 
 
 def _validated_env(env: Mapping[str, str] | None) -> dict[str, str] | None:

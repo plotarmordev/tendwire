@@ -1,8 +1,8 @@
-# Black-box ACP adapter compatibility probe
+# Black-box ACP adapter initialization probe
 
 Tendwire treats an ACP adapter as a separately installed executable. The
 adapter is not vendored, imported, rebased, or coupled to a repository layout.
-Run the compatibility probe after installing or upgrading any adapter and
+Run the initialization probe after installing or upgrading any adapter and
 before promoting that executable into the Tendwire runtime:
 
 ```console
@@ -15,9 +15,13 @@ object, and exits zero only when negotiation and shutdown succeed. Use
 `--timeout`, `--close-timeout`, and an absolute `--cwd` before the `--` marker
 when needed. Probe timeouts have hard upper bounds.
 
-The output is intentionally narrow. It contains fixed boolean capabilities,
-bounded counts for authentication methods and unknown capability extensions, a
-process-reaped flag, and a fixed failure category. It never contains:
+The probe scope is deliberately limited to `initialize`. It does not create a
+session, send a prompt, spend model tokens, or claim that the adapter actually
+implements ACP's mandatory baseline session methods. The output contains fixed
+booleans for optional capabilities advertised by the agent, bounded counts for
+schema-valid authentication methods and `_meta` capability-extension
+namespaces, a process-reaped flag, and a fixed failure category. It never
+contains:
 
 - adapter argv or executable paths;
 - working directories or environment values;
@@ -30,7 +34,7 @@ Example successful shape:
 ```json
 {
   "authentication": {"method_count": 0, "method_count_capped": false},
-  "capabilities": {
+  "advertised_capabilities": {
     "additional_directories": true,
     "auth_logout": false,
     "mcp_http": false,
@@ -38,28 +42,26 @@ Example successful shape:
     "prompt_audio": false,
     "prompt_embedded_context": false,
     "prompt_image": false,
-    "session_cancel": true,
     "session_close": true,
     "session_delete": true,
     "session_list": true,
     "session_load": true,
-    "session_new": true,
-    "session_prompt": true,
-    "session_resume": true,
-    "session_update": true
+    "session_resume": true
   },
-  "compatible": true,
+  "initialization_compatible": true,
   "extensions": {"capability_count": 0, "capability_count_capped": false},
   "failure": null,
+  "probe_scope": "initialize",
   "process_reaped": true,
   "protocol_version": 1,
-  "schema_version": 1
+  "schema_version": 2
 }
 ```
 
-An incompatible result exits with status 1 and reports only one of these stable
-categories: `invalid_configuration`, `launch_failed`, `timeout`,
+An initialization-incompatible result exits with status 1 and reports only one
+of these stable categories: `invalid_configuration`, `launch_failed`, `timeout`,
 `protocol_version`, `protocol_error`, `transport_error`, `shutdown_failed`, or
 `internal_error`. Keep the previously proven executable available for rollback;
-the probe validates initialization and capability negotiation, not account
-authentication or a stateful agent session.
+the probe validates initialization and advertised capability parsing, not
+account authentication, mandatory baseline method behavior, or a stateful agent
+session.

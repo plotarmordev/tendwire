@@ -35,7 +35,9 @@ def test_initialize_capabilities_and_session_lifecycle() -> None:
         assert initialized.capabilities.session_resume
         assert initialized.capabilities.session_close
         assert initialized.capabilities.session_delete
-        assert initialized.capabilities.raw["vendorFutureCapability"] == {"level": 2}
+        assert initialized.capabilities.raw["_meta"] == {
+            "vendor.example": {"level": 2}
+        }
         assert acp.state is ClientState.INITIALIZED
 
         created = acp.new_session(
@@ -59,8 +61,8 @@ def test_initialize_capabilities_and_session_lifecycle() -> None:
         assert second.sessions[0].title == "second"
         assert second.next_cursor is None
 
-        assert acp.close_session("s1")["vendorReceipt"] == "session/close"
-        assert acp.delete_session("s2")["vendorReceipt"] == "session/delete"
+        assert acp.close_session("s1")["_meta"]["vendor.example"]["receipt"] == "session/close"
+        assert acp.delete_session("s2")["_meta"]["vendor.example"]["receipt"] == "session/delete"
 
     assert acp.state is ClientState.CLOSED
     assert acp.exit is not None
@@ -167,6 +169,105 @@ def test_absolute_session_paths_are_enforced_before_write() -> None:
             acp.new_session("relative/path")
 
 
+def test_prompt_content_is_validated_and_gated_by_negotiated_capabilities() -> None:
+    with client("baseline") as acp:
+        acp.initialize()
+        with pytest.raises(AcpCapabilityError, match="image"):
+            acp.prompt(
+                "s1",
+                [{"type": "image", "data": "AA==", "mimeType": "image/png"}],
+            )
+        with pytest.raises(ValueError, match="text"):
+            acp.prompt("s1", [{"type": "text"}])
+        with pytest.raises(ValueError, match="outside"):
+            acp.prompt("s1", [{"type": "text", "text": "ok", "vendor": True}])
+
+
+def test_prompt_content_matches_stable_v1_generated_shapes() -> None:
+    blocks = [
+        {"type": "text", "text": "hello"},
+        {"type": "image", "data": "AA==", "mimeType": "image/png"},
+        {"type": "audio", "data": "AA==", "mimeType": "audio/wav"},
+        {"type": "resource_link", "name": "main.py", "uri": "file:///tmp/main.py"},
+        {
+            "type": "resource",
+            "resource": {
+                "uri": "file:///tmp/main.py",
+                "mimeType": "text/x-python",
+                "text": "print('ok')",
+            },
+        },
+    ]
+    with client("echo_prompt") as acp:
+        acp.initialize()
+        result = acp.prompt("s1", blocks)
+        assert result.stop_reason is StopReason.END_TURN
+
+
+def test_mcp_servers_match_stable_v1_generated_shapes_and_capabilities() -> None:
+    with client() as acp:
+        acp.initialize()
+        created = acp.new_session(
+            "/tmp/project",
+            mcp_servers=[
+                {
+                    "name": "stdio-tools",
+                    "command": "/usr/bin/tools",
+                    "args": ["--stdio"],
+                    "env": [{"name": "MODE", "value": "test"}],
+                },
+                {
+                    "type": "http",
+                    "name": "http-tools",
+                    "url": "https://example.invalid/mcp",
+                    "headers": [{"name": "Authorization", "value": "opaque"}],
+                },
+                {
+                    "type": "sse",
+                    "name": "legacy-tools",
+                    "url": "https://example.invalid/sse",
+                    "headers": [],
+                },
+            ],
+        )
+        assert created.session_id == "s-new"
+
+    with client("baseline") as acp:
+        acp.initialize()
+        with pytest.raises(AcpCapabilityError, match="HTTP"):
+            acp.new_session(
+                "/tmp/project",
+                mcp_servers=[
+                    {
+                        "type": "http",
+                        "name": "http-tools",
+                        "url": "https://example.invalid/mcp",
+                        "headers": [],
+                    }
+                ],
+            )
+        with pytest.raises(ValueError, match="absolute"):
+            acp.new_session(
+                "/tmp/project",
+                mcp_servers=[
+                    {"name": "stdio-tools", "command": "tools", "args": [], "env": []}
+                ],
+            )
+        with pytest.raises(ValueError, match="stable ACP v1"):
+            acp.new_session(
+                "/tmp/project",
+                mcp_servers=[
+                    {
+                        "type": "stdio",
+                        "name": "stdio-tools",
+                        "command": "/usr/bin/tools",
+                        "args": [],
+                        "env": [],
+                    }
+                ],
+            )
+
+
 def test_concurrent_initialize_is_exactly_once_and_returns_same_result() -> None:
     with client() as acp:
         results: list[object] = []
@@ -197,7 +298,7 @@ def test_backpressure_failure_remains_visible_after_full_queue_drains() -> None:
         assert acp.state is ClientState.FAILED
         assert isinstance(acp.failure, AcpEventQueueFullError)
         first = acp.next_update(timeout=1)
-        assert first.update_kind == "vendor_progress"
+        assert first.update_kind is SessionUpdateKind.AGENT_MESSAGE_CHUNK
         with pytest.raises(AcpTransportError):
             acp.next_update(timeout=1)
 
@@ -251,12 +352,43 @@ def test_stderr_tail_is_bounded_and_keeps_suffix() -> None:
 
 
 def test_unknown_adapter_extensions_remain_observable() -> None:
-    with client("extensions") as acp:
+    method = "_vendor.example/future_notification"
+    with client("extensions", supported_extension_notifications=(method,)) as acp:
         initialized = acp.initialize()
-        assert initialized.capabilities.raw["vendorFutureCapability"] == {"level": 2}
+        assert initialized.capabilities.raw["_meta"] == {
+            "vendor.example": {"level": 2}
+        }
         notification = acp.next_notification(timeout=1)
-        assert notification.method == "vendor/future_notification"
+        assert notification.method == method
         assert notification.params["opaque"] == {"revision": 9}
+
+
+def test_unrecognized_extension_notifications_are_ignored_without_backpressure() -> None:
+    with client("extension_flood", max_pending_events=1) as acp:
+        acp.initialize()
+        time.sleep(0.1)
+        assert acp.state is ClientState.INITIALIZED
+        with pytest.raises(AcpRequestTimeoutError):
+            acp.next_notification(timeout=0.05)
+
+
+def test_unsupported_inbound_request_gets_automatic_method_not_found() -> None:
+    with client("unknown_request") as acp:
+        acp.initialize()
+        confirmation = acp.next_update(timeout=1)
+        assert confirmation.session_id == "s-extension"
+        assert confirmation.update["content"]["text"] == "method-not-found"
+
+
+def test_explicitly_supported_extension_request_remains_observable() -> None:
+    method = "_vendor.example/request"
+    with client("supported_request", supported_extension_requests=(method,)) as acp:
+        acp.initialize()
+        request = acp.next_inbound_request(timeout=1)
+        assert request.method == method
+        acp.reject_inbound_request(request.request_id)
+        confirmation = acp.next_update(timeout=1)
+        assert confirmation.update["content"]["text"] == "method-not-found"
 
 
 def test_uncorrelated_null_error_response_does_not_poison_transport() -> None:
@@ -281,6 +413,14 @@ def test_boolean_protocol_version_is_not_accepted_as_integer_one() -> None:
         with pytest.raises(AcpProtocolError, match="protocol version"):
             acp.initialize()
         assert acp.state is ClientState.FAILED
+
+
+def test_unsupported_protocol_version_is_reaped_during_initialize() -> None:
+    acp = client("bool_version", close_timeout=0.1)
+    with pytest.raises(AcpProtocolError, match="protocol version"):
+        acp.initialize()
+    assert acp.process is not None
+    assert acp.process.poll() is not None
 
 
 @pytest.mark.parametrize(
