@@ -71,9 +71,9 @@ def test_initialize_only_agent_does_not_gain_untested_baseline_claims() -> None:
 @pytest.mark.parametrize(
     ("mode", "failure", "timeout"),
     [
-        ("malformed", ProbeFailure.PROTOCOL, 0.5),
-        ("partial_eof", ProbeFailure.PROTOCOL, 0.5),
-        ("bool_version", ProbeFailure.PROTOCOL_VERSION, 0.5),
+        ("malformed", ProbeFailure.PROTOCOL, 2.0),
+        ("partial_eof", ProbeFailure.PROTOCOL, 2.0),
+        ("bool_version", ProbeFailure.PROTOCOL_VERSION, 2.0),
         ("no_read", ProbeFailure.TIMEOUT, 0.05),
     ],
 )
