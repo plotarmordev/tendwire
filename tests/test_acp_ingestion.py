@@ -46,6 +46,16 @@ def _appended(sequence: int, event: AgentEvent) -> AppendBoundAgentEventResult:
     return AppendBoundAgentEventResult("inserted", event.event_id, sequence)
 
 
+def _config(db_path: Path, **kwargs: object) -> Config:
+    agent_event_source = str(kwargs.pop("agent_event_source", "acp_preferred"))
+    return Config(
+        host_id="host-a",
+        db_path=db_path,
+        agent_event_source=agent_event_source,
+        **kwargs,
+    )
+
+
 def test_messages_are_journaled_privately_and_projected_without_thoughts(
     tmp_path: Path,
 ) -> None:
@@ -69,7 +79,7 @@ def test_messages_are_journaled_privately_and_projected_without_thoughts(
         return TurnRefreshApplyResult(1, False)
 
     ingestor = AcpSessionIngestor(
-        Config(host_id="host-a", db_path=tmp_path / "events.db"),
+        _config(tmp_path / "events.db"),
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
@@ -130,11 +140,7 @@ def test_shadow_mode_journals_without_turn_projection(tmp_path: Path) -> None:
         raise AssertionError("shadow mode must not project turns")
 
     ingestor = AcpSessionIngestor(
-        Config(
-            host_id="host-a",
-            db_path=tmp_path / "events.db",
-            agent_event_source="acp_shadow",
-        ),
+        _config(tmp_path / "events.db", agent_event_source="acp_shadow"),
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
@@ -151,6 +157,10 @@ def test_shadow_mode_journals_without_turn_projection(tmp_path: Path) -> None:
     assert result.event is not None
     assert result.turn is None
     assert len(events) == 1
+    assert ingestor.source_turn_id is not None
+    assert ingestor.projector.project_turn_content("session-a")[
+        "assistant_stream_text"
+    ] == "shadow"
 
 
 def test_disabled_thought_policy_discards_before_persistence(tmp_path: Path) -> None:
@@ -158,11 +168,7 @@ def test_disabled_thought_policy_discards_before_persistence(tmp_path: Path) -> 
         raise AssertionError("disabled thoughts must not be persisted")
 
     ingestor = AcpSessionIngestor(
-        Config(
-            host_id="host-a",
-            db_path=tmp_path / "events.db",
-            acp_thought_policy="disabled",
-        ),
+        _config(tmp_path / "events.db", acp_thought_policy="disabled"),
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
@@ -193,7 +199,7 @@ def test_synthetic_event_identity_is_scoped_to_stream_generation(tmp_path: Path)
 
     for generation in ("generation-a", "generation-b"):
         ingestor = AcpSessionIngestor(
-            Config(host_id="host-a", db_path=tmp_path / "events.db"),
+            _config(tmp_path / "events.db"),
             session_id="session-a",
             stream_generation=generation,
             binding=_binding(),
@@ -218,7 +224,7 @@ def test_constructor_rejects_binding_for_another_acp_session(tmp_path: Path) -> 
 
     with pytest.raises(ValueError, match="does not match"):
         AcpSessionIngestor(
-            Config(host_id="host-a", db_path=tmp_path / "events.db"),
+            _config(tmp_path / "events.db"),
             session_id="session-a",
             stream_generation="generation-a",
             binding=mismatched,
@@ -232,7 +238,7 @@ def test_notification_session_mismatch_is_rejected_before_state_or_persistence(
         raise AssertionError("mismatched session must not cross the authority boundary")
 
     ingestor = AcpSessionIngestor(
-        Config(host_id="host-a", db_path=tmp_path / "events.db"),
+        _config(tmp_path / "events.db"),
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
@@ -271,11 +277,7 @@ def test_required_mode_fails_closed_when_durable_binding_is_stale(
         raise AssertionError("stale ACP events must not be projected")
 
     ingestor = AcpSessionIngestor(
-        Config(
-            host_id="host-a",
-            db_path=db_path,
-            agent_event_source="acp_required",
-        ),
+        _config(db_path, agent_event_source="acp_required"),
         session_id="session-a",
         stream_generation="generation-a",
         binding=binding,
@@ -295,6 +297,8 @@ def test_required_mode_fails_closed_when_durable_binding_is_stale(
     assert result.event.sequence is None
     assert result.turn is None
     assert list_agent_events(db_path, "host-a") == ()
+    assert ingestor.source_turn_id is None
+    assert ingestor.projector.session_snapshot("session-a") is None
 
 
 def test_default_authority_check_accepts_the_current_durable_binding(
@@ -304,7 +308,7 @@ def test_default_authority_check_accepts_the_current_durable_binding(
     binding = _binding()
     upsert_worker_bindings(db_path, [binding])
     ingestor = AcpSessionIngestor(
-        Config(host_id="host-a", db_path=db_path, agent_event_source="acp_required"),
+        _config(db_path, agent_event_source="acp_required"),
         session_id="session-a",
         stream_generation="generation-a",
         binding=binding,
@@ -335,11 +339,7 @@ def test_shadow_completion_never_projects_and_finality_is_idempotent(
         raise AssertionError("shadow mode must never project, including completion")
 
     ingestor = AcpSessionIngestor(
-        Config(
-            host_id="host-a",
-            db_path=tmp_path / "events.db",
-            agent_event_source="acp_shadow",
-        ),
+        _config(tmp_path / "events.db", agent_event_source="acp_shadow"),
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
@@ -387,11 +387,7 @@ def test_required_mode_projects_messages_and_final_exactly_once(tmp_path: Path) 
         return TurnRefreshApplyResult(1, False)
 
     ingestor = AcpSessionIngestor(
-        Config(
-            host_id="host-a",
-            db_path=tmp_path / "events.db",
-            agent_event_source="acp_required",
-        ),
+        _config(tmp_path / "events.db", agent_event_source="acp_required"),
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
@@ -431,7 +427,7 @@ def test_duplicate_durable_event_is_not_reprojected(tmp_path: Path) -> None:
         return TurnRefreshApplyResult(1, False)
 
     ingestor = AcpSessionIngestor(
-        Config(host_id="host-a", db_path=tmp_path / "events.db"),
+        _config(tmp_path / "events.db"),
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
@@ -449,6 +445,74 @@ def test_duplicate_durable_event_is_not_reprojected(tmp_path: Path) -> None:
 
     assert result.ignored_reason == "duplicate_event"
     assert not projected
+    assert ingestor.source_turn_id is None
+    assert ingestor.projector.session_snapshot("session-a") is None
+
+
+def test_append_exception_rolls_back_turn_identity_sequence_and_message(
+    tmp_path: Path,
+) -> None:
+    attempts = 0
+
+    def append(
+        _path: Path | str,
+        _host: str,
+        event: AgentEvent,
+        **_kwargs,
+    ) -> AppendBoundAgentEventResult:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("durable append failed")
+        return _appended(1, event)
+
+    ingestor = AcpSessionIngestor(
+        _config(tmp_path / "events.db"),
+        session_id="session-a",
+        stream_generation="generation-a",
+        binding=_binding(),
+        append_event=append,
+        apply_turn=lambda *_args, **_kwargs: TurnRefreshApplyResult(1, False),
+    )
+    notification = _update(
+        "agent_message_chunk",
+        content={"type": "text", "text": "exactly once"},
+    )
+
+    with pytest.raises(RuntimeError, match="durable append failed"):
+        ingestor.ingest_update(notification)
+    assert ingestor.source_turn_id is None
+    assert ingestor.projector.session_snapshot("session-a") is None
+
+    accepted = ingestor.ingest_update(notification)
+    assert accepted.event is not None and accepted.event.status == "inserted"
+    snapshot = ingestor.projector.session_snapshot("session-a")
+    assert snapshot is not None and snapshot["sequence"] == 1
+    assert ingestor.projector.project_turn_content("session-a")[
+        "assistant_stream_text"
+    ] == "exactly once"
+
+
+def test_oversized_first_chunk_does_not_leave_an_implicit_turn(tmp_path: Path) -> None:
+    from tendwire.backends.acp_projection import AcpEventProjector, AcpProjectionError
+
+    ingestor = AcpSessionIngestor(
+        _config(tmp_path / "events.db"),
+        session_id="session-a",
+        stream_generation="generation-a",
+        binding=_binding(),
+        projector=AcpEventProjector(max_event_bytes=128),
+    )
+
+    with pytest.raises(AcpProjectionError, match="size limit"):
+        ingestor.ingest_update(
+            _update(
+                "agent_message_chunk",
+                content={"type": "text", "text": "x" * 300},
+            )
+        )
+    assert ingestor.source_turn_id is None
+    assert ingestor.projector.session_snapshot("session-a") is None
 
 
 def test_atomic_durable_replay_is_reported_without_second_projection(
@@ -465,7 +529,7 @@ def test_atomic_durable_replay_is_reported_without_second_projection(
 
     def ingestor() -> AcpSessionIngestor:
         return AcpSessionIngestor(
-            Config(host_id="host-a", db_path=db_path),
+                _config(db_path),
             session_id="session-a",
             stream_generation="generation-a",
             binding=binding,
@@ -502,7 +566,7 @@ def test_producer_turn_identity_survives_transport_recreation(tmp_path: Path) ->
     identities: list[str] = []
     for generation in ("generation-a", "generation-b"):
         ingestor = AcpSessionIngestor(
-            Config(host_id="host-a", db_path=tmp_path / "events.db"),
+            _config(tmp_path / "events.db"),
             session_id="session-a",
             stream_generation=generation,
             binding=_binding(),
@@ -527,7 +591,7 @@ def test_private_summary_policy_retains_display_chunks_but_rejects_marked_raw_th
         return _appended(len(events), event)
 
     ingestor = AcpSessionIngestor(
-        Config(host_id="host-a", db_path=tmp_path / "events.db"),
+        _config(tmp_path / "events.db"),
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
@@ -577,11 +641,7 @@ def test_private_all_policy_retains_marked_raw_thought_privately(tmp_path: Path)
         return _appended(1, event)
 
     ingestor = AcpSessionIngestor(
-        Config(
-            host_id="host-a",
-            db_path=tmp_path / "events.db",
-            acp_thought_policy="private_all",
-        ),
+        _config(tmp_path / "events.db", acp_thought_policy="private_all"),
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),

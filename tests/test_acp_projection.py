@@ -163,53 +163,32 @@ def test_tool_lifecycle_merges_partial_updates_and_marks_raw_fields_private() ->
 
 def test_permission_request_updates_tool_and_keeps_options() -> None:
     projector = AcpEventProjector()
-    event = projector.normalize_permission_request(
-        {
-            "jsonrpc": "2.0",
-            "id": 42,
-            "method": "session/request_permission",
-            "params": {
-                "sessionId": "session-1",
-                "toolCall": {"toolCallId": "tool-9", "status": "pending"},
-                "options": [
-                    {"optionId": "yes", "name": "Allow", "kind": "allow_once"},
-                    {"optionId": "no", "name": "Reject", "kind": "reject_once"},
-                ],
-            },
+    request = {
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "session-1",
+            "toolCall": {"toolCallId": "tool-9", "status": "pending"},
+            "options": [
+                {"optionId": "yes", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "no", "name": "Reject", "kind": "reject_once"},
+            ],
         },
-    )
+    }
+    event = projector.normalize_permission_request(request, source_event_id="permission-42")
 
     assert event is not None
     assert event["kind"] == "tool_call_update"
     assert event["payload"]["permission"]["required"] is True
     assert event["payload"]["permission"]["options"][1]["optionId"] == "no"
-    assert event["source_event_id"] == "request:42"
-    assert event["event_id"] == "acp:session-1:request:42"
+    assert event["source_event_id"] == "permission-42"
+    assert event["event_id"] == "acp:session-1:permission-42"
     assert "payload.permission" in event["private_fields"]
 
     assert (
         projector.normalize_permission_request(
-            {
-                "jsonrpc": "2.0",
-                "id": 42,
-                "method": "session/request_permission",
-                "params": {
-                    "sessionId": "session-1",
-                    "toolCall": {"toolCallId": "tool-9", "status": "pending"},
-                    "options": [
-                        {
-                            "optionId": "yes",
-                            "name": "Allow",
-                            "kind": "allow_once",
-                        },
-                        {
-                            "optionId": "no",
-                            "name": "Reject",
-                            "kind": "reject_once",
-                        },
-                    ],
-                },
-            }
+            request, source_event_id="permission-42"
         )
         is None
     )
@@ -242,6 +221,156 @@ def test_plan_usage_and_session_info_are_full_or_merged_snapshots() -> None:
     assert cleared["payload"]["updatedAt"] == "2026-07-31T12:00:00Z"
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        {"type": "text", "text": "hello", "_meta": {"traceparent": "00-abc"}},
+        {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/png"},
+        {"type": "audio", "data": "YXVkaW8=", "mimeType": "audio/wav"},
+        {
+            "type": "resource_link",
+            "name": "source.py",
+            "uri": "file:///workspace/source.py",
+            "mimeType": "text/x-python",
+            "size": 42,
+        },
+        {
+            "type": "resource",
+            "resource": {
+                "uri": "file:///workspace/source.py",
+                "mimeType": "text/x-python",
+                "text": "print('ok')",
+                "_meta": {"messageCount": 1},
+            },
+        },
+    ],
+)
+def test_official_v1_content_block_shapes_are_accepted(content: dict[str, object]) -> None:
+    projector = AcpEventProjector()
+    event = projector.normalize_session_update(
+        _update("agent_message_chunk", messageId="message-1", content=content)
+    )
+
+    assert event is not None
+    assert event["payload"]["content"] == content
+
+
+def test_official_v1_tool_shapes_are_validated_and_preserved() -> None:
+    projector = AcpEventProjector()
+    projector.normalize_session_update(
+        _update(
+            "tool_call",
+            toolCallId="tool-1",
+            title="Edit source",
+            kind="edit",
+            status="in_progress",
+            locations=[{"path": "/workspace/source.py", "line": 7}],
+        )
+    )
+    event = projector.normalize_session_update(
+        _update(
+            "tool_call_update",
+            toolCallId="tool-1",
+            status="completed",
+            content=[
+                {
+                    "type": "diff",
+                    "path": "/workspace/source.py",
+                    "oldText": "old",
+                    "newText": "new",
+                    "_meta": {"traceparent": "00-tool"},
+                },
+                {"type": "terminal", "terminalId": "terminal-1"},
+                {
+                    "type": "content",
+                    "content": {"type": "text", "text": "done"},
+                },
+            ],
+        )
+    )
+
+    assert event is not None
+    assert event["payload"]["snapshot"]["status"] == "completed"
+    assert event["payload"]["snapshot"]["locations"] == [
+        {"path": "/workspace/source.py", "line": 7}
+    ]
+
+
+@pytest.mark.parametrize(
+    "notification,match",
+    [
+        (_update("agent_message_chunk", content={"type": "text"}), "string text"),
+        (_update("agent_message_chunk", content={"type": "future"}), "unsupported type"),
+        (_update("tool_call", toolCallId="tool-1"), "string title"),
+        (
+            _update(
+                "tool_call",
+                toolCallId="tool-1",
+                title="Bad status",
+                status="cancelled",
+            ),
+            "invalid status",
+        ),
+        (
+            _update("plan", entries=[{"content": "missing fields"}]),
+            "invalid priority",
+        ),
+        (_update("usage_update", used=1), "usage size"),
+        (_update("usage_update", used=True, size=10), "usage used"),
+        (_update("session_info_update", title=7), "title must be text"),
+    ],
+)
+def test_malformed_supported_v1_updates_fail_without_allocating_state(
+    notification: dict[str, object], match: str
+) -> None:
+    projector = AcpEventProjector()
+    with pytest.raises(AcpProjectionError, match=match):
+        projector.normalize_session_update(notification)
+    assert projector.session_snapshot("session-1") is None
+
+
+def test_usage_update_is_a_complete_snapshot_and_omission_clears_cost() -> None:
+    projector = AcpEventProjector()
+    projector.normalize_session_update(
+        _update(
+            "usage_update",
+            used=5,
+            size=100,
+            cost={"amount": 0.25, "currency": "USD"},
+        )
+    )
+    event = projector.normalize_session_update(
+        _update("usage_update", used=7, size=100)
+    )
+
+    assert event is not None
+    assert event["payload"] == {"used": 7, "size": 100}
+    assert projector.session_snapshot("session-1")["usage"] == {
+        "used": 7,
+        "size": 100,
+    }
+
+
+def test_implicit_v1_message_is_split_after_an_update_type_boundary() -> None:
+    projector = AcpEventProjector()
+    first = projector.normalize_session_update(
+        _update("agent_message_chunk", content={"type": "text", "text": "before"})
+    )
+    projector.normalize_session_update(
+        _update("tool_call", toolCallId="tool-1", title="Boundary")
+    )
+    second = projector.normalize_session_update(
+        _update("agent_message_chunk", content={"type": "text", "text": "after"})
+    )
+
+    assert first is not None and second is not None
+    assert first["payload"]["message_id"] == "implicit-agent_message-1"
+    assert second["payload"]["message_id"] == "implicit-agent_message-2"
+    assert projector.project_turn_content("session-1")["assistant_stream_text"] == (
+        "before\n\nafter"
+    )
+
+
 def test_explicit_event_ids_dedupe_replay_but_identical_unidentified_chunks_do_not() -> None:
     projector = AcpEventProjector()
     notification = _update(
@@ -265,7 +394,7 @@ def test_explicit_event_ids_dedupe_replay_but_identical_unidentified_chunks_do_n
     assert len(first["dedupe_hint"]) == 64
 
 
-def test_meta_event_id_is_used_as_replay_key() -> None:
+def test_meta_event_id_is_opaque_and_not_used_as_replay_key() -> None:
     projector = AcpEventProjector()
     notification = _update(
         "agent_message_chunk",
@@ -273,8 +402,11 @@ def test_meta_event_id_is_used_as_replay_key() -> None:
         content={"type": "text", "text": "once"},
         _meta={"eventId": "adapter-99"},
     )
-    assert projector.normalize_session_update(notification) is not None
-    assert projector.normalize_session_update(notification) is None
+    first = projector.normalize_session_update(notification)
+    second = projector.normalize_session_update(notification)
+    assert first is not None and second is not None
+    assert first["source_event_id"] is None
+    assert first["payload"]["extensions"]["update"] == {"eventId": "adapter-99"}
 
 
 def test_unknown_update_is_forward_compatible_and_malformed_input_is_rejected() -> None:
@@ -288,6 +420,16 @@ def test_unknown_update_is_forward_compatible_and_malformed_input_is_rejected() 
         projector.normalize_permission_request(
             {"sessionId": "session-1", "toolCall": {}, "options": []}
         )
+    with pytest.raises(AcpProjectionError, match="invalid kind"):
+        projector.normalize_permission_request(
+            {
+                "sessionId": "session-1",
+                "toolCall": {"toolCallId": "tool-1"},
+                "options": [
+                    {"optionId": "maybe", "name": "Maybe", "kind": "sometimes"}
+                ],
+            }
+        )
 
 
 def test_failed_normalization_does_not_consume_sequence_or_replay_id() -> None:
@@ -295,7 +437,7 @@ def test_failed_normalization_does_not_consume_sequence_or_replay_id() -> None:
     malformed = _update(
         "agent_message_chunk", messageId="answer-1", content="not-an-object"
     )
-    with pytest.raises(AcpProjectionError, match="missing content"):
+    with pytest.raises(AcpProjectionError, match="missing object content"):
         projector.normalize_session_update(malformed, source_event_id="event-1")
 
     valid = _update(
@@ -332,12 +474,20 @@ def test_sessions_have_independent_ordering_and_defensive_snapshots() -> None:
 def test_interleaved_explicit_messages_and_implicit_v1_chunks_do_not_alias() -> None:
     projector = AcpEventProjector()
 
-    for message_id, text in (("a", "A1"), ("b", "B"), ("a", "A2")):
+    for message_id, text in (("a", "A1"), ("b", "B")):
         projector.normalize_session_update(
             _update(
                 "agent_message_chunk",
                 messageId=message_id,
                 content={"type": "text", "text": text},
+            )
+        )
+    with pytest.raises(AcpProjectionError, match="reused after a message boundary"):
+        projector.normalize_session_update(
+            _update(
+                "agent_message_chunk",
+                messageId="a",
+                content={"type": "text", "text": "A2"},
             )
         )
     implicit = projector.normalize_session_update(
@@ -350,7 +500,7 @@ def test_interleaved_explicit_messages_and_implicit_v1_chunks_do_not_alias() -> 
     assert implicit is not None
     assert implicit["payload"]["message_id"] == "implicit-agent_message-1"
     assert projector.project_turn_content("session-1")["assistant_stream_text"] == (
-        "A1A2\n\nB\n\nstable-v1"
+        "A1\n\nB\n\nstable-v1"
     )
 
 
@@ -385,10 +535,13 @@ def test_permission_request_ids_do_not_collide_with_notification_event_ids() -> 
     notification = _update(
         "tool_call",
         toolCallId="tool-1",
+        title="Tracked tool",
         status="pending",
         _meta={"eventId": 42},
     )
-    assert projector.normalize_session_update(notification) is not None
+    assert projector.normalize_session_update(
+        notification, source_event_id="notification-42"
+    ) is not None
     permission = projector.normalize_permission_request(
         {
             "jsonrpc": "2.0",
@@ -404,7 +557,7 @@ def test_permission_request_ids_do_not_collide_with_notification_event_ids() -> 
         }
     )
     assert permission is not None
-    assert permission["source_event_id"] == "request:42"
+    assert permission["source_event_id"] is None
 
 
 def test_namespaced_extension_metadata_is_private_and_adapter_neutral() -> None:
@@ -437,32 +590,42 @@ def test_namespaced_extension_metadata_is_private_and_adapter_neutral() -> None:
     assert event is not None
     assert event["sequence"] == 1
     assert event["payload"]["extensions"] == {
-        "vendor.example/params": {"trace": "abc"},
-        "vendor.example/update": {"opaque": True}
+        "params": {"vendor.example/params": {"trace": "abc"}},
+        "update": {
+            "vendor.example/update": {"opaque": True},
+            "adapterInternal": "discard",
+        },
     }
     assert event["payload"]["content"]["_meta"] == {
-        "vendor.example/content": {"revision": 1}
+        "vendor.example/content": {"revision": 1},
+        "unscoped": "discard",
     }
-    assert "adapterInternal" not in repr(event["payload"])
-    assert "unscoped" not in repr(event["payload"])
+    assert "adapterInternal" in repr(event["payload"])
+    assert "unscoped" in repr(event["payload"])
 
 
 def test_plan_is_a_validated_full_replacement() -> None:
     projector = AcpEventProjector()
     projector.normalize_session_update(
-        _update("plan", entries=[{"content": "old", "status": "pending"}])
+        _update(
+            "plan",
+            entries=[{"content": "old", "priority": "medium", "status": "pending"}],
+        )
     )
     replacement = projector.normalize_session_update(
-        _update("plan", entries=[{"content": "new", "status": "completed"}])
+        _update(
+            "plan",
+            entries=[{"content": "new", "priority": "high", "status": "completed"}],
+        )
     )
     assert replacement is not None
     assert replacement["payload"]["entries"] == [
-        {"content": "new", "status": "completed"}
+        {"content": "new", "priority": "high", "status": "completed"}
     ]
     with pytest.raises(AcpProjectionError, match="entries must be an array"):
         projector.normalize_session_update(_update("plan", entries="bad"))
     assert projector.session_snapshot("session-1")["plan"] == [
-        {"content": "new", "status": "completed"}
+        {"content": "new", "priority": "high", "status": "completed"}
     ]
 
 
@@ -505,23 +668,23 @@ def test_bounded_state_fails_closed_and_drop_session_releases_capacity() -> None
         max_source_events_per_session=1,
         max_messages_per_kind=1,
         max_tool_calls_per_session=1,
-        max_state_fields=1,
+        max_state_fields=2,
         max_plan_entries=1,
         max_text_chars_per_message=3,
         max_event_bytes=1024,
     )
     assert projector.normalize_session_update(
-        _update("usage_update", used=1), source_event_id="one"
+        _update("usage_update", used=1, size=10), source_event_id="one"
     )
     with pytest.raises(AcpProjectionError, match="replay window"):
         projector.normalize_session_update(
-            _update("usage_update", used=2), source_event_id="two"
+            _update("usage_update", used=2, size=10), source_event_id="two"
         )
     with pytest.raises(AcpProjectionError, match="session limit"):
         projector.normalize_session_update(
             {
                 "sessionId": "session-2",
-                "update": {"sessionUpdate": "usage_update", "used": 1},
+                "update": {"sessionUpdate": "usage_update", "used": 1, "size": 10},
             }
         )
     assert projector.drop_session("session-1") is True
@@ -529,7 +692,7 @@ def test_bounded_state_fails_closed_and_drop_session_releases_capacity() -> None
     assert projector.normalize_session_update(
         {
             "sessionId": "session-2",
-            "update": {"sessionUpdate": "usage_update", "used": 1},
+            "update": {"sessionUpdate": "usage_update", "used": 1, "size": 10},
         }
     )
 
@@ -550,7 +713,7 @@ def test_failed_or_oversized_input_does_not_allocate_or_mutate_session() -> None
     accepted = projector.normalize_session_update(
         {
             "sessionId": "session-2",
-            "update": {"sessionUpdate": "usage_update", "used": 1},
+            "update": {"sessionUpdate": "usage_update", "used": 1, "size": 10},
         }
     )
     assert accepted is not None and accepted["sequence"] == 1
@@ -573,7 +736,7 @@ def test_total_retained_state_is_bounded_across_isolated_sessions() -> None:
     assert projector.normalize_session_update(
         {
             "sessionId": "session-a",
-            "update": {"sessionUpdate": "session_info_update", "value": "1234"},
+            "update": {"sessionUpdate": "session_info_update", "title": "1234"},
         }
     )
     with pytest.raises(AcpProjectionError, match="total retained state"):
@@ -582,7 +745,7 @@ def test_total_retained_state_is_bounded_across_isolated_sessions() -> None:
                 "sessionId": "session-b",
                 "update": {
                     "sessionUpdate": "session_info_update",
-                    "value": "1234",
+                    "title": "1234",
                 },
             }
         )
@@ -601,11 +764,21 @@ def test_all_non_message_events_remain_unreachable_from_legacy_turns() -> None:
         _update(
             "tool_call",
             toolCallId="tool-secret",
+            title="Private tool",
             rawInput={"secret": "do not leak raw input"},
         )
     )
     projector.normalize_session_update(
-        _update("plan", entries=[{"content": "do not leak plan"}])
+        _update(
+            "plan",
+            entries=[
+                {
+                    "content": "do not leak plan",
+                    "priority": "low",
+                    "status": "pending",
+                }
+            ],
+        )
     )
     projector.normalize_permission_request(
         {

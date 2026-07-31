@@ -22,7 +22,7 @@ from ..store.sqlite import (
     append_agent_event_for_binding,
     apply_turn_refresh,
 )
-from .acp_projection import AcpEventProjector
+from .acp_projection import AcpEventProjector, AcpProjectionCheckpoint
 
 
 AppendEvent = Callable[..., AppendBoundAgentEventResult]
@@ -148,14 +148,27 @@ class AcpSessionIngestor:
         )
         if thought_rejection is not None:
             return AcpIngestionResult("thought", ignored_reason=thought_rejection)
-        canonical = self.projector.normalize_session_update(
-            notification,
-            source_event_id=source_event_id,
-            replay=replay,
-        )
+        checkpoint = self.projector.checkpoint_session(self.session_id)
+        prior_turn_state = self._turn_state()
+        if self._source_turn_id is None and update_kind in _TURN_SCOPED_UPDATES:
+            self.start_turn()
+        try:
+            canonical = self.projector.normalize_session_update(
+                notification,
+                source_event_id=source_event_id,
+                replay=replay,
+            )
+        except BaseException:
+            self._restore_speculation(checkpoint, prior_turn_state)
+            raise
         if canonical is None:
+            self._restore_speculation(checkpoint, prior_turn_state)
             return AcpIngestionResult(None, ignored_reason="unsupported_or_duplicate")
-        return self._accept(canonical)
+        return self._accept(
+            canonical,
+            checkpoint=checkpoint,
+            prior_turn_state=prior_turn_state,
+        )
 
     def ingest_permission_request(
         self,
@@ -175,14 +188,27 @@ class AcpSessionIngestor:
             return AcpIngestionResult(None, ignored_reason=mismatch)
         if self._turn_complete:
             return AcpIngestionResult(None, ignored_reason="turn_already_complete")
-        canonical = self.projector.normalize_permission_request(
-            request,
-            source_event_id=source_event_id,
-            replay=replay,
-        )
+        checkpoint = self.projector.checkpoint_session(self.session_id)
+        prior_turn_state = self._turn_state()
+        if self._source_turn_id is None:
+            self.start_turn()
+        try:
+            canonical = self.projector.normalize_permission_request(
+                request,
+                source_event_id=source_event_id,
+                replay=replay,
+            )
+        except BaseException:
+            self._restore_speculation(checkpoint, prior_turn_state)
+            raise
         if canonical is None:
+            self._restore_speculation(checkpoint, prior_turn_state)
             return AcpIngestionResult(None, ignored_reason="duplicate")
-        return self._accept(canonical)
+        return self._accept(
+            canonical,
+            checkpoint=checkpoint,
+            prior_turn_state=prior_turn_state,
+        )
 
     def mark_prompt_complete(self) -> AcpIngestionResult:
         """Finalize the current text projection after ``session/prompt`` returns."""
@@ -204,53 +230,56 @@ class AcpSessionIngestor:
             ignored_reason="stale_binding" if turn.stale_binding else None,
         )
 
-    def _accept(self, canonical: Mapping[str, Any]) -> AcpIngestionResult:
+    def _accept(
+        self,
+        canonical: Mapping[str, Any],
+        *,
+        checkpoint: AcpProjectionCheckpoint,
+        prior_turn_state: tuple[int, str | None, bool],
+    ) -> AcpIngestionResult:
         kind = str(canonical.get("kind") or "")
         if kind == "thought" and self.config.acp_thought_policy == "disabled":
+            self._restore_speculation(checkpoint, prior_turn_state)
             return AcpIngestionResult(kind, ignored_reason="thought_policy_disabled")
-        if self._source_turn_id is None and kind in {
-            "user_message",
-            "agent_message",
-            "thought",
-            "tool_call",
-            "tool_call_update",
-            "plan",
-        }:
-            self.start_turn()
-
-        payload = canonical.get("payload")
-        if not isinstance(payload, Mapping):
-            raise ValueError("canonical ACP event payload must be a mapping")
-        sequence = canonical.get("sequence")
-        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
-            raise ValueError("canonical ACP event sequence must be nonnegative")
-        explicit_event_id = canonical.get("source_event_id")
-        source_id = (
-            str(explicit_event_id)
-            if explicit_event_id is not None and str(explicit_event_id)
-            else f"stream:{self.stream_generation}:{sequence}"
-        )
-        event = agent_event(
-            kind=kind,
-            source="acp",
-            worker_id=self.binding.worker_id,
-            payload=payload,
-            source_session_id=self.session_id,
-            source_turn_id=self._source_turn_id,
-            source_item_id=_source_item_id(kind, payload),
-            source_message_id=_source_message_id(kind, payload),
-            source_event_id=source_id,
-            source_sequence=sequence,
-            # The complete structured journal is private initially. Public and
-            # connector views require a separate explicit sanitizing projection.
-            visibility="private",
-        )
-        appended = self._append_event(
-            Path(self.config.db_path),
-            self.config.host_id,
-            event,
-            expected_binding=self.binding,
-        )
+        try:
+            payload = canonical.get("payload")
+            if not isinstance(payload, Mapping):
+                raise ValueError("canonical ACP event payload must be a mapping")
+            sequence = canonical.get("sequence")
+            if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+                raise ValueError("canonical ACP event sequence must be nonnegative")
+            explicit_event_id = canonical.get("source_event_id")
+            source_id = (
+                str(explicit_event_id)
+                if explicit_event_id is not None and str(explicit_event_id)
+                else f"stream:{self.stream_generation}:{sequence}"
+            )
+            event = agent_event(
+                kind=kind,
+                source="acp",
+                worker_id=self.binding.worker_id,
+                payload=payload,
+                source_session_id=self.session_id,
+                source_turn_id=self._source_turn_id,
+                source_item_id=_source_item_id(kind, payload),
+                source_message_id=_source_message_id(kind, payload),
+                source_event_id=source_id,
+                source_sequence=sequence,
+                # The complete structured journal is private initially. Public and
+                # connector views require a separate explicit sanitizing projection.
+                visibility="private",
+            )
+            appended = self._append_event(
+                Path(self.config.db_path),
+                self.config.host_id,
+                event,
+                expected_binding=self.binding,
+            )
+        except BaseException:
+            self._restore_speculation(checkpoint, prior_turn_state)
+            raise
+        if appended.status != "inserted":
+            self._restore_speculation(checkpoint, prior_turn_state)
 
         turn: TurnRefreshApplyResult | None = None
         if (
@@ -275,6 +304,17 @@ class AcpSessionIngestor:
                 else None
             ),
         )
+
+    def _turn_state(self) -> tuple[int, str | None, bool]:
+        return self._turn_ordinal, self._source_turn_id, self._turn_complete
+
+    def _restore_speculation(
+        self,
+        checkpoint: AcpProjectionCheckpoint,
+        prior_turn_state: tuple[int, str | None, bool],
+    ) -> None:
+        self.projector.restore_session(checkpoint)
+        self._turn_ordinal, self._source_turn_id, self._turn_complete = prior_turn_state
 
     def _project_turn(self, content: Mapping[str, Any]) -> TurnRefreshApplyResult:
         return self._apply_turn(
