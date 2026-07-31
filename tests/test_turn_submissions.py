@@ -277,6 +277,42 @@ def test_v18_to_v20_backfills_historical_submission_receipt(
         )
 
 
+def test_v19_to_v20_repairs_legacy_schema_without_phase2_ledgers(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy-v19-without-phase2-ledgers.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        store_sqlite._run_migrations(conn, target_version=18)
+        _insert_historical_send_receipt(
+            conn,
+            request_id="legacy-v19-submit",
+            state="accepted",
+            status="accepted",
+            instruction_text="legacy v19 prompt",
+        )
+        # The deployed pre-Phase-2 lineage used version 19 without creating
+        # the two Phase-2 ledgers.
+        conn.execute("PRAGMA user_version = 19")
+        conn.commit()
+
+        assert not store_sqlite._table_columns(conn, "turn_submissions")
+        assert not store_sqlite._table_columns(conn, "turn_supersessions")
+
+        store_sqlite._run_migrations(conn)
+
+        assert conn.execute("PRAGMA user_version").fetchone() == (
+            store_sqlite.STORE_SCHEMA_VERSION,
+        )
+        assert conn.execute(
+            """
+            SELECT owner_key, state
+            FROM turn_submissions
+            WHERE host_id = 'host-a' AND request_id = 'legacy-v19-submit'
+            """
+        ).fetchone() == ("legacy-worker:worker-a", "submitted")
+        assert store_sqlite._table_columns(conn, "turn_supersessions")
+
+
 def test_v19_to_v20_backfills_legacy_tombstone_alias(tmp_path: Path) -> None:
     db_path = tmp_path / "supersession-backfill.db"
     _seed_link_worker(db_path)

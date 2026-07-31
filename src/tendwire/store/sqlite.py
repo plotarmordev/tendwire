@@ -13102,6 +13102,16 @@ def _backfill_turn_supersessions_conn(conn: sqlite3.Connection) -> None:
 
 def _migrate_v19_to_v20_conn(conn: sqlite3.Connection) -> None:
     """Backfill Phase 1 history into the non-authoritative Phase 2 ledgers."""
+    # The pre-Phase-2 production lineage also used user_version 19, but did
+    # not contain either ledger table. Repair that valid legacy shape before
+    # backfilling instead of assuming every v19 store passed through this
+    # branch's v18 -> v19 migration.
+    conn.execute(CREATE_TURN_SUBMISSIONS_TABLE)
+    conn.execute(CREATE_TURN_SUPERSESSIONS_TABLE)
+    for statement in CREATE_TURN_SUBMISSION_INDEXES:
+        conn.execute(statement)
+    for statement in CREATE_TURN_SUPERSESSION_INDEXES:
+        conn.execute(statement)
     _backfill_turn_submissions_conn(conn)
     _backfill_turn_supersessions_conn(conn)
 
