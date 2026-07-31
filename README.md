@@ -584,8 +584,13 @@ explicit sanitized projection is introduced.
 Store maintenance retires expired structured agent-event payloads in bounded
 batches using `event_retention_days`. Compact identity tombstones remain so a
 replayed source event cannot be reinserted or silently change content after its
-private payload has expired. Tombstones intentionally retain hashes and opaque
-identity only; they are not a recoverable copy of the removed payload.
+private payload has expired. Due automatic daemon maintenance performs the same
+host-scoped retirement as explicit `store cleanup`, using a metadata-only scan
+that does not load private payloads. Tombstones intentionally retain bounded
+per-event hashes and opaque identity only; they are not a recoverable copy of the
+removed payload. Their count is permanent and grows with distinct source-event
+identities. SQLite secure deletion is best-effort page hygiene, not a promise of
+immediate physical erasure across WAL/checkpoints, snapshots, or backups.
 
 Snapshot history defaults are sized for a five-minute observation rhythm:
 $14 \times 24 \times 12 = 4032$ observations, while the 4096-row count

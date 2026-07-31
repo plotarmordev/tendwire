@@ -901,6 +901,8 @@ class TendwireDaemon:
             result = maybe_run_automatic_store_maintenance(
                 Path(self.config.db_path),
                 policy=policy,
+                agent_event_host_id=self.config.host_id,
+                agent_event_retention_days=self.config.event_retention_days,
                 turn_model=self.config.turn_model,
                 acknowledged_final_retention_days=(
                     self.config.acknowledged_final_retention_days
@@ -930,6 +932,12 @@ class TendwireDaemon:
                 )
             snapshot_result = result.get("snapshot")
             snapshot_counts = snapshot_result if isinstance(snapshot_result, Mapping) else {}
+            agent_event_result = result.get("agent_events")
+            agent_event_counts = (
+                agent_event_result
+                if isinstance(agent_event_result, Mapping)
+                else {}
+            )
             maintenance_status = {
                 "ok": bool(result.get("ok")) and bool(turn_change_result.get("ok")),
                 "status": (
@@ -941,6 +949,15 @@ class TendwireDaemon:
                 "examined": int(snapshot_counts.get("examined") or 0),
                 "deleted": int(snapshot_counts.get("deleted") or 0),
                 "remaining_candidates": bool(snapshot_counts.get("remaining_candidates")),
+                "agent_events_examined": int(
+                    agent_event_counts.get("examined") or 0
+                ),
+                "agent_events_deleted": int(
+                    agent_event_counts.get("deleted") or 0
+                ),
+                "agent_events_remaining_candidates": bool(
+                    agent_event_counts.get("remaining_candidates")
+                ),
             }
         except Exception:
             self._automatic_maintenance_status = {
@@ -950,6 +967,9 @@ class TendwireDaemon:
                 "examined": 0,
                 "deleted": 0,
                 "remaining_candidates": False,
+                "agent_events_examined": 0,
+                "agent_events_deleted": 0,
+                "agent_events_remaining_candidates": False,
             }
         else:
             self._automatic_maintenance_status = maintenance_status

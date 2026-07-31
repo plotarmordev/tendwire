@@ -2213,6 +2213,64 @@ def _assert_private_daemon_failure(
         assert value not in rendered
 
 
+def test_snapshot_maintenance_wires_agent_event_retention_without_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "maintenance-wiring.db"
+    config = Config(
+        host_id="daemon-host",
+        data_dir=tmp_path,
+        db_path=db_path,
+        event_retention_days=9,
+        snapshot_maintenance_batch_size=13,
+    )
+    init_store(db_path)
+    captured: dict[str, Any] = {}
+
+    def maintenance(path: Path, **kwargs: Any) -> dict[str, Any]:
+        captured.update({"path": path, **kwargs})
+        return {
+            "schema_version": 1,
+            "ok": True,
+            "status": "ok",
+            "due": False,
+            "snapshot": {
+                "examined": 0,
+                "deleted": 0,
+                "remaining_candidates": False,
+            },
+            "agent_events": {
+                "examined": 5,
+                "deleted": 4,
+                "remaining_candidates": True,
+            },
+        }
+
+    monkeypatch.setattr(
+        "tendwire.store.sqlite.maybe_run_automatic_store_maintenance",
+        maintenance,
+    )
+    daemon = TendwireDaemon(config)
+    daemon._after_snapshot_saved()
+
+    assert captured["path"] == db_path
+    assert captured["agent_event_host_id"] == "daemon-host"
+    assert captured["agent_event_retention_days"] == 9
+    assert captured["policy"].batch_size == 13
+    assert daemon._automatic_maintenance_status == {
+        "ok": True,
+        "status": "ok",
+        "due": False,
+        "examined": 0,
+        "deleted": 0,
+        "remaining_candidates": False,
+        "agent_events_examined": 5,
+        "agent_events_deleted": 4,
+        "agent_events_remaining_candidates": True,
+    }
+
+
 @_UNIX_SOCKET_TEST
 def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
     tmp_path: Path,
@@ -2234,7 +2292,9 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         command_receipt_retention_seconds=691_200,
         command_receipt_retention_count=77,
     )
-    calls: list[tuple[Path, Any, int, int, int, int, int, int]] = []
+    calls: list[
+        tuple[Path, Any, str | None, int | None, int, int, int, int, int, int]
+    ] = []
 
     def observe(_config: Config) -> Snapshot:
         snapshot = _public_snapshot()
@@ -2245,6 +2305,8 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         path: Path,
         *,
         policy: Any,
+        agent_event_host_id: str | None = None,
+        agent_event_retention_days: int | None = None,
         turn_model: str = "legacy",
         acknowledged_final_retention_days: int = 30,
         acknowledged_final_retention_count: int = 4096,
@@ -2260,6 +2322,8 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
             (
                 path,
                 policy,
+                agent_event_host_id,
+                agent_event_retention_days,
                 acknowledged_final_retention_days,
                 acknowledged_final_retention_count,
                 command_retry_horizon_seconds,
@@ -2279,6 +2343,11 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
                 "examined": 0,
                 "deleted": 0,
                 "remaining_candidates": False,
+            },
+            "agent_events": {
+                "examined": 2,
+                "deleted": 1,
+                "remaining_candidates": True,
             },
             "batch_size": policy.batch_size,
         }
@@ -2302,19 +2371,44 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         daemon.stop()
 
     assert len(calls) == 1
-    path, policy, final_days, final_count, retry_horizon, retention_seconds, retention_count, cadence = calls[0]
-    assert path == db_path
-    assert (
-        policy.retention_days,
-        policy.retention_count,
-        policy.batch_size,
+    (
+        path,
+        policy,
+        agent_host,
+        agent_days,
         final_days,
         final_count,
         retry_horizon,
         retention_seconds,
         retention_count,
         cadence,
-    ) == (21, 123, 17, 33, 456, 120, 691_200, 77, 91)
+    ) = calls[0]
+    assert path == db_path
+    assert (
+        policy.retention_days,
+        policy.retention_count,
+        policy.batch_size,
+        agent_host,
+        agent_days,
+        final_days,
+        final_count,
+        retry_horizon,
+        retention_seconds,
+        retention_count,
+        cadence,
+    ) == (
+        21,
+        123,
+        17,
+        "daemon-host",
+        config.event_retention_days,
+        33,
+        456,
+        120,
+        691_200,
+        77,
+        91,
+    )
     assert health["store"]["maintenance"]["last_check"] == {
         "ok": True,
         "status": "not_due",
@@ -2322,6 +2416,9 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         "examined": 0,
         "deleted": 0,
         "remaining_candidates": False,
+        "agent_events_examined": 2,
+        "agent_events_deleted": 1,
+        "agent_events_remaining_candidates": True,
     }
 
 
@@ -2373,6 +2470,9 @@ def test_cli_snapshot_persists_when_automatic_maintenance_fails(
         "examined": 0,
         "deleted": 0,
         "remaining_candidates": False,
+        "agent_events_examined": 0,
+        "agent_events_deleted": 0,
+        "agent_events_remaining_candidates": False,
     }
     assert str(tmp_path) not in encoded
     assert "secret.db" not in encoded

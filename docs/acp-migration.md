@@ -130,16 +130,22 @@ implementation.
 
 ## Retention
 
-`event_retention_days` also bounds raw structured ACP journal payloads. Online
-maintenance replaces expired payload rows with compact identity tombstones in
-bounded batches. A tombstone retains the original sequence and a replay-contract
-fingerprint, allowing exact retries to remain idempotent and conflicting reuse
-to fail closed without retaining messages, thoughts, raw tool input/output, or
-other source payloads. Tombstones are intentionally not deleted automatically:
-removing them would make a late replay indistinguishable from a new event.
-SQLite secure deletion is enabled for this bounded cleanup transaction, but WAL
-files, filesystem snapshots, and backups retain their own operator-managed
-lifecycle and are not a cryptographic erasure guarantee.
+`event_retention_days` also bounds raw structured ACP journal payloads. Due
+automatic maintenance and explicit online cleanup replace expired payload rows
+with compact identity tombstones in bounded batches. Candidate scanning reads
+only bounded identity metadata and the existing payload digest; it does not load
+the retired private payload into maintenance memory. A tombstone retains the
+original sequence and a replay-contract fingerprint, allowing exact retries to
+remain idempotent and conflicting reuse to fail closed without retaining
+messages, thoughts, raw tool input/output, or other source payloads.
+
+Each tombstone has bounded per-event identity metadata, but tombstone count is
+permanent and therefore grows with the number of distinct source events.
+Tombstones are intentionally not deleted automatically: removing them would make
+a late replay indistinguishable from a new event. Cleanup asks SQLite to scrub
+deleted cells in modified pages, but WAL/checkpoint timing, filesystem snapshots,
+and backups have independent operator-managed lifecycles. Logical retention is
+not an immediate physical-erasure or cryptographic-erasure guarantee.
 
 ## Cross-repository requirements
 
