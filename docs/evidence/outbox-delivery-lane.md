@@ -1,14 +1,5 @@
 # Connector outbox delivery-lane recovery
 
-## Production incident
-
-This hardening follows an eight-hour head-of-line incident in which an
-`awaiting_ack` source had no actionable wake-up deadline. The durable row was
-still present, but it had become a delivery-lane zombie: later finals sharing
-its ordering key could not pass it and no poll made the root eligible again.
-The recovery preserved the source and its ordering identity, and the incident
-window closed with zero lost final deliveries.
-
 ## ACK deadline and ordered recovery
 
 `final_ready` sources enter `awaiting_ack` only after their presentation plan is

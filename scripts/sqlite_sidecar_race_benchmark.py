@@ -966,7 +966,6 @@ def _run_herdres_phase(
     environment = os.environ.copy()
     private_environment = {
         "HERDRES_TENDWIRE_MODE": "source",
-        "HERDRES_TENDWIRE_DELTA_LIMIT": "500",
         "HERDRES_TENDWIRE_BIN": f"{recorder} --socket-path {socket_path}",
         "HERDR_TELEGRAM_TOPICS_STATE": str(state_path),
         "TENDWIRE_DB_PATH": str(db_path),
@@ -994,6 +993,13 @@ def _run_herdres_phase(
             if herdres_root.resolve() not in module_path.parents:
                 raise RuntimeError("herdres_origin_failed")
         origin_ok = True
+        # The paired Herdres owns its turn page size (it changed 50 -> 100 in
+        # luminexord/herdres 31c3152); derive the expected command sequence from
+        # the paired checkout instead of hardcoding a value that breaks the
+        # pairing every time Herdres retunes it.
+        turn_page_limit = getattr(tendwire_client, "TURN_LIST_PAGE_LIMIT", 50)
+        if type(turn_page_limit) is not int or turn_page_limit < 1:
+            raise RuntimeError("herdres_turn_page_limit_invalid")
         runtime = source_sync.SyncRuntime(
             tendwire=tendwire_client.TendwireClient(timeout=10.0),
             telegram=telegram_delivery.TelegramClient(token="", dry_run=True),
@@ -1033,38 +1039,40 @@ def _run_herdres_phase(
         os.environ.clear()
         os.environ.update(environment)
     records = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
-    expected_snapshot = ["--socket-path", str(socket_path), "snapshot", "--json"]
-    expected_pending = ["--socket-path", str(socket_path), "pending", "--json"]
-    expected_delta_prefix = [
-        "--socket-path",
-        str(socket_path),
-        "turn",
-        "delta",
-        "--json",
-        "--limit",
-        "500",
-    ]
-    commands_exact = len(records) == 9
+    def _normalized_client_call(argv: list[str]) -> list[str]:
+        # Watermark tokens are run-specific; validate their shape, then
+        # normalize so the sequence stays exactly comparable.
+        normalized = list(argv)
+        for index, value in enumerate(normalized):
+            if (
+                index > 0
+                and normalized[index - 1] == "--watermark"
+                and value.startswith("twdelta1.")
+            ):
+                normalized[index] = "<WATERMARK>"
+        return normalized
+
+    expected_commands = []
     for pass_index in range(3):
-        offset = pass_index * 3
-        commands_exact = commands_exact and records[offset] == expected_snapshot
-        delta_command = records[offset + 1] if len(records) > offset + 1 else []
-        commands_exact = commands_exact and delta_command[:7] == expected_delta_prefix
-        if pass_index == 0:
-            commands_exact = commands_exact and len(delta_command) == 7
-        else:
-            commands_exact = (
-                commands_exact
-                and len(delta_command) == 9
-                and delta_command[7] == "--watermark"
-                and isinstance(delta_command[8], str)
-                and delta_command[8].startswith("twdelta1.")
-            )
-        commands_exact = (
-            commands_exact
-            and len(records) > offset + 2
-            and records[offset + 2] == expected_pending
+        delta_call = [
+            "--socket-path",
+            str(socket_path),
+            "turn",
+            "delta",
+            "--json",
+            "--limit",
+            "500",
+        ]
+        if pass_index > 0:
+            delta_call.extend(("--watermark", "<WATERMARK>"))
+        expected_commands.extend(
+            (["--socket-path", str(socket_path), "snapshot", "--json"],
+             delta_call,
+             ["--socket-path", str(socket_path), "pending", "--json"])
         )
+    commands_exact = [
+        _normalized_client_call(record) for record in records
+    ] == expected_commands
     noop_results = results[1:]
     return {
         "mode": "source",

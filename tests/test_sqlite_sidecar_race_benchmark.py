@@ -7,6 +7,14 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+
+import pytest
+
+_HERDRES_ROOT = os.environ.get("TENDWIRE_BENCHMARK_HERDRES_ROOT")
+_requires_herdres_root = pytest.mark.skipif(
+    not (_HERDRES_ROOT and Path(_HERDRES_ROOT).is_dir()),
+    reason="sidecar benchmark needs TENDWIRE_BENCHMARK_HERDRES_ROOT pointing at a herdres checkout",
+)
 from types import ModuleType
 from typing import Any
 
@@ -139,6 +147,7 @@ def test_argument_contract_requires_positive_exact_work(field: str) -> None:
         driver._argument_values(namespace)
 
 
+@_requires_herdres_root
 def test_tiny_installed_candidate_run_emits_complete_aggregate() -> None:
     completed = _invoke(
         "--iterations",
@@ -199,6 +208,7 @@ def test_tiny_installed_candidate_run_emits_complete_aggregate() -> None:
     assert all(value is True for value in report["checks"].values())
 
 
+@_requires_herdres_root
 def test_hostile_failure_is_redacted_and_restores_parent_resources() -> None:
     roots_before = _temporary_roots()
     fds_before = _fd_snapshot()

@@ -36,12 +36,10 @@ from ..core.turns import (
     redact_private_prompt_text,
 )
 from ..store.sqlite import (
-    TURN_CLAIM_SWEEP_MIN_GRACE_SECONDS,
     apply_turn_refresh,
     latest_turn_id_for_worker,
     list_worker_bindings,
     prune_backend_pending,
-    sweep_turn_claims,
 )
 
 
@@ -52,6 +50,8 @@ _TURN_CONTENT_KEYS = (
     "model",
     "complete",
     "has_open_turn",
+    "awaiting_input",
+    "pending_decision",
 )
 _CODEX_SESSION_TURN_KIND = "codex_session_id"
 _OMP_SESSION_TURN_KIND = "omp_session_path"
@@ -609,6 +609,32 @@ def _backend_pending_from_turn(turn: Mapping[str, Any]) -> dict[str, Any] | None
     }
 
 
+def _public_turn_pending_projection(
+    observation: PendingObservation,
+) -> dict[str, Any]:
+    """Return the private-neutral decision fields persisted with an open turn."""
+    if observation.kind != "open_prompt" or observation.decision_kind is None:
+        return {}
+    mode = {
+        "single": "buttons",
+        "multi": "multi",
+        "plan": "plan",
+    }[observation.decision_kind]
+    return {
+        "awaiting_input": True,
+        "pending_decision": {
+            "prompt": observation.question,
+            "mode": mode,
+            "options": [
+                {"id": str(ordinal), "label": label}
+                for ordinal, label in enumerate(observation.decision_options, 1)
+            ],
+            "multi_select": observation.decision_multi_select,
+            "question_count": observation.decision_question_count,
+        },
+    }
+
+
 class _TurnReadTimeout(Exception):
     """Fixed internal timeout signal; never serialized with private details."""
 
@@ -687,10 +713,6 @@ def _read_private_turn(
             raise _TurnReadFailed from None
         return None
     if completed.returncode != 0:
-        # Herdr 0.7.5 removed ``pane turn``. Its generic pane.read result is
-        # terminal scrollback, not a canonical prompt/final stream and does
-        # not carry a stable turn identity. Fail closed unless the configured
-        # adapter still provides the semantic command.
         if raise_timeout:
             raise _TurnReadFailed
         return None
@@ -706,6 +728,7 @@ def _read_private_turn(
             raise _TurnReadFailed
         return None
     pending_observation = _pending_observation_from_turn(turn)
+    pending_projection = _public_turn_pending_projection(pending_observation)
     if turn.get("available") is False:
         return (
             {"_backend_pending_observation": pending_observation}
@@ -726,12 +749,14 @@ def _read_private_turn(
         )
         if raise_timeout:
             opened_data = dict(opened or {})
+            opened_data.update(pending_projection)
             opened_data["_backend_pending_observation"] = pending_observation
             return opened_data
 
         return opened
 
     content = {key: turn.get(key) for key in _TURN_CONTENT_KEYS if key in turn}
+    content.update(pending_projection)
     if raise_timeout:
         content["_backend_pending_observation"] = pending_observation
     # Prefer the stable prompt-scoped id so a turn keeps one identity from
@@ -4000,6 +4025,7 @@ def _refresh_turn_binding(
                 cancelled=cancel_event.is_set if cancel_event is not None else None,
                 observed_at=current_time,
                 pending_stale_grace_seconds=grace_seconds,
+                turn_model=config.turn_model,
             )
         except Exception:
             return TurnRefreshResult(status, 0)
@@ -4056,6 +4082,7 @@ def _refresh_turn_binding(
                 cancelled=cancel_event.is_set if cancel_event is not None else None,
                 observed_at=current_time,
                 pending_stale_grace_seconds=grace_seconds,
+                turn_model=config.turn_model,
             )
         elif content is not None:
             applied = apply_turn_refresh(
@@ -4067,6 +4094,7 @@ def _refresh_turn_binding(
                 deadline_monotonic=apply_deadline_monotonic,
                 cancelled=cancel_event.is_set if cancel_event is not None else None,
                 observed_at=current_time,
+                turn_model=config.turn_model,
             )
         else:
             return TurnRefreshResult("missing", 0)
@@ -4523,20 +4551,6 @@ class TurnIngestionScheduler:
                 },
                 cancelled=self._cancel_event.is_set,
                 observed_at=self._utc_clock(),
-            )
-        except Exception:
-            pass
-
-        try:
-            sweep_turn_claims(
-                self.config.db_path,
-                self.config.host_id,
-                grace_seconds=max(
-                    TURN_CLAIM_SWEEP_MIN_GRACE_SECONDS,
-                    10.0 * self.refresh_interval_seconds,
-                ),
-                hard_ttl_seconds=self.config.turn_claim_hard_ttl_seconds,
-                now=self._utc_clock(),
             )
         except Exception:
             pass

@@ -8,7 +8,6 @@ Environment=TENDWIRE_HERDR_BACKEND=socket
 Environment=TENDWIRE_DB_PATH=%h/.local/share/tendwire/tendwire.db
 Environment=TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS=2.0
 Environment=TENDWIRE_TURN_REFRESH_WORKERS=4
-Environment=TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS=86400
 ExecStart=%h/.local/bin/tendwire daemon --db-path %h/.local/share/tendwire/tendwire.db
 KillMode=control-group
 KillSignal=SIGTERM

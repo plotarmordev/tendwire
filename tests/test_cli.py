@@ -20,7 +20,7 @@ import pytest
 from tendwire.backends import herdr_cli
 from tendwire.cli import _build_parser, main, observe_public_snapshot
 from tendwire.config import Config
-from tendwire.core.models import AttentionSignal, Snapshot, Space, SuggestedAction, Worker, WorkerBinding
+from tendwire.core.models import AttentionSignal, Snapshot, SuggestedAction, Worker, WorkerBinding
 from tendwire.core.projector import project_from_raw
 from tendwire.daemon_api import TendwireDaemonAPI, UnixSocketJSONServer
 from tendwire.store.sqlite import (
@@ -508,7 +508,7 @@ def test_cli_turns_definite_unavailable_refreshes_once_then_reads_exact_page(
                 "cursor": None,
                 "since": None,
                 "turn_refresh_interval_seconds": 2.0,
-                "claim_hard_ttl_seconds": 86400,
+                "turn_model": os.environ.get("TENDWIRE_TURN_MODEL", "observed"),
             },
         )
     ]
@@ -585,7 +585,7 @@ def test_cli_turns_continuation_unavailable_reads_cache_without_refresh(
             "cursor": position_value if position_flag == "--cursor" else None,
             "since": position_value if position_flag == "--since" else None,
             "turn_refresh_interval_seconds": 2.0,
-            "claim_hard_ttl_seconds": 86400,
+            "turn_model": os.environ.get("TENDWIRE_TURN_MODEL", "observed"),
         }
     ]
 
@@ -1079,6 +1079,7 @@ def test_cli_long_content_pages_match_direct_store_and_daemon(
         "long-host",
         "worker-1",
         {
+            "source_turn_id": "cli-long-content-source",
             "user_text": "short prompt",
             "assistant_final_text": canonical,
             "complete": True,
@@ -1277,6 +1278,7 @@ def test_cli_short_v1_compatibility_then_known_incomplete_refusal(
         "compat-host",
         "worker-1",
         {
+            "source_turn_id": "cli-short-content-source",
             "user_text": "  short prompt\n",
             "assistant_final_text": "\n short final  ",
             "complete": True,
@@ -2097,6 +2099,7 @@ def test_cli_snapshot_persistence_passes_explicit_observation_authority(
     )
     captured: list[SnapshotObservationContext] = []
     captured_atomic: list[tuple[list[WorkerBinding], str | None, bool, bool]] = []
+    captured_turn_models: list[str] = []
 
     monkeypatch.setattr(
         "tendwire.cli.fetch_herdr_snapshot_observation",
@@ -2107,12 +2110,14 @@ def test_cli_snapshot_persistence_passes_explicit_observation_authority(
         _db_path: Path,
         _snapshot: Snapshot,
         *,
+        turn_model: str,
         observation: SnapshotObservationContext,
         worker_bindings: list[WorkerBinding],
         binding_backend: str | None,
         binding_observation_authoritative: bool,
         binding_workers_present: bool,
     ) -> bool:
+        captured_turn_models.append(turn_model)
         captured.append(observation)
         captured_atomic.append(
             (
@@ -2134,6 +2139,7 @@ def test_cli_snapshot_persistence_passes_explicit_observation_authority(
     assert captured_atomic == [
         ([], "herdr", health.status == "healthy", bool(workers))
     ]
+    assert captured_turn_models == [config.turn_model]
 
 
 def test_rejected_stale_snapshot_does_not_persist_stale_worker_bindings(
@@ -2282,6 +2288,7 @@ def test_cli_legacy_observation_cannot_claim_complete_authority(
     worker = Worker(id="worker-1", name="Worker One", status="blocked")
     captured: list[SnapshotObservationContext] = []
     captured_atomic: list[tuple[list[WorkerBinding], str | None]] = []
+    captured_turn_models: list[str] = []
 
     monkeypatch.setattr(
         "tendwire.cli.fetch_herdr_state",
@@ -2292,12 +2299,14 @@ def test_cli_legacy_observation_cannot_claim_complete_authority(
         _db_path: Path,
         _snapshot: Snapshot,
         *,
+        turn_model: str,
         observation: SnapshotObservationContext,
         worker_bindings: list[WorkerBinding],
         binding_backend: str | None,
         binding_observation_authoritative: bool,
         binding_workers_present: bool,
     ) -> bool:
+        captured_turn_models.append(turn_model)
         captured.append(observation)
         captured_atomic.append((worker_bindings, binding_backend))
         return True
@@ -2309,6 +2318,7 @@ def test_cli_legacy_observation_cannot_claim_complete_authority(
     assert len(captured) == 1
     assert captured[0].authority == "none"
     assert captured_atomic == [([], "herdr")]
+    assert captured_turn_models == [config.turn_model]
 
 
 def test_cli_attention_json_reads_store_backed_lifecycle(
@@ -2679,7 +2689,13 @@ def test_cli_module_invocation() -> None:
         env=env,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stderr == ""
+    turn_model = env.get("TENDWIRE_TURN_MODEL", "observed").strip().lower()
+    expected_stderr = (
+        ""
+        if turn_model == "observed"
+        else f"turn_model={turn_model} is a compatibility alias and behaves as observed\n"
+    )
+    assert result.stderr == expected_stderr
     payload = json.loads(result.stdout)
     assert payload["schema_version"] == 2
     assert payload["host_id"] == "module-host"

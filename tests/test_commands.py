@@ -10,6 +10,7 @@ import pytest
 from tendwire.core.commands import (
     ALLOWED_ACTIONS,
     COMMAND_ENVELOPE_SCHEMA_VERSION,
+    COMMAND_ENVELOPE_V3_SCHEMA_VERSION,
     COMMAND_REQUEST_SCHEMA_VERSION,
     DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES,
     DISPOSITION_IN_PROGRESS,
@@ -45,6 +46,7 @@ from tendwire.core.commands import (
     parse_command_request,
     resolve_target,
     sanitize_command_result,
+    turn_submission_id,
     validate_instruction_text,
     validate_request,
     worker_candidate,
@@ -227,6 +229,43 @@ def test_parse_command_request_accepts_integer_one_schema_version() -> None:
     assert error is None
     assert request is not None
     assert request.schema_version == 1
+
+
+def test_command_request_negotiates_response_v3_explicitly() -> None:
+    default, default_error = parse_command_request(
+        json.dumps({"schema_version": 1, "action": "noop"})
+    )
+    opted_in, opted_error = parse_command_request(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "action": "noop",
+                "response_schema_version": 3,
+            }
+        )
+    )
+
+    assert default_error is opted_error is None
+    assert default is not None and default.response_schema_version == 2
+    assert "response_schema_version" not in default.to_dict()
+    assert opted_in is not None and opted_in.response_schema_version == 3
+    assert opted_in.to_dict()["response_schema_version"] == 3
+
+
+@pytest.mark.parametrize("value", [1, 4, True, "3", None])
+def test_command_request_rejects_unsupported_response_schema(value: Any) -> None:
+    request, error = parse_command_request(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "action": "noop",
+                "response_schema_version": value,
+            }
+        )
+    )
+    assert request is None
+    assert error is not None
+    assert error["code"] == STATUS_INVALID_REQUEST
 
 
 @pytest.mark.parametrize("value", [True, False])
@@ -435,6 +474,53 @@ def test_command_envelope_shape_matches_contract() -> None:
     assert payload["status"] == "noop"
     assert payload["disposition"] == DISPOSITION_NO_RECEIPT
     _assert_no_forbidden_fields(payload)
+
+
+def test_command_envelope_v3_roundtrips_only_accepted_submission_fields() -> None:
+    request = CommandRequest(
+        action="send_instruction",
+        request_id="v3-request",
+        dry_run=False,
+        target={"worker_id": "w-1"},
+        instruction={"text": "hello"},
+        response_schema_version=3,
+    )
+    result = {
+        "turn_id": "turn-public",
+        "submission_id": turn_submission_id("host-a", "v3-request"),
+    }
+    envelope = CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_ACCEPTED,
+        disposition=DISPOSITION_TERMINAL_ACCEPTED,
+        result=result,
+        schema_version=COMMAND_ENVELOPE_V3_SCHEMA_VERSION,
+    )
+
+    assert envelope.schema_version == 3
+    assert CommandEnvelope.from_dict(envelope.to_dict()).to_dict() == envelope.to_dict()
+    pending_link = CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_ACCEPTED,
+        disposition=DISPOSITION_TERMINAL_ACCEPTED,
+        result={
+            "turn_id": None,
+            "submission_id": turn_submission_id("host-a", "v3-request"),
+        },
+        schema_version=COMMAND_ENVELOPE_V3_SCHEMA_VERSION,
+    )
+    assert pending_link.result["turn_id"] is None
+    with pytest.raises(ValueError, match="accepted instruction submission"):
+        CommandEnvelope.from_result(
+            request,
+            ok=True,
+            status=STATUS_ACCEPTED,
+            disposition=DISPOSITION_TERMINAL_ACCEPTED,
+            result={"turn_id": "turn-public"},
+            schema_version=COMMAND_ENVELOPE_V3_SCHEMA_VERSION,
+        )
 
 
 @pytest.mark.parametrize(

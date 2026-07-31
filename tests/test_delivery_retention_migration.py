@@ -875,7 +875,7 @@ def test_v10_to_v12_migration_retains_finals_without_reposting_or_leaking(
     finals = _seed_v10_finals(db_path)
 
     init_store(db_path)
-    assert store_sqlite.STORE_SCHEMA_VERSION == 19
+    assert store_sqlite.STORE_SCHEMA_VERSION == 21
 
     delivered_key = _final_key(*finals["delivered"])
     hold_keys = {_final_key(*finals[label]) for label in ("hold-a", "hold-b")}
@@ -1335,7 +1335,7 @@ def test_v10_to_v12_migration_failure_rolls_back_the_entire_transition(
         ),
     ],
 )
-def test_v10_to_v12_then_same_owner_worker_churn_preserves_graph_without_repost(
+def test_v10_to_v12_history_stays_immutable_when_observed_turn_arrives(
     tmp_path: Path,
     root_state: str,
     delivered_proof: bool,
@@ -1475,12 +1475,41 @@ def test_v10_to_v12_then_same_owner_worker_churn_preserves_graph_without_repost(
     ) == 1
     _assert_historical_route(
         db_path,
-        worker_id="worker-b",
-        worker_fingerprint=worker_b.workers[0].fingerprint,
-        space_id="space-b",
+        worker_id="worker-a",
+        worker_fingerprint="worker-a-fingerprint",
+        space_id="space-a",
     )
     assert _historical_root(db_path) == expected_root
     assert _historical_graph(db_path) == expected_graph
+    with sqlite3.connect(str(db_path)) as conn:
+        observed = conn.execute(
+            """
+            SELECT turn_id, worker_id, worker_fingerprint, space_id,
+                   json_extract(payload_json, '$.source_turn_id')
+            FROM turns
+            WHERE host_id = ? AND turn_id != ?
+            """,
+            (_HOST_ID, _HISTORICAL_TURN_ID),
+        ).fetchone()
+        assert observed is not None
+        observed_turn_id = str(observed[0])
+        assert tuple(observed[1:4]) == (
+            "worker-b",
+            worker_b.workers[0].fingerprint,
+            "space-b",
+        )
+        assert str(observed[4]) != _HISTORICAL_SOURCE_TOKEN
+        observed_root = conn.execute(
+            """
+            SELECT delivery_key, delivery_kind, status
+            FROM connector_outbox
+            WHERE turn_id = ?
+            """,
+            (observed_turn_id,),
+        ).fetchone()
+        assert observed_root is not None
+        observed_key = str(observed_root[0])
+        assert tuple(observed_root[1:]) == ("final_ready", "queued")
 
     init_store(db_path)
     assert _observe_literal_continuity_final(
@@ -1516,7 +1545,9 @@ def test_v10_to_v12_then_same_owner_worker_churn_preserves_graph_without_repost(
 
     polled = api.poll({"name": "turn-final", "limit": 100})
     assert [item["key"] for item in polled["items"]] == (
-        [_HISTORICAL_FINAL_KEY] if root_state == "queued" else []
+        [_HISTORICAL_FINAL_KEY]
+        if root_state == "queued"
+        else [observed_key]
     )
     if root_state == "migration-hold":
         inspected = api.inspect(
@@ -1532,7 +1563,7 @@ def test_v10_to_v12_then_same_owner_worker_churn_preserves_graph_without_repost(
         ]
 
 
-def test_v10_migration_hold_never_merges_same_source_under_k2(
+def test_v10_migration_hold_stays_immutable_under_observed_k2(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "literal-v10-continuity-k2.db"
@@ -1617,35 +1648,41 @@ def test_v10_migration_hold_never_merges_same_source_under_k2(
         ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
-    assert len(roots) == 2
-    by_owner = {root[5]["stable_key"]: root for root in roots}
-    assert by_owner[_STABLE_KEY][:5] == (
+    assert len(roots) == 3
+    historical = next(root for root in roots if root[0] == _HISTORICAL_ROOT_OUTBOX_ID)
+    assert historical[:5] == (
         _HISTORICAL_ROOT_OUTBOX_ID,
         _HISTORICAL_FINAL_KEY,
         "final_migration_hold",
         _HISTORICAL_TURN_ID,
         "dead_letter",
     )
-    assert by_owner[_STABLE_KEY_2][2] == "final_ready"
-    assert by_owner[_STABLE_KEY_2][3] != _HISTORICAL_TURN_ID
-    assert by_owner[_STABLE_KEY_2][4] == "queued"
-    assert len(source_turns) == 2
-    source_by_owner = {
+    observed_roots = [root for root in roots if root[0] != _HISTORICAL_ROOT_OUTBOX_ID]
+    by_owner = {root[5]["stable_key"]: root for root in observed_roots}
+    assert set(by_owner) == {_STABLE_KEY, _STABLE_KEY_2}
+    for owner_key in (_STABLE_KEY, _STABLE_KEY_2):
+        assert by_owner[owner_key][2] == "final_ready"
+        assert by_owner[owner_key][3] != _HISTORICAL_TURN_ID
+        assert by_owner[owner_key][4] == "queued"
+    assert len(source_turns) == 3
+    historical_source = next(
+        row for row in source_turns if row[0] == _HISTORICAL_TURN_ID
+    )
+    assert historical_source[1]["source_turn_id"] == _HISTORICAL_SOURCE_TOKEN
+    observed_source_by_owner = {
         turn_payload["meta"]["stable_key"]: (turn_id, turn_payload)
         for turn_id, turn_payload in source_turns
+        if turn_id != _HISTORICAL_TURN_ID
     }
-    assert source_by_owner[_STABLE_KEY][0] == _HISTORICAL_TURN_ID
-    assert (
-        source_by_owner[_STABLE_KEY][1]["source_turn_id"]
-        == _HISTORICAL_SOURCE_TOKEN
+    assert set(observed_source_by_owner) == {_STABLE_KEY, _STABLE_KEY_2}
+    assert all(
+        turn_payload["source_turn_id"] != _HISTORICAL_SOURCE_TOKEN
+        for _turn_id, turn_payload in observed_source_by_owner.values()
     )
-    assert source_by_owner[_STABLE_KEY_2][0] != _HISTORICAL_TURN_ID
-    assert (
-        source_by_owner[_STABLE_KEY_2][1]["source_turn_id"]
-        != _HISTORICAL_SOURCE_TOKEN
-    )
+    same_owner_key = str(by_owner[_STABLE_KEY][1])
     new_key = str(by_owner[_STABLE_KEY_2][1])
-    new_turn_id = str(source_by_owner[_STABLE_KEY_2][0])
+    same_owner_turn_id = str(observed_source_by_owner[_STABLE_KEY][0])
+    new_turn_id = str(observed_source_by_owner[_STABLE_KEY_2][0])
     source_identities = sorted(
         (
             turn_id,
@@ -1656,6 +1693,10 @@ def test_v10_migration_hold_never_merges_same_source_under_k2(
     )
     expected_source_revisions = {
         (_HISTORICAL_TURN_ID, _HISTORICAL_REVISION),
+        (
+            same_owner_turn_id,
+            str(by_owner[_STABLE_KEY][5]["content_revision"]),
+        ),
         (
             new_turn_id,
             str(by_owner[_STABLE_KEY_2][5]["content_revision"]),
@@ -1743,7 +1784,7 @@ def test_v10_migration_hold_never_merges_same_source_under_k2(
     assert source_revisions_after_restart == expected_source_revisions
     api = ConnectorOutboxAPI(db_path, _HOST_ID)
     polled = api.poll({"name": "turn-final", "limit": 100})
-    assert [item["key"] for item in polled["items"]] == [new_key]
+    assert [item["key"] for item in polled["items"]] == [same_owner_key, new_key]
     assert _HISTORICAL_FINAL_KEY not in {
         item["key"] for item in polled["items"]
     }

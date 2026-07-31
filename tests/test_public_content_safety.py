@@ -368,6 +368,29 @@ def test_public_structural_key_allowlist_rejects_dynamic_id_and_fingerprint_shap
     assert sanitize_public_value({"host_id": "session_PUBLICSAFETY123456"}) == {}
 
 
+def test_public_submission_verdict_is_closed_vocabulary() -> None:
+    assert sanitize_public_value({"submission_verdict": "submitted"}) == {
+        "submission_verdict": "submitted"
+    }
+    assert sanitize_public_value({"submission_verdict": "agent_not_ready"}) == {
+        "submission_verdict": "agent_not_ready"
+    }
+    assert sanitize_public_value(
+        {"submission_verdict": "agent_target_ambiguous"}
+    ) == {"submission_verdict": "agent_target_ambiguous"}
+    assert sanitize_public_value({"submission_verdict": "invented"}) == {}
+    assert sanitize_public_value({"submission_verdict": 1}) == {}
+
+
+def test_public_submission_diagnostics_drop_composer_state() -> None:
+    assert sanitize_public_value(
+        {
+            "submission_verdict": "agent_prompt_stalled",
+            "composer_state": "instruction_visible",
+        }
+    ) == {"submission_verdict": "agent_prompt_stalled"}
+
+
 @pytest.mark.parametrize("host_id", ("output-excerpt", "pane-id-private"))
 def test_public_host_id_provenance_preserves_opaque_field_name_words(host_id: str) -> None:
     snapshot = Snapshot(
@@ -1081,6 +1104,7 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
         host_id,
         worker_id,
         {
+            "source_turn_id": "boundary-content-source",
             "assistant_final_text": dirty_final,
             "complete": True,
             "has_open_turn": False,

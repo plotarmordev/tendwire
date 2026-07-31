@@ -946,7 +946,7 @@ def test_daemon_turn_list_is_store_projection_only(
             "cursor": "twlist1.public",
             "since": None,
             "turn_refresh_interval_seconds": 2.0,
-            "claim_hard_ttl_seconds": 86400,
+            "turn_model": config.turn_model,
         }
         for call in projection_calls
     )
@@ -1377,8 +1377,10 @@ def test_socket_daemon_fallback_drops_unordered_health_timestamp(
         _db_path: Path,
         _snapshot: Snapshot,
         *,
+        turn_model: str,
         observation: SnapshotObservationContext,
     ) -> None:
+        assert turn_model == config.turn_model
         captured.append(observation)
 
     backend = _Backend()
@@ -1420,6 +1422,7 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
         command_retry_horizon_seconds=120,
         command_receipt_retention_seconds=691_200,
         command_receipt_retention_count=77,
+        turn_model="shadow",
     )
     snapshot = project_from_raw(
         config,
@@ -1489,6 +1492,7 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
     encoded = json.dumps(health)
 
     assert health["status"] == "ok"
+    assert health["turn_model"] == "shadow"
     assert health["daemon"]["started_at"]
     assert health["store"]["counts"]["snapshots"] == 1
     assert health["store"]["outbox"]["pending"] == 1
@@ -2241,6 +2245,7 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         path: Path,
         *,
         policy: Any,
+        turn_model: str = "legacy",
         acknowledged_final_retention_days: int = 30,
         acknowledged_final_retention_count: int = 4096,
         command_retry_horizon_seconds: int = 604_800,
@@ -2250,6 +2255,7 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         now: str | None = None,
     ) -> dict[str, Any]:
         assert now is None
+        assert turn_model == config.turn_model
         calls.append(
             (
                 path,
@@ -4730,6 +4736,17 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
             calls.append({"method": method, "params": dict(params)})
             if method == "agent.get":
                 return {"result": {"agent": {"pane_id": "pane-private"}}}
+            if method == "pane.read":
+                return {
+                    "type": "pane_read",
+                    "read": {"text": "Completed previous turn.\n── status: idle ──"},
+                }
+            if method == "agent.prompt":
+                return {
+                    "type": "agent_prompted",
+                    "agent": {"pane_id": "pane-private"},
+                    "delivery": "submitted",
+                }
             return {"accepted": True}
 
         def close(self) -> None:
@@ -4815,11 +4832,16 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
         assert calls == [
             {"method": "agent.get", "params": {"target": "agent-private"}},
             {"method": "agent.get", "params": {"target": "agent-private"}},
-            {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+u"]}},
-            {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+a", "ctrl+k"]}},
-            {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+a", "backspace"]}},
-            {"method": "pane.send_input", "params": {"pane_id": "pane-private", "text": "hello", "keys": ["Enter"]}},
+            {
+                "method": "agent.prompt",
+                "params": {
+                    "target": "agent-private",
+                    "text": "hello",
+                    "wait": {"until": ["working"], "timeout_ms": 5000},
+                },
+            },
         ]
+        assert not any(call["method"] == "pane.send_keys" for call in calls)
         receipt = get_command_request(db_path, "cmd-host", "req-1")
         assert receipt is not None
         assert receipt["state"] == "accepted"
@@ -4856,7 +4878,7 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
         assert cli_result == replay["result"]
         assert cli_result["disposition"] == DISPOSITION_TERMINAL_ACCEPTED
         _assert_no_public_json_forbidden(cli_result)
-        assert len([call for call in calls if call["method"] == "pane.send_input"]) == 1
+        assert len([call for call in calls if call["method"] == "agent.prompt"]) == 1
         for response in [*responses, replay]:
             encoded = json.dumps(response)
             assert "agent-private" not in encoded

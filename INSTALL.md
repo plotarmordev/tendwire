@@ -45,7 +45,6 @@ Environment=TENDWIRE_HERDR_BACKEND=socket
 Environment=TENDWIRE_DB_PATH=%h/.local/share/tendwire/tendwire.db
 Environment=TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS=2.0
 Environment=TENDWIRE_TURN_REFRESH_WORKERS=4
-Environment=TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS=86400
 ExecStart=%h/.local/bin/tendwire daemon --db-path %h/.local/share/tendwire/tendwire.db
 KillMode=control-group
 KillSignal=SIGTERM
@@ -74,13 +73,6 @@ do not consume Tendwire's shipped example. Keep the four shutdown-hardening
 directives synchronized in that Herdres-owned template and verify the generated
 unit after either repository changes.
 
-Herdr 0.7.5 no longer includes the semantic `pane turn` CLI command. A
-Herdres-managed install must keep `TENDWIRE_HERDR_BIN` pointed at
-`herdr_turn_adapter.py` for generic pane-backed turns. Bare Herdr remains usable
-for snapshots, events, commands, and native Codex/OMP session-backed turns, but
-generic pane turn ingestion fails closed rather than treating terminal
-scrollback as canonical prompt/final content.
-
 `KillMode=control-group` is intentional: the daemon's Herdr adapter and
 isolated turn readers are supervised children in the same service cgroup.
 `SIGTERM` starts Tendwire's bounded shutdown, closes the listening socket, and
@@ -104,9 +96,6 @@ reconciles. `TENDWIRE_TURN_REFRESH_WORKERS` defaults to `4`, must be from 1
 through 32, and cannot exceed `TENDWIRE_MAX_WORKERS`. Every adapter uses
 `TENDWIRE_HERDR_TIMEOUT_SECONDS`; the queue is fixed at 64. One private target
 is serialized with itself while distinct targets can use the worker pool.
-Unobserved command-turn claims become terminal tombstones after
-`TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS` (default `86400`).
-
 OMP JSONL cache/IPC state is coordinate-only: parse/EOF and replay offsets,
 observed file identity/size/timestamps, an open-turn flag, and validated project
 root. It never contains or transports prompt IDs or user/final/stream bodies.

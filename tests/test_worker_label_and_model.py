@@ -182,7 +182,13 @@ def test_merge_turn_content_persists_model(tmp_path: Path) -> None:
     save_snapshot(db, snapshot)
     updated = merge_turn_content(
         db, "turn-host", "worker-1",
-        {"user_text": "hi", "assistant_final_text": "done", "complete": True, "model": "claude-fable-5"},
+        {
+            "source_turn_id": "model-source",
+            "user_text": "hi",
+            "assistant_final_text": "done",
+            "complete": True,
+            "model": "claude-fable-5",
+        },
         observed_at="2026-01-01T00:00:00+00:00",
     )
     payload = turns_payload_from_store(db, "turn-host", snapshot=snapshot)

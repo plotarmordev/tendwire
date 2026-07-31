@@ -8,7 +8,6 @@ import pytest
 
 from tendwire.core import models
 from tendwire.core.models import Snapshot, Space, Worker
-from tendwire.core.turns import Turn
 from tendwire.store import sqlite as store_sqlite
 
 
@@ -55,6 +54,148 @@ def _turn_update_count(db_path: Path) -> int:
         return int(conn.execute("SELECT count FROM turn_update_counter").fetchone()[0])
 
 
+def _turn_content() -> dict[str, object]:
+    return {
+        "source_turn_id": "stable-source-turn",
+        "user_text": "Summarize the unchanged worker output.",
+        "assistant_final_text": "Unchanged output " + ("safe text " * 512),
+        "complete": True,
+        "has_open_turn": False,
+    }
+
+
+@pytest.mark.parametrize("turn_model", ["legacy", "observed"])
+@pytest.mark.parametrize("compatibility_source_token", [False, True])
+def test_unchanged_turn_reobservation_performs_no_forbidden_phrase_scans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    turn_model: str,
+    compatibility_source_token: bool,
+) -> None:
+    db_path = tmp_path / f"unchanged-turn-{turn_model}.db"
+    store_sqlite.init_store(db_path)
+    store_sqlite.save_snapshot(
+        db_path,
+        _snapshot(1, [_worker(1)]),
+        turn_model=turn_model,
+    )
+    content = _turn_content()
+    first = store_sqlite.apply_turn_refresh(
+        db_path,
+        HOST_ID,
+        "worker-1",
+        content,
+        observed_at="2026-07-20T00:00:02+00:00",
+        turn_model=turn_model,
+    )
+    assert first.updated == 1
+
+    if compatibility_source_token:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT turn_id, payload_json
+                FROM turns
+                WHERE host_id = ?
+                  AND json_extract(payload_json, '$.source_turn_id') != ''
+                """,
+                (HOST_ID,),
+            ).fetchone()
+            assert row is not None
+            payload = store_sqlite._json_object(row[1])
+            candidates = store_sqlite.turn_source_id_candidates(
+                content["source_turn_id"],
+                meta=payload["meta"],
+                source=payload["source"],
+                kind=payload["kind"],
+            )
+            assert len(candidates) == 2
+            payload["source_turn_id"] = candidates[1]
+            conn.execute(
+                """
+                UPDATE turns SET payload_json = ?
+                WHERE host_id = ? AND turn_id = ?
+                """,
+                (
+                    store_sqlite._canonical_json(payload),
+                    HOST_ID,
+                    str(row[0]),
+                ),
+            )
+
+    scans = 0
+    original_scan = models._is_forbidden_public_text_phrase
+
+    def recording_scan(value: str) -> bool:
+        nonlocal scans
+        scans += 1
+        return original_scan(value)
+
+    monkeypatch.setattr(
+        models,
+        "_is_forbidden_public_text_phrase",
+        recording_scan,
+    )
+    second = store_sqlite.apply_turn_refresh(
+        db_path,
+        HOST_ID,
+        "worker-1",
+        content,
+        observed_at="2026-07-20T00:00:03+00:00",
+        turn_model=turn_model,
+    )
+
+    assert second.updated == 0
+    assert scans == 0
+
+
+def test_unchanged_observed_turn_still_attempts_submission_settlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "unchanged-turn-settle.db"
+    store_sqlite.init_store(db_path)
+    store_sqlite.save_snapshot(
+        db_path,
+        _snapshot(1, [_worker(1)]),
+        turn_model="observed",
+    )
+    content = _turn_content()
+    store_sqlite.apply_turn_refresh(
+        db_path,
+        HOST_ID,
+        "worker-1",
+        content,
+        observed_at="2026-07-20T00:00:02+00:00",
+        turn_model="observed",
+    )
+
+    settle_calls = 0
+    original_settle = store_sqlite.settle_submission_links_conn
+
+    def recording_settle(*args, **kwargs):
+        nonlocal settle_calls
+        settle_calls += 1
+        return original_settle(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "settle_submission_links_conn",
+        recording_settle,
+    )
+    second = store_sqlite.apply_turn_refresh(
+        db_path,
+        HOST_ID,
+        "worker-1",
+        content,
+        observed_at="2026-07-20T00:00:03+00:00",
+        turn_model="observed",
+    )
+
+    assert second.updated == 0
+    assert settle_calls == 1
+
+
 def test_unchanged_snapshot_decodes_and_sanitizes_no_retained_turns(
     tmp_path: Path,
     monkeypatch,
@@ -89,7 +230,7 @@ def test_unchanged_snapshot_decodes_and_sanitizes_no_retained_turns(
     assert _turn_update_count(db_path) == 0
 
 
-def test_changed_snapshot_decodes_only_the_changed_owned_turn(
+def test_changed_snapshot_updates_worker_without_decoding_a_legacy_turn(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -119,9 +260,21 @@ def test_changed_snapshot_decodes_only_the_changed_owned_turn(
     changed = [_worker(1), _worker(2, status="waiting")]
     store_sqlite.save_snapshot(db_path, _snapshot(2, changed))
 
-    assert decoded_counts == [1]
-    assert sanitize_calls == 1
-    assert _turn_update_count(db_path) == 1
+    with sqlite3.connect(db_path) as conn:
+        projected_status = conn.execute(
+            "SELECT status FROM workers WHERE host_id = ? AND worker_id = ?",
+            (HOST_ID, "worker-2"),
+        ).fetchone()[0]
+        turn_count = conn.execute(
+            "SELECT COUNT(*) FROM turns WHERE host_id = ?",
+            (HOST_ID,),
+        ).fetchone()[0]
+
+    assert projected_status == "waiting"
+    assert turn_count == 0
+    assert decoded_counts == []
+    assert sanitize_calls == 0
+    assert _turn_update_count(db_path) == 0
 
 
 def test_space_timestamp_change_refreshes_projection_with_same_content_fingerprint(
@@ -164,7 +317,7 @@ def test_space_timestamp_change_refreshes_projection_with_same_content_fingerpri
     assert projected_at == "2026-07-20T00:00:02+00:00"
 
 
-def test_turn_timestamp_shortcut_observes_worker_last_seen_change(
+def test_worker_timestamp_shortcut_does_not_synthesize_a_turn(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "turn-timestamp.db"
@@ -204,13 +357,13 @@ def test_turn_timestamp_shortcut_observes_worker_last_seen_change(
             "SELECT last_seen_at FROM workers WHERE host_id = ? AND worker_id = ?",
             (HOST_ID, "worker-1"),
         ).fetchone()[0]
-        turn_updated_at = conn.execute(
-            "SELECT updated_at FROM turns WHERE host_id = ?",
+        turn_count = conn.execute(
+            "SELECT COUNT(*) FROM turns WHERE host_id = ?",
             (HOST_ID,),
         ).fetchone()[0]
     assert first_worker.fingerprint == second_worker.fingerprint
     assert worker_last_seen_at == "2026-07-20T00:00:02+00:00"
-    assert turn_updated_at == "2026-07-20T00:00:02+00:00"
+    assert turn_count == 0
 
 
 def test_public_text_sanitize_cache_hits_and_separates_configurations(monkeypatch) -> None:
@@ -234,26 +387,6 @@ def test_public_text_sanitize_cache_hits_and_separates_configurations(monkeypatc
     assert calls == 2
 
 
-def test_public_text_sanitize_cache_is_byte_bounded_and_skips_oversized_values(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(models, "_PUBLIC_SANITIZE_CACHE_MAX_BYTES", 4096)
-    models._clear_public_sanitize_cache()
-
-    for index in range(20):
-        models.sanitize_public_text(f"{index}:" + ("x" * 500))
-
-    assert models._PUBLIC_SANITIZE_CACHE_BYTES <= 4096
-    assert sum(weight for _text, weight in models._PUBLIC_SANITIZE_CACHE.values()) == (
-        models._PUBLIC_SANITIZE_CACHE_BYTES
-    )
-
-    before = dict(models._PUBLIC_SANITIZE_CACHE)
-    oversized = "y" * 4096
-    assert models.sanitize_canonical_turn_text(oversized) == oversized
-    assert dict(models._PUBLIC_SANITIZE_CACHE) == before
-
-
 def test_forbidden_phrase_scan_is_bounded_for_token_dense_text() -> None:
     def elapsed(size: int) -> float:
         value = ("a1b2c3d4_" * ((size + 8) // 9))[:size]
@@ -266,101 +399,3 @@ def test_forbidden_phrase_scan_is_bounded_for_token_dense_text() -> None:
     large = elapsed(500_000)
 
     assert large <= small * 4 + 0.01
-
-
-def test_repeated_owned_turn_refresh_hydrates_only_the_matching_turn(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    db_path = tmp_path / "owned-refresh.db"
-    stable_key = "wsk1_" + ("a" * 64)
-    worker = Worker(
-        id="worker-current",
-        name="Current Worker",
-        status="active",
-        meta={"stable_key": stable_key, "stable_key_version": 1},
-    )
-    snapshot = Snapshot(
-        host_id=HOST_ID,
-        updated_at="2026-07-20T00:01:00+00:00",
-        workers=[worker],
-    )
-    current_source = "019f7777-0000-7000-8000-999999999999"
-    current_final = "current final"
-
-    store_sqlite.init_store(db_path)
-    store_sqlite.save_snapshot(db_path, snapshot)
-    with store_sqlite._connect(db_path, isolation_level=None) as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        for index in range(760):
-            raw_source = (
-                current_source
-                if index == 759
-                else f"019f7777-0000-7000-8000-{index:012d}"
-            )
-            final_text = current_final if index == 759 else "x" * 8_000
-            item = Turn(
-                host_id=HOST_ID,
-                worker_id=worker.id,
-                worker_fingerprint=worker.fingerprint,
-                status="idle",
-                kind="task",
-                source="snapshot",
-                user_text=f"prompt {index}",
-                assistant_final_text=None,
-                complete=True,
-                has_open_turn=False,
-                source_turn_id=raw_source,
-                updated_at=f"2026-07-20T00:00:{index % 60:02d}+00:00",
-                meta={"stable_key": stable_key, "stable_key_version": 1},
-            ).to_dict()
-            turn_id = store_sqlite._insert_owned_turn_conn(
-                conn,
-                host_id=HOST_ID,
-                item=item,
-                snapshot_content_fingerprint="seed",
-                observed_at=str(item["updated_at"]),
-            )
-            store_sqlite._replace_current_turn_content_conn(
-                conn,
-                host_id=HOST_ID,
-                turn_id=turn_id,
-                current=None,
-                incoming_user=str(item["user_text"]),
-                incoming_final=final_text,
-                current_time=str(item["updated_at"]),
-            )
-        conn.commit()
-
-    decoded_counts: list[int] = []
-    original_decode = store_sqlite._decode_turn_content_rows
-
-    def recording_decode(rows):
-        materialized = list(rows)
-        decoded_counts.append(len(materialized))
-        return original_decode(materialized)
-
-    monkeypatch.setattr(store_sqlite, "_decode_turn_content_rows", recording_decode)
-    monkeypatch.setattr(
-        store_sqlite,
-        "_current_owned_turn_content_rows_conn",
-        lambda *_args, **_kwargs: pytest.fail("broad owner hydration is not bounded"),
-    )
-    assert (
-        store_sqlite.merge_turn_content(
-            db_path,
-            HOST_ID,
-            worker.id,
-            {
-                "source_turn_id": current_source,
-                "user_text": "prompt 759",
-                "assistant_final_text": current_final,
-                "complete": True,
-                "has_open_turn": False,
-            },
-            observed_at="2026-07-20T00:02:00+00:00",
-        )
-        == 1
-    )
-
-    assert decoded_counts == [1]

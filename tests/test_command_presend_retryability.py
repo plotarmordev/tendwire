@@ -168,6 +168,17 @@ class _FakeSocketClient:
             if self.agent_get_response is not None:
                 return self.agent_get_response
             return {"result": {"agent": {"pane_id": "pane-w-1"}}}
+        if method == "pane.read":
+            return {
+                "type": "pane_read",
+                "read": {"text": "Completed previous turn.\n── status: idle ──"},
+            }
+        if method == "agent.prompt":
+            return {
+                "type": "agent_prompted",
+                "agent": {"pane_id": "pane-w-1"},
+                "delivery": "submitted",
+            }
         return {"accepted": True}
 
     def close(self) -> None:
@@ -189,7 +200,7 @@ def _sent_texts(calls: list[dict[str, Any]]) -> list[str]:
     return [
         str(call["params"].get("text"))
         for call in calls
-        if call["method"] == "pane.send_input"
+        if call["method"] == "agent.prompt"
     ]
 
 

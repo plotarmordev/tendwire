@@ -748,6 +748,7 @@ class TendwireDaemon:
             result = maybe_run_automatic_store_maintenance(
                 Path(self.config.db_path),
                 policy=policy,
+                turn_model=self.config.turn_model,
                 acknowledged_final_retention_days=(
                     self.config.acknowledged_final_retention_days
                 ),
@@ -829,6 +830,7 @@ class TendwireDaemon:
         save_snapshot(
             Path(self.config.db_path),
             snapshot,
+            turn_model=self.config.turn_model,
             observation=SnapshotObservationContext(
                 authority="none",
                 observed_at=_valid_observation_timestamp(backend_health.observed_at),
@@ -1007,6 +1009,7 @@ class TendwireDaemon:
                 else "degraded"
             ),
             "host_id": self.config.host_id,
+            "turn_model": self.config.turn_model,
             "daemon": {
                 "status": "healthy",
                 "started_at": self.started_at,
@@ -1136,7 +1139,7 @@ class TendwireDaemon:
             cursor=cursor,
             since=since,
             turn_refresh_interval_seconds=self.config.turn_refresh_interval_seconds,
-            claim_hard_ttl_seconds=self.config.turn_claim_hard_ttl_seconds,
+            turn_model=self.config.turn_model,
         )
 
     def get_turn_content(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1161,6 +1164,7 @@ class TendwireDaemon:
             field=params.get("field"),
             cursor=params.get("cursor"),
             schema_version=params.get("schema_version", 1),
+            turn_model=self.config.turn_model,
         )
 
     def get_turn_delta(
@@ -1187,6 +1191,7 @@ class TendwireDaemon:
             watermark=watermark,
             cursor=cursor,
             limit=limit,
+            turn_model=self.config.turn_model,
         )
 
     def connector_call(self, method: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1211,6 +1216,7 @@ class TendwireDaemon:
             max_lease_seconds=self.config.connector_max_claim_ttl_seconds,
             ack_ttl_seconds=self.config.connector_ack_ttl_seconds,
             max_attempts=self.config.max_outbox_attempts,
+            turn_model=self.config.turn_model,
         ).dispatch(method, params)
 
     def _connector_periodic_tick(self) -> None:

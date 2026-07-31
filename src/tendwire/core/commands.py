@@ -32,6 +32,10 @@ from .models import (
 
 COMMAND_REQUEST_SCHEMA_VERSION = 1
 COMMAND_ENVELOPE_SCHEMA_VERSION = 2
+COMMAND_ENVELOPE_V3_SCHEMA_VERSION = 3
+SUPPORTED_COMMAND_ENVELOPE_SCHEMA_VERSIONS = frozenset(
+    {COMMAND_ENVELOPE_SCHEMA_VERSION, COMMAND_ENVELOPE_V3_SCHEMA_VERSION}
+)
 
 ALLOWED_ACTIONS = frozenset(
     {
@@ -44,7 +48,16 @@ ALLOWED_ACTIONS = frozenset(
     }
 )
 REQUEST_ALLOWED_FIELDS = frozenset(
-    {"schema_version", "action", "request_id", "dry_run", "target", "instruction", "params"}
+    {
+        "schema_version",
+        "action",
+        "request_id",
+        "dry_run",
+        "target",
+        "instruction",
+        "params",
+        "response_schema_version",
+    }
 )
 
 # Canonical status values for command results/envelopes.
@@ -199,6 +212,9 @@ _FORBIDDEN_REQUEST_COMPACT = frozenset(name.replace("_", "") for name in FORBIDD
 
 MAX_INSTRUCTION_LENGTH = 4096
 _REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}", re.ASCII)
+_TURN_SUBMISSION_ID_RE = re.compile(r"twsub1\.[0-9a-f]{64}", re.ASCII)
+_INSTRUCTION_FINGERPRINT_DOMAIN = b"tendwire.instruction-fingerprint.v1"
+_TURN_SUBMISSION_ID_DOMAIN = b"tendwire.turn-submission-id.v1"
 
 # Workers that must not receive instructions.
 _DISALLOWED_WORKER_STATUSES = frozenset({"closed", "failed", "unknown"})
@@ -279,6 +295,11 @@ def _contains_c1_control(text: str) -> bool:
     return any(0x80 <= ord(char) <= 0x9F for char in text)
 
 
+def _is_raw_instruction_control(char: str) -> bool:
+    code = ord(char)
+    return (code < 32 and code not in {9, 10}) or code == 127
+
+
 def validate_instruction_text(text: Any) -> dict[str, Any] | None:
     """Validate instruction text and return an error dict, or None if valid."""
     if text is None:
@@ -311,13 +332,82 @@ def validate_instruction_text(text: Any) -> dict[str, Any] | None:
         )
     # Reject C0 controls except LF and tab, plus DEL.
     for char in text:
-        code = ord(char)
-        if (code < 32 and code not in {9, 10}) or code == 127:
+        if _is_raw_instruction_control(char):
             return instruction_text_error(
                 STATUS_INVALID_REQUEST,
                 "instruction.text must not contain raw control characters",
             )
     return None
+
+
+def normalize_instruction_text(text: Any) -> str:
+    """Return the Phase-1 whitespace-normalized instruction text.
+
+    Line boundaries remain significant, while runs of horizontal or other
+    intra-line whitespace are collapsed. The function is deliberately pure so
+    claim matching and the Phase-2 ledger cannot drift apart.
+
+    Herdr observations may retain terminal framing bytes at the outer edge of
+    otherwise exact input (for example a trailing U+0001). Submitted
+    instructions reject every such C0/C1 byte, so ignoring only edge controls
+    is collision-safe for ledger matching. Controls inside the instruction
+    remain significant and therefore fail closed.
+    """
+    raw = str(text or "")
+    start = 0
+    end = len(raw)
+    while start < end and (
+        _is_raw_instruction_control(raw[start])
+        or 0x80 <= ord(raw[start]) <= 0x9F
+    ):
+        start += 1
+    while end > start and (
+        _is_raw_instruction_control(raw[end - 1])
+        or 0x80 <= ord(raw[end - 1]) <= 0x9F
+    ):
+        end -= 1
+    return "\n".join(
+        " ".join(line.split()) for line in raw[start:end].splitlines()
+    ).strip()
+
+
+def instruction_fingerprint(text: Any) -> str:
+    """Return an opaque, versioned digest suitable for ledger matching.
+
+    Valid instruction text can consist entirely of whitespace even though its
+    normalized form is empty. Preserve the normalized matching behavior for
+    ordinary text, but fingerprint the raw text in that edge case so shadow
+    ledger bookkeeping can never reject an otherwise valid legacy send.
+    """
+    normalized = normalize_instruction_text(text)
+    fingerprint_text = normalized or str(text or "")
+    digest = hashlib.sha256(
+        _INSTRUCTION_FINGERPRINT_DOMAIN
+        + b"\x00"
+        + fingerprint_text.encode("utf-8")
+    ).hexdigest()
+    return f"twins1.{digest}"
+
+
+def turn_submission_id(host_id: Any, request_id: Any) -> str:
+    """Return the deterministic opaque submission ID for one host/request."""
+    clean_host_id = str(host_id or "").strip()
+    clean_request_id = str(request_id or "").strip()
+    if not clean_host_id or not clean_request_id:
+        raise ValueError("turn submission identity fields must be non-empty")
+    digest = hashlib.sha256(
+        _TURN_SUBMISSION_ID_DOMAIN
+        + b"\x00"
+        + clean_host_id.encode("utf-8")
+        + b"\x00"
+        + clean_request_id.encode("utf-8")
+    ).hexdigest()
+    return f"twsub1.{digest}"
+
+
+def is_turn_submission_id(value: Any) -> bool:
+    """Return whether value is a supported opaque submission ID."""
+    return isinstance(value, str) and _TURN_SUBMISSION_ID_RE.fullmatch(value) is not None
 
 
 def _validate_target_shape(target: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -390,6 +480,7 @@ class CommandRequest:
     target: dict[str, Any] | None = None
     instruction: dict[str, Any] | None = None
     params: dict[str, Any] | None = None
+    response_schema_version: int = COMMAND_ENVELOPE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "action", _string_value(self.action))
@@ -398,9 +489,10 @@ class CommandRequest:
         object.__setattr__(self, "target", _clean_mapping(self.target))
         object.__setattr__(self, "instruction", _clean_mapping(self.instruction))
         object.__setattr__(self, "params", _clean_mapping(self.params))
+        object.__setattr__(self, "response_schema_version", self.response_schema_version)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "action": self.action,
             "request_id": self.request_id,
@@ -409,6 +501,9 @@ class CommandRequest:
             "instruction": self.instruction,
             "params": self.params,
         }
+        if self.response_schema_version != COMMAND_ENVELOPE_SCHEMA_VERSION:
+            payload["response_schema_version"] = self.response_schema_version
+        return payload
 
     def payload_fingerprint(self) -> str:
         """Return the legacy raw-request fingerprint used by compatibility callers.
@@ -430,6 +525,10 @@ class CommandRequest:
             target=data.get("target"),
             instruction=data.get("instruction"),
             params=data.get("params"),
+            response_schema_version=data.get(
+                "response_schema_version",
+                COMMAND_ENVELOPE_SCHEMA_VERSION,
+            ),
         )
 
 
@@ -625,6 +724,18 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
             STATUS_INVALID_REQUEST,
             "dry_run must be a JSON boolean",
             details={"field": "dry_run"},
+        )
+
+    if (
+        isinstance(request.response_schema_version, bool)
+        or not isinstance(request.response_schema_version, int)
+        or request.response_schema_version
+        not in SUPPORTED_COMMAND_ENVELOPE_SCHEMA_VERSIONS
+    ):
+        return error_value(
+            STATUS_INVALID_REQUEST,
+            "response_schema_version must be 2 or 3",
+            details={"field": "response_schema_version"},
         )
 
     if request.action not in ALLOWED_ACTIONS:
@@ -850,6 +961,17 @@ def parse_command_request(payload: str) -> tuple[CommandRequest | None, dict[str
             "dry_run must be a JSON boolean",
             details={"field": "dry_run"},
         )
+    if "response_schema_version" in data and (
+        isinstance(data.get("response_schema_version"), bool)
+        or not isinstance(data.get("response_schema_version"), int)
+        or data.get("response_schema_version")
+        not in SUPPORTED_COMMAND_ENVELOPE_SCHEMA_VERSIONS
+    ):
+        return None, error_value(
+            STATUS_INVALID_REQUEST,
+            "response_schema_version must be 2 or 3",
+            details={"field": "response_schema_version"},
+        )
     try:
         request = CommandRequest.from_dict(data)
     except Exception as exc:  # noqa: BLE001
@@ -900,10 +1022,10 @@ class CommandEnvelope:
         if (
             isinstance(self.schema_version, bool)
             or not isinstance(self.schema_version, int)
-            or self.schema_version != COMMAND_ENVELOPE_SCHEMA_VERSION
+            or self.schema_version not in SUPPORTED_COMMAND_ENVELOPE_SCHEMA_VERSIONS
         ):
             raise ValueError(
-                f"command envelope schema_version must be {COMMAND_ENVELOPE_SCHEMA_VERSION}"
+                "command envelope schema_version must be 2 or 3"
             )
 
         mutating = self.action in {
@@ -984,6 +1106,31 @@ class CommandEnvelope:
                 or self.status != STATUS_REQUEST_STATE_UNCERTAIN
             ):
                 raise ValueError("terminal_uncertain disposition has an inconsistent command tuple")
+        if self.schema_version == COMMAND_ENVELOPE_V3_SCHEMA_VERSION:
+            submission_id = (
+                clean_result.get("submission_id")
+                if isinstance(clean_result, Mapping)
+                else None
+            )
+            turn_id = (
+                clean_result.get("turn_id")
+                if isinstance(clean_result, Mapping)
+                else None
+            )
+            if (
+                self.action != "send_instruction"
+                or self.disposition != DISPOSITION_TERMINAL_ACCEPTED
+                or not is_turn_submission_id(submission_id)
+                or not isinstance(clean_result, Mapping)
+                or "turn_id" not in clean_result
+                or not (
+                    turn_id is None
+                    or (isinstance(turn_id, str) and bool(turn_id))
+                )
+            ):
+                raise ValueError(
+                    "schema-v3 envelopes require an accepted instruction submission"
+                )
         if self.status == STATUS_ANSWER_IN_PROGRESS and not (
             self.action == "answer_decision"
             and live_mutation
@@ -1057,6 +1204,7 @@ class CommandEnvelope:
         result: dict[str, Any] | None = None,
         error: dict[str, Any] | None = None,
         warnings: list[str] | None = None,
+        schema_version: int = COMMAND_ENVELOPE_SCHEMA_VERSION,
     ) -> "CommandEnvelope":
         return cls(
             ok=ok,
@@ -1068,6 +1216,7 @@ class CommandEnvelope:
             result=result,
             error=error,
             warnings=list(warnings or []),
+            schema_version=schema_version,
         )
 
     @classmethod

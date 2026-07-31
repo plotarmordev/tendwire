@@ -12,26 +12,15 @@ from typing import Any
 import pytest
 
 from tendwire.config import Config
-from tendwire.core.commands import (
-    DISPOSITION_TERMINAL_ACCEPTED,
-    STATUS_ACCEPTED,
-    CommandEnvelope,
-    CommandRequest,
-    build_canonical_mutation,
-)
 from tendwire.connectors import ConnectorOutboxAPI
 from tendwire.core.projector import project_from_raw
 from tendwire.core.turns import turn_final_delivery_identity
 from tendwire.store import sqlite as store_sqlite
 from tendwire.store.sqlite import (
     cleanup_acknowledged_final_retention,
-    finish_command_request,
-    get_command_request,
     init_store,
-    mark_command_send_started,
     merge_turn_content,
     reclaim_expired_connector_leases,
-    reserve_command_request,
     save_snapshot,
     store_status,
     turns_payload_from_store,
@@ -85,7 +74,6 @@ def _source_turns(db_path: Path, snapshot: Any, *, host_id: str = HOST_ID) -> li
         schema_version=2,
         limit=250,
         turn_refresh_interval_seconds=1_000_000_000,
-        claim_hard_ttl_seconds=1_000_000_000,
     )
     return [
         turn
@@ -803,106 +791,6 @@ def test_storage_pressure_surface_is_aggregate_and_omits_final_content_and_ids(
     assert "turn-final:revision:" not in encoded
     assert "private_state_json" not in encoded
 
-
-def test_completed_command_receipt_does_not_release_command_linked_pending_turn(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "command-pending-protection.db"
-    snapshot = _new_store(db_path)
-    pending = store_sqlite.upsert_command_pending_turn(
-        db_path,
-        HOST_ID,
-        snapshot.workers[0],
-        request_id="request-pending-1",
-        instruction_text="keep this command pending",
-        observed_at="2026-01-01T00:00:00+00:00",
-    )
-    assert pending is not None
-    request = CommandRequest(
-        action="send_instruction",
-        request_id="request-pending-1",
-        dry_run=False,
-        target={"worker_id": WORKER_ID},
-        instruction={"text": "keep this command pending"},
-    )
-    canonical = build_canonical_mutation(request, public_worker_id=WORKER_ID)
-    accepted = CommandEnvelope.from_result(
-        request,
-        ok=True,
-        status=STATUS_ACCEPTED,
-        disposition=DISPOSITION_TERMINAL_ACCEPTED,
-        result={"worker_id": WORKER_ID},
-    )
-    reservation = reserve_command_request(
-        db_path,
-        host_id=HOST_ID,
-        request_id=request.request_id or "",
-        action=request.action,
-        canonical_version=canonical.canonical_version,
-        canonical_fingerprint=canonical.fingerprint,
-        canonical_request_json=canonical.canonical_json,
-        public_worker_id=canonical.public_worker_id,
-        pending_result_json=accepted.to_json(),
-    )
-    owner_token = reservation["owner_token"]
-    assert isinstance(owner_token, str)
-    assert mark_command_send_started(
-        db_path,
-        host_id=HOST_ID,
-        request_id=request.request_id or "",
-        canonical_fingerprint=canonical.fingerprint,
-        owner_token=owner_token,
-        binding_fingerprint="retention-binding",
-    )["status"] == "send_started"
-    assert finish_command_request(
-        db_path,
-        host_id=HOST_ID,
-        request_id=request.request_id or "",
-        canonical_fingerprint=canonical.fingerprint,
-        owner_token=owner_token,
-        expected_state="send_started",
-        terminal_state="accepted",
-        status=STATUS_ACCEPTED,
-        result_json=accepted.to_json(),
-    )["status"] == "accepted"
-    receipt = get_command_request(db_path, HOST_ID, "request-pending-1")
-    assert receipt is not None
-    assert receipt["status"] == "accepted"
-    assert receipt["state"] == "accepted"
-
-    _merge_final(
-        db_path,
-        snapshot,
-        source_turn_id="separate-final",
-        final_text="separate delivered final",
-        observed_at="2026-01-02T00:00:00+00:00",
-    )
-    api = ConnectorOutboxAPI(db_path, HOST_ID)
-    source = _poll_one_source(api)
-    _finish_source(api, source, version="retention-command-guard")
-    cleanup = _aggressive_cleanup(db_path)
-    assert cleanup["deleted"] == 1
-
-    listed = turns_payload_from_store(
-        db_path,
-        HOST_ID,
-        snapshot=snapshot,
-        schema_version=2,
-        limit=250,
-        turn_refresh_interval_seconds=1_000_000_000,
-        claim_hard_ttl_seconds=1_000_000_000,
-    )["turns"]
-    protected = [
-        turn
-        for turn in listed
-        if turn.get("origin_command_id") == "request-pending-1"
-    ]
-    assert len(protected) == 1
-    assert protected[0]["id"] == pending["id"]
-    assert protected[0]["complete"] is False
-    assert protected[0]["has_open_turn"] is True
-    assert protected[0]["user_text"] == "keep this command pending"
-    assert _source_turns(db_path, snapshot) == []
 
 
 def test_concurrent_final_merges_create_unique_anchors_drained_in_durable_order(

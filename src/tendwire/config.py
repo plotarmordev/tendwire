@@ -6,14 +6,17 @@ No external config-file parser is required.
 
 from __future__ import annotations
 
-import os
+import logging
 import math
+import os
 import platform
 import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 
 HERDR_BACKENDS = frozenset({"cli", "socket"})
+TURN_MODELS = frozenset({"legacy", "dual", "shadow", "observed"})
+DEFAULT_TURN_MODEL = "observed"
 DEFAULT_EVENT_DEBOUNCE_SECONDS = 0.05
 DEFAULT_RECONCILE_INTERVAL_SECONDS = 300.0
 DEFAULT_EVENT_RETENTION_DAYS = 7
@@ -21,7 +24,8 @@ DEFAULT_OUTPUT_EXCERPT_CHARS = 200
 DEFAULT_MAX_WORKERS = 512
 DEFAULT_TURN_REFRESH_INTERVAL_SECONDS = 2.0
 DEFAULT_TURN_REFRESH_WORKERS = 4
-DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS = 86_400
+DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS = 60
+DEFAULT_SUBMISSION_HARD_TTL_SECONDS = 86_400
 DEFAULT_PENDING_STALE_GRACE_SECONDS = 30.0
 DEFAULT_MAX_OUTBOX_ATTEMPTS = 10
 DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS = 60
@@ -45,6 +49,7 @@ MAX_SNAPSHOT_MAINTENANCE_BATCH_SIZE = 1000
 MAX_RETENTION_DAYS = 365_000
 MAX_SQLITE_INTEGER = (1 << 63) - 1
 MAX_MAINTENANCE_CADENCE_SECONDS = MAX_RETENTION_DAYS * 24 * 60 * 60
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,7 @@ class Config:
     socket_path: Path | None = None
     herdr_timeout_seconds: float = 5.0
     herdr_backend: str = "cli"
+    turn_model: str = DEFAULT_TURN_MODEL
     event_debounce_seconds: float = DEFAULT_EVENT_DEBOUNCE_SECONDS
     reconcile_interval_seconds: float = DEFAULT_RECONCILE_INTERVAL_SECONDS
     event_retention_days: int = DEFAULT_EVENT_RETENTION_DAYS
@@ -65,7 +71,8 @@ class Config:
     max_workers: int = DEFAULT_MAX_WORKERS
     turn_refresh_interval_seconds: float = DEFAULT_TURN_REFRESH_INTERVAL_SECONDS
     turn_refresh_workers: int = DEFAULT_TURN_REFRESH_WORKERS
-    turn_claim_hard_ttl_seconds: int = DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS
+    submission_link_window_seconds: int = DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS
+    submission_hard_ttl_seconds: int = DEFAULT_SUBMISSION_HARD_TTL_SECONDS
     pending_stale_grace_seconds: float = DEFAULT_PENDING_STALE_GRACE_SECONDS
     max_outbox_attempts: int = DEFAULT_MAX_OUTBOX_ATTEMPTS
     connector_claim_ttl_seconds: int = DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS
@@ -109,6 +116,16 @@ class Config:
             allowed = ", ".join(sorted(HERDR_BACKENDS))
             raise ValueError(f"herdr_backend must be one of: {allowed}")
         object.__setattr__(self, "herdr_backend", backend)
+        turn_model = str(self.turn_model or "").strip().lower()
+        if turn_model not in TURN_MODELS:
+            allowed = ", ".join(sorted(TURN_MODELS))
+            raise ValueError(f"turn_model must be one of: {allowed}")
+        object.__setattr__(self, "turn_model", turn_model)
+        if turn_model != "observed":
+            _LOGGER.warning(
+                "turn_model=%s is a compatibility alias and behaves as observed",
+                turn_model,
+            )
         object.__setattr__(
             self,
             "event_debounce_seconds",
@@ -159,13 +176,26 @@ class Config:
             raise ValueError("turn_refresh_workers must be <= max_workers")
         object.__setattr__(
             self,
-            "turn_claim_hard_ttl_seconds",
+            "submission_link_window_seconds",
             _bounded_positive_int(
-                self.turn_claim_hard_ttl_seconds,
-                "turn_claim_hard_ttl_seconds",
+                self.submission_link_window_seconds,
+                "submission_link_window_seconds",
                 maximum=MAX_MAINTENANCE_CADENCE_SECONDS,
             ),
         )
+        object.__setattr__(
+            self,
+            "submission_hard_ttl_seconds",
+            _bounded_positive_int(
+                self.submission_hard_ttl_seconds,
+                "submission_hard_ttl_seconds",
+                maximum=MAX_MAINTENANCE_CADENCE_SECONDS,
+            ),
+        )
+        if self.submission_hard_ttl_seconds < self.submission_link_window_seconds:
+            raise ValueError(
+                "submission_hard_ttl_seconds must be >= submission_link_window_seconds"
+            )
         object.__setattr__(
             self,
             "pending_stale_grace_seconds",
@@ -412,6 +442,7 @@ def load_config(
     socket_group: str | None = None,
     herdr_timeout_seconds: float | str | None = None,
     herdr_backend: str | None = None,
+    turn_model: str | None = None,
     event_debounce_seconds: float | str | None = None,
     reconcile_interval_seconds: float | str | None = None,
     event_retention_days: int | str | None = None,
@@ -419,7 +450,8 @@ def load_config(
     max_workers: int | str | None = None,
     turn_refresh_interval_seconds: float | str | None = None,
     turn_refresh_workers: int | str | None = None,
-    turn_claim_hard_ttl_seconds: int | str | None = None,
+    submission_link_window_seconds: int | str | None = None,
+    submission_hard_ttl_seconds: int | str | None = None,
     pending_stale_grace_seconds: float | str | None = None,
     max_outbox_attempts: int | str | None = None,
     connector_claim_ttl_seconds: int | str | None = None,
@@ -501,6 +533,11 @@ def load_config(
         socket_path=resolved_socket_path,
         herdr_timeout_seconds=resolved_herdr_timeout_seconds,
         herdr_backend=resolved_herdr_backend,
+        turn_model=_resolve_value(
+            turn_model,
+            "TENDWIRE_TURN_MODEL",
+            DEFAULT_TURN_MODEL,
+        ),
         event_debounce_seconds=_resolve_value(
             event_debounce_seconds,
             "TENDWIRE_EVENT_DEBOUNCE_SECONDS",
@@ -536,10 +573,15 @@ def load_config(
             "TENDWIRE_TURN_REFRESH_WORKERS",
             DEFAULT_TURN_REFRESH_WORKERS,
         ),
-        turn_claim_hard_ttl_seconds=_resolve_value(
-            turn_claim_hard_ttl_seconds,
-            "TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS",
-            DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS,
+        submission_link_window_seconds=_resolve_value(
+            submission_link_window_seconds,
+            "TENDWIRE_SUBMISSION_LINK_WINDOW_SECONDS",
+            DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS,
+        ),
+        submission_hard_ttl_seconds=_resolve_value(
+            submission_hard_ttl_seconds,
+            "TENDWIRE_SUBMISSION_HARD_TTL_SECONDS",
+            DEFAULT_SUBMISSION_HARD_TTL_SECONDS,
         ),
         pending_stale_grace_seconds=_resolve_value(
             pending_stale_grace_seconds,

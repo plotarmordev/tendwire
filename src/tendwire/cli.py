@@ -698,6 +698,7 @@ def observe_public_snapshot(
         save_snapshot(
             config.db_path,
             snapshot,
+            turn_model=config.turn_model,
             observation=SnapshotObservationContext(
                 authority=authority,
                 observed_at=health.observed_at,
@@ -1103,7 +1104,7 @@ def cmd_turns(
                 cursor=cursor,
                 since=since,
                 turn_refresh_interval_seconds=config.turn_refresh_interval_seconds,
-                claim_hard_ttl_seconds=config.turn_claim_hard_ttl_seconds,
+                turn_model=config.turn_model,
             )
     elif daemon_attempt.error_kind == "timeout":
         payload = {
@@ -1184,6 +1185,7 @@ def cmd_turn_content_get(config: Config, args: argparse.Namespace) -> int:
             field=args.field,
             cursor=args.cursor,
             schema_version=1,
+            turn_model=config.turn_model,
         )
     print(_content_payload_json(payload, indent=2))
     return 0 if payload.get("ok") is not False and isinstance(payload.get("text"), str) else 1
@@ -1283,6 +1285,7 @@ def cmd_turn_delta(config: Config, args: argparse.Namespace) -> int:
             watermark=args.watermark,
             cursor=args.cursor,
             limit=args.limit,
+            turn_model=config.turn_model,
         )
     elif daemon_attempt.error_kind == "timeout":
         payload = {
@@ -1634,6 +1637,7 @@ def cmd_connector(config: Config, args: argparse.Namespace) -> int:
         max_lease_seconds=config.connector_max_claim_ttl_seconds,
         ack_ttl_seconds=config.connector_ack_ttl_seconds,
         max_attempts=config.max_outbox_attempts,
+        turn_model=config.turn_model,
     ).dispatch(method, params)
     print(_connector_payload_json(payload, indent=2))
     return 0 if payload.get("ok") is not False else 1
