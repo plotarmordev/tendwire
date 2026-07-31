@@ -47,6 +47,15 @@ def _nonnegative_float(value: Any) -> float | None:
     return converted
 
 
+def _public_failure_type(value: Any) -> str | None:
+    """Return a bounded exception type label, never arbitrary failure text."""
+    if not isinstance(value, str) or not value or len(value) > 128:
+        return None
+    if any(not (character.isalnum() or character in "._") for character in value):
+        return None
+    return value
+
+
 _STORE_COUNT_FIELDS = (
     "snapshots",
     "events",
@@ -517,6 +526,7 @@ class DaemonHooks:
     submit_command: Callable[[Config, str], CommandEnvelope | Mapping[str, Any]] = _default_submit_command
     event_backend_factory: Callable[[Config, threading.Event], Any] | None = None
     turn_scheduler_factory: Callable[[Config], Any] = _default_turn_scheduler_factory
+    acp_runtime_factory: Callable[[Config, threading.Event], Any | None] | None = None
 
 
 class TendwireDaemon:
@@ -540,6 +550,8 @@ class TendwireDaemon:
         self._server: UnixSocketJSONServer | None = None
         self._event_backend: Any | None = None
         self._turn_scheduler: Any | None = None
+        self._acp_runtime: Any | None = None
+        self._acp_startup_failure_type: str | None = None
         self._stop_lock = threading.Lock()
         self._automatic_maintenance_status: dict[str, Any] | None = None
 
@@ -589,6 +601,8 @@ class TendwireDaemon:
             else:
                 self._snapshot = self.hooks.observe_initial_snapshot(self.config)
                 self._after_snapshot_saved()
+
+            self._start_acp_runtime()
 
             scheduler = self.hooks.turn_scheduler_factory(self.config)
             self._turn_scheduler = scheduler
@@ -651,6 +665,9 @@ class TendwireDaemon:
                     )
                 except Exception:
                     pass
+            runtime = self._acp_runtime
+            self._acp_runtime = None
+            self._stop_acp_runtime(runtime)
             self._event_backend = None
             if backend is not None:
                 try:
@@ -692,15 +709,19 @@ class TendwireDaemon:
             server = self._server
             backend = self._event_backend
             scheduler = self._turn_scheduler
+            runtime = self._acp_runtime
             self._server = None
             self._event_backend = None
             self._turn_scheduler = None
+            self._acp_runtime = None
 
         if server is not None:
             try:
                 server.close()
             except Exception:
                 pass
+
+        self._stop_acp_runtime(runtime)
 
         if backend is not None:
             flush = getattr(backend, "flush", None)
@@ -729,6 +750,135 @@ class TendwireDaemon:
                 backend.stop()
             except Exception:
                 pass
+
+    def _start_acp_runtime(self) -> None:
+        """Start an injected ACP runtime according to the configured policy."""
+        policy = self.config.agent_event_source
+        self._acp_startup_failure_type = None
+        if policy == "legacy":
+            return
+
+        factory = self.hooks.acp_runtime_factory
+        if factory is None:
+            if policy == "acp_required":
+                raise RuntimeError("ACP runtime is required but unavailable")
+            return
+
+        runtime: Any | None = None
+        try:
+            runtime = factory(self.config, self.stop_event)
+            if runtime is None:
+                if policy == "acp_required":
+                    raise RuntimeError("ACP runtime is required but unavailable")
+                return
+            self._acp_runtime = runtime
+            runtime.start()
+            health = self._acp_runtime_health()
+            if health["healthy"] is not True:
+                failure_type = health.get("failure_type")
+                self._acp_startup_failure_type = _public_failure_type(failure_type)
+                raise RuntimeError("ACP runtime did not become healthy")
+        except Exception as exc:
+            self._acp_startup_failure_type = (
+                self._acp_startup_failure_type or type(exc).__name__
+            )
+            if runtime is not None:
+                self._stop_acp_runtime(runtime)
+            self._acp_runtime = None
+            if policy == "acp_required":
+                raise RuntimeError(
+                    "ACP runtime is required but failed to start "
+                    f"({self._acp_startup_failure_type})"
+                ) from None
+
+    def _stop_acp_runtime(self, runtime: Any | None) -> None:
+        """Best-effort bounded shutdown for an injected ACP runtime."""
+        if runtime is None:
+            return
+        timeout = self.config.acp_shutdown_timeout_seconds
+        stop = getattr(runtime, "stop", None)
+        if callable(stop):
+            try:
+                stop(timeout=timeout)
+            except Exception:
+                pass
+        join = getattr(runtime, "join", None)
+        if callable(join):
+            try:
+                join(timeout=timeout)
+            except Exception:
+                pass
+
+    def _acp_runtime_health(self) -> dict[str, Any]:
+        """Return a fixed, public-safe ACP lifecycle aggregate."""
+        counters = {
+            "updates_ingested": 0,
+            "permissions_ingested": 0,
+            "permissions_selected": 0,
+            "permissions_cancelled": 0,
+            "invalid_permission_selections": 0,
+            "prompts_started": 0,
+            "prompts_completed": 0,
+            "prompts_failed": 0,
+            "cancellation_requests": 0,
+        }
+        policy = self.config.agent_event_source
+        if policy == "legacy":
+            return {
+                "policy": policy,
+                "status": "disabled",
+                "healthy": False,
+                "state": "disabled",
+                "failure_type": None,
+                "counters": counters,
+            }
+
+        runtime = self._acp_runtime
+        if runtime is None:
+            return {
+                "policy": policy,
+                "status": "unavailable",
+                "healthy": False,
+                "state": "unavailable",
+                "failure_type": self._acp_startup_failure_type,
+                "counters": counters,
+            }
+
+        status_method = getattr(runtime, "status", None)
+        try:
+            raw = status_method() if callable(status_method) else None
+        except Exception as exc:
+            return {
+                "policy": policy,
+                "status": "degraded",
+                "healthy": False,
+                "state": "failed",
+                "failure_type": type(exc).__name__,
+                "counters": counters,
+            }
+
+        def field(name: str) -> Any:
+            if isinstance(raw, Mapping):
+                return raw.get(name)
+            return getattr(raw, name, None)
+
+        state_value = field("state")
+        state = getattr(state_value, "value", state_value)
+        if state not in {"new", "starting", "running", "stopping", "stopped", "failed"}:
+            state = "unknown"
+        healthy = field("healthy") is True and state == "running"
+        for key in counters:
+            counters[key] = _nonnegative_int(field(key))
+        failure_type_value = field("failure_type")
+        failure_type = _public_failure_type(failure_type_value)
+        return {
+            "policy": policy,
+            "status": "healthy" if healthy else "degraded",
+            "healthy": healthy,
+            "state": state,
+            "failure_type": failure_type,
+            "counters": counters,
+        }
 
     def _after_snapshot_saved(self) -> None:
         if self.config.db_path is None:
@@ -999,6 +1149,7 @@ class TendwireDaemon:
             or stored_last_snapshot_at
             or snapshot.updated_at
         )
+        acp_health = self._acp_runtime_health()
         payload = {
             "schema_version": 1,
             "status": (
@@ -1006,6 +1157,10 @@ class TendwireDaemon:
                 if store_ok
                 and not maintenance_degraded
                 and pending_ingestion["status"] == "healthy"
+                and (
+                    self.config.agent_event_source != "acp_required"
+                    or acp_health["healthy"] is True
+                )
                 else "degraded"
             ),
             "host_id": self.config.host_id,
@@ -1053,6 +1208,7 @@ class TendwireDaemon:
                 self.config,
                 self._turn_scheduler,
             ),
+            "acp": acp_health,
             "pending_ingestion": pending_ingestion,
             "limits": {
                 "event_debounce_seconds": self.config.event_debounce_seconds,
