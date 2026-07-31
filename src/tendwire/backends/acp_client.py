@@ -195,11 +195,8 @@ class AcpClient:
         # Updates and permission requests share one reader-ordered queue.  A
         # pair of duplicate queues can both reorder cross-kind events and fail
         # the transport when an embedding consumes only one of them.
-        self._session_events: queue.Queue[SessionEvent | object] = queue.Queue(
-            max_pending_events
-        )
-        self._session_event_backlog: deque[SessionEvent] = deque()
-        self._session_event_lock = threading.Lock()
+        self._session_events: deque[SessionEvent] = deque()
+        self._session_event_condition = threading.Condition()
         self._notifications: queue.Queue[RawNotification | object] = queue.Queue(
             max_pending_events
         )
@@ -721,37 +718,50 @@ class AcpClient:
         deadline = None
         if timeout is not None:
             deadline = time.monotonic() + _positive_timeout(timeout, "timeout")
-        with self._session_event_lock:
+        with self._session_event_condition:
             while True:
-                for index, candidate in enumerate(self._session_event_backlog):
-                    if self._session_event_matches(candidate, expected):
-                        del self._session_event_backlog[index]
-                        return candidate  # type: ignore[return-value]
+                index = self._matching_session_event_index(expected)
+                if index is not None:
+                    candidate = self._session_events[index]
+                    del self._session_events[index]
+                    self._session_event_condition.notify_all()
+                    return candidate  # type: ignore[return-value]
+                if self.state in {
+                    ClientState.FAILED,
+                    ClientState.CLOSING,
+                    ClientState.CLOSED,
+                }:
+                    self._raise_unusable()
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     raise AcpRequestTimeoutError(
                         f"timed out waiting for ACP {description}"
                     )
-                candidate = self._queue_get(
-                    self._session_events,
-                    remaining,
-                    description,
-                )
-                if isinstance(candidate, PermissionRequest):
-                    with self._permission_lock:
-                        pending = (
-                            self._pending_permissions.get(candidate.request_id)
-                            is candidate
-                        )
-                    if not pending:
-                        continue
-                if self._session_event_matches(candidate, expected):
-                    return candidate  # type: ignore[return-value]
-                if len(self._session_event_backlog) >= self.max_pending_events:
-                    raise AcpEventQueueFullError(
-                        "ACP typed event backlog is full; consume the ordered stream"
+                self._session_event_condition.wait(timeout=remaining)
+
+    def _matching_session_event_index(self, expected: object) -> int | None:
+        index = 0
+        removed_stale = False
+        while index < len(self._session_events):
+            candidate = self._session_events[index]
+            if isinstance(candidate, PermissionRequest):
+                with self._permission_lock:
+                    pending = (
+                        self._pending_permissions.get(candidate.request_id)
+                        is candidate
                     )
-                self._session_event_backlog.append(candidate)
+                if not pending:
+                    del self._session_events[index]
+                    removed_stale = True
+                    continue
+            if self._session_event_matches(candidate, expected):
+                if removed_stale:
+                    self._session_event_condition.notify_all()
+                return index
+            index += 1
+        if removed_stale:
+            self._session_event_condition.notify_all()
+        return None
 
     @staticmethod
     def _session_event_matches(candidate: SessionEvent, expected: object) -> bool:
@@ -776,16 +786,20 @@ class AcpClient:
 
     def close(self) -> None:
         wait_for_other_close = False
+        closed_without_process = False
         with self._state_lock:
             if self._state in {ClientState.CLOSED, ClientState.NEW}:
                 self._state = ClientState.CLOSED
                 self._closed.set()
-                return
-            if self._state is ClientState.CLOSING:
+                closed_without_process = True
+            elif self._state is ClientState.CLOSING:
                 wait_for_other_close = True
             else:
                 was_failed = self._state is ClientState.FAILED
                 self._state = ClientState.CLOSING
+        if closed_without_process:
+            self._signal_queues()
+            return
         if wait_for_other_close:
             self._closed.wait(timeout=self.close_timeout * 3)
             return
@@ -1070,10 +1084,7 @@ class AcpClient:
             return
         if isinstance(message, JsonRpcNotification):
             if message.method == "session/update":
-                self._put_lossless(
-                    self._session_events,
-                    parse_session_update(message.params),
-                )
+                self._put_session_event(parse_session_update(message.params))
             elif message.method in self.supported_extension_notifications:
                 self._put_lossless(
                     self._notifications,
@@ -1111,7 +1122,7 @@ class AcpClient:
                     )
                 )
             else:
-                self._put_lossless(self._session_events, parsed)
+                self._put_session_event(parsed)
         elif message.method in self.supported_extension_requests:
             self._put_lossless(
                 self._inbound_requests,
@@ -1136,6 +1147,19 @@ class AcpClient:
             raise AcpEventQueueFullError(
                 "ACP event queue is full; refusing to drop protocol data"
             ) from exc
+
+    def _put_session_event(self, value: SessionEvent) -> None:
+        deadline = time.monotonic() + min(self.request_timeout, 0.5)
+        with self._session_event_condition:
+            while len(self._session_events) >= self.max_pending_events:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AcpEventQueueFullError(
+                        "ACP event queue is full; refusing to drop protocol data"
+                    )
+                self._session_event_condition.wait(timeout=remaining)
+            self._session_events.append(value)
+            self._session_event_condition.notify_all()
 
     def _queue_get(
         self,
@@ -1198,8 +1222,9 @@ class AcpClient:
                 pass
 
     def _signal_queues(self) -> None:
+        with self._session_event_condition:
+            self._session_event_condition.notify_all()
         for target in (
-            self._session_events,
             self._notifications,
             self._inbound_requests,
         ):

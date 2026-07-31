@@ -15,7 +15,13 @@ from tendwire.backends.acp_client import (
     AcpTransportError,
     ClientState,
 )
-from tendwire.backends.acp_protocol import AcpProtocolError, SessionUpdateKind, StopReason
+from tendwire.backends.acp_protocol import (
+    AcpProtocolError,
+    PermissionRequest,
+    SessionUpdate,
+    SessionUpdateKind,
+    StopReason,
+)
 
 
 FAKE_AGENT = Path(__file__).parent / "fixtures" / "acp_fake_agent.py"
@@ -23,6 +29,63 @@ FAKE_AGENT = Path(__file__).parent / "fixtures" / "acp_fake_agent.py"
 
 def client(mode: str = "normal", **kwargs: object) -> AcpClient:
     return AcpClient([sys.executable, "-u", str(FAKE_AGENT), mode], **kwargs)
+
+
+def _typed_update(index: int) -> SessionUpdate:
+    update = {
+        "sessionUpdate": "agent_message_chunk",
+        "messageId": f"message-{index}",
+        "content": {"type": "text", "text": str(index)},
+    }
+    raw = {"sessionId": "s", "update": update}
+    return SessionUpdate("s", SessionUpdateKind.AGENT_MESSAGE_CHUNK, update, None, raw)
+
+
+def _typed_permission(index: int) -> PermissionRequest:
+    raw = {
+        "sessionId": "s",
+        "toolCall": {"toolCallId": f"tool-{index}"},
+        "options": [],
+    }
+    return PermissionRequest(
+        index,
+        "s",
+        raw["toolCall"],
+        (),
+        None,
+        raw,
+    )
+
+
+def _install_permission(acp: AcpClient, request: PermissionRequest) -> None:
+    with acp._permission_lock:
+        acp._pending_permissions[request.request_id] = request
+    acp._put_session_event(request)
+
+
+def _waiter_has_released_condition(acp: AcpClient, ready: threading.Event) -> None:
+    assert ready.wait(timeout=1)
+    # The routing callback signals just before Condition.wait(). Acquiring the
+    # condition proves that the consumer has actually released it to sleep.
+    with acp._session_event_condition:
+        pass
+
+
+def _wait_for_condition_waiters(acp: AcpClient, count: int) -> None:
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with acp._session_event_condition:
+            if len(acp._session_event_condition._waiters) >= count:
+                return
+        time.sleep(0.001)
+    raise AssertionError("session event consumers did not start waiting")
+
+
+def _capture_failure(method, failures: list[BaseException]) -> None:
+    try:
+        method()
+    except BaseException as exc:
+        failures.append(exc)
 
 
 def test_initialize_capabilities_and_session_lifecycle() -> None:
@@ -119,6 +182,143 @@ def test_ordered_session_event_api_preserves_cross_kind_reader_order() -> None:
         thread.join(timeout=2)
         assert not thread.is_alive()
         assert outcome[0].stop_reason is StopReason.END_TURN
+
+
+@pytest.mark.parametrize("first_kind", ("permission", "update"))
+def test_concurrent_typed_consumers_route_either_first_kind_without_deadlock(
+    first_kind: str,
+) -> None:
+    acp = client()
+    update = _typed_update(1)
+    permission = _typed_permission(1)
+    waiting = threading.Event()
+    original_match = acp._matching_session_event_index
+    waiting_type = SessionUpdate if first_kind == "permission" else PermissionRequest
+
+    def observe_wait(expected: object) -> int | None:
+        result = original_match(expected)
+        if expected is waiting_type and result is None:
+            waiting.set()
+        return result
+
+    acp._matching_session_event_index = observe_wait  # type: ignore[method-assign]
+    if first_kind == "permission":
+        _install_permission(acp, permission)
+    else:
+        acp._put_session_event(update)
+
+    updates: list[SessionUpdate] = []
+    permissions: list[PermissionRequest] = []
+    update_thread = threading.Thread(target=lambda: updates.append(acp.next_update()))
+    permission_thread = threading.Thread(
+        target=lambda: permissions.append(acp.next_permission_request())
+    )
+    blocked_thread = update_thread if first_kind == "permission" else permission_thread
+    matching_thread = permission_thread if first_kind == "permission" else update_thread
+    blocked_thread.start()
+    _waiter_has_released_condition(acp, waiting)
+    matching_thread.start()
+    matching_thread.join(timeout=1)
+    assert not matching_thread.is_alive()
+
+    if first_kind == "permission":
+        acp._put_session_event(update)
+    else:
+        _install_permission(acp, permission)
+    blocked_thread.join(timeout=1)
+    assert not blocked_thread.is_alive()
+    assert updates == [update]
+    assert permissions == [permission]
+    assert list(acp._session_events) == []
+
+
+def test_ordered_consumer_remains_exact_with_mixed_session_events() -> None:
+    acp = client()
+    expected: list[SessionUpdate | PermissionRequest] = []
+    for index in range(20):
+        event: SessionUpdate | PermissionRequest
+        if index % 2:
+            event = _typed_permission(index)
+            _install_permission(acp, event)
+        else:
+            event = _typed_update(index)
+            acp._put_session_event(event)
+        expected.append(event)
+
+    assert [acp.next_session_event() for _ in expected] == expected
+    assert list(acp._session_events) == []
+
+
+def test_close_and_failure_wake_all_session_event_waiters() -> None:
+    acp = client()
+    failures: list[BaseException] = []
+    threads = [
+        threading.Thread(
+            target=lambda method=method: _capture_failure(method, failures)
+        )
+        for method in (acp.next_update, acp.next_permission_request)
+    ]
+    for thread in threads:
+        thread.start()
+    _wait_for_condition_waiters(acp, 2)
+    acp.close()
+    for thread in threads:
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+    assert len(failures) == 2
+
+    failed = client()
+    failure: list[BaseException] = []
+    thread = threading.Thread(
+        target=lambda: _capture_failure(failed.next_session_event, failure)
+    )
+    thread.start()
+    _wait_for_condition_waiters(failed, 1)
+    failed._set_failed(AcpTransportError("boom"))
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert len(failure) == 1
+    assert isinstance(failure[0], AcpTransportError)
+
+
+def test_mixed_typed_consumer_stress_is_bounded_and_exactly_once() -> None:
+    acp = client(max_pending_events=8)
+    count = 200
+    updates: list[SessionUpdate] = []
+    permissions: list[PermissionRequest] = []
+    update_thread = threading.Thread(
+        target=lambda: updates.extend(acp.next_update() for _ in range(count))
+    )
+    permission_thread = threading.Thread(
+        target=lambda: permissions.extend(
+            acp.next_permission_request() for _ in range(count)
+        )
+    )
+    update_thread.start()
+    permission_thread.start()
+    maximum_depth = 0
+    for index in range(count):
+        update = _typed_update(index)
+        permission = _typed_permission(index)
+        if index % 2:
+            _install_permission(acp, permission)
+            acp._put_session_event(update)
+        else:
+            acp._put_session_event(update)
+            _install_permission(acp, permission)
+        with acp._session_event_condition:
+            maximum_depth = max(maximum_depth, len(acp._session_events))
+    update_thread.join(timeout=3)
+    permission_thread.join(timeout=3)
+
+    assert not update_thread.is_alive()
+    assert not permission_thread.is_alive()
+    assert maximum_depth <= acp.max_pending_events
+    assert [item.update["messageId"] for item in updates] == [
+        f"message-{index}" for index in range(count)
+    ]
+    assert [item.request_id for item in permissions] == list(range(count))
+    assert list(acp._session_events) == []
 
 
 def test_cancel_resolves_pending_permissions_as_cancelled() -> None:
