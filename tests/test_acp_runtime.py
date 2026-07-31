@@ -96,6 +96,9 @@ class FakeClient:
         self.calls.append(("prompt", (session_id, prompt), kwargs))
         if self.prompt_failure is not None:
             raise self.prompt_failure
+        on_submitted = kwargs.get("on_submitted")
+        if callable(on_submitted):
+            on_submitted()
         return self.prompt_result
 
     def prepare_prompt(self, prompt: object) -> tuple[dict[str, Any], ...]:
@@ -1180,6 +1183,35 @@ def test_prompt_requires_crash_stable_producer_identity_before_remote_send(
         assert service.status().state is RuntimeState.RUNNING
     finally:
         service.stop()
+
+
+def test_submit_prompt_acknowledges_frame_before_end_of_turn(tmp_path: Path) -> None:
+    class BlockingPromptClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release = threading.Event()
+
+        def prompt(self, session_id: str, prompt: object, **kwargs: Any) -> object:
+            self.calls.append(("prompt", (session_id, prompt), kwargs))
+            on_submitted = kwargs.get("on_submitted")
+            assert callable(on_submitted)
+            on_submitted()
+            assert self.release.wait(1.0)
+            return self.prompt_result
+
+    client = BlockingPromptClient()
+    service = runtime(tmp_path, client).start()
+    started = time.monotonic()
+    service.submit_prompt(
+        "long turn",
+        producer_turn_id="producer-turn-ack",
+        acknowledgement_timeout=0.25,
+    )
+    assert time.monotonic() - started < 0.2
+    assert service.status().prompts_completed == 0
+    client.release.set()
+    wait_until(lambda: service.status().prompts_completed == 1)
+    service.stop()
 
 
 def test_ignored_update_does_not_increment_persisted_counter(tmp_path: Path) -> None:

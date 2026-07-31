@@ -517,6 +517,12 @@ def _default_turn_scheduler_factory(config: Config) -> Any:
     return TurnIngestionScheduler(config)
 
 
+def _default_acp_runtime_factory(config: Config, stop_event: threading.Event) -> Any:
+    from .backends.acp_coordinator import production_acp_runtime_factory
+
+    return production_acp_runtime_factory(config, stop_event)
+
+
 @dataclass(frozen=True)
 class DaemonHooks:
     """Dependency injection points for deterministic daemon tests."""
@@ -526,7 +532,9 @@ class DaemonHooks:
     submit_command: Callable[[Config, str], CommandEnvelope | Mapping[str, Any]] = _default_submit_command
     event_backend_factory: Callable[[Config, threading.Event], Any] | None = None
     turn_scheduler_factory: Callable[[Config], Any] = _default_turn_scheduler_factory
-    acp_runtime_factory: Callable[[Config, threading.Event], Any | None] | None = None
+    acp_runtime_factory: Callable[[Config, threading.Event], Any | None] | None = (
+        _default_acp_runtime_factory
+    )
 
 
 class TendwireDaemon:
@@ -608,6 +616,11 @@ class TendwireDaemon:
             if self.config.agent_event_source != "acp_required":
                 scheduler = self.hooks.turn_scheduler_factory(self.config)
                 self._turn_scheduler = scheduler
+                if self.config.agent_event_source == "acp_preferred":
+                    owns_worker = getattr(self._acp_runtime, "owns_worker", None)
+                    set_exclusion = getattr(scheduler, "set_worker_exclusion", None)
+                    if callable(owns_worker) and callable(set_exclusion):
+                        set_exclusion(owns_worker)
 
             api = TendwireDaemonAPI(
                 get_snapshot=self.get_snapshot,
@@ -1433,6 +1446,22 @@ class TendwireDaemon:
             sort_keys=True,
             separators=(",", ":"),
         )
+        policy = self.config.agent_event_source
+        runtime = self._acp_runtime
+        route = getattr(runtime, "prompt_route", None)
+        if policy == "acp_required" or (
+            policy == "acp_preferred" and callable(route)
+        ):
+            from .command_submission import submit_command
+
+            return submit_command(
+                self.config,
+                payload,
+                acp_prompt_router=(
+                    route if callable(route) else lambda _worker: None
+                ),
+                acp_required=policy == "acp_required",
+            )
         return self.hooks.submit_command(self.config, payload)
 
 

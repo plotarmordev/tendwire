@@ -4429,6 +4429,28 @@ class TurnIngestionScheduler:
             TurnRefreshKey,
             tuple[_TurnRefreshItem, float],
         ] = {}
+        self._worker_excluded: Callable[[str, str], bool] | None = None
+
+    def set_worker_exclusion(
+        self,
+        callback: Callable[[str, str], bool] | None,
+    ) -> None:
+        """Exclude workers currently owned by a stronger semantic source."""
+        with self._condition:
+            self._worker_excluded = callback
+            self._rescan_requested = True
+            self._condition.notify_all()
+
+    def _is_worker_excluded(self, binding: WorkerBinding) -> bool:
+        callback = self._worker_excluded
+        if callback is None:
+            return False
+        try:
+            return callback(binding.worker_id, binding.worker_fingerprint) is True
+        except Exception:
+            # Authority uncertainty must not let the legacy reader overwrite
+            # a potentially ACP-owned worker.
+            return True
 
     def start(self) -> None:
         with self._condition:
@@ -4517,7 +4539,7 @@ class TurnIngestionScheduler:
         items = [
             _TurnRefreshItem.from_binding(binding)
             for binding in bindings
-            if _eligible_turn_binding(binding)
+            if _eligible_turn_binding(binding) and not self._is_worker_excluded(binding)
         ]
         with self._condition:
             self._scan_failed = False
@@ -4585,6 +4607,8 @@ class TurnIngestionScheduler:
         except _BindingLookupFailed:
             return TurnRefreshResult("failed", 0, retry_binding_lookup=True)
         if binding is None:
+            return TurnRefreshResult("stale_binding", 0)
+        if self._is_worker_excluded(binding):
             return TurnRefreshResult("stale_binding", 0)
         try:
             if self._uses_default_reader:

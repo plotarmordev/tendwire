@@ -2,7 +2,8 @@
 
 This document defines the experimental migration from backend-specific
 transcript readers to Agent Client Protocol (ACP). ACP is not yet Tendwire's
-default or a production-wired semantic authority.
+default. The stock daemon now contains the production coordinator and command
+path, but activates them only for an explicitly Herdr-owned ACP worker.
 Herdr remains authoritative for workspace, pane, worker identity, process
 liveness, and command routing until the ACP control path is proven separately.
 Tendwire remains authoritative for persistence, reconciliation, public safety,
@@ -13,21 +14,22 @@ command receipts, and connector delivery.
 `TENDWIRE_AGENT_EVENT_SOURCE` controls projection precedence:
 
 - `legacy`: use the existing Herdr/Codex/OMP turn readers only.
-- `acp_shadow`: with an explicitly supplied ACP runtime, ingest ACP events
+- `acp_shadow`: ingest ACP events
   durably without projecting them; legacy turns remain authoritative. Automated
   comparison is not implemented yet.
-- `acp_preferred`: an experimental integration surface for future per-worker
-  ACP authority and legacy fallback. The stock daemon does not discover or
-  construct an ACP runtime.
+- `acp_preferred`: use an explicitly Herdr-owned ACP endpoint when available;
+  fall back to legacy only before any ACP command reservation or observable
+  send.
 - `acp_required`: use ACP only and fail closed when the binding or stream is not
   healthy. The daemon does not start its legacy turn scheduler in this mode.
-  This mode requires an explicitly supplied healthy authority runtime and is
-  intended for conformance testing, not rollout.
+  This mode requires every eligible worker endpoint to be ACP-owned and healthy.
+  Zero observed workers is a valid idle state; if a later worker appears
+  without ACP ownership, runtime health immediately becomes degraded.
 
-The default is `legacy`. Selecting an ACP mode does not discover an adapter,
-invent an ACP session, or bind a worker. Until a per-worker authority
-coordinator exists, operators must not interpret `acp_preferred` as proof that
-ACP is authoritative.
+The default is `legacy`. In an ACP mode the coordinator asks Herdr for a
+one-shot private endpoint, validates its worker generation and explicit
+`acp_owned_ready` lifecycle, then creates/loads/resumes the ACP session. An
+ordinary live PTY session is never treated as ACP-owned.
 
 ## Authority split
 
@@ -36,7 +38,7 @@ ACP is authoritative.
 | Workspace and logical pane identity | Herdr |
 | Public stable worker identity | Tendwire's authenticated Herdr projection |
 | ACP session and message identity | ACP agent, stored privately by Tendwire |
-| Messages, thoughts, tools, plans, and usage | Future ACP authority coordinator; currently experimental |
+| Messages, thoughts, tools, plans, and usage | ACP coordinator for ACP-owned workers; currently experimental |
 | Turn finality and connector eligibility | Tendwire durable projection |
 | Telegram presentation and delivery state | Herdres |
 | Command idempotency and uncertain outcomes | Tendwire command receipts |
@@ -109,7 +111,7 @@ Tendwire rebase. The current initialization-only probe is not a promotion gate:
 it does not authenticate, create/load a session, prompt, validate updates,
 exercise permissions/cancellation, or pin an executable digest. Stateful
 conformance fixtures and an immutable rollback manifest are still required.
-Session resume/replay reconciliation is likewise incomplete.
+Adapter promotion and rollback remain operator-managed.
 
 ## Runtime lifecycle
 
@@ -119,10 +121,23 @@ shutdown. Tendwire must not claim an ACP worker healthy until initialization,
 capability negotiation, session creation/load/resume, and private worker binding
 all succeed.
 
-The stock daemon currently has no production ACP runtime factory or multi-worker
-supervisor. Herdr must first provide authenticated per-worker launch/session
-metadata, and Tendwire must add per-worker health, authority, reconnect, and
-durable projection recovery before ACP can become the default.
+The stock daemon has a multi-worker runtime factory. It discovers endpoints
+through Herdr's private `agent.acp_endpoint` method, validates the fixed stdio
+attach shape, and supervises one runtime per worker generation. Endpoint
+tickets are one-shot private values: Tendwire uses one only for its immediate
+attach and never persists or publishes it. Reconnect always re-resolves Herdr
+authority and mints a fresh endpoint.
+
+While attached, the coordinator uses non-mutating `agent.acp_status` checks
+before every prompt and during reconciliation. The reported lifecycle must be
+`acp_owned_attached` and its numeric generation must match the attached slot.
+A mismatch or unavailable status retires the slot before any prompt frame is
+written. Endpoint minting is never used as a status probe.
+
+In `acp_preferred`, the legacy scheduler remains available only for workers not
+currently owned by a healthy ACP slot. It rechecks this exclusion after dequeue
+and immediately before a legacy read, preventing queued legacy work from
+overwriting or duplicating the active ACP worker projection.
 
 Disconnect handling is conservative:
 
@@ -132,8 +147,11 @@ Disconnect handling is conservative:
 4. Reinitialize and rebind before accepting ACP events again.
 5. Reconcile replayed messages and tool calls by producer identity.
 
-These disconnect steps are requirements, not a description of the current
-implementation.
+Command acknowledgement occurs after the complete `session/prompt` request
+frame is written, not after the agent finishes the turn. End-of-turn response
+and update draining continue under runtime supervision. A failure after the
+durable `send_started` transition is terminally uncertain and never falls back
+to a second transport.
 
 ## Retention
 
@@ -163,12 +181,11 @@ not an immediate physical-erasure or cryptographic-erasure guarantee.
 
 ## Cross-repository requirements
 
-Herdr needs an ACP-aware launch or proxy surface that exposes enough private
-metadata for Tendwire to bind an ACP session to an existing logical pane. The
-binding must survive terminal/session churn without making ACP identity a
-public continuity input. It must also identify adapter executable/version,
-session-open mode, working directory, and binding generation without exposing
-those values on public APIs.
+Herdr provides a private `agent.acp_endpoint` launch/proxy surface containing
+adapter identity/version, session-open mode, cwd, generation, and an explicitly
+ACP-owned lifecycle. Tendwire accepts only the configured Herdr executable and
+the fixed `agent acp-attach` argument shape; arbitrary executable, environment,
+or argument injection is rejected.
 
 Herdres needs optional presentations for sanitized tool and plan progress. It
 does not ingest ACP directly: it continues polling Tendwire's neutral outbox so
@@ -191,8 +208,7 @@ must pass before `acp_required` is considered:
 - fallback after adapter failure without regressing existing final delivery;
 - exact worker continuity across Herdr pane moves and agent-session recreation.
 
-The isolated ACP runtime now implements prompt submission, cancellation, and
-permission handling. Production daemon routing remains a later control-path
-migration: it must connect those primitives to the per-worker authority
-coordinator while preserving Tendwire's existing request receipts and
-uncertain-outcome rules before replacing Herdr command routing.
+The ACP runtime implements prompt submission, cancellation, permission handling,
+per-worker coordination, reconnect, and receipt-backed command routing. ACP
+remains non-default until the cross-repository integration and rollout gates
+above pass against real adapters.

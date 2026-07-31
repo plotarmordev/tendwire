@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, TypeVar
+from typing import Any, Callable, TypeVar
 
 from tendwire import __version__
 
@@ -406,6 +406,7 @@ class AcpClient:
         *,
         timeout: float | None = None,
         require_initialized: bool = True,
+        on_written: Callable[[], None] | None = None,
     ) -> Any:
         if require_initialized:
             self._require_initialized()
@@ -432,6 +433,8 @@ class AcpClient:
                 request_envelope(request_id, method, params),
                 deadline=deadline,
             )
+            if on_written is not None:
+                on_written()
         except BaseException:
             with self._pending_lock:
                 if self._pending.get(request_id) is pending:
@@ -580,6 +583,7 @@ class AcpClient:
         prompt: str | Sequence[Mapping[str, Any]],
         *,
         timeout: float | None = None,
+        on_submitted: Callable[[], None] | None = None,
     ) -> PromptResult:
         content = list(self.prepare_prompt(prompt))
         session_id = _nonempty(session_id, "session_id")
@@ -595,6 +599,7 @@ class AcpClient:
                 "session/prompt",
                 {"sessionId": session_id, "prompt": content},
                 timeout=self.prompt_timeout if timeout is None else timeout,
+                on_written=on_submitted,
             )
             response_received = True
         finally:

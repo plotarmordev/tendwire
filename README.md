@@ -570,14 +570,13 @@ snapshot/projections instead of publishing a truncated authoritative snapshot.
 Incremental events that would add workers over the cap are ignored with the
 same public-safe degraded evidence.
 
-The stock daemon currently defaults to `legacy`. ACP runtime discovery,
-per-worker authority selection, and automatic reconnect are not production
-wired yet; ACP modes are integration/test surfaces that require an explicitly
-supplied runtime factory. `acp_shadow` persists ACP events without projecting
-them, but no automated shadow comparator is implemented. `acp_preferred` must
-not be treated as a production authority promise until that coordinator exists.
-`acp_required` fails startup without an explicit healthy runtime and never
-starts the legacy turn scheduler. None of these modes makes agent thoughts
+The stock daemon currently defaults to `legacy`. ACP modes use Herdr's private
+`agent.acp_endpoint` contract and accept only workers explicitly marked
+`acp_owned_ready`; ordinary PTY workers are never attached as sidecars.
+`acp_shadow` persists ACP events without projecting them, but no automated
+shadow comparator is implemented. `acp_preferred` falls back only before an ACP
+reservation/send, while `acp_required` fails closed and never starts the legacy
+turn scheduler. None of these modes makes agent thoughts
 public: thought events remain private diagnostic data unless a separate,
 explicit sanitized projection is introduced.
 

@@ -142,6 +142,7 @@ class AcpRuntimeClient(Protocol):
         prompt: str | Sequence[Mapping[str, Any]],
         *,
         timeout: float | None = None,
+        on_submitted: Callable[[], None] | None = None,
     ) -> PromptResult: ...
 
     def prepare_prompt(
@@ -279,6 +280,7 @@ class AcpRuntime:
         )
         self._close_thread: threading.Thread | None = None
         self._close_failures: list[BaseException] = []
+        self._prompt_threads: set[threading.Thread] = set()
 
         self._updates_ingested = 0
         self._permissions_ingested = 0
@@ -374,6 +376,7 @@ class AcpRuntime:
         producer_turn_id: str | None = None,
         timeout: float | None = None,
         drain_timeout: float | None = None,
+        on_submitted: Callable[[], None] | None = None,
     ) -> PromptResult:
         """Submit one prompt and finalize only after its prior updates drain."""
 
@@ -402,10 +405,13 @@ class AcpRuntime:
                 self._record_failure(exc)
                 raise
             try:
+                prompt_kwargs: dict[str, Any] = {"timeout": timeout}
+                if on_submitted is not None:
+                    prompt_kwargs["on_submitted"] = on_submitted
                 result = self._client.prompt(
                     session_id,
                     prepared_prompt,
-                    timeout=timeout,
+                    **prompt_kwargs,
                 )
             except BaseException as exc:
                 with self._state_lock:
@@ -446,6 +452,68 @@ class AcpRuntime:
             with self._state_lock:
                 self._prompts_completed += 1
             return result
+
+    def submit_prompt(
+        self,
+        prompt: str | Sequence[Mapping[str, Any]],
+        *,
+        producer_turn_id: str,
+        acknowledgement_timeout: float,
+        completion_timeout: float | None = None,
+    ) -> None:
+        """Start a prompt and return after its complete frame is written.
+
+        End-of-turn completion continues under runtime supervision. A caller
+        can therefore durably acknowledge delivery without blocking for the
+        agent's entire turn. If acknowledgement is not observed, delivery is
+        uncertain and the command layer must never retry it automatically.
+        """
+
+        if acknowledgement_timeout <= 0:
+            raise ValueError("acknowledgement_timeout must be positive")
+        acknowledged = threading.Event()
+        finished = threading.Event()
+        failures: list[BaseException] = []
+
+        def run_prompt() -> None:
+            try:
+                self.prompt(
+                    prompt,
+                    producer_turn_id=producer_turn_id,
+                    timeout=completion_timeout,
+                    on_submitted=acknowledged.set,
+                )
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                finished.set()
+                with self._state_lock:
+                    self._prompt_threads.discard(threading.current_thread())
+
+        thread = threading.Thread(
+            target=run_prompt,
+            name="tendwire-acp-prompt",
+            daemon=True,
+        )
+        with self._state_lock:
+            self._prompt_threads.add(thread)
+        thread.start()
+        deadline = time.monotonic() + acknowledgement_timeout
+        while True:
+            if acknowledged.is_set():
+                return
+            if finished.is_set():
+                if failures:
+                    raise failures[0]
+                raise AcpRuntimeProtocolError(
+                    "ACP prompt completed without a submission acknowledgement"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AcpRuntimeStopTimeout(
+                    "ACP prompt submission acknowledgement timed out"
+                )
+            acknowledged.wait(min(remaining, 0.01))
 
     def cancel(self) -> None:
         """Cancel the active session and any permission requests pending in it."""
@@ -494,7 +562,9 @@ class AcpRuntime:
         if wait_limit <= 0:
             raise ValueError("join timeout must be positive")
         deadline = time.monotonic() + wait_limit
-        for thread in self._threads:
+        with self._state_lock:
+            threads = (*self._threads, *self._prompt_threads)
+        for thread in threads:
             if thread is threading.current_thread() or thread.ident is None:
                 continue
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -502,7 +572,7 @@ class AcpRuntime:
             thread is threading.current_thread()
             or thread.ident is None
             or not thread.is_alive()
-            for thread in self._threads
+            for thread in threads
         )
 
     def stop(self, *, timeout: float | None = None) -> None:

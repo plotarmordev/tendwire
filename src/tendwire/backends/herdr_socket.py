@@ -300,6 +300,32 @@ class HerdrSocketClient:
     ) -> Any:
         return self.request("agent.send", params, timeout=timeout)
 
+    def agent_acp_endpoint(
+        self,
+        target: str,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        """Mint a one-shot, private ACP attach endpoint for one live agent."""
+        return self.request(
+            "agent.acp_endpoint",
+            {"target": target},
+            timeout=timeout,
+        )
+
+    def agent_acp_status(
+        self,
+        target: str,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        """Read ACP ownership/generation without minting an attach ticket."""
+        return self.request(
+            "agent.acp_status",
+            {"target": target},
+            timeout=timeout,
+        )
+
     def _send_request(
         self,
         method: str,

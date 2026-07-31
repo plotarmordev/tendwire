@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol
 
 from .config import Config
 from .core.actions import CommandContext, execute_command
@@ -104,6 +104,28 @@ _PANE_SUBMIT_TARGET_KINDS = frozenset(
 )
 
 SocketClientFactory = Callable[[Config], Any]
+
+
+class AcpPromptRoute(Protocol):
+    """One live, authority-checked ACP prompt route owned by the daemon.
+
+    The route deliberately exposes neither adapter argv nor session identity.
+    Its binding fingerprint is private durable evidence used only by the
+    command receipt state machine.
+    """
+
+    binding_fingerprint: str
+
+    def prompt(
+        self,
+        text: str,
+        *,
+        producer_turn_id: str,
+        timeout: float,
+    ) -> object: ...
+
+
+AcpPromptRouter = Callable[[Worker], AcpPromptRoute | None]
 
 
 @dataclass(frozen=True)
@@ -2608,6 +2630,186 @@ def replay_command_receipt(
     )
 
 
+def submit_acp_command(
+    config: Config,
+    params: Mapping[str, Any] | str,
+    *,
+    prompt_router: AcpPromptRouter,
+    required: bool = False,
+) -> CommandEnvelope | None:
+    """Submit ``send_instruction`` through a live ACP worker route.
+
+    ``None`` means the ACP path made no durable change and an optional policy
+    may safely use the legacy Herdr sender.  Once a receipt reaches
+    ``send_started``, every failure is terminally uncertain and this function
+    never permits a second transport attempt.
+    """
+
+    payload = params if isinstance(params, str) else _raw_payload_from_mapping(params)
+    request, parse_error = parse_command_request(payload)
+    if parse_error is not None or request is None:
+        return None
+    if validate_request(request) is not None:
+        return None
+    if request.dry_run:
+        return None
+    if request.action != "send_instruction":
+        return (
+            _backend_unavailable(
+                request,
+                "command is not supported by the required ACP control path",
+            )
+            if required and request.action in _MUTATING_ACTIONS
+            else None
+        )
+
+    existing_receipt: Mapping[str, Any] | None = None
+    if config.db_path is not None:
+        try:
+            candidate = get_command_request(
+                config.db_path,
+                config.host_id,
+                request.request_id or "",
+            )
+        except Exception:
+            candidate = None
+        if isinstance(candidate, Mapping):
+            existing_receipt = candidate
+
+    takeover: _ReceiptTakeover | None = None
+    if existing_receipt is not None:
+        decided = _receipt_authority(config, request, existing_receipt)
+        if isinstance(decided, CommandEnvelope):
+            return _negotiated_submission_envelope(config, request, decided)
+        takeover = decided
+
+    try:
+        snapshot = _current_snapshot(config)
+    except Exception:  # noqa: BLE001
+        if takeover is not None:
+            return _request_in_progress(request)
+        return (
+            _backend_unavailable(
+                request,
+                "Current worker authority is temporarily unavailable",
+            )
+            if required
+            else None
+        )
+
+    health_error = _backend_health_error(config, request, snapshot)
+    worker = _resolve_authoritative_worker(request, snapshot)
+    if isinstance(worker, CommandEnvelope):
+        if takeover is not None:
+            return _request_in_progress(request)
+        if health_error is not None:
+            return health_error if required else None
+        return worker
+    if takeover is not None and worker.id != takeover.public_worker_id:
+        return _duplicate_request(request)
+
+    permanent_error = _worker_status_error(request, worker) or health_error
+    if permanent_error is not None:
+        if required:
+            canonical = build_canonical_mutation(request, public_worker_id=worker.id)
+            reservation = _reserve_canonical_request(config, request, canonical)
+            if isinstance(reservation, CommandEnvelope):
+                return reservation
+            return _finish_before_send(config, request, reservation, permanent_error)
+        return None
+
+    try:
+        route = prompt_router(worker)
+    except Exception:  # noqa: BLE001
+        route = None
+    if route is None:
+        if takeover is not None:
+            return _request_in_progress(request)
+        return (
+            _backend_unavailable(request, "ACP worker route is unavailable")
+            if required
+            else None
+        )
+    binding_fingerprint = str(
+        getattr(route, "binding_fingerprint", "") or ""
+    ).strip()
+    if not binding_fingerprint:
+        if takeover is not None:
+            return _request_in_progress(request)
+        return (
+            _backend_unavailable(request, "ACP worker route has no durable authority")
+            if required
+            else None
+        )
+
+    canonical = build_canonical_mutation(request, public_worker_id=worker.id)
+    reservation = _reserve_canonical_request(config, request, canonical)
+    if isinstance(reservation, CommandEnvelope):
+        return reservation
+    send_started = _mark_request_send_started(
+        config,
+        request,
+        reservation,
+        binding_fingerprint=binding_fingerprint,
+        worker=worker,
+        instruction_text=_instruction_text(request),
+    )
+    if isinstance(send_started, CommandEnvelope):
+        return send_started
+    if not isinstance(send_started, Mapping):
+        return _recover_request(config, request, reservation.canonical)
+
+    try:
+        route.prompt(
+            _instruction_text(request),
+            producer_turn_id=turn_submission_id(
+                config.host_id,
+                request.request_id or "",
+            ),
+            timeout=config.acp_request_timeout_seconds,
+        )
+    except Exception:  # noqa: BLE001
+        return _finish_request(
+            config,
+            request,
+            reservation,
+            _instruction_uncertain_envelope(
+                request,
+                worker,
+                verdict="unknown",
+            ),
+            expected_state="send_started",
+            terminal_state="uncertain",
+        )
+
+    observed_turn: Mapping[str, Any] | None = send_started
+    if config.db_path is not None:
+        try:
+            refreshed = linked_turn_for_submission(
+                config.db_path,
+                host_id=config.host_id,
+                request_id=request.request_id or "",
+            )
+        except Exception:  # noqa: BLE001
+            refreshed = None
+        if isinstance(refreshed, Mapping):
+            observed_turn = refreshed
+    accepted = _accepted_send_envelope(
+        request,
+        worker,
+        observed_turn,
+        submission_verdict="submitted",
+    )
+    return _finish_request(
+        config,
+        request,
+        reservation,
+        accepted,
+        expected_state="send_started",
+        terminal_state="accepted",
+    )
+
+
 def _submit_command_v2(
     config: Config,
     params: Mapping[str, Any] | str,
@@ -2889,8 +3091,31 @@ def submit_command(
     params: Mapping[str, Any] | str,
     *,
     socket_client_factory: SocketClientFactory | None = None,
+    acp_prompt_router: AcpPromptRouter | None = None,
+    acp_required: bool = False,
 ) -> CommandEnvelope:
     """Submit one command and apply optional response-envelope negotiation."""
+    if acp_prompt_router is not None:
+        acp_envelope = submit_acp_command(
+            config,
+            params,
+            prompt_router=acp_prompt_router,
+            required=acp_required,
+        )
+        if acp_envelope is not None:
+            payload = (
+                params
+                if isinstance(params, str)
+                else _raw_payload_from_mapping(params)
+            )
+            request, parse_error = parse_command_request(payload)
+            if parse_error is None and request is not None:
+                return _negotiated_submission_envelope(
+                    config,
+                    request,
+                    acp_envelope,
+                )
+            return acp_envelope
     envelope = _submit_command_v2(
         config,
         params,
