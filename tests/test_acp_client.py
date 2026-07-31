@@ -101,6 +101,26 @@ def test_prompt_stream_and_permission_response_can_run_concurrently() -> None:
         assert outcome[0].stop_reason is StopReason.END_TURN
 
 
+def test_ordered_session_event_api_preserves_cross_kind_reader_order() -> None:
+    with client() as acp:
+        acp.initialize()
+        outcome: list[object] = []
+        thread = threading.Thread(
+            target=lambda: outcome.append(acp.prompt("s1", "inspect"))
+        )
+        thread.start()
+        first = acp.next_session_event(timeout=1)
+        second = acp.next_session_event(timeout=1)
+        assert first.update_kind is SessionUpdateKind.AGENT_THOUGHT_CHUNK
+        assert second.options[0].option_id == "allow"
+        acp.respond_permission(second.request_id, option_id="allow")
+        third = acp.next_session_event(timeout=1)
+        assert third.update_kind is SessionUpdateKind.PLAN
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert outcome[0].stop_reason is StopReason.END_TURN
+
+
 def test_cancel_resolves_pending_permissions_as_cancelled() -> None:
     with client() as acp:
         acp.initialize()

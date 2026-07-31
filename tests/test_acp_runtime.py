@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import sqlite3
+import sys
 import threading
 import time
 from dataclasses import replace
@@ -11,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from tendwire.backends.acp_client import AcpRequestTimeoutError
+from tendwire.backends.acp_client import AcpClient, AcpRequestTimeoutError
 from tendwire.backends.acp_protocol import (
     PermissionOption,
     PermissionOptionKind,
@@ -40,12 +41,16 @@ from tendwire.store.sqlite import (
 
 
 _END = object()
+FAKE_AGENT = Path(__file__).parent / "fixtures" / "acp_fake_agent.py"
 
 
 class FakeClient:
     def __init__(self) -> None:
-        self.updates: queue.Queue[SessionUpdate | object] = queue.Queue()
-        self.permissions: queue.Queue[PermissionRequest | object] = queue.Queue()
+        self.events: queue.Queue[SessionUpdate | PermissionRequest | object] = queue.Queue()
+        # Existing tests enqueue through the typed names; both feed the one
+        # reader-ordered stream used by the runtime.
+        self.updates = self.events
+        self.permissions = self.events
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
         self.permission_responses: list[tuple[object, str | None, bool]] = []
         self.prompt_result: object = PromptResult(StopReason.END_TURN, {})
@@ -90,6 +95,11 @@ class FakeClient:
             raise self.prompt_failure
         return self.prompt_result
 
+    def prepare_prompt(self, prompt: object) -> tuple[dict[str, Any], ...]:
+        if isinstance(prompt, str):
+            return ({"type": "text", "text": prompt},)
+        return tuple(dict(block) for block in prompt)  # type: ignore[arg-type]
+
     def cancel(self, session_id: str) -> None:
         self.calls.append(("cancel", (session_id,), {}))
 
@@ -113,6 +123,20 @@ class FakeClient:
         assert isinstance(value, PermissionRequest)
         return value
 
+    def next_session_event(
+        self,
+        *,
+        timeout: float,
+    ) -> SessionUpdate | PermissionRequest:
+        try:
+            value = self.events.get(timeout=timeout)
+        except queue.Empty as exc:
+            raise AcpRequestTimeoutError("idle") from exc
+        if value is _END:
+            raise EOFError("closed")
+        assert isinstance(value, SessionUpdate | PermissionRequest)
+        return value
+
     def respond_permission(
         self,
         request_id: object,
@@ -125,8 +149,7 @@ class FakeClient:
     def close(self) -> None:
         self.close_calls += 1
         self.closed = True
-        self.updates.put(_END)
-        self.permissions.put(_END)
+        self.events.put(_END)
 
 
 class FakeIngestor:
@@ -136,6 +159,8 @@ class FakeIngestor:
         self.updates: list[object] = []
         self.permissions: list[tuple[object, str | None]] = []
         self.completions = 0
+        self.completion_reasons: list[StopReason] = []
+        self.load_resets = 0
         self.update_failure: BaseException | None = None
         self.permission_failure: BaseException | None = None
         self.update_result: object = None
@@ -146,22 +171,41 @@ class FakeIngestor:
         self.started.append(producer_turn_id)
         return "opaque-turn"
 
-    def ingest_update(self, raw: object) -> object:
+    def ingest_update(self, raw: object, **_kwargs: Any) -> object:
         if self.update_failure is not None:
             raise self.update_failure
         self.updates.append(raw)
         return self.update_result
 
     def ingest_permission_request(
-        self, raw: object, *, source_event_id: str | None = None
+        self,
+        raw: object,
+        *,
+        source_event_id: str | None = None,
+        **_kwargs: Any,
     ) -> object:
         if self.permission_failure is not None:
             raise self.permission_failure
         self.permissions.append((raw, source_event_id))
         return self.permission_result
 
-    def mark_prompt_complete(self) -> object:
+    def begin_prompt(
+        self,
+        prompt: object,
+        *,
+        producer_turn_id: str | None = None,
+    ) -> object:
+        return self.start_turn(producer_turn_id=producer_turn_id)
+
+    def reset_after_load(self) -> None:
+        self.load_resets += 1
+
+    def mark_prompt_complete(
+        self,
+        stop_reason: StopReason = StopReason.END_TURN,
+    ) -> object:
         self.completions += 1
+        self.completion_reasons.append(stop_reason)
         return self.completion_result
 
 
@@ -221,7 +265,11 @@ def runtime(
     upsert_worker_bindings(db_path, [continuity])
     return AcpRuntime(
         client,  # type: ignore[arg-type]
-        config=Config(host_id="host-a", db_path=db_path),
+        config=Config(
+            host_id="host-a",
+            db_path=db_path,
+            agent_event_source="acp_required",
+        ),
         binding=continuity,
         cwd=tmp_path,
         stream_generation="generation-private-secret",
@@ -394,21 +442,27 @@ def test_load_and_resume_use_requested_session(
     client = FakeClient()
     db_path = tmp_path / "events.db"
     existing = binding("existing-private")
+    ingestor = FakeIngestor("existing-private")
     upsert_worker_bindings(db_path, [existing])
     service = AcpRuntime(
         client,  # type: ignore[arg-type]
-        config=Config(host_id="host-a", db_path=db_path),
+        config=Config(
+            host_id="host-a",
+            db_path=db_path,
+            agent_event_source="acp_required",
+        ),
         binding=existing,
         cwd=tmp_path,
         session_mode=mode,
         session_id="existing-private",
-        ingestor=FakeIngestor("existing-private"),  # type: ignore[arg-type]
+        ingestor=ingestor,  # type: ignore[arg-type]
         poll_timeout=0.01,
         stop_timeout=0.5,
     ).start()
     try:
         assert client.calls[1][0] == method
         assert client.calls[1][1][0] == "existing-private"
+        assert ingestor.load_resets == (1 if mode is SessionOpenMode.LOAD else 0)
     finally:
         service.stop()
 
@@ -430,7 +484,11 @@ def test_load_and_resume_reject_agent_session_mismatch_and_close(
     upsert_worker_bindings(db_path, [existing])
     service = AcpRuntime(
         client,  # type: ignore[arg-type]
-        config=Config(host_id="host-a", db_path=db_path),
+        config=Config(
+            host_id="host-a",
+            db_path=db_path,
+            agent_event_source="acp_required",
+        ),
         binding=existing,
         cwd=tmp_path,
         session_mode=mode,
@@ -953,20 +1011,25 @@ def test_cross_kind_ingestion_cannot_overtake_an_active_update(
     order: list[str] = []
 
     class OrderedIngestor(FakeIngestor):
-        def ingest_update(self, raw: object) -> None:
+        def ingest_update(self, raw: object, **kwargs: Any) -> None:
             order.append("update-start")
             update_entered.set()
             assert release_update.wait(timeout=1)
-            super().ingest_update(raw)
+            super().ingest_update(raw, **kwargs)
             order.append("update-end")
 
         def ingest_permission_request(
-            self, raw: object, *, source_event_id: str | None = None
+            self,
+            raw: object,
+            *,
+            source_event_id: str | None = None,
+            **kwargs: Any,
         ) -> None:
             order.append("permission")
             super().ingest_permission_request(
                 raw,
                 source_event_id=source_event_id,
+                **kwargs,
             )
 
     service = runtime(tmp_path, client, OrderedIngestor()).start()
@@ -982,6 +1045,57 @@ def test_cross_kind_ingestion_cannot_overtake_an_active_update(
         assert order == ["update-start", "update-end", "permission"]
     finally:
         release_update.set()
+        service.stop()
+
+
+def test_load_drains_replay_larger_than_client_queue_before_response(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "load.db"
+    current = binding("s-load")
+    upsert_worker_bindings(db_path, [current])
+    client = AcpClient(
+        [sys.executable, "-u", str(FAKE_AGENT), "load_replay"],
+        max_pending_events=4,
+    )
+    service = AcpRuntime(
+        client,
+        config=Config(
+            host_id="host-a",
+            db_path=db_path,
+            agent_event_source="acp_required",
+        ),
+        binding=current,
+        cwd=tmp_path,
+        session_mode=SessionOpenMode.LOAD,
+        session_id="s-load",
+        poll_timeout=0.005,
+        stop_timeout=2,
+    ).start()
+    try:
+        assert service.status().updates_ingested == 64
+        assert len(list_agent_events(db_path, "host-a")) == 64
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM connector_outbox").fetchone()[0] == 0
+    finally:
+        service.stop(timeout=2)
+
+
+@pytest.mark.parametrize("stop_reason", tuple(StopReason))
+def test_runtime_carries_every_prompt_stop_reason_to_completion(
+    tmp_path: Path,
+    stop_reason: StopReason,
+) -> None:
+    client = FakeClient()
+    client.prompt_result = PromptResult(stop_reason, {"stopReason": stop_reason.value})
+    ingestor = FakeIngestor()
+    service = runtime(tmp_path, client, ingestor).start()
+    try:
+        result = service.prompt("no echo", producer_turn_id="turn-a")
+        assert result.stop_reason is stop_reason
+        assert ingestor.started == ["turn-a"]
+        assert ingestor.completion_reasons == [stop_reason]
+    finally:
         service.stop()
 
 

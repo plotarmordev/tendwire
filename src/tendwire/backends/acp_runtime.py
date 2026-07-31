@@ -144,11 +144,18 @@ class AcpRuntimeClient(Protocol):
         timeout: float | None = None,
     ) -> PromptResult: ...
 
+    def prepare_prompt(
+        self,
+        prompt: str | Sequence[Mapping[str, Any]],
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
     def cancel(self, session_id: str) -> None: ...
 
-    def next_update(self, *, timeout: float) -> SessionUpdate: ...
-
-    def next_permission_request(self, *, timeout: float) -> PermissionRequest: ...
+    def next_session_event(
+        self,
+        *,
+        timeout: float,
+    ) -> SessionUpdate | PermissionRequest: ...
 
     def respond_permission(
         self,
@@ -257,8 +264,8 @@ class AcpRuntime:
         self._idle_condition = threading.Condition(self._state_lock)
         self._stop_event = threading.Event()
         self._threads: tuple[threading.Thread, ...] = ()
-        self._update_idle_epoch = 0
-        self._permission_idle_epoch = 0
+        self._event_idle_epoch = 0
+        self._setup_replay = False
         self._close_thread: threading.Thread | None = None
         self._close_failures: list[BaseException] = []
 
@@ -297,6 +304,15 @@ class AcpRuntime:
             try:
                 self._require_current_binding(self._binding)
                 self._client.initialize(client_capabilities=self._client_capabilities)
+                if self._session_mode is SessionOpenMode.LOAD:
+                    assert self._requested_session_id is not None
+                    # ACP load may synchronously replay more updates than the
+                    # bounded client queue can hold before returning.  Bind and
+                    # drain the ordered stream before issuing the request.
+                    self._session_id = self._requested_session_id
+                    self._ingestor = self._make_ingestor(self._requested_session_id)
+                    self._setup_replay = True
+                    self._start_consumer()
                 session = self._open_session()
                 if not isinstance(session, SessionResult) or not session.session_id:
                     raise AcpRuntimeProtocolError(
@@ -314,23 +330,18 @@ class AcpRuntime:
                             "ACP session setup returned an unexpected session"
                         )
                     self._require_current_binding(self._binding)
-                self._session_id = session.session_id
-                self._ingestor = self._make_ingestor(session.session_id)
-                threads = (
-                    threading.Thread(
-                        target=self._consume_updates,
-                        name="tendwire-acp-updates",
-                        daemon=True,
-                    ),
-                    threading.Thread(
-                        target=self._consume_permissions,
-                        name="tendwire-acp-permissions",
-                        daemon=True,
-                    ),
-                )
-                self._threads = threads
-                for thread in threads:
-                    thread.start()
+                if self._session_mode is SessionOpenMode.LOAD:
+                    self._wait_for_event_idle(
+                        self._stop_timeout,
+                        allowed_state=RuntimeState.STARTING,
+                    )
+                    with self._ingest_lock:
+                        self._require_ingestor().reset_after_load()
+                    self._setup_replay = False
+                else:
+                    self._session_id = session.session_id
+                    self._ingestor = self._make_ingestor(session.session_id)
+                    self._start_consumer()
                 with self._state_lock:
                     if self._failure is not None:
                         raise self._failure
@@ -363,14 +374,23 @@ class AcpRuntime:
             with self._state_lock:
                 self._prompts_started += 1
             try:
-                ingestor.start_turn(producer_turn_id=producer_turn_id)
+                prepared_prompt = _prepare_prompt_content(self._client, prompt)
+                prompt_event = ingestor.begin_prompt(
+                    prepared_prompt,
+                    producer_turn_id=producer_turn_id,
+                )
+                _raise_for_binding_rejection(prompt_event)
             except BaseException as exc:
                 with self._state_lock:
                     self._prompts_failed += 1
                 self._record_failure(exc)
                 raise
             try:
-                result = self._client.prompt(session_id, prompt, timeout=timeout)
+                result = self._client.prompt(
+                    session_id,
+                    prepared_prompt,
+                    timeout=timeout,
+                )
             except BaseException as exc:
                 with self._state_lock:
                     self._prompts_failed += 1
@@ -398,9 +418,9 @@ class AcpRuntime:
             # after the response is a barrier: every earlier queued update has
             # been durably ingested before the turn is marked complete.
             try:
-                self._wait_for_post_response_idle(wait_limit)
+                self._wait_for_event_idle(wait_limit)
                 with self._ingest_lock:
-                    completion = ingestor.mark_prompt_complete()
+                    completion = ingestor.mark_prompt_complete(result.stop_reason)
                     _raise_for_binding_rejection(completion)
             except BaseException as exc:
                 with self._state_lock:
@@ -416,7 +436,11 @@ class AcpRuntime:
 
         self.raise_if_failed()
         session_id, _ = self._running_components()
-        self._cancel_session(session_id)
+        try:
+            self._cancel_session(session_id)
+        except BaseException as exc:
+            self._record_failure(exc)
+            raise
 
     def status(self) -> AcpRuntimeStatus:
         """Return redacted health and counters safe for a public status API."""
@@ -619,52 +643,62 @@ class AcpRuntime:
         if expected not in current:
             raise AcpRuntimeBindingError("ACP worker binding is not current")
 
-    def _consume_updates(self) -> None:
+    def _start_consumer(self) -> None:
+        if self._threads:
+            return
+        thread = threading.Thread(
+            target=self._consume_session_events,
+            name="tendwire-acp-session-events",
+            daemon=True,
+        )
+        self._threads = (thread,)
+        thread.start()
+
+    def _consume_session_events(self) -> None:
         try:
             while True:
                 try:
-                    update = self._client.next_update(timeout=self._poll_timeout)
+                    event = self._client.next_session_event(timeout=self._poll_timeout)
                 except TimeoutError:
                     with self._idle_condition:
-                        self._update_idle_epoch += 1
+                        self._event_idle_epoch += 1
                         self._idle_condition.notify_all()
                     if self._stop_event.is_set():
                         return
                     continue
-                if update.session_id != self._session_id:
-                    raise AcpRuntimeProtocolError(
-                        "ACP update belongs to a different session"
+                setup_replay = self._setup_replay
+                if isinstance(event, SessionUpdate):
+                    if event.session_id != self._session_id:
+                        raise AcpRuntimeProtocolError(
+                            "ACP update belongs to a different session"
+                        )
+                    ingestor = self._require_ingestor()
+                    with self._ingest_lock:
+                        outcome = ingestor.ingest_update(
+                            event.raw,
+                            replay=setup_replay,
+                            setup_replay=setup_replay,
+                        )
+                        _raise_for_binding_rejection(outcome)
+                    with self._state_lock:
+                        self._updates_ingested += 1
+                elif isinstance(event, PermissionRequest):
+                    self._handle_permission(
+                        event,
+                        setup_replay=setup_replay,
                     )
-                ingestor = self._require_ingestor()
-                with self._ingest_lock:
-                    outcome = ingestor.ingest_update(update.raw)
-                    _raise_for_binding_rejection(outcome)
-                with self._state_lock:
-                    self._updates_ingested += 1
+                else:  # pragma: no cover - typed protocol invariant
+                    raise AcpRuntimeProtocolError("ACP session event type is invalid")
         except BaseException as exc:
             if not self._stop_event.is_set():
                 self._record_failure(exc)
 
-    def _consume_permissions(self) -> None:
-        try:
-            while True:
-                try:
-                    request = self._client.next_permission_request(
-                        timeout=self._poll_timeout
-                    )
-                except TimeoutError:
-                    with self._idle_condition:
-                        self._permission_idle_epoch += 1
-                        self._idle_condition.notify_all()
-                    if self._stop_event.is_set():
-                        return
-                    continue
-                self._handle_permission(request)
-        except BaseException as exc:
-            if not self._stop_event.is_set():
-                self._record_failure(exc)
-
-    def _handle_permission(self, request: PermissionRequest) -> None:
+    def _handle_permission(
+        self,
+        request: PermissionRequest,
+        *,
+        setup_replay: bool = False,
+    ) -> None:
         """Journal then resolve one permission, failing closed before response."""
 
         response_attempted = False
@@ -678,6 +712,8 @@ class AcpRuntime:
                 outcome = ingestor.ingest_permission_request(
                     request.raw,
                     source_event_id=_permission_source_event_id(request.request_id),
+                    replay=setup_replay,
+                    setup_replay=setup_replay,
                 )
                 _raise_for_binding_rejection(outcome)
             with self._state_lock:
@@ -731,18 +767,19 @@ class AcpRuntime:
                         self._permissions_cancelled += 1
             raise
 
-    def _wait_for_post_response_idle(self, timeout: float) -> None:
+    def _wait_for_event_idle(
+        self,
+        timeout: float,
+        *,
+        allowed_state: RuntimeState = RuntimeState.RUNNING,
+    ) -> None:
         deadline = time.monotonic() + timeout
         with self._idle_condition:
-            update_epoch = self._update_idle_epoch
-            permission_epoch = self._permission_idle_epoch
-            while (
-                self._update_idle_epoch <= update_epoch
-                or self._permission_idle_epoch <= permission_epoch
-            ):
+            event_epoch = self._event_idle_epoch
+            while self._event_idle_epoch <= event_epoch:
                 if self._failure is not None:
                     raise self._failure
-                if self._state is not RuntimeState.RUNNING:
+                if self._state is not allowed_state:
                     raise AcpRuntimeStateError(
                         "ACP runtime stopped before prompt updates drained"
                     )
@@ -789,6 +826,24 @@ def _permission_source_event_id(request_id: RequestId) -> str:
     """Return a bounded opaque ID while preserving JSON-RPC ID types."""
 
     return f"permission:{stable_fingerprint({'request_id': request_id})}"
+
+
+def _prepare_prompt_content(
+    client: AcpRuntimeClient,
+    prompt: str | Sequence[Mapping[str, Any]],
+) -> tuple[Mapping[str, Any], ...]:
+    """Validate before persistence when the transport exposes its validator."""
+
+    prepare = getattr(client, "prepare_prompt", None)
+    if callable(prepare):
+        prepared = tuple(prepare(prompt))
+    elif isinstance(prompt, str):
+        prepared = ({"type": "text", "text": prompt},)
+    else:
+        prepared = tuple(dict(block) for block in prompt)
+    if not prepared or any(not isinstance(block, Mapping) for block in prepared):
+        raise ValueError("prompt must contain at least one content block")
+    return tuple(dict(block) for block in prepared)
 
 
 def _runtime_client_capabilities(

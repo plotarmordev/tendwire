@@ -8,7 +8,8 @@ projects only user/assistant text into the existing turn model.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from ..store.sqlite import (
     append_agent_event_and_apply_turn_for_binding,
 )
 from .acp_projection import AcpEventProjector, AcpProjectionCheckpoint
+from .acp_protocol import StopReason
 
 
 PersistEvent = Callable[..., AppendProjectedAgentEventResult]
@@ -126,6 +128,7 @@ class AcpSessionIngestor:
         *,
         source_event_id: str | None = None,
         replay: bool = False,
+        setup_replay: bool = False,
     ) -> AcpIngestionResult:
         """Normalize, journal, and conditionally project ``session/update``."""
 
@@ -165,7 +168,74 @@ class AcpSessionIngestor:
             canonical,
             checkpoint=checkpoint,
             prior_turn_state=prior_turn_state,
+            project_turn=not setup_replay,
+            replay_namespace="load" if setup_replay else None,
         )
+
+    def begin_prompt(
+        self,
+        prompt: Sequence[Mapping[str, Any]],
+        *,
+        producer_turn_id: str | None = None,
+    ) -> AcpIngestionResult:
+        """Durably record outgoing prompt content before transport send."""
+
+        blocks = [dict(block) for block in prompt]
+        if not blocks:
+            raise ValueError("prompt must contain at least one content block")
+        checkpoint = self.projector.checkpoint_session(self.session_id)
+        prior_turn_state = self._turn_state()
+        source_turn_id = self.start_turn(producer_turn_id=producer_turn_id)
+        text = "\n".join(
+            str(block.get("text"))
+            for block in blocks
+            if block.get("type") == "text" and isinstance(block.get("text"), str)
+        )
+        source_event_id = f"prompt-input:{source_turn_id}"
+        try:
+            canonical = self.projector.normalize_session_update(
+                {
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": self.session_id,
+                        "update": {
+                            "sessionUpdate": "user_message_chunk",
+                            "messageId": source_event_id,
+                            "content": {"type": "text", "text": text},
+                        },
+                    },
+                },
+                source_event_id=source_event_id,
+                replay=False,
+            )
+            if canonical is None:  # pragma: no cover - fresh turn invariant
+                raise RuntimeError("outgoing ACP prompt was unexpectedly duplicated")
+            payload = canonical.get("payload")
+            if not isinstance(payload, Mapping):  # pragma: no cover - projector invariant
+                raise RuntimeError("outgoing ACP prompt projection is invalid")
+            canonical = {
+                **canonical,
+                "payload": {
+                    **payload,
+                    "prompt_content": deepcopy(blocks),
+                    "outgoing": True,
+                },
+            }
+        except BaseException:
+            self._restore_speculation(checkpoint, prior_turn_state)
+            raise
+        return self._accept(
+            canonical,
+            checkpoint=checkpoint,
+            prior_turn_state=prior_turn_state,
+        )
+
+    def reset_after_load(self) -> None:
+        """Drop replay turn assembly before accepting a new active prompt."""
+
+        self.projector.reset_turn(self.session_id)
+        self._source_turn_id = None
+        self._turn_complete = False
 
     def ingest_permission_request(
         self,
@@ -173,6 +243,7 @@ class AcpSessionIngestor:
         *,
         source_event_id: str | None = None,
         replay: bool = False,
+        setup_replay: bool = False,
     ) -> AcpIngestionResult:
         """Journal a permission request as a private tool lifecycle update."""
 
@@ -205,9 +276,14 @@ class AcpSessionIngestor:
             canonical,
             checkpoint=checkpoint,
             prior_turn_state=prior_turn_state,
+            project_turn=not setup_replay,
+            replay_namespace="load" if setup_replay else None,
         )
 
-    def mark_prompt_complete(self) -> AcpIngestionResult:
+    def mark_prompt_complete(
+        self,
+        stop_reason: StopReason | str = StopReason.END_TURN,
+    ) -> AcpIngestionResult:
         """Durably finalize the current turn after ``session/prompt`` returns."""
 
         if self._source_turn_id is None:
@@ -217,8 +293,16 @@ class AcpSessionIngestor:
         checkpoint = self.projector.checkpoint_session(self.session_id)
         prior_turn_state = self._turn_state()
         try:
+            try:
+                normalized_reason = StopReason(stop_reason)
+            except ValueError as exc:
+                raise ValueError("unsupported ACP prompt stop reason") from exc
             content = self.projector.mark_turn_complete(self.session_id)
             content["source_turn_id"] = self._source_turn_id
+            content["assistant_final_text"] = _final_text_for_stop_reason(
+                str(content.get("assistant_final_text") or ""),
+                normalized_reason,
+            )
             marker = agent_event(
                 kind="extension",
                 source="acp",
@@ -227,6 +311,8 @@ class AcpSessionIngestor:
                     "schema_version": 1,
                     "extension": "tendwire.acp.prompt_completion",
                     "complete": True,
+                    "stop_reason": normalized_reason.value,
+                    "outcome": _STOP_REASON_OUTCOMES[normalized_reason],
                     "projection": content,
                 },
                 source_session_id=self.session_id,
@@ -275,6 +361,8 @@ class AcpSessionIngestor:
         *,
         checkpoint: AcpProjectionCheckpoint,
         prior_turn_state: tuple[int, str | None, bool],
+        project_turn: bool = True,
+        replay_namespace: str | None = None,
     ) -> AcpIngestionResult:
         kind = str(canonical.get("kind") or "")
         if kind == "thought" and self.config.acp_thought_policy == "disabled":
@@ -291,7 +379,17 @@ class AcpSessionIngestor:
             source_id = (
                 str(explicit_event_id)
                 if explicit_event_id is not None and str(explicit_event_id)
-                else f"stream:{self.stream_generation}:{sequence}"
+                else (
+                    _replay_source_event_id(
+                        replay_namespace,
+                        session_id=self.session_id,
+                        sequence=sequence,
+                        kind=kind,
+                        payload=payload,
+                    )
+                    if replay_namespace is not None
+                    else f"stream:{self.stream_generation}:{sequence}"
+                )
             )
             event = agent_event(
                 kind=kind,
@@ -312,6 +410,7 @@ class AcpSessionIngestor:
             if (
                 kind in {"user_message", "agent_message"}
                 and self.config.agent_event_source != "acp_shadow"
+                and project_turn
             ):
                 content = self.projector.project_turn_content(self.session_id)
                 if self._source_turn_id is not None:
@@ -361,6 +460,49 @@ class AcpSessionIngestor:
     ) -> None:
         self.projector.restore_session(checkpoint)
         self._turn_ordinal, self._source_turn_id, self._turn_complete = prior_turn_state
+
+
+_STOP_REASON_OUTCOMES = {
+    StopReason.END_TURN: "completed",
+    StopReason.MAX_TOKENS: "truncated_max_tokens",
+    StopReason.MAX_TURN_REQUESTS: "truncated_max_turn_requests",
+    StopReason.REFUSAL: "refused",
+    StopReason.CANCELLED: "cancelled",
+}
+
+_STOP_REASON_NOTICES = {
+    StopReason.MAX_TOKENS: "[ACP response truncated: token limit reached]",
+    StopReason.MAX_TURN_REQUESTS: "[ACP response truncated: request limit reached]",
+    StopReason.REFUSAL: "[ACP agent refused the request]",
+    StopReason.CANCELLED: "[ACP prompt cancelled]",
+}
+
+
+def _final_text_for_stop_reason(text: str, stop_reason: StopReason) -> str:
+    notice = _STOP_REASON_NOTICES.get(stop_reason)
+    if notice is None:
+        return text
+    return f"{text}\n\n{notice}" if text else notice
+
+
+def _replay_source_event_id(
+    namespace: str,
+    *,
+    session_id: str,
+    sequence: int,
+    kind: str,
+    payload: Mapping[str, Any],
+) -> str:
+    fingerprint = stable_fingerprint(
+        {
+            "session": session_id,
+            "sequence": sequence,
+            "kind": kind,
+            "payload": payload,
+        }
+    )
+    return f"{namespace}:{fingerprint}"
+
 
 def _source_message_id(kind: str, payload: Mapping[str, Any]) -> str | None:
     if kind not in {"user_message", "agent_message", "thought"}:

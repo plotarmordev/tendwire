@@ -11,6 +11,7 @@ from tendwire.backends.acp_ingestion import AcpSessionIngestor
 from tendwire.config import Config
 from tendwire.core.agent_events import AgentEvent, AppendBoundAgentEventResult
 from tendwire.core.models import WorkerBinding
+from tendwire.backends.acp_protocol import StopReason
 from tendwire.store.sqlite import (
     AppendProjectedAgentEventResult,
     TurnRefreshApplyResult,
@@ -432,6 +433,63 @@ def test_required_mode_projects_messages_and_final_exactly_once(tmp_path: Path) 
     assert [turn["complete"] for turn in turns] == [False, True]
     assert turns[-1]["assistant_final_text"] == "answer"
     assert turns[-1]["assistant_stream_text"] == ""
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "outcome", "notice"),
+    (
+        (StopReason.END_TURN, "completed", None),
+        (StopReason.MAX_TOKENS, "truncated_max_tokens", "token limit"),
+        (
+            StopReason.MAX_TURN_REQUESTS,
+            "truncated_max_turn_requests",
+            "request limit",
+        ),
+        (StopReason.REFUSAL, "refused", "refused"),
+        (StopReason.CANCELLED, "cancelled", "cancelled"),
+    ),
+)
+def test_outgoing_prompt_is_durable_before_no_echo_completion_stop_reason(
+    tmp_path: Path,
+    stop_reason: StopReason,
+    outcome: str,
+    notice: str | None,
+) -> None:
+    events: list[AgentEvent] = []
+    turns: list[dict[str, object]] = []
+
+    def append(_path, _host, event, **_kwargs):
+        events.append(event)
+        return _appended(len(events), event)
+
+    def apply(_path, _host, _worker, content, **_kwargs):
+        turns.append(dict(content))
+        return TurnRefreshApplyResult(len(turns), False)
+
+    ingestor = AcpSessionIngestor(
+        _config(tmp_path / "events.db", agent_event_source="acp_required"),
+        session_id="session-a",
+        stream_generation="generation-a",
+        binding=_binding(),
+        persist_event=_persist(append, apply),
+    )
+    begun = ingestor.begin_prompt(
+        ({"type": "text", "text": "question not echoed"},),
+        producer_turn_id="turn-a",
+    )
+    completed = ingestor.mark_prompt_complete(stop_reason)
+
+    assert begun.event is not None and begun.event.status == "inserted"
+    assert events[0].kind == "user_message"
+    assert events[0].payload["outgoing"] is True
+    assert turns[0]["user_text"] == "question not echoed"
+    assert completed.event is not None
+    assert events[-1].payload["stop_reason"] == stop_reason.value
+    assert events[-1].payload["outcome"] == outcome
+    final_text = str(turns[-1]["assistant_final_text"])
+    assert (notice is not None and notice in final_text) or (
+        notice is None and final_text == ""
+    )
 
 
 def test_duplicate_durable_event_can_idempotently_repair_projection(tmp_path: Path) -> None:

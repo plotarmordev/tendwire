@@ -166,6 +166,14 @@ for line in sys.stdin:
             {"sessionId": "s-new", "modes": {"currentModeId": "default"}},
         )
     elif method == "session/load" or method == "session/resume":
+        if MODE == "load_replay" and method == "session/load":
+            for index in range(64):
+                update(
+                    params["sessionId"],
+                    "user_message_chunk" if index % 2 == 0 else "agent_message_chunk",
+                    messageId=f"replay-{index}",
+                    content={"type": "text", "text": str(index)},
+                )
         response(request_id, {"configOptions": [{"id": "model", "currentValue": "x"}]})
     elif method == "session/close" or method == "session/delete":
         response(request_id, {"_meta": {"vendor.example": {"receipt": method}}})
