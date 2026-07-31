@@ -16,6 +16,7 @@ from tendwire.store.sqlite import (
     AppendProjectedAgentEventResult,
     TurnRefreshApplyResult,
     list_agent_events,
+    list_public_agent_events,
     upsert_worker_bindings,
 )
 
@@ -489,6 +490,99 @@ def test_outgoing_prompt_is_durable_before_no_echo_completion_stop_reason(
     assert (notice is not None and notice in final_text) or (
         notice is None and final_text == ""
     )
+
+
+def test_live_prompt_echo_is_suppressed_but_load_replay_user_message_is_retained(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "events.db"
+    binding = _binding()
+    upsert_worker_bindings(db_path, [binding])
+    ingestor = AcpSessionIngestor(
+        _config(db_path, agent_event_source="acp_shadow"),
+        session_id="session-a",
+        stream_generation="generation-a",
+        binding=binding,
+    )
+    ingestor.begin_prompt(
+        ({"type": "text", "text": "one question"},),
+        producer_turn_id="producer-turn-a",
+    )
+
+    echo = ingestor.ingest_update(
+        _update(
+            "user_message_chunk",
+            messageId="adapter-echo",
+            content={"type": "text", "text": "one question"},
+        )
+    )
+    historical = ingestor.ingest_update(
+        _update(
+            "user_message_chunk",
+            messageId="historical-user",
+            content={"type": "text", "text": "historical question"},
+        ),
+        replay=True,
+        setup_replay=True,
+    )
+
+    assert echo.event is None and echo.ignored_reason == "prompt_echo"
+    assert historical.event is not None
+    events = list_agent_events(db_path, "host-a")
+    assert [event.event.kind for event in events] == ["user_message", "user_message"]
+    assert events[0].event.payload["assembled_text"] == "one question"
+    assert events[1].event.payload["assembled_text"] == "historical question"
+    assert list_public_agent_events(db_path, "host-a") == ()
+
+
+@pytest.mark.parametrize(
+    ("update_kind", "fields"),
+    [
+        ("available_commands_update", {"availableCommands": [{"name": "review"}]}),
+        ("current_mode_update", {"currentModeId": "agent"}),
+        (
+            "config_option_update",
+            {"configOptions": [{"id": "model", "currentValue": "safe"}]},
+        ),
+    ],
+)
+def test_stable_control_updates_persist_privately_and_replay_idempotently(
+    tmp_path: Path,
+    update_kind: str,
+    fields: dict[str, object],
+) -> None:
+    db_path = tmp_path / f"{update_kind}.db"
+    binding = _binding()
+    upsert_worker_bindings(db_path, [binding])
+    notification = _update(update_kind, **fields)
+
+    outcomes = []
+    for generation in ("generation-a", "generation-b"):
+        ingestor = AcpSessionIngestor(
+            _config(db_path),
+            session_id="session-a",
+            stream_generation=generation,
+            binding=binding,
+        )
+        outcomes.append(
+            ingestor.ingest_update(
+                notification,
+                replay=True,
+                setup_replay=True,
+            )
+        )
+
+    assert outcomes[0].event is not None and outcomes[0].event.status == "inserted"
+    assert outcomes[1].event is not None and outcomes[1].event.status == "replayed"
+    events = list_agent_events(db_path, "host-a")
+    assert len(events) == 1
+    assert events[0].event.kind == "extension"
+    assert events[0].event.visibility == "private"
+    assert events[0].event.public_payload == {}
+    assert events[0].event.payload["extension"] == (
+        f"acp.session_update.{update_kind}"
+    )
+    assert list_public_agent_events(db_path, "host-a") == ()
 
 
 def test_duplicate_durable_event_can_idempotently_repair_projection(tmp_path: Path) -> None:

@@ -16,6 +16,50 @@ def _update(session_update: str, **fields: object) -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize(
+    ("update_kind", "fields"),
+    [
+        (
+            "available_commands_update",
+            {"availableCommands": [{"name": "review", "description": "Review"}]},
+        ),
+        ("current_mode_update", {"currentModeId": "agent"}),
+        (
+            "config_option_update",
+            {"configOptions": [{"id": "model", "currentValue": "safe"}]},
+        ),
+    ],
+)
+def test_stable_session_control_updates_are_private_canonical_extensions(
+    update_kind: str,
+    fields: dict[str, object],
+) -> None:
+    projector = AcpEventProjector()
+    notification = _update(update_kind, **fields)
+
+    event = projector.normalize_session_update(
+        notification,
+        source_event_id="stable-update-1",
+    )
+    duplicate = projector.normalize_session_update(
+        notification,
+        source_event_id="stable-update-1",
+        replay=True,
+    )
+
+    assert event is not None
+    assert event["kind"] == "extension"
+    assert event["privacy"] == "private"
+    assert event["private_fields"] == ["payload"]
+    assert event["payload"] == {
+        "schema_version": 1,
+        "extension": f"acp.session_update.{update_kind}",
+        "update": fields,
+    }
+    assert duplicate is None
+    assert projector.project_turn_content("session-1")["has_open_turn"] is False
+
+
 def test_message_chunks_are_assembled_by_session_kind_and_message_id() -> None:
     projector = AcpEventProjector()
 

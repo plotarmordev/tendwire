@@ -222,6 +222,8 @@ class AcpRuntime:
                 "ACP new requires a non-ACP worker continuity binding"
             )
         if mode is not SessionOpenMode.NEW:
+            if binding.backend != "acp":
+                raise ValueError("ACP load/resume requires an ACP backend binding")
             if binding.turn_target_kind != "acp_session_id":
                 raise ValueError("ACP runtime requires an ACP session worker binding")
             if binding.turn_target_value != session_id:
@@ -269,7 +271,12 @@ class AcpRuntime:
         self._threads: tuple[threading.Thread, ...] = ()
         self._event_idle_epoch = 0
         self._setup_replay = False
-        self._provisional_binding: WorkerBinding | None = None
+        # NEW acquires authority through its binder during start. LOAD/RESUME
+        # are handed an existing live ACP lease and own releasing it once the
+        # runtime stops or fails.
+        self._provisional_binding: WorkerBinding | None = (
+            binding if mode is not SessionOpenMode.NEW else None
+        )
         self._close_thread: threading.Thread | None = None
         self._close_failures: list[BaseException] = []
 
@@ -376,6 +383,9 @@ class AcpRuntime:
         with self._prompt_lock:
             self.raise_if_failed()
             session_id, ingestor = self._running_components()
+            if not isinstance(producer_turn_id, str) or not producer_turn_id.strip():
+                raise ValueError("producer_turn_id must be non-empty text")
+            stable_producer_turn_id = producer_turn_id.strip()
             with self._state_lock:
                 self._prompts_started += 1
             try:
@@ -383,7 +393,7 @@ class AcpRuntime:
                 prepared_prompt = _prepare_prompt_content(self._client, prompt)
                 prompt_event = ingestor.begin_prompt(
                     prepared_prompt,
-                    producer_turn_id=producer_turn_id,
+                    producer_turn_id=stable_producer_turn_id,
                 )
                 _raise_for_binding_rejection(prompt_event)
             except BaseException as exc:
@@ -756,8 +766,9 @@ class AcpRuntime:
                             setup_replay=setup_replay,
                         )
                         _raise_for_binding_rejection(outcome)
-                    with self._state_lock:
-                        self._updates_ingested += 1
+                    if _outcome_has_persisted_event(outcome):
+                        with self._state_lock:
+                            self._updates_ingested += 1
                 elif isinstance(event, PermissionRequest):
                     self._handle_permission(
                         event,
@@ -792,8 +803,9 @@ class AcpRuntime:
                     setup_replay=setup_replay,
                 )
                 _raise_for_binding_rejection(outcome)
-            with self._state_lock:
-                self._permissions_ingested += 1
+            if _outcome_has_persisted_event(outcome):
+                with self._state_lock:
+                    self._permissions_ingested += 1
 
             selected: str | None = None
             callback_failure: BaseException | None = None
@@ -961,6 +973,12 @@ def _raise_for_binding_rejection(outcome: object) -> None:
         or turn_stale is True
     ):
         raise AcpRuntimeBindingError("ACP worker binding is no longer current")
+
+
+def _outcome_has_persisted_event(outcome: object) -> bool:
+    """Count only updates that reached the durable event boundary."""
+
+    return getattr(outcome, "event", None) is not None
 
 
 __all__ = [

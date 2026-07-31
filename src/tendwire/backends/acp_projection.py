@@ -33,6 +33,7 @@ SUPPORTED_EVENT_KINDS: Final[frozenset[str]] = frozenset(
         "plan",
         "usage",
         "session_info",
+        "extension",
     }
 )
 
@@ -43,6 +44,9 @@ _UPDATE_KIND_MAP: Final[dict[str, str]] = {
     "tool_call": "tool_call",
     "tool_call_update": "tool_call_update",
     "plan": "plan",
+    "available_commands_update": "extension",
+    "current_mode_update": "extension",
+    "config_option_update": "extension",
     "usage_update": "usage",
     "session_info_update": "session_info",
 }
@@ -245,6 +249,12 @@ class AcpEventProjector:
             payload = self._normalize_plan(state, update)
         elif kind == "usage":
             payload = self._normalize_usage(state, update)
+        elif kind == "extension":
+            payload = {
+                "schema_version": 1,
+                "extension": f"acp.session_update.{update_name}",
+                "update": _without_discriminator(update),
+            }
         else:
             payload = self._normalize_session_info(state, update)
         extension_meta = _scoped_metadata(params=params, update=update)
@@ -1234,6 +1244,9 @@ def _canonical_event(
     privacy = "session"
     private_fields: list[str] = []
     if kind == "thought":
+        privacy = "private"
+        private_fields = ["payload"]
+    elif kind == "extension":
         privacy = "private"
         private_fields = ["payload"]
     elif kind in {"tool_call", "tool_call_update"}:

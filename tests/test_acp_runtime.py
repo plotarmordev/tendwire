@@ -166,8 +166,17 @@ class FakeIngestor:
         self.load_resets = 0
         self.update_failure: BaseException | None = None
         self.permission_failure: BaseException | None = None
-        self.update_result: object = None
-        self.permission_result: object = None
+        persisted = SimpleNamespace(status="inserted")
+        self.update_result: object = SimpleNamespace(
+            event=persisted,
+            turn=None,
+            ignored_reason=None,
+        )
+        self.permission_result: object = SimpleNamespace(
+            event=persisted,
+            turn=None,
+            ignored_reason=None,
+        )
         self.completion_result: object = None
 
     def start_turn(self, *, producer_turn_id: str | None = None) -> str:
@@ -217,7 +226,7 @@ def binding(session_id: str = "session-private") -> WorkerBinding:
         host_id="host-a",
         worker_id="worker-public",
         worker_fingerprint="worker-fingerprint",
-        backend="herdr",
+        backend="acp",
         target_kind="pane_id",
         target_value="pane-private-secret",
         turn_target_kind="acp_session_id",
@@ -403,6 +412,15 @@ def test_start_negotiates_opens_one_session_and_binds_factory(tmp_path: Path) ->
         assert service.status().healthy
     finally:
         service.stop()
+    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
+    retired = list_worker_bindings(
+        db_path,
+        "host-a",
+        backend="acp",
+        include_expired=True,
+    )
+    assert len(retired) == 1
+    assert retired[0].reason == "acp_runtime_stopped"
 
 
 @pytest.mark.parametrize(
@@ -469,6 +487,15 @@ def test_load_and_resume_use_requested_session(
         assert ingestor.load_resets == (1 if mode is SessionOpenMode.LOAD else 0)
     finally:
         service.stop()
+    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
+    retired = list_worker_bindings(
+        db_path,
+        "host-a",
+        backend="acp",
+        include_expired=True,
+    )
+    assert len(retired) == 1
+    assert retired[0].reason == "acp_runtime_stopped"
 
 
 @pytest.mark.parametrize("mode", [SessionOpenMode.LOAD, SessionOpenMode.RESUME])
@@ -507,6 +534,40 @@ def test_load_and_resume_reject_agent_session_mismatch_and_close(
     assert client.closed
     assert client.close_calls == 1
     assert service.status().state is RuntimeState.FAILED
+    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
+    retired = list_worker_bindings(
+        db_path,
+        "host-a",
+        backend="acp",
+        include_expired=True,
+    )
+    assert len(retired) == 1
+    assert retired[0].reason == "acp_startup_rollback"
+
+
+@pytest.mark.parametrize("mode", [SessionOpenMode.LOAD, SessionOpenMode.RESUME])
+def test_load_and_resume_reject_non_acp_binding_before_transport(
+    tmp_path: Path,
+    mode: SessionOpenMode,
+) -> None:
+    client = FakeClient()
+    legacy = replace(binding("existing-private"), backend="herdr")
+
+    with pytest.raises(ValueError, match="ACP backend binding"):
+        AcpRuntime(
+            client,  # type: ignore[arg-type]
+            config=Config(
+                host_id="host-a",
+                db_path=tmp_path / "events.db",
+                agent_event_source="acp_required",
+            ),
+            binding=legacy,
+            cwd=tmp_path,
+            session_mode=mode,
+            session_id="existing-private",
+        )
+
+    assert client.calls == []
 
 
 def test_new_accepts_unpredictable_agent_generated_session_id(tmp_path: Path) -> None:
@@ -700,7 +761,7 @@ def test_prompt_rechecks_binding_before_remote_send(tmp_path: Path) -> None:
     )
 
     with pytest.raises(AcpRuntimeBindingError):
-        service.prompt("must not send")
+        service.prompt("must not send", producer_turn_id="producer-private")
     assert [call[0] for call in client.calls].count("prompt") == 0
 
 
@@ -1101,6 +1162,43 @@ def test_prompt_finalizes_only_after_valid_response_and_update_drain(
         service.stop()
 
 
+def test_prompt_requires_crash_stable_producer_identity_before_remote_send(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    ingestor = FakeIngestor()
+    service = runtime(tmp_path, client, ingestor).start()
+    try:
+        with pytest.raises(ValueError, match="producer_turn_id"):
+            service.prompt("question")
+        with pytest.raises(ValueError, match="producer_turn_id"):
+            service.prompt("question", producer_turn_id="  ")
+
+        assert [call[0] for call in client.calls].count("prompt") == 0
+        assert ingestor.started == []
+        assert service.status().prompts_started == 0
+        assert service.status().state is RuntimeState.RUNNING
+    finally:
+        service.stop()
+
+
+def test_ignored_update_does_not_increment_persisted_counter(tmp_path: Path) -> None:
+    client = FakeClient()
+    ingestor = FakeIngestor()
+    ingestor.update_result = SimpleNamespace(
+        event=None,
+        turn=None,
+        ignored_reason="prompt_echo",
+    )
+    service = runtime(tmp_path, client, ingestor).start()
+    try:
+        client.updates.put(update())
+        wait_until(lambda: len(ingestor.updates) == 1)
+        assert service.status().updates_ingested == 0
+    finally:
+        service.stop()
+
+
 def test_stale_binding_completion_is_terminal_and_not_counted_complete(
     tmp_path: Path,
 ) -> None:
@@ -1114,7 +1212,7 @@ def test_stale_binding_completion_is_terminal_and_not_counted_complete(
     service = runtime(tmp_path, client, ingestor).start()
 
     with pytest.raises(AcpRuntimeBindingError):
-        service.prompt("question")
+        service.prompt("question", producer_turn_id="producer-private")
 
     status = service.status()
     assert status.state is RuntimeState.FAILED
@@ -1148,7 +1246,13 @@ def test_prompt_finality_waits_for_permission_resolution(tmp_path: Path) -> None
 
     def run_prompt() -> None:
         try:
-            result.append(service.prompt("question", drain_timeout=0.5))
+            result.append(
+                service.prompt(
+                    "question",
+                    producer_turn_id="producer-private",
+                    drain_timeout=0.5,
+                )
+            )
         except BaseException as exc:
             failure.append(exc)
 
@@ -1182,12 +1286,13 @@ def test_cross_kind_ingestion_cannot_overtake_an_active_update(
     order: list[str] = []
 
     class OrderedIngestor(FakeIngestor):
-        def ingest_update(self, raw: object, **kwargs: Any) -> None:
+        def ingest_update(self, raw: object, **kwargs: Any) -> object:
             order.append("update-start")
             update_entered.set()
             assert release_update.wait(timeout=1)
-            super().ingest_update(raw, **kwargs)
+            result = super().ingest_update(raw, **kwargs)
             order.append("update-end")
+            return result
 
         def ingest_permission_request(
             self,
@@ -1195,9 +1300,9 @@ def test_cross_kind_ingestion_cannot_overtake_an_active_update(
             *,
             source_event_id: str | None = None,
             **kwargs: Any,
-        ) -> None:
+        ) -> object:
             order.append("permission")
-            super().ingest_permission_request(
+            return super().ingest_permission_request(
                 raw,
                 source_event_id=source_event_id,
                 **kwargs,
@@ -1280,16 +1385,16 @@ def test_prompt_transport_failure_cancels_and_makes_runtime_terminal(
     service = runtime(tmp_path, client, ingestor).start()
 
     with pytest.raises(AcpRequestTimeoutError) as raised:
-        service.prompt("question")
+        service.prompt("question", producer_turn_id="producer-private")
 
     assert raised.value is failure
-    assert ingestor.started == [None]
+    assert ingestor.started == ["producer-private"]
     assert ingestor.completions == 0
     assert ("cancel", ("session-private",), {}) in client.calls
     assert service.status().cancellation_requests == 1
     assert service.status().state is RuntimeState.FAILED
     with pytest.raises(AcpRequestTimeoutError):
-        service.prompt("unsafe retry")
+        service.prompt("unsafe retry", producer_turn_id="producer-private-2")
     with pytest.raises(AcpRequestTimeoutError):
         service.stop()
 
@@ -1303,7 +1408,7 @@ def test_invalid_prompt_response_never_marks_complete_and_propagates(
     service = runtime(tmp_path, client, ingestor).start()
 
     with pytest.raises(AcpRuntimeProtocolError, match="invalid response"):
-        service.prompt("question")
+        service.prompt("question", producer_turn_id="producer-private")
     assert ingestor.completions == 0
     assert service.status().state is RuntimeState.FAILED
     with pytest.raises(AcpRuntimeProtocolError):

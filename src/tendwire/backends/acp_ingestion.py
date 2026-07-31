@@ -85,6 +85,7 @@ class AcpSessionIngestor:
         self._turn_ordinal = 0
         self._source_turn_id: str | None = None
         self._turn_complete = False
+        self._local_prompt_recorded = False
 
     @property
     def source_turn_id(self) -> str | None:
@@ -101,9 +102,10 @@ class AcpSessionIngestor:
             raise ValueError("producer_turn_id must be non-empty text or None")
         self._turn_ordinal += 1
         self.projector.reset_turn(self.session_id)
-        # An authoritative producer turn ID must retain identity across ACP
-        # transport recreation.  Generation only scopes locally synthesized
-        # ordinals, whose meaning cannot survive a reconnect.
+        # An authoritative producer turn ID retains identity across ACP
+        # transport recreation.  The fallback exists only for unsolicited or
+        # historical inbound streams; outgoing prompts require producer
+        # identity before any durable or remote side effect.
         identity = (
             {
                 "source": "acp",
@@ -114,12 +116,12 @@ class AcpSessionIngestor:
             else {
                 "source": "acp",
                 "session": self.session_id,
-                "generation": self.stream_generation,
                 "turn": self._turn_ordinal,
             }
         )
         self._source_turn_id = f"acpt_{stable_fingerprint(identity)}"
         self._turn_complete = False
+        self._local_prompt_recorded = False
         return self._source_turn_id
 
     def ingest_update(
@@ -142,6 +144,17 @@ class AcpSessionIngestor:
         update_kind = _session_update_kind(notification)
         if self._turn_complete and update_kind in _TURN_SCOPED_UPDATES:
             return AcpIngestionResult(None, ignored_reason="turn_already_complete")
+        if (
+            update_kind == "user_message_chunk"
+            and self._local_prompt_recorded
+            and not replay
+        ):
+            # ACP agents commonly echo the prompt as a user-message update.
+            # begin_prompt() already journaled the complete producer-owned
+            # input, so accepting the echo would duplicate both the journal
+            # and the compatibility turn. Load replay has no local producer
+            # record and must continue to retain historical user messages.
+            return AcpIngestionResult("user_message", ignored_reason="prompt_echo")
         thought_rejection = _thought_rejection_reason(
             notification,
             policy=self.config.acp_thought_policy,
@@ -180,6 +193,8 @@ class AcpSessionIngestor:
     ) -> AcpIngestionResult:
         """Durably record outgoing prompt content before transport send."""
 
+        if not isinstance(producer_turn_id, str) or not producer_turn_id.strip():
+            raise ValueError("producer_turn_id must be non-empty text")
         blocks = [dict(block) for block in prompt]
         if not blocks:
             raise ValueError("prompt must contain at least one content block")
@@ -224,11 +239,14 @@ class AcpSessionIngestor:
         except BaseException:
             self._restore_speculation(checkpoint, prior_turn_state)
             raise
-        return self._accept(
+        result = self._accept(
             canonical,
             checkpoint=checkpoint,
             prior_turn_state=prior_turn_state,
         )
+        if result.event is not None and result.event.status != "binding_changed":
+            self._local_prompt_recorded = True
+        return result
 
     def reset_after_load(self) -> None:
         """Drop replay turn assembly before accepting a new active prompt."""
@@ -236,6 +254,7 @@ class AcpSessionIngestor:
         self.projector.reset_turn(self.session_id)
         self._source_turn_id = None
         self._turn_complete = False
+        self._local_prompt_recorded = False
 
     def ingest_permission_request(
         self,
@@ -344,6 +363,7 @@ class AcpSessionIngestor:
                 ignored_reason="stale_binding",
             )
         self._turn_complete = True
+        self._local_prompt_recorded = False
         return AcpIngestionResult(
             "extension",
             event=persisted.event,
@@ -360,7 +380,7 @@ class AcpSessionIngestor:
         canonical: Mapping[str, Any],
         *,
         checkpoint: AcpProjectionCheckpoint,
-        prior_turn_state: tuple[int, str | None, bool],
+        prior_turn_state: tuple[int, str | None, bool, bool],
         project_turn: bool = True,
         replay_namespace: str | None = None,
     ) -> AcpIngestionResult:
@@ -450,16 +470,26 @@ class AcpSessionIngestor:
             ),
         )
 
-    def _turn_state(self) -> tuple[int, str | None, bool]:
-        return self._turn_ordinal, self._source_turn_id, self._turn_complete
+    def _turn_state(self) -> tuple[int, str | None, bool, bool]:
+        return (
+            self._turn_ordinal,
+            self._source_turn_id,
+            self._turn_complete,
+            self._local_prompt_recorded,
+        )
 
     def _restore_speculation(
         self,
         checkpoint: AcpProjectionCheckpoint,
-        prior_turn_state: tuple[int, str | None, bool],
+        prior_turn_state: tuple[int, str | None, bool, bool],
     ) -> None:
         self.projector.restore_session(checkpoint)
-        self._turn_ordinal, self._source_turn_id, self._turn_complete = prior_turn_state
+        (
+            self._turn_ordinal,
+            self._source_turn_id,
+            self._turn_complete,
+            self._local_prompt_recorded,
+        ) = prior_turn_state
 
 
 _STOP_REASON_OUTCOMES = {
