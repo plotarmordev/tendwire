@@ -14151,7 +14151,7 @@ def test_v20_to_v21_adds_herdr_turn_watermark_and_provenance_tables(
     with sqlite3.connect(str(db_path)) as conn:
         assert conn.execute("PRAGMA user_version").fetchone() == (
             store_sqlite.STORE_SCHEMA_VERSION,
-        ) == (23,)
+        ) == (26,)
         assert {
             str(row[0])
             for row in conn.execute(

@@ -58,6 +58,8 @@ The structured event journal accepts these semantic kinds:
 - plan
 - usage
 - session information
+- private extension/control state, including available commands, current mode,
+  and session configuration updates
 
 Producer IDs, raw inputs, raw outputs, session IDs, terminal IDs, paths, and
 reasoning are private. Public turn projection is deliberately narrower:
@@ -189,6 +191,8 @@ must pass before `acp_required` is considered:
 - fallback after adapter failure without regressing existing final delivery;
 - exact worker continuity across Herdr pane moves and agent-session recreation.
 
-ACP prompt submission, cancellation, and permission handling are a later
-control-path migration. They must preserve Tendwire's existing request receipts
-and uncertain-outcome rules before replacing Herdr command routing.
+The isolated ACP runtime now implements prompt submission, cancellation, and
+permission handling. Production daemon routing remains a later control-path
+migration: it must connect those primitives to the per-worker authority
+coordinator while preserving Tendwire's existing request receipts and
+uncertain-outcome rules before replacing Herdr command routing.
