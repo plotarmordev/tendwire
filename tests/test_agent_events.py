@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -9,9 +12,11 @@ import pytest
 from tendwire.core.agent_events import (
     AGENT_EVENT_KINDS,
     AGENT_EVENT_MAX_PAYLOAD_BYTES,
+    AGENT_EVENT_MAX_TOTAL_ITEMS,
     AgentEventIdentityConflict,
     agent_event,
 )
+from tendwire.core.models import WorkerBinding
 from tendwire.store import sqlite as store_sqlite
 
 
@@ -46,6 +51,7 @@ def test_agent_event_contract_covers_acp_primary_kinds() -> None:
         "plan",
         "usage",
         "session_info",
+        "extension",
     }
 
 
@@ -82,6 +88,48 @@ def test_deterministic_identity_rejects_changed_replay(tmp_path: Path) -> None:
     stored = store_sqlite.list_agent_events(db_path, "host-1")
     assert len(stored) == 1
     assert stored[0].event.payload == {"text": "original"}
+
+
+def test_source_identity_reuse_cannot_evade_conflict_by_changing_kind_or_sequence(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "store.db"
+    original = _message_event(sequence=4)
+    changed_kind = agent_event(
+        kind="plan",
+        source="acp",
+        worker_id="worker-1",
+        source_session_id="private-session-1",
+        source_event_id="stable-source-id",
+        source_sequence=5,
+        payload={"entries": []},
+    )
+    original_with_id = agent_event(
+        kind="agent_message",
+        source="acp",
+        worker_id="worker-1",
+        source_session_id="private-session-1",
+        source_event_id="stable-source-id",
+        source_sequence=4,
+        payload={"text": "hello"},
+    )
+    assert original_with_id.event_id == changed_kind.event_id
+    store_sqlite.append_agent_event(db_path, "host-1", original_with_id)
+    with pytest.raises(AgentEventIdentityConflict):
+        store_sqlite.append_agent_event(db_path, "host-1", changed_kind)
+
+    changed_sequence_kind = agent_event(
+        kind="plan",
+        source="acp",
+        worker_id="worker-1",
+        source_session_id="private-session-1",
+        source_sequence=original.source_sequence,
+        payload={"entries": []},
+    )
+    assert original.event_id == changed_sequence_kind.event_id
+    store_sqlite.append_agent_event(db_path, "host-2", original)
+    with pytest.raises(AgentEventIdentityConflict):
+        store_sqlite.append_agent_event(db_path, "host-2", changed_sequence_kind)
 
 
 def test_private_ids_and_payload_never_enter_public_projection(tmp_path: Path) -> None:
@@ -188,6 +236,122 @@ def test_payload_is_bounded_and_json_safe() -> None:
             source_event_id="event-1",
             payload={"opaque": object()},
         )
+    for value in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="non-finite"):
+            agent_event(
+                kind="usage",
+                source="acp",
+                worker_id="worker-1",
+                source_event_id="event-1",
+                payload={"tokens": value},
+            )
+    with pytest.raises(ValueError, match="too many total items"):
+        agent_event(
+            kind="usage",
+            source="acp",
+            worker_id="worker-1",
+            source_event_id="event-1",
+            payload={
+                str(index): [0] * 256
+                for index in range((AGENT_EVENT_MAX_TOTAL_ITEMS // 256) + 1)
+            },
+        )
+
+
+def test_payload_and_opaque_ids_preserve_valid_unicode_exactly() -> None:
+    circled = agent_event(
+        kind="agent_message",
+        source="acp",
+        worker_id="worker-1",
+        source_event_id="①",
+        visibility="public",
+        payload={"text": "① and fullwidth ｅ and NUL \x00 remain private-exact"},
+    )
+    ascii_event = agent_event(
+        kind="agent_message",
+        source="acp",
+        worker_id="worker-1",
+        source_event_id="1",
+        payload={"text": "1"},
+    )
+    assert circled.event_id != ascii_event.event_id
+    assert circled.source_event_id == "①"
+    assert circled.payload["text"] == "① and fullwidth ｅ and NUL \x00 remain private-exact"
+    assert "\x00" not in str(circled.public_payload.get("text", ""))
+
+    with pytest.raises(ValueError, match="valid Unicode"):
+        _message_event(sequence=9, text="\ud800")
+    with pytest.raises(ValueError, match="must not contain NUL"):
+        agent_event(
+            kind="usage",
+            source="acp",
+            worker_id="worker-1",
+            source_event_id="bad\x00id",
+            payload={},
+        )
+
+
+def test_journal_payload_is_adapter_neutral_and_preserves_namespaced_extensions(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "text": "portable message",
+        "org.example.agent/experimental-v2": {
+            "futureField": [1, "two", {"enabled": True}],
+            "_meta": {"opaque": "retained privately"},
+        },
+    }
+    event = agent_event(
+        kind="extension",
+        source="org.example.agent/v2",
+        worker_id="worker-1",
+        source_event_id="extension-event",
+        payload=payload,
+    )
+    store_sqlite.append_agent_event(tmp_path / "store.db", "host-1", event)
+    stored = store_sqlite.list_agent_events(tmp_path / "store.db", "host-1")
+    assert stored[0].event.source == "org.example.agent/v2"
+    assert stored[0].event.payload == payload
+    with pytest.raises(ValueError, match="extension events must remain private"):
+        agent_event(
+            kind="extension",
+            source="org.example.agent/v2",
+            worker_id="worker-1",
+            source_event_id="unsafe-public-extension",
+            visibility="public",
+            payload=payload,
+        )
+
+
+def test_observed_at_is_strict_aware_and_canonical_utc() -> None:
+    event = agent_event(
+        kind="usage",
+        source="acp",
+        worker_id="worker-1",
+        source_event_id="event-1",
+        payload={"at": datetime(2026, 7, 31, tzinfo=timezone.utc)},
+        observed_at="2026-08-01T08:00:00+08:00",
+    )
+    assert event.observed_at == "2026-08-01T00:00:00+00:00"
+    assert event.payload["at"] == "2026-07-31T00:00:00+00:00"
+    for invalid in ("not-a-time", "/home/private", "2026-07-31T00:00:00"):
+        with pytest.raises(ValueError, match="aware ISO-8601"):
+            agent_event(
+                kind="usage",
+                source="acp",
+                worker_id="worker-1",
+                source_event_id="event-1",
+                payload={},
+                observed_at=invalid,
+            )
+    with pytest.raises(ValueError, match="naive datetime"):
+        agent_event(
+            kind="usage",
+            source="acp",
+            worker_id="worker-1",
+            source_event_id="event-1",
+            payload={"at": datetime(2026, 7, 31)},
+        )
 
 
 def test_store_rejects_noncanonical_public_projection(tmp_path: Path) -> None:
@@ -195,6 +359,160 @@ def test_store_rejects_noncanonical_public_projection(tmp_path: Path) -> None:
     tampered = replace(event, public_payload={"session_id": "private-session"})
     with pytest.raises(ValueError, match="canonical agent event contract"):
         store_sqlite.append_agent_event(tmp_path / "store.db", "host-1", tampered)
+
+
+def test_store_fails_closed_when_public_projection_is_corrupted(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "store.db"
+    store_sqlite.append_agent_event(db_path, "host-1", _message_event(sequence=1))
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE agent_events SET public_payload_json = ?",
+            ('{"cwd":"/home/private","text":"safe"}',),
+        )
+    with pytest.raises(store_sqlite.StoreSchemaError, match="invalid_agent_event_row"):
+        store_sqlite.list_public_agent_events(db_path, "host-1")
+
+
+def test_host_scoping_and_concurrent_replay_are_isolated(tmp_path: Path) -> None:
+    db_path = tmp_path / "store.db"
+    event = _message_event(sequence=1)
+    store_sqlite.init_store(db_path)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(
+            executor.map(
+                lambda _: store_sqlite.append_agent_event(db_path, "host-1", event),
+                range(24),
+            )
+        )
+    assert sum(result.inserted for result in results) == 1
+    assert len({result.sequence for result in results}) == 1
+
+    other = store_sqlite.append_agent_event(db_path, "host-2", event)
+    assert other.inserted is True
+    assert len(store_sqlite.list_agent_events(db_path, "host-1")) == 1
+    assert len(store_sqlite.list_agent_events(db_path, "host-2")) == 1
+    assert store_sqlite.list_agent_events(db_path, "host-3") == ()
+    with pytest.raises(ValueError, match="host_id must not be empty"):
+        store_sqlite.list_agent_events(db_path, "   ")
+
+
+def test_binding_guard_and_event_append_are_one_atomic_operation(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "store.db"
+    binding = WorkerBinding(
+        host_id="host-1",
+        worker_id="worker-1",
+        worker_fingerprint="worker-fingerprint-1",
+        backend="herdr",
+        target_kind="pane",
+        target_value="pane-1",
+        turn_target_kind="pane",
+        turn_target_value="pane-1",
+        sendable=True,
+        observed_at="2026-07-31T00:00:00+00:00",
+        expires_at="9999-12-31T23:59:59+00:00",
+        private_fingerprint="private-binding-generation-1",
+    )
+    store_sqlite.upsert_worker_bindings(db_path, [binding])
+    event = _message_event(sequence=1)
+
+    inserted = store_sqlite.append_agent_event_for_binding(
+        db_path,
+        "host-1",
+        event,
+        expected_binding=binding,
+    )
+    replayed = store_sqlite.append_agent_event_for_binding(
+        db_path,
+        "host-1",
+        event,
+        expected_binding=binding,
+    )
+    assert (inserted.status, inserted.inserted, inserted.sequence) == (
+        "inserted",
+        True,
+        replayed.sequence,
+    )
+    assert (replayed.status, replayed.inserted) == ("replayed", False)
+
+    replacement = replace(
+        binding,
+        worker_id="worker-replacement",
+        worker_fingerprint="worker-fingerprint-2",
+        observed_at="2026-07-31T00:00:01+00:00",
+    )
+    store_sqlite.upsert_worker_bindings(db_path, [replacement])
+    rejected_event = _message_event(sequence=2, text="must not persist")
+    rejected = store_sqlite.append_agent_event_for_binding(
+        db_path,
+        "host-1",
+        rejected_event,
+        expected_binding=binding,
+    )
+    assert (rejected.status, rejected.sequence, rejected.inserted) == (
+        "binding_changed",
+        None,
+        False,
+    )
+    assert [
+        stored.event.payload["text"]
+        for stored in store_sqlite.list_agent_events(db_path, "host-1")
+    ] == ["hello"]
+
+
+def test_database_constraints_and_indexes_cover_public_and_source_identity(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "store.db"
+    store_sqlite.append_agent_event(db_path, "host-1", _message_event(sequence=1))
+    with sqlite3.connect(db_path) as conn:
+        indexes = {
+            str(row[1]) for row in conn.execute("PRAGMA index_list(agent_events)")
+        }
+        assert {
+            "idx_agent_events_host_visibility_sequence",
+            "idx_agent_events_source_event_identity",
+            "idx_agent_events_source_sequence_identity",
+        } <= indexes
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE agent_events SET kind = 'thought' WHERE host_id = 'host-1'"
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE agent_events SET public_payload_json = '[]' "
+                "WHERE host_id = 'host-1'"
+            )
+
+
+@pytest.mark.parametrize("source_version", range(store_sqlite.STORE_SCHEMA_VERSION))
+def test_agent_event_schema_migrates_from_every_prior_version(
+    tmp_path: Path,
+    source_version: int,
+) -> None:
+    db_path = tmp_path / f"v{source_version}.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE durable_sentinel (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO durable_sentinel VALUES ('preserved')")
+        conn.commit()
+        store_sqlite._run_migrations(conn, target_version=source_version)
+        store_sqlite._run_migrations(conn)
+        assert conn.execute("PRAGMA user_version").fetchone() == (
+            store_sqlite.STORE_SCHEMA_VERSION,
+        )
+        assert conn.execute("SELECT value FROM durable_sentinel").fetchone() == (
+            "preserved",
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'agent_events'"
+        ).fetchone() == (1,)
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 
 
 def test_v21_migration_is_idempotent_and_preserves_existing_store(
@@ -209,8 +527,69 @@ def test_v21_migration_is_idempotent_and_preserves_existing_store(
     store_sqlite.init_store(db_path)
     store_sqlite.init_store(db_path)
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone() == (22,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (23,)
         columns = {
             str(row[1]) for row in conn.execute("PRAGMA table_info(agent_events)")
         }
     assert {"sequence", "event_id", "private_payload_json"} <= columns
+
+
+def test_v22_migration_rekeys_legacy_event_identity_without_losing_sequence(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "v22-event.db"
+    event = _message_event(sequence=7)
+    legacy_identity = {
+        "schema_version": 1,
+        "source": event.source,
+        "session_id": event.source_session_id,
+        "event_id": event.source_event_id,
+        "sequence": event.source_sequence,
+        "kind": event.kind,
+    }
+    legacy_event_id = hashlib.sha256(
+        store_sqlite._canonical_json(legacy_identity).encode("utf-8")
+    ).hexdigest()
+    with sqlite3.connect(db_path) as conn:
+        store_sqlite._run_migrations(conn, target_version=22)
+        conn.execute(
+            """
+            INSERT INTO agent_events (
+                sequence, host_id, event_id, kind, source, worker_id,
+                visibility, source_session_id, source_turn_id,
+                source_item_id, source_message_id, source_event_id,
+                source_sequence, observed_at, payload_fingerprint,
+                private_payload_json, public_payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                19,
+                "host-1",
+                legacy_event_id,
+                event.kind,
+                event.source,
+                event.worker_id,
+                event.visibility,
+                event.source_session_id,
+                event.source_turn_id,
+                event.source_item_id,
+                event.source_message_id,
+                event.source_event_id,
+                event.source_sequence,
+                event.observed_at,
+                event.payload_fingerprint,
+                store_sqlite._canonical_json(event.payload),
+                store_sqlite._canonical_json(event.public_payload),
+            ),
+        )
+        conn.commit()
+        store_sqlite._run_migrations(conn)
+        row = conn.execute(
+            "SELECT sequence, event_id FROM agent_events"
+        ).fetchone()
+        assert row == (19, event.event_id)
+        assert conn.execute("PRAGMA user_version").fetchone() == (23,)
+
+    replay = store_sqlite.append_agent_event(db_path, "host-1", event)
+    assert replay.inserted is False
+    assert replay.sequence == 19

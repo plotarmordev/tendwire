@@ -11,10 +11,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import unicodedata
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from .models import sanitize_public_mapping, utc_timestamp
@@ -28,6 +28,7 @@ AgentEventKind = Literal[
     "plan",
     "usage",
     "session_info",
+    "extension",
 ]
 AgentEventVisibility = Literal["private", "public"]
 
@@ -41,6 +42,7 @@ AGENT_EVENT_KINDS = frozenset(
         "plan",
         "usage",
         "session_info",
+        "extension",
     }
 )
 AGENT_EVENT_VISIBILITIES = frozenset({"private", "public"})
@@ -48,6 +50,7 @@ AGENT_EVENT_MAX_PAYLOAD_BYTES = 64 * 1024
 AGENT_EVENT_MAX_PUBLIC_PAYLOAD_BYTES = 64 * 1024
 AGENT_EVENT_MAX_TEXT_CHARS = 32 * 1024
 AGENT_EVENT_MAX_COLLECTION_ITEMS = 256
+AGENT_EVENT_MAX_TOTAL_ITEMS = 4096
 AGENT_EVENT_MAX_DEPTH = 12
 AGENT_EVENT_MAX_IDENTIFIER_CHARS = 2048
 AGENT_EVENT_QUERY_DEFAULT_LIMIT = 100
@@ -69,24 +72,79 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _identifier(value: Any, field: str, *, required: bool = False) -> str | None:
+def normalize_agent_event_identifier(
+    value: Any,
+    field: str,
+    *,
+    required: bool = False,
+) -> str | None:
+    """Validate an opaque identifier without changing its source identity.
+
+    Protocol identifiers are byte-significant.  Compatibility normalization or
+    trimming would make distinct source IDs collide (for example ``"1"`` and
+    ``"①"`` under NFKC), defeating the journal's replay-conflict checks.
+    """
     if value is None:
         if required:
             raise ValueError(f"{field} must not be empty")
         return None
     if not isinstance(value, str):
         raise ValueError(f"{field} must be text or None")
-    normalized = unicodedata.normalize("NFKC", value).replace("\x00", "").strip()
-    if not normalized:
-        if required:
-            raise ValueError(f"{field} must not be empty")
-        return None
-    if len(normalized) > AGENT_EVENT_MAX_IDENTIFIER_CHARS:
+    if not value.strip():
+        raise ValueError(f"{field} must not be empty")
+    if "\x00" in value:
+        raise ValueError(f"{field} must not contain NUL")
+    if len(value) > AGENT_EVENT_MAX_IDENTIFIER_CHARS:
         raise ValueError(f"{field} is too long")
-    return normalized
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{field} must contain valid Unicode") from exc
+    return value
 
 
-def _normalize_payload_value(value: Any, *, depth: int = 0) -> Any:
+def _timestamp(value: str | datetime | None) -> str:
+    if value is None:
+        return utc_timestamp()
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw or len(raw) > 64:
+            raise ValueError("observed_at must be an aware ISO-8601 timestamp")
+        if raw.endswith(("Z", "z")):
+            raw = raw[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise ValueError(
+                "observed_at must be an aware ISO-8601 timestamp"
+            ) from exc
+    else:
+        raise ValueError("observed_at must be an aware ISO-8601 timestamp")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("observed_at must be an aware ISO-8601 timestamp")
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _valid_unicode(value: str) -> str:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(
+            "agent event payload contains invalid Unicode"
+        ) from exc
+    return value
+
+
+def _normalize_payload_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    item_budget: list[int] | None = None,
+) -> Any:
+    if item_budget is None:
+        item_budget = [AGENT_EVENT_MAX_TOTAL_ITEMS]
     if depth > AGENT_EVENT_MAX_DEPTH:
         raise ValueError("agent event payload is nested too deeply")
     if value is None or isinstance(value, bool | int):
@@ -96,33 +154,45 @@ def _normalize_payload_value(value: Any, *, depth: int = 0) -> Any:
             raise ValueError("agent event payload contains a non-finite number")
         return value
     if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("agent event payload contains a naive datetime")
         return utc_timestamp(value)
     if isinstance(value, str):
-        normalized = unicodedata.normalize("NFKC", value).replace("\x00", "")
-        if len(normalized) > AGENT_EVENT_MAX_TEXT_CHARS:
+        if len(value) > AGENT_EVENT_MAX_TEXT_CHARS:
             raise ValueError("agent event payload text is too long")
-        return normalized
+        return _valid_unicode(value)
     if isinstance(value, Mapping):
         if len(value) > AGENT_EVENT_MAX_COLLECTION_ITEMS:
             raise ValueError("agent event payload mapping has too many entries")
+        item_budget[0] -= len(value)
+        if item_budget[0] < 0:
+            raise ValueError("agent event payload has too many total items")
         result: dict[str, Any] = {}
         for raw_key, item in value.items():
             if not isinstance(raw_key, str):
                 raise ValueError("agent event payload keys must be text")
-            key = unicodedata.normalize("NFKC", raw_key).replace("\x00", "")
+            key = _valid_unicode(raw_key)
             if not key or len(key) > 256:
                 raise ValueError("agent event payload contains an invalid key")
-            if key in result:
-                raise ValueError(
-                    "agent event payload keys collide after normalization"
-                )
-            result[key] = _normalize_payload_value(item, depth=depth + 1)
+            result[key] = _normalize_payload_value(
+                item,
+                depth=depth + 1,
+                item_budget=item_budget,
+            )
         return result
     if isinstance(value, tuple | list):
         if len(value) > AGENT_EVENT_MAX_COLLECTION_ITEMS:
             raise ValueError("agent event payload sequence has too many entries")
+        item_budget[0] -= len(value)
+        if item_budget[0] < 0:
+            raise ValueError("agent event payload has too many total items")
         return [
-            _normalize_payload_value(item, depth=depth + 1) for item in value
+            _normalize_payload_value(
+                item,
+                depth=depth + 1,
+                item_budget=item_budget,
+            )
+            for item in value
         ]
     raise ValueError("agent event payload must contain only JSON-safe values")
 
@@ -186,7 +256,7 @@ class AgentEvent:
             "worker_id": self.worker_id,
             "visibility": self.visibility,
             "observed_at": self.observed_at,
-            "payload": dict(self.public_payload),
+            "payload": deepcopy(self.public_payload),
         }
         if sequence is not None:
             result["sequence"] = int(sequence)
@@ -206,7 +276,7 @@ def agent_event(
     source_event_id: str | None = None,
     source_sequence: int | None = None,
     visibility: AgentEventVisibility | str = "private",
-    observed_at: str | None = None,
+    observed_at: str | datetime | None = None,
 ) -> AgentEvent:
     """Validate and construct an event with deterministic retry identity.
 
@@ -222,13 +292,23 @@ def agent_event(
         raise ValueError("visibility must be private or public")
     if normalized_kind == "thought" and normalized_visibility != "private":
         raise ValueError("thought events must remain private")
-    normalized_source = _identifier(source, "source", required=True)
-    normalized_worker = _identifier(worker_id, "worker_id", required=True)
-    session_id = _identifier(source_session_id, "source_session_id")
-    turn_id = _identifier(source_turn_id, "source_turn_id")
-    item_id = _identifier(source_item_id, "source_item_id")
-    message_id = _identifier(source_message_id, "source_message_id")
-    event_id = _identifier(source_event_id, "source_event_id")
+    if normalized_kind == "extension" and normalized_visibility != "private":
+        raise ValueError("extension events must remain private")
+    normalized_source = normalize_agent_event_identifier(
+        source, "source", required=True
+    )
+    normalized_worker = normalize_agent_event_identifier(
+        worker_id, "worker_id", required=True
+    )
+    session_id = normalize_agent_event_identifier(
+        source_session_id, "source_session_id"
+    )
+    turn_id = normalize_agent_event_identifier(source_turn_id, "source_turn_id")
+    item_id = normalize_agent_event_identifier(source_item_id, "source_item_id")
+    message_id = normalize_agent_event_identifier(
+        source_message_id, "source_message_id"
+    )
+    event_id = normalize_agent_event_identifier(source_event_id, "source_event_id")
     if source_sequence is not None and (
         isinstance(source_sequence, bool)
         or not isinstance(source_sequence, int)
@@ -245,21 +325,22 @@ def agent_event(
         normalized_payload,
         visibility=normalized_visibility,  # type: ignore[arg-type]
     )
-    identity = {
+    identity: dict[str, Any] = {
         "schema_version": AGENT_EVENT_SCHEMA_VERSION,
         "source": normalized_source,
         "session_id": session_id,
-        "event_id": event_id,
-        "sequence": source_sequence,
-        "kind": normalized_kind,
     }
+    if event_id is not None:
+        identity.update({"identity": "event_id", "value": event_id})
+    else:
+        identity.update({"identity": "sequence", "value": source_sequence})
     return AgentEvent(
         event_id=_fingerprint(identity),
         kind=normalized_kind,  # type: ignore[arg-type]
         source=normalized_source or "",
         worker_id=normalized_worker or "",
         visibility=normalized_visibility,  # type: ignore[arg-type]
-        observed_at=_identifier(observed_at, "observed_at") or utc_timestamp(),
+        observed_at=_timestamp(observed_at),
         payload=normalized_payload,
         public_payload=public_payload,
         payload_fingerprint=_fingerprint(normalized_payload),
@@ -289,6 +370,19 @@ class AppendAgentEventResult:
     sequence: int
     event_id: str
     inserted: bool
+
+
+@dataclass(frozen=True)
+class AppendBoundAgentEventResult:
+    """Atomic binding check and journal append outcome."""
+
+    status: Literal["inserted", "replayed", "binding_changed"]
+    event_id: str
+    sequence: int | None = None
+
+    @property
+    def inserted(self) -> bool:
+        return self.status == "inserted"
 
 
 class AgentEventIdentityConflict(RuntimeError):

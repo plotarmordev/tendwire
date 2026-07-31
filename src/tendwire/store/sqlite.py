@@ -70,8 +70,10 @@ from ..core.agent_events import (
     AgentEvent,
     AgentEventIdentityConflict,
     AppendAgentEventResult,
+    AppendBoundAgentEventResult,
     StoredAgentEvent,
     agent_event,
+    normalize_agent_event_identifier,
 )
 from ..core.commands import (
     CommandEnvelope,
@@ -143,7 +145,7 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 22
+STORE_SCHEMA_VERSION = 23
 CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 _LEGACY_TURN_CLAIM_HARD_TTL_SECONDS = 86_400
 TURN_CHANGE_RETENTION_DAYS = 7
@@ -1536,7 +1538,7 @@ CREATE TABLE IF NOT EXISTS agent_events (
     kind TEXT NOT NULL CHECK (
         kind IN (
             'user_message', 'agent_message', 'thought', 'tool_call',
-            'tool_call_update', 'plan', 'usage', 'session_info'
+            'tool_call_update', 'plan', 'usage', 'session_info', 'extension'
         )
     ),
     source TEXT NOT NULL,
@@ -1553,8 +1555,66 @@ CREATE TABLE IF NOT EXISTS agent_events (
     private_payload_json TEXT NOT NULL,
     public_payload_json TEXT NOT NULL,
     UNIQUE (host_id, event_id),
+    CHECK (length(host_id) BETWEEN 1 AND 2048),
+    CHECK (instr(host_id, char(0)) = 0),
+    CHECK (length(event_id) = 64),
+    CHECK (length(source) BETWEEN 1 AND 2048),
+    CHECK (instr(source, char(0)) = 0),
+    CHECK (length(worker_id) BETWEEN 1 AND 2048),
+    CHECK (instr(worker_id, char(0)) = 0),
+    CHECK (
+        source_session_id IS NULL OR (
+            length(source_session_id) BETWEEN 1 AND 2048
+            AND instr(source_session_id, char(0)) = 0
+        )
+    ),
+    CHECK (
+        source_turn_id IS NULL OR (
+            length(source_turn_id) BETWEEN 1 AND 2048
+            AND instr(source_turn_id, char(0)) = 0
+        )
+    ),
+    CHECK (
+        source_item_id IS NULL OR (
+            length(source_item_id) BETWEEN 1 AND 2048
+            AND instr(source_item_id, char(0)) = 0
+        )
+    ),
+    CHECK (
+        source_message_id IS NULL OR (
+            length(source_message_id) BETWEEN 1 AND 2048
+            AND instr(source_message_id, char(0)) = 0
+        )
+    ),
+    CHECK (
+        source_event_id IS NULL OR (
+            length(source_event_id) BETWEEN 1 AND 2048
+            AND instr(source_event_id, char(0)) = 0
+        )
+    ),
+    CHECK (length(observed_at) BETWEEN 20 AND 40),
+    CHECK (length(payload_fingerprint) = 64),
+    CHECK (
+        CASE WHEN json_valid(private_payload_json)
+        THEN json_type(private_payload_json) = 'object' ELSE 0 END
+    ),
+    CHECK (
+        length(CAST(private_payload_json AS BLOB)) <= 65536
+    ),
+    CHECK (
+        CASE WHEN json_valid(public_payload_json)
+        THEN json_type(public_payload_json) = 'object' ELSE 0 END
+    ),
+    CHECK (
+        length(CAST(public_payload_json AS BLOB)) <= 65536
+    ),
+    CHECK (visibility != 'private' OR public_payload_json = '{}'),
     CHECK (source_event_id IS NOT NULL OR source_sequence IS NOT NULL),
-    CHECK (kind != 'thought' OR visibility = 'private')
+    CHECK (
+        source_event_id IS NOT NULL
+        OR (source_session_id IS NOT NULL AND source_sequence IS NOT NULL)
+    ),
+    CHECK (kind NOT IN ('thought', 'extension') OR visibility = 'private')
 );
 """
 
@@ -1574,6 +1634,27 @@ CREATE_AGENT_EVENT_INDEXES = (
     (
         "CREATE INDEX IF NOT EXISTS idx_agent_events_host_source_sequence "
         "ON agent_events(host_id, source, sequence)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_agent_events_host_visibility_sequence "
+        "ON agent_events(host_id, visibility, sequence)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_agent_events_host_observed_sequence "
+        "ON agent_events(host_id, observed_at, sequence)"
+    ),
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "idx_agent_events_source_event_identity "
+        "ON agent_events("
+        "host_id, source, COALESCE(source_session_id, ''), source_event_id"
+        ") WHERE source_event_id IS NOT NULL"
+    ),
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "idx_agent_events_source_sequence_identity "
+        "ON agent_events(host_id, source, source_session_id, source_sequence) "
+        "WHERE source_event_id IS NULL"
     ),
 )
 
@@ -13190,6 +13271,114 @@ def _migrate_v21_to_v22_conn(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+def _migrate_v22_to_v23_conn(conn: sqlite3.Connection) -> None:
+    """Harden event identity and rebuild v22 rows under the canonical contract."""
+    columns = [
+        "sequence",
+        "host_id",
+        "event_id",
+        "kind",
+        "source",
+        "worker_id",
+        "visibility",
+        "source_session_id",
+        "source_turn_id",
+        "source_item_id",
+        "source_message_id",
+        "source_event_id",
+        "source_sequence",
+        "observed_at",
+        "payload_fingerprint",
+        "private_payload_json",
+        "public_payload_json",
+    ]
+    rows = conn.execute(
+        "SELECT " + ", ".join(columns) + " FROM agent_events ORDER BY sequence"
+    ).fetchall()
+    conn.execute("ALTER TABLE agent_events RENAME TO agent_events_v22")
+    conn.execute(CREATE_AGENT_EVENTS_TABLE)
+    try:
+        for row in rows:
+            try:
+                private_payload = _json_object(row[15])
+                public_payload = _json_object(row[16])
+                if _canonical_json(private_payload) != row[15]:
+                    raise StoreSchemaError("invalid_v22_agent_event_payload")
+                if _canonical_json(public_payload) != row[16]:
+                    raise StoreSchemaError("invalid_v22_agent_event_projection")
+                host_id = normalize_agent_event_identifier(
+                    row[1], "host_id", required=True
+                )
+                canonical = agent_event(
+                    kind=row[3],
+                    source=row[4],
+                    worker_id=row[5],
+                    visibility=row[6],
+                    source_session_id=row[7],
+                    source_turn_id=row[8],
+                    source_item_id=row[9],
+                    source_message_id=row[10],
+                    source_event_id=row[11],
+                    source_sequence=row[12],
+                    observed_at=row[13],
+                    payload=private_payload,
+                )
+                legacy_identity = {
+                    "schema_version": 1,
+                    "source": canonical.source,
+                    "session_id": canonical.source_session_id,
+                    "event_id": canonical.source_event_id,
+                    "sequence": canonical.source_sequence,
+                    "kind": canonical.kind,
+                }
+                legacy_event_id = hashlib.sha256(
+                    _canonical_json(legacy_identity).encode("utf-8")
+                ).hexdigest()
+                if str(row[2]) != legacy_event_id:
+                    raise StoreSchemaError("invalid_v22_agent_event_identity")
+                if str(row[14]) != canonical.payload_fingerprint:
+                    raise StoreSchemaError("invalid_v22_agent_event_fingerprint")
+                if public_payload != canonical.public_payload:
+                    raise StoreSchemaError("invalid_v22_agent_event_projection")
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise StoreSchemaError("invalid_v22_agent_event_row") from exc
+            conn.execute(
+                """
+                INSERT INTO agent_events (
+                    sequence, host_id, event_id, kind, source, worker_id,
+                    visibility, source_session_id, source_turn_id,
+                    source_item_id, source_message_id, source_event_id,
+                    source_sequence, observed_at, payload_fingerprint,
+                    private_payload_json, public_payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(row[0]),
+                    host_id,
+                    canonical.event_id,
+                    canonical.kind,
+                    canonical.source,
+                    canonical.worker_id,
+                    canonical.visibility,
+                    canonical.source_session_id,
+                    canonical.source_turn_id,
+                    canonical.source_item_id,
+                    canonical.source_message_id,
+                    canonical.source_event_id,
+                    canonical.source_sequence,
+                    canonical.observed_at,
+                    canonical.payload_fingerprint,
+                    _canonical_json(canonical.payload),
+                    _canonical_json(canonical.public_payload),
+                ),
+            )
+    except sqlite3.IntegrityError as exc:
+        raise StoreSchemaError("conflicting_v22_agent_event_identity") from exc
+    conn.execute("DROP TABLE agent_events_v22")
+    for statement in CREATE_AGENT_EVENT_INDEXES:
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -13213,6 +13402,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(19, 20, _migrate_v19_to_v20_conn),
     Migration(20, 21, _migrate_v20_to_v21_conn),
     Migration(21, 22, _migrate_v21_to_v22_conn),
+    Migration(22, 23, _migrate_v22_to_v23_conn),
 )
 
 
@@ -13424,10 +13614,11 @@ def _agent_event_from_row(row: tuple[Any, ...]) -> StoredAgentEvent:
     kind = str(row[3])
     if kind not in AGENT_EVENT_KINDS:
         raise StoreSchemaError("invalid_agent_event_kind")
-    return StoredAgentEvent(
-        sequence=int(row[0]),
-        host_id=str(row[1]),
-        event=AgentEvent(
+    try:
+        normalized_host = normalize_agent_event_identifier(
+            row[1], "host_id", required=True
+        )
+        stored_event = AgentEvent(
             event_id=str(row[2]),
             kind=kind,  # type: ignore[arg-type]
             source=str(row[4]),
@@ -13443,7 +13634,29 @@ def _agent_event_from_row(row: tuple[Any, ...]) -> StoredAgentEvent:
             payload_fingerprint=str(row[14]),
             payload=private_payload,
             public_payload=public_payload,
-        ),
+        )
+        canonical = agent_event(
+            kind=stored_event.kind,
+            source=stored_event.source,
+            worker_id=stored_event.worker_id,
+            payload=stored_event.payload,
+            source_session_id=stored_event.source_session_id,
+            source_turn_id=stored_event.source_turn_id,
+            source_item_id=stored_event.source_item_id,
+            source_message_id=stored_event.source_message_id,
+            source_event_id=stored_event.source_event_id,
+            source_sequence=stored_event.source_sequence,
+            visibility=stored_event.visibility,
+            observed_at=stored_event.observed_at,
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise StoreSchemaError("invalid_agent_event_row") from exc
+    if canonical != stored_event:
+        raise StoreSchemaError("invalid_agent_event_row")
+    return StoredAgentEvent(
+        sequence=int(row[0]),
+        host_id=normalized_host or "",
+        event=stored_event,
     )
 
 
@@ -13476,19 +13689,7 @@ def _agent_event_conflicts(existing: StoredAgentEvent, incoming: AgentEvent) -> 
     )
 
 
-def append_agent_event(
-    db_path: Path | str,
-    host_id: str,
-    event: AgentEvent,
-) -> AppendAgentEventResult:
-    """Append one structured event, or return its existing replay sequence.
-
-    Reusing a deterministic event identity with different content is rejected
-    instead of silently mutating the journal or accepting source corruption.
-    """
-    normalized_host = str(host_id).strip()
-    if not normalized_host:
-        raise ValueError("host_id must not be empty")
+def _canonical_agent_event_for_append(event: AgentEvent) -> AgentEvent:
     if not isinstance(event, AgentEvent):
         raise ValueError("event must be an AgentEvent")
     canonical_event = agent_event(
@@ -13507,61 +13708,136 @@ def append_agent_event(
     )
     if canonical_event != event:
         raise ValueError("event must use the canonical agent event contract")
+    return canonical_event
+
+
+def _append_agent_event_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    event: AgentEvent,
+) -> AppendAgentEventResult:
     private_json = _canonical_json(event.payload)
     public_json = _canonical_json(event.public_payload)
-    with _connect(db_path, prepare=True) as conn:
-        _ensure_schema(conn)
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            cursor = conn.execute(
-                """
-                INSERT INTO agent_events (
-                    host_id, event_id, kind, source, worker_id, visibility,
-                    source_session_id, source_turn_id, source_item_id,
-                    source_message_id, source_event_id, source_sequence,
-                    observed_at, payload_fingerprint, private_payload_json,
-                    public_payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(host_id, event_id) DO NOTHING
-                """,
-                (
-                    normalized_host,
-                    event.event_id,
-                    event.kind,
-                    event.source,
-                    event.worker_id,
-                    event.visibility,
-                    event.source_session_id,
-                    event.source_turn_id,
-                    event.source_item_id,
-                    event.source_message_id,
-                    event.source_event_id,
-                    event.source_sequence,
-                    event.observed_at,
-                    event.payload_fingerprint,
-                    private_json,
-                    public_json,
-                ),
-            )
-            inserted = cursor.rowcount == 1
-            row = conn.execute(
-                _AGENT_EVENT_SELECT
-                + " WHERE host_id = ? AND event_id = ?",
-                (normalized_host, event.event_id),
-            ).fetchone()
-            if row is None:
-                raise StoreSchemaError("agent_event_append_failed")
-            stored = _agent_event_from_row(row)
-            if _agent_event_conflicts(stored, event):
-                raise AgentEventIdentityConflict(event.event_id)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+    cursor = conn.execute(
+        """
+        INSERT INTO agent_events (
+            host_id, event_id, kind, source, worker_id, visibility,
+            source_session_id, source_turn_id, source_item_id,
+            source_message_id, source_event_id, source_sequence,
+            observed_at, payload_fingerprint, private_payload_json,
+            public_payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(host_id, event_id) DO NOTHING
+        """,
+        (
+            host_id,
+            event.event_id,
+            event.kind,
+            event.source,
+            event.worker_id,
+            event.visibility,
+            event.source_session_id,
+            event.source_turn_id,
+            event.source_item_id,
+            event.source_message_id,
+            event.source_event_id,
+            event.source_sequence,
+            event.observed_at,
+            event.payload_fingerprint,
+            private_json,
+            public_json,
+        ),
+    )
+    inserted = cursor.rowcount == 1
+    row = conn.execute(
+        _AGENT_EVENT_SELECT + " WHERE host_id = ? AND event_id = ?",
+        (host_id, event.event_id),
+    ).fetchone()
+    if row is None:
+        raise StoreSchemaError("agent_event_append_failed")
+    stored = _agent_event_from_row(row)
+    if _agent_event_conflicts(stored, event):
+        raise AgentEventIdentityConflict(event.event_id)
     return AppendAgentEventResult(
         sequence=stored.sequence,
         event_id=event.event_id,
         inserted=inserted,
+    )
+
+
+def append_agent_event(
+    db_path: Path | str,
+    host_id: str,
+    event: AgentEvent,
+) -> AppendAgentEventResult:
+    """Append one structured event, or return its existing replay sequence.
+
+    Reusing a deterministic event identity with different content is rejected
+    instead of silently mutating the journal or accepting source corruption.
+    """
+    normalized_host = normalize_agent_event_identifier(
+        host_id, "host_id", required=True
+    )
+    _canonical_agent_event_for_append(event)
+    with _connect(db_path, prepare=True) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = _append_agent_event_conn(conn, normalized_host or "", event)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return result
+
+
+def append_agent_event_for_binding(
+    db_path: Path | str,
+    host_id: str,
+    event: AgentEvent,
+    *,
+    expected_binding: WorkerBinding,
+) -> AppendBoundAgentEventResult:
+    """Append only while the expected active worker binding remains current.
+
+    The binding check and insert share one ``BEGIN IMMEDIATE`` transaction, so
+    a concurrent inventory refresh cannot invalidate the binding between the
+    check and journal mutation.
+    """
+    normalized_host = normalize_agent_event_identifier(
+        host_id, "host_id", required=True
+    )
+    _canonical_agent_event_for_append(event)
+    if not isinstance(expected_binding, WorkerBinding):
+        raise ValueError("expected_binding must be a WorkerBinding")
+    with _connect(db_path, prepare=True) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not _agent_event_binding_matches_conn(
+                conn,
+                normalized_host or "",
+                event.worker_id,
+                expected_binding,
+            ):
+                conn.rollback()
+                return AppendBoundAgentEventResult(
+                    status="binding_changed",
+                    event_id=event.event_id,
+                )
+            result = _append_agent_event_conn(
+                conn,
+                normalized_host or "",
+                event,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return AppendBoundAgentEventResult(
+        status="inserted" if result.inserted else "replayed",
+        event_id=result.event_id,
+        sequence=result.sequence,
     )
 
 
@@ -13591,6 +13867,7 @@ def list_agent_events(
         isinstance(after_sequence, bool)
         or not isinstance(after_sequence, int)
         or after_sequence < 0
+        or after_sequence > (1 << 63) - 1
     ):
         raise ValueError("after_sequence must be a nonnegative integer")
     if (
@@ -13601,20 +13878,29 @@ def list_agent_events(
         raise ValueError(
             f"limit must be between 1 and {AGENT_EVENT_QUERY_MAX_LIMIT}"
         )
+    normalized_host = normalize_agent_event_identifier(
+        host_id, "host_id", required=True
+    )
+    normalized_filters: list[tuple[str, str | None]] = []
+    for column, value, field in (
+        ("worker_id", worker_id, "worker_id"),
+        ("source", source, "source"),
+        ("source_session_id", session_id, "source_session_id"),
+        ("source_turn_id", turn_id, "source_turn_id"),
+    ):
+        normalized_filters.append(
+            (column, normalize_agent_event_identifier(value, field))
+        )
+    if visibility is not None and visibility not in {"private", "public"}:
+        raise ValueError("visibility must be private, public, or None")
     if not _sqlite_store_exists(db_path):
         return ()
     clauses = ["host_id = ?", "sequence > ?"]
-    parameters: list[Any] = [str(host_id), int(after_sequence)]
-    for column, value in (
-        ("worker_id", worker_id),
-        ("source", source),
-        ("source_session_id", session_id),
-        ("source_turn_id", turn_id),
-        ("visibility", visibility),
-    ):
+    parameters: list[Any] = [normalized_host, int(after_sequence)]
+    for column, value in (*normalized_filters, ("visibility", visibility)):
         if value is not None:
             clauses.append(f"{column} = ?")
-            parameters.append(str(value))
+            parameters.append(value)
     parameters.append(int(limit))
     with _connect(db_path) as conn:
         _ensure_schema(conn)
@@ -22520,6 +22806,52 @@ def _turn_refresh_binding_matches_conn(
         str(expected.worker_id),
         str(expected.worker_fingerprint),
         str(expected.backend),
+        expected.turn_target_kind,
+        expected.turn_target_value,
+    )
+
+
+def _agent_event_binding_matches_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    worker_id: str,
+    expected: WorkerBinding,
+) -> bool:
+    """Match the complete routing generation used by an agent event stream."""
+    if (
+        str(expected.host_id) != str(host_id)
+        or str(expected.worker_id) != str(worker_id)
+    ):
+        return False
+    row = conn.execute(
+        """
+        SELECT
+            worker_id,
+            worker_fingerprint,
+            backend,
+            target_kind,
+            target_value,
+            turn_target_kind,
+            turn_target_value
+        FROM worker_bindings
+        WHERE host_id = ?
+          AND backend = ?
+          AND private_fingerprint = ?
+          AND expires_at > ?
+        """,
+        (
+            str(host_id),
+            str(expected.backend),
+            str(expected.private_fingerprint),
+            utc_timestamp(),
+        ),
+    ).fetchone()
+    return row is not None and tuple(row) == (
+        str(expected.worker_id),
+        str(expected.worker_fingerprint),
+        str(expected.backend),
+        str(expected.target_kind),
+        str(expected.target_value),
         expected.turn_target_kind,
         expected.turn_target_value,
     )
