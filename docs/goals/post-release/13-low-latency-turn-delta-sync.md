@@ -1,6 +1,6 @@
 # Goal 13: Low-latency turn delta sync
 
-Status: complete
+Status: urgent, not implemented
 
 Owners: Tendwire and Herdres
 

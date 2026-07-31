@@ -366,6 +366,41 @@ def test_canonical_herdr_pane_identity_uses_exact_authoritative_grammar(
     assert worker_identity.canonical_herdr_pane_identity(workspace_id, pane_id) == expected
 
 
+def test_worker_record_separates_canonical_identity_from_raw_observation() -> None:
+    canonical = _worker_record_from_item(
+        {
+            "workspaceId": "w65383a2e877513",
+            "paneId": "w65383a2e877513:pA",
+            "agent": "codex",
+        },
+        pane_info_observed=True,
+        identity_source="event:pane.updated",
+    )
+    assert canonical.workspace_id == "w65383a2e877513"
+    assert canonical.pane_id == "w65383a2e877513:pA"
+    assert canonical.observed_workspace_id == canonical.workspace_id
+    assert canonical.observed_pane_id == canonical.pane_id
+    assert canonical.identity_source == "event:pane.updated"
+    assert canonical.pane_info_observed is True
+
+    raw_runtime_identity = _worker_record_from_item(
+        {
+            "workspace_id": 7,
+            "pane_id": 41,
+            "agent": "codex",
+        },
+        pane_info_observed=True,
+        identity_source="event:pane.agent_status_changed",
+    )
+    assert raw_runtime_identity.workspace_id is None
+    assert raw_runtime_identity.pane_id is None
+    assert raw_runtime_identity.observed_workspace_id == "7"
+    assert raw_runtime_identity.observed_pane_id == "41"
+    assert raw_runtime_identity.identity_source == "event:pane.agent_status_changed"
+    assert raw_runtime_identity.pane_info_observed is True
+    assert herdr_cli._stable_pane_identity(raw_runtime_identity) is None
+
+
 @pytest.mark.parametrize(
     ("workspace_id", "pane_id"),
     [

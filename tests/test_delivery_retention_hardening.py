@@ -528,7 +528,7 @@ def test_automatic_maintenance_round_robins_eligible_final_hosts(
     assert status_b["final_retention"]["acknowledged"] == 0
 
 
-def test_turn_final_fail_and_defer_persist_only_allowlisted_reason_codes(
+def test_turn_final_fail_and_defer_keep_public_reason_contract_private(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "turn-final-reason-codes.db"
@@ -603,18 +603,25 @@ def test_turn_final_fail_and_defer_persist_only_allowlisted_reason_codes(
     assert failed["status"] == "retry_scheduled"
     assert deferred["status"] == "deferred"
     assert allowlisted["status"] == "retry_scheduled"
+    assert stored[0]["reason_detail"] == (
+        "telegram topic 98765 chat 12345 message 54321 "
+        "[redacted] bot-[redacted]"
+    )
+    assert stored[1]["reason_detail"] == stored[0]["reason_detail"]
+    assert "reason_detail" not in stored[2]
+    for backend_fragment in ("telegram", "98765", "12345", "54321"):
+        assert backend_fragment in stored[0]["reason_detail"]
+        assert backend_fragment not in public_json
     for private_fragment in (
         unsafe_reason,
         "telegram",
-        "98765",
-        "12345",
-        "54321",
         "/tmp/private",
         "bot-token",
         "SECRET",
     ):
-        assert all(private_fragment not in value for value in stored_json)
         assert private_fragment not in public_json
+    for secret_fragment in (unsafe_reason, "/tmp/private", "bot-token", "SECRET"):
+        assert all(secret_fragment not in value for value in stored_json)
 
 
 def test_store_status_snapshot_pressure_is_exactly_host_scoped(

@@ -67,10 +67,14 @@ class _WorkerRecord:
     private_fingerprint: str
     turn_target_kind: str | None = None
     turn_target_value: str | None = None
-    # Raw top-level Herdr fields retained only in memory. The public pane id is
-    # authoritative only when it canonically belongs to the workspace id.
+    # Canonical public Herdr identity used exclusively for continuity. Raw
+    # observations remain private and separate so routing compatibility can
+    # never accidentally feed stable-key derivation.
     workspace_id: str | None = None
     pane_id: str | None = None
+    observed_workspace_id: str | None = None
+    observed_pane_id: str | None = None
+    identity_source: str = "unknown"
     terminal_id: str | None = None
     agent_session_id: str | None = None
     # Continuity is authorized only by a PaneInfo observation, never by
@@ -1436,18 +1440,29 @@ def _worker_record_from_item(
     config: Config | None = None,
     *,
     pane_info_observed: bool = False,
+    identity_source: str = "unknown",
 ) -> _WorkerRecord:
     item = _strip_turn_observation_fields(item)
     worker = _worker_from_item(item)
     worker = _worker_with_summary(worker, _bounded_excerpt(worker.summary, _output_excerpt_limit(config)))
     turn_target = _turn_target_from_item(item)
+    observed_workspace_id = _first_text(item, ("workspace_id", "workspaceId"))
+    observed_pane_id = _first_text(item, ("pane_id", "paneId"))
+    canonical_identity = canonical_herdr_pane_identity(
+        observed_workspace_id,
+        observed_pane_id,
+    )
+    workspace_id, pane_id = canonical_identity or (None, None)
     return _WorkerRecord(
         worker=worker,
         private_fingerprint=_private_identity_from_item(item, config),
         turn_target_kind=turn_target[0] if turn_target is not None else None,
         turn_target_value=turn_target[1] if turn_target is not None else None,
-        workspace_id=_first_text(item, ("workspace_id", "workspaceId")),
-        pane_id=_first_text(item, ("pane_id", "paneId")),
+        workspace_id=workspace_id,
+        pane_id=pane_id,
+        observed_workspace_id=observed_workspace_id,
+        observed_pane_id=observed_pane_id,
+        identity_source=identity_source,
         terminal_id=_first_text(item, ("terminal_id", "terminalId")),
         agent_session_id=(
             _nested_text(item, "agent_session", "value")
@@ -1481,6 +1496,7 @@ def _agent_observation_record(
             item,
             config,
             pane_info_observed=False,
+            identity_source="agent.list",
         ),
         unmatched_agent_observation=True,
     )
@@ -1622,6 +1638,9 @@ def _record_with_worker(record: _WorkerRecord, worker: Worker) -> _WorkerRecord:
         turn_target_value=record.turn_target_value,
         workspace_id=record.workspace_id,
         pane_id=record.pane_id,
+        observed_workspace_id=record.observed_workspace_id,
+        observed_pane_id=record.observed_pane_id,
+        identity_source=record.identity_source,
         terminal_id=record.terminal_id,
         agent_session_id=record.agent_session_id,
         pane_info_observed=record.pane_info_observed,
@@ -2054,6 +2073,9 @@ def _ambiguous_agent_record(
         private_fingerprint=private_fingerprint,
         workspace_id=record.workspace_id,
         pane_id=record.pane_id,
+        observed_workspace_id=record.observed_workspace_id,
+        observed_pane_id=record.observed_pane_id,
+        identity_source=record.identity_source,
         terminal_id=record.terminal_id,
         agent_session_id=record.agent_session_id,
         pane_info_observed=False,
@@ -2120,6 +2142,9 @@ def _merge_agent_pane_record(
         turn_target_value=turn_target_value,
         workspace_id=workspace_id,
         pane_id=pane_id,
+        observed_workspace_id=pane_record.observed_workspace_id,
+        observed_pane_id=pane_record.observed_pane_id,
+        identity_source=pane_record.identity_source,
         terminal_id=terminal_id,
         agent_session_id=pane_record.agent_session_id,
         pane_info_observed=True,
@@ -2309,7 +2334,12 @@ def _records_from_agent_and_pane_payloads(
         ]
     )
     pane_records = [
-        _worker_record_from_item(item, config, pane_info_observed=True)
+        _worker_record_from_item(
+            item,
+            config,
+            pane_info_observed=True,
+            identity_source="pane.list",
+        )
         for item in pane_items
     ]
     agent_items = _collapse_exact_observation_items(

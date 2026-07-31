@@ -394,35 +394,6 @@ def test_scan_dispatches_reader_before_blocked_orphan_prune_completes(
     scheduler.stop()
 
 
-def test_scheduler_scan_sweeps_turn_claims_with_configured_ttls(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    config, _snapshot, _bindings = _scheduler_store(tmp_path, 1)
-    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
-
-    monkeypatch.setattr(
-        herdr_turns,
-        "prune_backend_pending",
-        lambda *_args, **_kwargs: 0,
-    )
-
-    def observed_sweep(*args: Any, **kwargs: Any) -> int:
-        calls.append((args, kwargs))
-        return 0
-
-    monkeypatch.setattr(herdr_turns, "sweep_turn_claims", observed_sweep)
-    scheduler = TurnIngestionScheduler(config, refresh_interval_seconds=7.5)
-
-    scheduler._scan_bindings()
-
-    assert len(calls) == 1
-    args, kwargs = calls[0]
-    assert args == (config.db_path, config.host_id)
-    assert kwargs["grace_seconds"] == 75.0
-    assert kwargs["hard_ttl_seconds"] == config.turn_claim_hard_ttl_seconds
-    assert isinstance(kwargs["now"], str)
-
 
 def test_transient_initial_binding_scan_retries_once_and_dispatches(
     tmp_path: Path,

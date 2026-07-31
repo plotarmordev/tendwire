@@ -452,8 +452,9 @@ def test_subscription_surfaces_herdr_075_empty_id_schema_error(tmp_path: Path) -
 
     with _FakeHerdrServer(tmp_path, handler) as server:
         client = HerdrSocketClient(str(server.path), timeout=1)
-        with pytest.raises(HerdrErrorResponse, match="missing field pane_id"):
+        with pytest.raises(HerdrErrorResponse, match="missing field pane_id") as raised:
             client.events_subscribe(["pane.agent_status_changed"])
+        assert raised.value.uncorrelated is True
         client.close()
 
 
@@ -487,7 +488,7 @@ def test_ordinary_request_rejects_herdr_075_empty_id_error(tmp_path: Path) -> No
                 "id": "",
                 "error": {
                     "code": "invalid_request",
-                    "message": "uncorrelated ordinary request error",
+                    "message": "invalid request: ordinary request error",
                 },
             }
         )

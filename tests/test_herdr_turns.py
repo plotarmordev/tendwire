@@ -181,9 +181,10 @@ def test_refresh_structured_turn_content_uses_private_binding_without_public_lea
             stdout=json.dumps(
                 {
                     "result": {
-                        "turn": {
-                            "available": True,
-                            "user_text": "Why is Telegram showing lifecycle status?",
+                            "turn": {
+                                "available": True,
+                                "source_turn_id": "private-binding-source",
+                                "user_text": "Why is Telegram showing lifecycle status?",
                             "assistant_final_text": "Use Tendwire turn text, not pane_id pane-private.",
                             "assistant_stream_text": "Checking source mode...",
                             "complete": True,
@@ -220,51 +221,6 @@ def test_refresh_structured_turn_content_uses_private_binding_without_public_lea
     assert "agent-private" not in public_json
     assert turn["complete"] is True
     assert turn["has_open_turn"] is False
-
-
-def test_missing_pane_turn_cli_fails_closed_without_reading_scrollback(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    config = Config(
-        host_id="turn-host",
-        db_path=tmp_path / "turns.db",
-        herdr_bin="herdr",
-        herdr_timeout_seconds=2,
-    )
-    monkeypatch.setattr(
-        herdr_turns.subprocess,
-        "run",
-        lambda args, **kwargs: subprocess.CompletedProcess(
-            args=args,
-            returncode=2,
-            stdout="",
-            stderr="error: unrecognized subcommand 'turn'",
-        ),
-    )
-    monkeypatch.setattr(
-        herdr_turns,
-        "_read_private_turn_via_socket",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("terminal scrollback must not become a canonical turn")
-        ),
-        raising=False,
-    )
-
-    with pytest.raises(herdr_turns._TurnReadFailed):
-        herdr_turns._read_private_turn(
-            config,
-            "pane-private",
-            raise_timeout=True,
-        )
-    assert (
-        herdr_turns._read_private_turn(
-            config,
-            "pane-private",
-            raise_timeout=False,
-        )
-        is None
-    )
 
 
 def test_refresh_structured_turn_content_reads_codex_session_jsonl(

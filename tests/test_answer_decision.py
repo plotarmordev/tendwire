@@ -76,8 +76,9 @@ def _seed_pending_decision(
     tmp_path: Path,
     *,
     turn: dict[str, Any] | None = None,
+    turn_model: str = "observed",
 ) -> tuple[Any, Worker, str]:
-    config = _config(tmp_path)
+    config = _config(tmp_path, turn_model=turn_model)
     worker = Worker(id="w-1", name="Alpha", status="active")
     binding = _binding(
         worker,
@@ -516,6 +517,34 @@ def test_answer_decision_request_id_replay_does_not_resend_keys(tmp_path: Path) 
     assert first.ok is True
     assert first.status == STATUS_ACCEPTED
     assert replay.to_dict() == first.to_dict()
+    assert calls == [
+        {
+            "method": "pane.send_keys",
+            "params": {
+                "pane_id": "decision-pane-private",
+                "keys": ["2"],
+            },
+        }
+    ]
+
+
+def test_answer_decision_observed_mode_completes_without_instruction_turn(
+    tmp_path: Path,
+) -> None:
+    config, _worker, decision_ref = _seed_pending_decision(
+        tmp_path,
+        turn_model="observed",
+    )
+    calls: list[dict[str, Any]] = []
+
+    result = submit_command(
+        config,
+        _answer_request(decision_ref, request_id="observed-answer-decision"),
+        socket_client_factory=_factory(calls),
+    )
+
+    assert result.ok is True
+    assert result.status == STATUS_ACCEPTED
     assert calls == [
         {
             "method": "pane.send_keys",

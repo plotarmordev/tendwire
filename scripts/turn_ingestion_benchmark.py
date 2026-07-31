@@ -375,12 +375,15 @@ def _seed_store(
     store.save_snapshot(db_path, snapshot)
     if store.upsert_worker_bindings(db_path, bindings) != len(bindings):
         raise RuntimeError("binding_seed_failed")
-    for binding in bindings:
+    for ordinal, binding in enumerate(bindings):
         applied = store.apply_turn_refresh(
             db_path,
             FIXTURE_HOST,
             binding.worker_id,
-            content,
+            {
+                **content,
+                "source_turn_id": f"synthetic-source-turn-{ordinal}",
+            },
             expected_binding=binding,
             observed_at=FIXTURE_TIMESTAMP,
         )

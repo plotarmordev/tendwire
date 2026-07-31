@@ -124,11 +124,6 @@ _GLOBAL_EVENT_NAMES = tuple(
     for event_name in _SUPPORTED_EVENT_NAMES
     if event_name not in _PARAMETERIZED_EVENT_NAMES
 )
-_HERDR_074_GLOBAL_EVENT_NAMES = tuple(
-    event_name
-    for event_name in _HERDR_074_EVENT_NAMES
-    if event_name not in _PARAMETERIZED_EVENT_NAMES
-)
 _CLOSED_EVENT_NAMES = frozenset({"pane.closed", "pane.exited"})
 _SPACE_EVENT_NAMES = frozenset(
     {
@@ -140,10 +135,9 @@ _SPACE_EVENT_NAMES = frozenset(
     }
 )
 _WORKTREE_EVENT_NAMES = frozenset({"worktree.created", "worktree.opened", "worktree.removed"})
-# ``pane.updated`` is a refresh notification, not an authoritative PaneInfo
-# observation. Herdr 0.7.5 may emit it with partial or differently shaped pane
-# metadata, so routing it through worker projection can replace the identity
-# inputs established by pane.list. Keep the 474e9ce identity path unchanged.
+# ``pane.updated`` is normalized from Herdr 0.7.5's scalar
+# ``PaneOutputChanged`` event. It is a turn-refresh notification, not a
+# PaneInfo observation, and therefore must never rebuild worker identity.
 _PANE_WORKER_EVENT_NAMES = frozenset({"pane.created", "pane.focused"})
 _TURN_REFRESH_EVENT_NAMES = frozenset(
     {
@@ -429,36 +423,34 @@ def _privatize_pane_event_id(item: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def _top_level_pane_identity(
-    payload: Mapping[str, Any],
-) -> tuple[str, str] | None:
-    """Return only an explicit top-level pane-scoped identity tuple."""
-    workspace_value = _field_value(payload, "workspace_id")
-    pane_value = _field_value(payload, "pane_id")
-    if not isinstance(workspace_value, (str, int, float, bool)):
-        return None
-    if not isinstance(pane_value, (str, int, float, bool)):
-        return None
-    workspace_id = str(workspace_value)
-    pane_id = str(pane_value)
-    if not workspace_id or not pane_id:
-        return None
-    return workspace_id, pane_id
-
-
 def _pane_event_payload_with_provenance(
     payload: Mapping[str, Any],
     *entity_names: str,
+    allow_top_level_pane_info: bool = False,
 ) -> tuple[dict[str, Any], bool]:
-    """Return a pane-event item and whether PaneInfo provenance authorizes it."""
+    """Return a pane-event item and whether a full PaneInfo authorizes it."""
     item, selected_entity = _entity_payload_with_source(payload, *entity_names)
-    top_level_identity = _top_level_pane_identity(payload)
-    if selected_entity in {"agent", "worker"} and top_level_identity is not None:
-        item["workspace_id"], item["pane_id"] = top_level_identity
-        return item, True
-    if selected_entity in {None, "pane"}:
-        return _privatize_pane_event_id(item), True
-    return item, False
+    # EventData's internally tagged discriminator is envelope metadata, not a
+    # PaneInfo field. Keeping it would make event and pane.list projections
+    # differ even after their identity pair was canonicalized.
+    for key in list(item):
+        if _compact_key(key) == "type":
+            item.pop(key, None)
+    # Scalar agent/status events and nested agent/worker objects are not
+    # PaneInfo, even when they repeat workspace_id/pane_id. Treating them as
+    # PaneInfo was the observation-layer path that admitted alternate identity
+    # representations. Pane lifecycle events historically also carry a full
+    # top-level PaneInfo, so their caller opts into that established shape.
+    top_level_identity = canonical_herdr_pane_identity(
+        _first_text(item, ("workspace_id", "workspaceId")),
+        _first_text(item, ("pane_id", "paneId")),
+    )
+    pane_info_observed = selected_entity == "pane" or (
+        selected_entity is None
+        and allow_top_level_pane_info
+        and top_level_identity is not None
+    )
+    return _privatize_pane_event_id(item), pane_info_observed
 
 
 def _pane_event_payload(payload: Mapping[str, Any], *entity_names: str) -> dict[str, Any]:
@@ -924,6 +916,7 @@ class HerdrEventBackend:
         if not save_snapshot(
             self.db_path,
             snapshot,
+            turn_model=self.config.turn_model,
             observation=observation,
             worker_bindings=worker_bindings,
             binding_backend=BACKEND_NAME if worker_bindings is not None else None,
@@ -940,6 +933,7 @@ class HerdrEventBackend:
             result = maybe_run_automatic_store_maintenance(
                 self.db_path,
                 policy=policy,
+                turn_model=self.config.turn_model,
                 acknowledged_final_retention_days=(
                     self.config.acknowledged_final_retention_days
                 ),
@@ -1749,13 +1743,12 @@ class HerdrEventBackend:
                 for event_name in _HERDR_074_PANE_SCOPED_FALLBACK_EVENT_NAMES
             ]
         else:
-            # An empty installation still needs a live stream for future
-            # workspace/pane creation.  A zero-entry legacy fallback merely
-            # repeats the negotiation failure/reconnect loop, so retain every
-            # 0.7.4 event that is valid without a pane parameter.
+            # An empty installation has no pane id with which to build the
+            # pane-scoped compatibility request. Fall back to the pre-0.7.5
+            # global shape instead of retrying the rejected mixed shape on
+            # every reconnect.
             subscriptions = [
-                {"type": event_name}
-                for event_name in _HERDR_074_GLOBAL_EVENT_NAMES
+                {"type": event_name} for event_name in _HERDR_074_EVENT_NAMES
             ]
         params = {"subscriptions": subscriptions}
         try:
@@ -1838,6 +1831,7 @@ class HerdrEventBackend:
             has_turn_refresh_event = any(
                 event.name in _TURN_REFRESH_EVENT_NAMES for event in events
             )
+            notify_turn_refresh = has_turn_refresh_event
             for event in events:
                 if event.name != "pane.turn_completed":
                     continue
@@ -1860,7 +1854,6 @@ class HerdrEventBackend:
                 if changed or has_producer_identity:
                     self._persist_current_state(observed_at=accepted_at)
                 self._commit_producer_identities(events)
-                notify_turn_refresh = has_turn_refresh_event
             except (HerdrContinuityUnavailableError, InstallationKeyError):
                 self._mark_unhealthy("continuity_unavailable")
             finally:
@@ -1883,12 +1876,14 @@ class HerdrEventBackend:
                 "pane",
                 "agent",
                 "worker",
+                allow_top_level_pane_info=True,
             )
             if not _pane_has_agent(item) and self._match_binding(item) is None:
                 return False
             return self._upsert_worker_from_item(
                 item,
                 pane_info_observed=pane_info_observed,
+                identity_source=f"event:{event.name}",
             )
         if event.name == "pane.agent_detected":
             item, pane_info_observed = _pane_event_payload_with_provenance(
@@ -1900,6 +1895,7 @@ class HerdrEventBackend:
             return self._upsert_worker_from_item(
                 item,
                 pane_info_observed=pane_info_observed,
+                identity_source=f"event:{event.name}",
             )
         if event.name == "pane.agent_status_changed":
             item, pane_info_observed = _pane_event_payload_with_provenance(
@@ -1918,25 +1914,30 @@ class HerdrEventBackend:
                     and _has_authoritative_binding_target(item)
                 ),
                 pane_info_observed=pane_info_observed,
+                identity_source=f"event:{event.name}",
             )
         if event.name == "pane.moved":
             item, pane_info_observed = _pane_event_payload_with_provenance(
                 event.payload,
                 "pane",
+                allow_top_level_pane_info=True,
             )
             return self._apply_pane_moved(
                 item,
                 pane_info_observed=pane_info_observed,
+                identity_source=f"event:{event.name}",
             )
         if event.name in _CLOSED_EVENT_NAMES:
             item, pane_info_observed = _pane_event_payload_with_provenance(
                 event.payload,
                 "pane",
+                allow_top_level_pane_info=True,
             )
             return self._apply_pane_closed(
                 item,
                 reason=event.name.replace(".", "_"),
                 pane_info_observed=pane_info_observed,
+                identity_source=f"event:{event.name}",
             )
         if event.name == "pane.output_matched":
             return False
@@ -1990,13 +1991,32 @@ class HerdrEventBackend:
         *,
         status: str | None = None,
         pane_info_observed: bool = False,
+        identity_source: str = "event",
     ) -> tuple[Worker | None, WorkerBinding | None, WorkerBinding | None]:
         try:
             record = _worker_record_from_item(
                 item,
                 self.config,
                 pane_info_observed=pane_info_observed,
+                identity_source=identity_source,
             )
+            if pane_info_observed and canonical_herdr_pane_identity(
+                record.workspace_id,
+                record.pane_id,
+            ) is None:
+                matched_owner = self._match_binding(item)
+                existing_owner = (
+                    self._workers.get(matched_owner.worker_id)
+                    if matched_owner is not None
+                    else None
+                )
+                if (
+                    existing_owner is not None
+                    and _authenticated_local_stable_key(existing_owner) is not None
+                ):
+                    raise HerdrContinuityUnavailableError(
+                        "Herdr event PaneInfo has no canonical public pane identity"
+                    )
             workers, bindings = _workers_and_bindings_from_records(
                 self.config,
                 [record],
@@ -2106,11 +2126,12 @@ class HerdrEventBackend:
             if len(owner_ids) != 1:
                 continue
             worker_id = next(iter(owner_ids))
-            if record.pane_id and record.terminal_id:
-                self._pane_terminals[record.pane_id] = record.terminal_id
+            observed_pane_id = record.observed_pane_id or record.pane_id
+            if observed_pane_id and record.terminal_id:
+                self._pane_terminals[observed_pane_id] = record.terminal_id
             self._add_owner(
                 self._pane_owners,
-                record.pane_id,
+                observed_pane_id,
                 worker_id,
             )
             self._add_owner(
@@ -2293,6 +2314,7 @@ class HerdrEventBackend:
         status: str | None = None,
         update_binding: bool = True,
         pane_info_observed: bool = False,
+        identity_source: str = "event",
     ) -> bool:
         if not item:
             return False
@@ -2302,6 +2324,7 @@ class HerdrEventBackend:
             item,
             status=status,
             pane_info_observed=pane_info_observed,
+            identity_source=identity_source,
         )
         if worker is None:
             return False
@@ -2394,6 +2417,31 @@ class HerdrEventBackend:
                 item,
                 binding,
             )
+            compatibility_identity = canonical_herdr_pane_identity(
+                _first_text(item, ("workspace_id", "workspaceId")),
+                _first_text(item, ("pane_id", "paneId")),
+            )
+            pane_owner_ids = (
+                self._pane_owners.get(compatibility_identity[1], set())
+                if compatibility_identity is not None
+                else set()
+            )
+            if (
+                matched_binding is None
+                and len(compatibility_owner_ids) == 1
+                and compatibility_owner_ids <= pane_owner_ids
+            ):
+                compatibility_owner_id = next(iter(compatibility_owner_ids))
+                owner_bindings = [
+                    current_binding
+                    for current_binding in self._bindings.values()
+                    if current_binding.worker_id == compatibility_owner_id
+                ]
+                if len(owner_bindings) == 1:
+                    # Scalar events can locate an already-authenticated owner
+                    # through the private pane map, but cannot replace that
+                    # owner's identity or binding with event-only fields.
+                    matched_binding = owner_bindings[0]
             matched_owner_ids = (
                 {matched_binding.worker_id}
                 if matched_binding is not None
@@ -2580,6 +2628,7 @@ class HerdrEventBackend:
         item: Mapping[str, Any],
         *,
         pane_info_observed: bool = False,
+        identity_source: str = "event:pane.moved",
     ) -> bool:
         authoritative_identity = (
             pane_info_observed and _has_authoritative_identity_tuple(item)
@@ -2587,6 +2636,7 @@ class HerdrEventBackend:
         observed_worker, observed_binding, _matched = self._event_worker_and_binding(
             item,
             pane_info_observed=pane_info_observed,
+            identity_source=identity_source,
         )
         source_owner_ids = self._previous_ownership_worker_ids(item)
         if len(source_owner_ids) > 1:
@@ -2804,6 +2854,7 @@ class HerdrEventBackend:
         *,
         reason: str,
         pane_info_observed: bool = False,
+        identity_source: str = "event",
     ) -> bool:
         observed_worker: Worker | None = None
         matched_binding: WorkerBinding | None = None
@@ -2813,6 +2864,7 @@ class HerdrEventBackend:
                 item,
                 status="closed",
                 pane_info_observed=True,
+                identity_source=identity_source,
             )
         observed_stable_key = (
             _authenticated_local_stable_key(observed_worker)
@@ -2840,6 +2892,7 @@ class HerdrEventBackend:
                     item,
                     status="closed",
                     pane_info_observed=False,
+                    identity_source=identity_source,
                 )
             if matched_binding is not None:
                 binding = matched_binding

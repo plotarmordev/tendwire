@@ -425,15 +425,6 @@ resubscribe to the same official event set.
 
 The daemon owns ongoing turn ingestion. It scans eligible durable Codex, OMP,
 and pane bindings immediately at startup and every two seconds by default.
-For pane bindings, a configured wrapper that still implements
-`pane turn PANE_ID --last --format json` remains authoritative. Standalone
-Herdr 0.7.5 removed that CLI subcommand. Tendwire deliberately does not convert
-generic terminal scrollback into canonical turns: `pane.read` has no stable turn
-identity or prompt/final boundary, so doing so can create duplicate turns and
-publish incomplete terminal output as a final. Bare-Herdr pane ingestion
-therefore reports a fixed adapter failure until a semantic wrapper is selected
-with `TENDWIRE_HERDR_BIN`. Codex and OMP session-backed bindings continue to use
-Tendwire's native readers.
 Persisted
 `pane.created`, `pane.focused`, `pane.moved`, `pane.closed`, `pane.exited`,
 `pane.agent_detected`, `pane.agent_status_changed`, and
@@ -556,7 +547,7 @@ variables:
 | `store_maintenance_cadence_seconds` | `TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS` | `3600` | positive integer |
 | `turn_refresh_interval_seconds` | `TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS` | `2.0` | finite positive float |
 | `turn_refresh_workers` | `TENDWIRE_TURN_REFRESH_WORKERS` | `4` | integer from 1 through 32 and no greater than `max_workers` |
-| `turn_claim_hard_ttl_seconds` | `TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS` | `86400` | positive integer; unobserved command claims become terminal after this interval |
+| `turn_model` | `TENDWIRE_TURN_MODEL` | `observed` | `observed`; `legacy`, `dual`, and `shadow` are deprecated aliases with identical observed behavior |
 
 The socket/event backend uses `event_debounce_seconds` for event batching and
 `reconcile_interval_seconds` for bounded periodic full reconciles. Set
@@ -1414,6 +1405,9 @@ change is required.
   least one non-empty explicit selector.
 - `instruction` — optional; for `send_instruction` contains `text` only.
 - `params` — optional opaque parameters.
+- `response_schema_version` — optional response negotiation. Omit it (or use
+  `2`) for the unchanged schema-v2 envelope. A client may explicitly use `3`
+  to receive the accepted instruction submission handle described below.
 
 Requests containing connector or low-level terminal fields are rejected before
 any backend call. Rejected fields include `telegram`, `chat_id`, `topic_id`,
@@ -1447,6 +1441,34 @@ The envelope contains exactly those fields. The local daemon's outer RPC frame
 remains schema v1; for `command.submit`, its `result` is this exact schema-v2
 command envelope. The CLI unwraps that result and prints the schema-v2 command
 envelope itself.
+
+For a non-dry-run `send_instruction`, a client can opt into schema v3 by
+setting request `response_schema_version: 3`. Only an accepted response is
+projected as v3; its existing `result.turn_id` remains unchanged and
+`result.submission_id` is added as an opaque deterministic `twsub1.*` handle.
+The default and all current Herdres requests remain byte-for-byte schema v2.
+The durable receipt also remains schema v2, so response negotiation does not
+change idempotency evidence.
+
+Each instruction that reaches `send_started` is written atomically to the
+`turn_submissions` ledger. Submission never creates a `turns` row; only a
+source-derived observation can create a public turn. The ledger stores a
+whitespace-normalized instruction digest, never another raw instruction copy,
+and advances to `submitted` or `uncertain` with the terminal receipt transaction.
+Unlinked rows expire after
+`TENDWIRE_SUBMISSION_HARD_TTL_SECONDS` (default `86400`); candidate linkage uses
+the symmetric observation window configured by
+`TENDWIRE_SUBMISSION_LINK_WINDOW_SECONDS` (default `60`). Source-derived
+observations settle this ledger only after the matching
+window closes: a component links only when it contains exactly one submission
+and one unlinked observation; larger components become `ambiguous`. Linkage is
+metadata and does not change observation-derived turn identity, turn-list order,
+Goal 10 delivery, or Herdres consumption. Lazy and periodic settlement cover
+both submission-first and observation-first arrival order.
+
+`TENDWIRE_TURN_MODEL` remains accepted for rollout compatibility. `legacy`,
+`dual`, and `shadow` emit a warning and use the same observation-authoritative
+behavior as `observed`.
 
 `disposition`, not `status` alone, is the receipt-authority and finality
 contract:

@@ -973,7 +973,7 @@ def test_v12_migration_uses_effective_recovery_lineage_without_repost_or_hold(
     api = ConnectorOutboxAPI(db_path, HOST_ID)
     assert api.poll({"name": FINAL_NAME, "limit": 100})["items"] == []
     with sqlite3.connect(str(db_path)) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == store_sqlite.STORE_SCHEMA_VERSION == 19
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == store_sqlite.STORE_SCHEMA_VERSION == 21
         anchor = conn.execute(
             """
             SELECT delivery_kind, status
@@ -1010,7 +1010,7 @@ def test_v12_migration_uses_effective_recovery_lineage_without_repost_or_hold(
     assert cleanup["deleted"] == 1
 
 
-def test_v12_migrated_recovery_lineage_survives_same_owner_worker_churn(
+def test_v12_recovery_history_stays_immutable_when_observed_turn_arrives(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "v12-recovered-lineage-owner-churn.db"
@@ -1063,7 +1063,9 @@ def test_v12_migrated_recovery_lineage_survives_same_owner_worker_churn(
     after_churn = _turn_graph_snapshot(db_path, turn_id)
     assert after_churn == before
     api = ConnectorOutboxAPI(db_path, HOST_ID)
-    assert api.poll({"name": FINAL_NAME, "limit": 100})["items"] == []
+    observed_items = api.poll({"name": FINAL_NAME, "limit": 100})["items"]
+    assert len(observed_items) == 1
+    assert observed_items[0]["key"] != original_key
     with sqlite3.connect(str(db_path)) as conn:
         current = conn.execute(
             """
@@ -1076,22 +1078,41 @@ def test_v12_migrated_recovery_lineage_survives_same_owner_worker_churn(
         assert current is not None
         current_payload = json.loads(str(current[3]))
         assert current[:3] == (
+            "worker-recovery-a",
+            "fingerprint-recovery-a",
+            "space-recovery-a",
+        )
+        assert current_payload["id"] == turn_id
+        assert current_payload["source_turn_id"] == RECOVERY_LEGACY_SOURCE_TOKEN
+        observed = conn.execute(
+            """
+            SELECT turn_id, worker_id, worker_fingerprint, space_id, payload_json
+            FROM turns
+            WHERE host_id = ? AND turn_id != ?
+            """,
+            (HOST_ID, turn_id),
+        ).fetchone()
+        assert observed is not None
+        observed_payload = json.loads(str(observed[4]))
+        assert tuple(observed[1:4]) == (
             "worker-recovery-b",
             worker_b.workers[0].fingerprint,
             "space-recovery-b",
         )
-        assert current_payload["id"] == turn_id
-        assert current_payload["source_turn_id"] == RECOVERY_LEGACY_SOURCE_TOKEN
+        assert observed_payload["id"] == str(observed[0])
+        assert observed_payload["source_turn_id"] != RECOVERY_LEGACY_SOURCE_TOKEN
         public_payloads = [
             str(row[0])
-            for row in conn.execute(
-                """
-                SELECT payload_json FROM turns WHERE host_id = ?
-                UNION ALL
-                SELECT payload_json FROM connector_outbox WHERE host_id = ?
-                """,
-                (HOST_ID, HOST_ID),
-            ).fetchall()
+                for row in conn.execute(
+                    """
+                    SELECT payload_json FROM turns
+                    WHERE host_id = ? AND turn_id != ?
+                    UNION ALL
+                    SELECT payload_json FROM connector_outbox
+                    WHERE host_id = ? AND turn_id != ?
+                    """,
+                    (HOST_ID, turn_id, HOST_ID, turn_id),
+                ).fetchall()
         ]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     encoded_public = "\n".join(public_payloads)

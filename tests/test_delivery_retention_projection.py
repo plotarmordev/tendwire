@@ -21,7 +21,6 @@ from tendwire.store.sqlite import (
     list_worker_bindings,
     merge_turn_content,
     save_snapshot,
-    upsert_command_pending_turn,
     turns_payload_from_store,
     upsert_worker_bindings,
 )
@@ -38,7 +37,6 @@ CONTINUITY_RAW_SOURCE = "backend-source-stable-42"
 CONTINUITY_FINAL = "abcdefghijkl"
 PRIVATE_ROUTE_A = "private-route-worker-a"
 PRIVATE_ROUTE_B = "private-route-worker-b"
-FROZEN_LEGACY_SOURCE_A = "turnsrc-840f2677167ab65aa0655a39"
 
 
 def _owner_snapshot(
@@ -80,24 +78,6 @@ def _private_binding(snapshot: Snapshot, route: str) -> WorkerBinding:
         turn_target_value=route,
         sendable=True,
     )
-
-
-def _source_turn_payloads(db_path: Path) -> list[tuple[str, dict[str, Any], int]]:
-    with sqlite3.connect(str(db_path)) as conn:
-        rows = conn.execute(
-            """
-            SELECT turn_id, payload_json, list_sequence
-            FROM turns
-            WHERE host_id = ?
-            ORDER BY turn_id
-            """,
-            (HOST_ID,),
-        ).fetchall()
-    return [
-        (str(turn_id), json.loads(str(raw_payload)), int(list_sequence))
-        for turn_id, raw_payload, list_sequence in rows
-        if json.loads(str(raw_payload)).get("source_turn_id")
-    ]
 
 
 def _continuity_graph_snapshot(db_path: Path) -> dict[str, Any]:
@@ -167,7 +147,7 @@ def _assert_continuity_integrity(db_path: Path) -> None:
     with sqlite3.connect(str(db_path)) as conn:
         assert conn.execute("PRAGMA user_version").fetchone() == (
             store_sqlite.STORE_SCHEMA_VERSION,
-        ) == (19,)
+        ) == (21,)
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         current_counts = conn.execute(
             """
@@ -315,98 +295,6 @@ def _prepare_recoverable_graph(
     return recovered, public_responses
 
 
-def _freeze_source_token(db_path: Path, frozen_token: str) -> str:
-    rows = _source_turn_payloads(db_path)
-    assert len(rows) == 1
-    turn_id, payload, _list_sequence = rows[0]
-    payload["source_turn_id"] = frozen_token
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute(
-            """
-            UPDATE turns
-            SET payload_json = ?
-            WHERE host_id = ? AND turn_id = ?
-            """,
-            (json.dumps(payload, sort_keys=True), HOST_ID, turn_id),
-        )
-    return turn_id
-
-
-def _clone_ambiguous_source_alias(db_path: Path) -> str:
-    duplicate_turn_id = "turn-existing-v11-legacy-alias"
-    rows = _source_turn_payloads(db_path)
-    assert len(rows) == 1
-    original_turn_id, payload, _list_sequence = rows[0]
-    assert payload.get("source") == "worker:worker-a"
-    frozen_token = FROZEN_LEGACY_SOURCE_A
-    payload["id"] = duplicate_turn_id
-    payload["source_turn_id"] = frozen_token
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute("PRAGMA foreign_keys = ON")
-        original = conn.execute(
-            """
-            SELECT worker_id, worker_fingerprint, space_id, status, kind,
-                   updated_at, snapshot_content_fingerprint, observed_at
-            FROM turns
-            WHERE host_id = ? AND turn_id = ?
-            """,
-            (HOST_ID, original_turn_id),
-        ).fetchone()
-        current = conn.execute(
-            """
-            SELECT user_text, assistant_final_text, user_state, final_state
-            FROM turn_content_revisions
-            WHERE host_id = ? AND turn_id = ? AND is_current = 1
-            """,
-            (HOST_ID, original_turn_id),
-        ).fetchone()
-        assert original is not None
-        assert current is not None
-        list_sequence = store_sqlite._turn_list_sequence_conn(
-            conn,
-            HOST_ID,
-            duplicate_turn_id,
-        )
-        conn.execute(
-            """
-            INSERT INTO turns (
-                host_id, turn_id, worker_id, worker_fingerprint, space_id,
-                status, kind, updated_at, fingerprint,
-                snapshot_content_fingerprint, observed_at, payload_json,
-                list_sequence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                HOST_ID,
-                duplicate_turn_id,
-                *original[:6],
-                f"frozen-fingerprint-{duplicate_turn_id}",
-                original[6],
-                original[7],
-                json.dumps(payload, sort_keys=True),
-                list_sequence,
-            ),
-        )
-        revision = store_sqlite._insert_turn_content_revision_conn(
-            conn,
-            host_id=HOST_ID,
-            turn_id=duplicate_turn_id,
-            user_text=current[0],
-            assistant_final_text=current[1],
-            user_state=str(current[2]),
-            final_state=str(current[3]),
-            created_at="2026-01-02T00:00:05+00:00",
-        )
-        assert store_sqlite._ensure_final_ready_anchor_conn(
-            conn,
-            host_id=HOST_ID,
-            turn_id=duplicate_turn_id,
-            content_revision_value=revision,
-            now="2026-01-02T00:00:05+00:00",
-        ) is not None
-    return duplicate_turn_id
-
-
 def _snapshot(db_path: Path, *, status: str = "active", second: int = 0) -> Snapshot:
     return project_from_raw(
         Config(host_id=HOST_ID, db_path=db_path),
@@ -442,6 +330,7 @@ def _seed_complete_final(db_path: Path, snapshot: Snapshot) -> tuple[str, str]:
         HOST_ID,
         WORKER_ID,
         {
+            "source_turn_id": "snapshot-complete-source",
             "user_text": USER_TEXT,
             "assistant_final_text": FINAL_TEXT,
             "complete": True,
@@ -1038,22 +927,13 @@ def test_snapshot_projection_and_anchor_roll_back_together(
     assert snapshot_count == 1
 
 
-def test_snapshot_omission_preserves_real_command_and_source_provenance(
+def test_snapshot_omission_preserves_observed_source_provenance(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "snapshot-provenance.db"
     original = _snapshot(db_path)
     init_store(db_path)
     save_snapshot(db_path, original)
-    pending = upsert_command_pending_turn(
-        db_path,
-        HOST_ID,
-        original.workers[0],
-        request_id="command-retained",
-        instruction_text=USER_TEXT,
-        observed_at="2026-01-01T00:00:01+00:00",
-    )
-    assert pending is not None
     assert merge_turn_content(
         db_path,
         HOST_ID,
@@ -1079,7 +959,7 @@ def test_snapshot_omission_preserves_real_command_and_source_provenance(
         ]
     assert len(source_turns) == 1
     turn_id, source_payload = source_turns[0]
-    assert source_payload["origin_command_id"] == "command-retained"
+    assert source_payload.get("origin_command_id") is None
     source_identity = str(source_payload["source_turn_id"])
     assert source_identity.startswith("turnsrc-")
 
@@ -1107,7 +987,7 @@ def test_snapshot_omission_preserves_real_command_and_source_provenance(
         ).fetchone()[0]
     assert surviving is not None
     surviving_payload = json.loads(str(surviving[0]))
-    assert surviving_payload["origin_command_id"] == "command-retained"
+    assert surviving_payload.get("origin_command_id") is None
     assert surviving_payload["source_turn_id"] == source_identity
     assert anchor_count == 1
 
@@ -1150,7 +1030,7 @@ def test_stale_different_fingerprint_snapshot_cannot_regress_or_prune_projection
     latest = latest_snapshot(db_path, HOST_ID)
 
     assert worker_status == ("waiting",)
-    assert turn_status == ("waiting",)
+    assert turn_status == ("active",)
     assert snapshot_count == 2
     assert anchor_count == 1
     assert latest is not None
@@ -1296,216 +1176,4 @@ def test_same_owner_exact_source_survives_worker_fingerprint_space_and_source_ch
             """,
             (HOST_ID,),
         ).fetchone() == (0,)
-    _assert_continuity_integrity(db_path)
-
-
-@pytest.mark.parametrize(
-    ("replacement_key", "expected_source_count", "expected_root_kinds"),
-    [
-        pytest.param(
-            STABLE_KEY_A,
-            1,
-            ("final_ready",),
-            id="exact-owner",
-        ),
-        pytest.param(
-            STABLE_KEY_B,
-            2,
-            ("final_ready", "final_ready"),
-            id="different-owner",
-        ),
-        pytest.param(
-            None,
-            2,
-            ("final_ready", "final_migration_hold"),
-            id="missing-owner",
-        ),
-    ],
-)
-def test_existing_v12_legacy_source_token_dual_matches_only_exact_owner(
-    tmp_path: Path,
-    replacement_key: str | None,
-    expected_source_count: int,
-    expected_root_kinds: tuple[str, ...],
-) -> None:
-    label = replacement_key[-1] if replacement_key is not None else "missing"
-    db_path = tmp_path / f"existing-v12-legacy-token-{label}.db"
-    first = _owner_snapshot(
-        db_path,
-        worker_id="worker-a",
-        stable_key=STABLE_KEY_A,
-        space_id="space-a",
-        second=0,
-    )
-    init_store(db_path)
-    assert save_snapshot(db_path, first) is True
-    _merge_continuity_final(
-        db_path,
-        first,
-        worker_id="worker-a",
-        observed_at="2026-01-02T00:00:01+00:00",
-    )
-    historical_turn_id = _freeze_source_token(db_path, FROZEN_LEGACY_SOURCE_A)
-    before = _continuity_graph_snapshot(db_path)
-
-    replacement = _owner_snapshot(
-        db_path,
-        worker_id="worker-b",
-        stable_key=replacement_key,
-        space_id="space-b",
-        second=10,
-    )
-    assert save_snapshot(db_path, replacement) is True
-    assert merge_turn_content(
-        db_path,
-        HOST_ID,
-        "worker-b",
-        {
-            "source_turn_id": CONTINUITY_RAW_SOURCE,
-            "assistant_final_text": CONTINUITY_FINAL,
-            "complete": True,
-            "has_open_turn": False,
-        },
-        observed_at="2026-01-02T00:00:11+00:00",
-    ) == 1
-
-    source_rows = _source_turn_payloads(db_path)
-    assert len(source_rows) == expected_source_count
-    historical = next(row for row in source_rows if row[0] == historical_turn_id)
-    assert historical[1]["id"] == historical_turn_id
-    assert historical[1]["source_turn_id"] == FROZEN_LEGACY_SOURCE_A
-    root_rows: list[tuple[str, str, dict[str, Any]]] = []
-    with sqlite3.connect(str(db_path)) as conn:
-        root_rows = [
-            (str(turn_id), str(kind), json.loads(str(raw_payload)))
-            for turn_id, kind, raw_payload in conn.execute(
-                """
-                SELECT turn_id, delivery_kind, payload_json
-                FROM connector_outbox
-                WHERE host_id = ?
-                  AND delivery_kind IN ('final_ready', 'final_migration_hold')
-                ORDER BY id
-                """,
-                (HOST_ID,),
-            ).fetchall()
-        ]
-    assert tuple(row[1] for row in root_rows) == expected_root_kinds
-
-    if replacement_key == STABLE_KEY_A:
-        assert _continuity_graph_snapshot(db_path) == before
-        assert root_rows[0][0] == historical_turn_id
-        assert root_rows[0][2]["stable_key"] == STABLE_KEY_A
-    elif replacement_key == STABLE_KEY_B:
-        assert {row[2]["stable_key"] for row in root_rows} == {
-            STABLE_KEY_A,
-            STABLE_KEY_B,
-        }
-        assert len({row[0] for row in root_rows}) == 2
-    else:
-        assert root_rows[0][2]["stable_key"] == STABLE_KEY_A
-        assert root_rows[1][2]["schema_version"] == 1
-        assert "stable_key" not in root_rows[1][2]
-        assert len({row[0] for row in root_rows}) == 2
-
-    after_first_replay = _continuity_graph_snapshot(db_path)
-    init_store(db_path)
-    assert save_snapshot(db_path, replacement) is True
-    assert merge_turn_content(
-        db_path,
-        HOST_ID,
-        "worker-b",
-        {
-            "source_turn_id": CONTINUITY_RAW_SOURCE,
-            "assistant_final_text": CONTINUITY_FINAL,
-            "complete": True,
-            "has_open_turn": False,
-        },
-        observed_at="2026-01-02T00:00:11+00:00",
-    ) == 0
-    assert _continuity_graph_snapshot(db_path) == after_first_replay
-    _assert_continuity_integrity(db_path)
-
-
-def test_exact_owner_source_ambiguity_rolls_back_turn_pending_and_graph(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "existing-v12-source-ambiguity.db"
-    first = _owner_snapshot(
-        db_path,
-        worker_id="worker-a",
-        stable_key=STABLE_KEY_A,
-        space_id="space-a",
-        second=0,
-    )
-    init_store(db_path)
-    assert save_snapshot(db_path, first) is True
-    _merge_continuity_final(
-        db_path,
-        first,
-        worker_id="worker-a",
-        observed_at="2026-01-02T00:00:01+00:00",
-    )
-
-    second = _owner_snapshot(
-        db_path,
-        worker_id="worker-b",
-        stable_key=STABLE_KEY_A,
-        space_id="space-b",
-        second=10,
-    )
-    assert save_snapshot(db_path, second) is True
-    binding = _private_binding(second, PRIVATE_ROUTE_B)
-    upsert_worker_bindings(db_path, [binding])
-    duplicate_turn_id = _clone_ambiguous_source_alias(db_path)
-    before = _continuity_graph_snapshot(db_path)
-    before_turns = _turn_rows_snapshot(db_path)
-    assert len(before["source_identities"]) == 2
-    assert duplicate_turn_id in {row[0] for row in before["source_identities"]}
-
-    with pytest.raises(
-        store_sqlite.StoreSchemaError,
-        match="turn_owner_source_ambiguous",
-    ):
-        store_sqlite.apply_turn_refresh(
-            db_path,
-            HOST_ID,
-            "worker-b",
-            {
-                "source_turn_id": CONTINUITY_RAW_SOURCE,
-                "assistant_final_text": CONTINUITY_FINAL,
-                "complete": True,
-                "has_open_turn": False,
-            },
-            backend_pending={
-                "question": "must roll back with ambiguous source",
-                "choices": [{"choice_id": "rollback-choice", "label": "Rollback"}],
-            },
-            expected_binding=binding,
-            observed_at="2026-01-02T00:00:11+00:00",
-        )
-
-    assert _continuity_graph_snapshot(db_path) == before
-    assert _turn_rows_snapshot(db_path) == before_turns
-    assert store_sqlite.list_backend_pending(db_path, HOST_ID) == {}
-    with sqlite3.connect(str(db_path)) as conn:
-        assert conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM connector_outbox
-            WHERE host_id = ?
-              AND delivery_kind = 'final_ready'
-              AND status IN ('queued', 'deferred', 'retry')
-            """,
-            (HOST_ID,),
-        ).fetchone() == (2,)
-        assert conn.execute(
-            "SELECT COUNT(*) FROM turns WHERE host_id = ?",
-            (HOST_ID,),
-        ).fetchone()[0] == len(before["turn_content_revisions"])
-    _assert_continuity_integrity(db_path)
-
-    init_store(db_path)
-    assert _continuity_graph_snapshot(db_path) == before
-    assert _turn_rows_snapshot(db_path) == before_turns
-    assert store_sqlite.list_backend_pending(db_path, HOST_ID) == {}
     _assert_continuity_integrity(db_path)
