@@ -16,7 +16,16 @@ from pathlib import Path
 
 HERDR_BACKENDS = frozenset({"cli", "socket"})
 TURN_MODELS = frozenset({"legacy", "dual", "shadow", "observed"})
+AGENT_EVENT_SOURCES = frozenset(
+    {"legacy", "acp_shadow", "acp_preferred", "acp_required"}
+)
+ACP_THOUGHT_POLICIES = frozenset({"disabled", "private_summary", "private_all"})
 DEFAULT_TURN_MODEL = "observed"
+DEFAULT_AGENT_EVENT_SOURCE = "acp_preferred"
+DEFAULT_ACP_THOUGHT_POLICY = "private_summary"
+DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS = 30.0
+DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+DEFAULT_ACP_MAX_FRAME_BYTES = 8 * 1024 * 1024
 DEFAULT_EVENT_DEBOUNCE_SECONDS = 0.05
 DEFAULT_RECONCILE_INTERVAL_SECONDS = 300.0
 DEFAULT_EVENT_RETENTION_DAYS = 7
@@ -64,6 +73,11 @@ class Config:
     herdr_timeout_seconds: float = 5.0
     herdr_backend: str = "cli"
     turn_model: str = DEFAULT_TURN_MODEL
+    agent_event_source: str = DEFAULT_AGENT_EVENT_SOURCE
+    acp_thought_policy: str = DEFAULT_ACP_THOUGHT_POLICY
+    acp_request_timeout_seconds: float = DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS
+    acp_shutdown_timeout_seconds: float = DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS
+    acp_max_frame_bytes: int = DEFAULT_ACP_MAX_FRAME_BYTES
     event_debounce_seconds: float = DEFAULT_EVENT_DEBOUNCE_SECONDS
     reconcile_interval_seconds: float = DEFAULT_RECONCILE_INTERVAL_SECONDS
     event_retention_days: int = DEFAULT_EVENT_RETENTION_DAYS
@@ -126,6 +140,41 @@ class Config:
                 "turn_model=%s is a compatibility alias and behaves as observed",
                 turn_model,
             )
+        agent_event_source = str(self.agent_event_source or "").strip().lower()
+        if agent_event_source not in AGENT_EVENT_SOURCES:
+            allowed = ", ".join(sorted(AGENT_EVENT_SOURCES))
+            raise ValueError(f"agent_event_source must be one of: {allowed}")
+        object.__setattr__(self, "agent_event_source", agent_event_source)
+        acp_thought_policy = str(self.acp_thought_policy or "").strip().lower()
+        if acp_thought_policy not in ACP_THOUGHT_POLICIES:
+            allowed = ", ".join(sorted(ACP_THOUGHT_POLICIES))
+            raise ValueError(f"acp_thought_policy must be one of: {allowed}")
+        object.__setattr__(self, "acp_thought_policy", acp_thought_policy)
+        object.__setattr__(
+            self,
+            "acp_request_timeout_seconds",
+            _positive_finite_float(
+                self.acp_request_timeout_seconds,
+                "acp_request_timeout_seconds",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "acp_shutdown_timeout_seconds",
+            _positive_finite_float(
+                self.acp_shutdown_timeout_seconds,
+                "acp_shutdown_timeout_seconds",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "acp_max_frame_bytes",
+            _bounded_positive_int(
+                self.acp_max_frame_bytes,
+                "acp_max_frame_bytes",
+                maximum=64 * 1024 * 1024,
+            ),
+        )
         object.__setattr__(
             self,
             "event_debounce_seconds",
@@ -443,6 +492,11 @@ def load_config(
     herdr_timeout_seconds: float | str | None = None,
     herdr_backend: str | None = None,
     turn_model: str | None = None,
+    agent_event_source: str | None = None,
+    acp_thought_policy: str | None = None,
+    acp_request_timeout_seconds: float | str | None = None,
+    acp_shutdown_timeout_seconds: float | str | None = None,
+    acp_max_frame_bytes: int | str | None = None,
     event_debounce_seconds: float | str | None = None,
     reconcile_interval_seconds: float | str | None = None,
     event_retention_days: int | str | None = None,
@@ -537,6 +591,31 @@ def load_config(
             turn_model,
             "TENDWIRE_TURN_MODEL",
             DEFAULT_TURN_MODEL,
+        ),
+        agent_event_source=_resolve_value(
+            agent_event_source,
+            "TENDWIRE_AGENT_EVENT_SOURCE",
+            DEFAULT_AGENT_EVENT_SOURCE,
+        ),
+        acp_thought_policy=_resolve_value(
+            acp_thought_policy,
+            "TENDWIRE_ACP_THOUGHT_POLICY",
+            DEFAULT_ACP_THOUGHT_POLICY,
+        ),
+        acp_request_timeout_seconds=_resolve_value(
+            acp_request_timeout_seconds,
+            "TENDWIRE_ACP_REQUEST_TIMEOUT_SECONDS",
+            DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS,
+        ),
+        acp_shutdown_timeout_seconds=_resolve_value(
+            acp_shutdown_timeout_seconds,
+            "TENDWIRE_ACP_SHUTDOWN_TIMEOUT_SECONDS",
+            DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS,
+        ),
+        acp_max_frame_bytes=_resolve_value(
+            acp_max_frame_bytes,
+            "TENDWIRE_ACP_MAX_FRAME_BYTES",
+            DEFAULT_ACP_MAX_FRAME_BYTES,
         ),
         event_debounce_seconds=_resolve_value(
             event_debounce_seconds,

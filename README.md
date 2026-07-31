@@ -35,6 +35,11 @@ through the Herdr socket/event backend. Both paths normalize Herdr state into
 neutral Tendwire spaces, workers, attention, turns, pending interactions,
 command results, connector jobs, and backend health.
 
+ACP is the preferred semantic source for compatible, authenticated worker
+sessions while Herdr remains the process and identity authority. Source
+precedence, privacy, fallback behavior, and cross-repository rollout are
+defined in [docs/acp-migration.md](docs/acp-migration.md).
+
 Herdres can use Tendwire as its source/control plane while Herdres remains the
 Telegram connector. Tendwire owns Herdr observation, private bindings,
 turns/pending interactions, attention, command routing, receipts, backend
@@ -548,6 +553,11 @@ variables:
 | `turn_refresh_interval_seconds` | `TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS` | `2.0` | finite positive float |
 | `turn_refresh_workers` | `TENDWIRE_TURN_REFRESH_WORKERS` | `4` | integer from 1 through 32 and no greater than `max_workers` |
 | `turn_model` | `TENDWIRE_TURN_MODEL` | `observed` | `observed`; `legacy`, `dual`, and `shadow` are deprecated aliases with identical observed behavior |
+| `agent_event_source` | `TENDWIRE_AGENT_EVENT_SOURCE` | `acp_preferred` | `legacy`, `acp_shadow`, `acp_preferred`, or `acp_required` |
+| `acp_thought_policy` | `TENDWIRE_ACP_THOUGHT_POLICY` | `private_summary` | `disabled`, `private_summary`, or `private_all`; never a public-delivery grant |
+| `acp_request_timeout_seconds` | `TENDWIRE_ACP_REQUEST_TIMEOUT_SECONDS` | `30.0` | finite positive float |
+| `acp_shutdown_timeout_seconds` | `TENDWIRE_ACP_SHUTDOWN_TIMEOUT_SECONDS` | `5.0` | finite positive float |
+| `acp_max_frame_bytes` | `TENDWIRE_ACP_MAX_FRAME_BYTES` | `8388608` | integer from 1 through 67108864 |
 
 The socket/event backend uses `event_debounce_seconds` for event batching and
 `reconcile_interval_seconds` for bounded periodic full reconciles. Set
@@ -559,6 +569,14 @@ workers than the cap, Tendwire reports a degraded
 snapshot/projections instead of publishing a truncated authoritative snapshot.
 Incremental events that would add workers over the cap are ignored with the
 same public-safe degraded evidence.
+
+`acp_preferred` means ACP is the primary semantic source only for workers with
+an authenticated ACP session binding; workers without one continue through the
+existing Herdr turn adapters. `acp_shadow` persists and compares ACP events but
+does not project them into turns. `acp_required` fails closed for an unbound or
+unhealthy ACP worker. None of these modes makes agent thoughts public: thought
+events remain private diagnostic data unless a separate, explicit sanitized
+projection is introduced.
 
 Snapshot history defaults are sized for a five-minute observation rhythm:
 $14 \times 24 \times 12 = 4032$ observations, while the 4096-row count

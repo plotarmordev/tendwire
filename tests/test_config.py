@@ -9,6 +9,11 @@ import sys
 import pytest
 
 from tendwire.config import (
+    DEFAULT_ACP_MAX_FRAME_BYTES,
+    DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS,
+    DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS,
+    DEFAULT_ACP_THOUGHT_POLICY,
+    DEFAULT_AGENT_EVENT_SOURCE,
     DEFAULT_COMMAND_RECEIPT_RETENTION_COUNT,
     DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS,
     DEFAULT_COMMAND_RETRY_HORIZON_SECONDS,
@@ -25,6 +30,84 @@ from tendwire.config import (
     Config,
     load_config,
 )
+
+
+def test_acp_event_source_defaults_to_preferred_with_private_summaries(
+    monkeypatch,
+) -> None:
+    for name in (
+        "TENDWIRE_AGENT_EVENT_SOURCE",
+        "TENDWIRE_ACP_THOUGHT_POLICY",
+        "TENDWIRE_ACP_REQUEST_TIMEOUT_SECONDS",
+        "TENDWIRE_ACP_SHUTDOWN_TIMEOUT_SECONDS",
+        "TENDWIRE_ACP_MAX_FRAME_BYTES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    config = load_config()
+
+    assert config.agent_event_source == DEFAULT_AGENT_EVENT_SOURCE == "acp_preferred"
+    assert config.acp_thought_policy == DEFAULT_ACP_THOUGHT_POLICY == "private_summary"
+    assert config.acp_request_timeout_seconds == DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS == 30.0
+    assert config.acp_shutdown_timeout_seconds == DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS == 5.0
+    assert config.acp_max_frame_bytes == DEFAULT_ACP_MAX_FRAME_BYTES == 8 * 1024 * 1024
+
+
+def test_acp_configuration_uses_explicit_before_environment(monkeypatch) -> None:
+    monkeypatch.setenv("TENDWIRE_AGENT_EVENT_SOURCE", "acp_shadow")
+    monkeypatch.setenv("TENDWIRE_ACP_THOUGHT_POLICY", "private_all")
+    monkeypatch.setenv("TENDWIRE_ACP_REQUEST_TIMEOUT_SECONDS", "11")
+    monkeypatch.setenv("TENDWIRE_ACP_SHUTDOWN_TIMEOUT_SECONDS", "3")
+    monkeypatch.setenv("TENDWIRE_ACP_MAX_FRAME_BYTES", "4096")
+
+    environment = load_config()
+    explicit = load_config(
+        agent_event_source="acp_required",
+        acp_thought_policy="disabled",
+        acp_request_timeout_seconds="7.5",
+        acp_shutdown_timeout_seconds="2.5",
+        acp_max_frame_bytes="8192",
+    )
+
+    assert environment.agent_event_source == "acp_shadow"
+    assert environment.acp_thought_policy == "private_all"
+    assert environment.acp_request_timeout_seconds == 11.0
+    assert environment.acp_shutdown_timeout_seconds == 3.0
+    assert environment.acp_max_frame_bytes == 4096
+    assert explicit.agent_event_source == "acp_required"
+    assert explicit.acp_thought_policy == "disabled"
+    assert explicit.acp_request_timeout_seconds == 7.5
+    assert explicit.acp_shutdown_timeout_seconds == 2.5
+    assert explicit.acp_max_frame_bytes == 8192
+
+
+@pytest.mark.parametrize("value", ["", "acp", "preferred", "future"])
+def test_acp_event_source_rejects_unknown_values(value: str) -> None:
+    with pytest.raises(ValueError, match="agent_event_source must be one of"):
+        Config(agent_event_source=value)
+
+
+@pytest.mark.parametrize("value", ["", "public", "summary", "future"])
+def test_acp_thought_policy_rejects_unknown_values(value: str) -> None:
+    with pytest.raises(ValueError, match="acp_thought_policy must be one of"):
+        Config(acp_thought_policy=value)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("acp_request_timeout_seconds", 0),
+        ("acp_request_timeout_seconds", float("inf")),
+        ("acp_shutdown_timeout_seconds", -1),
+        ("acp_shutdown_timeout_seconds", "invalid"),
+        ("acp_max_frame_bytes", 0),
+        ("acp_max_frame_bytes", True),
+        ("acp_max_frame_bytes", 64 * 1024 * 1024 + 1),
+    ],
+)
+def test_acp_bounds_reject_invalid_values(field: str, value: object) -> None:
+    with pytest.raises(ValueError):
+        Config(**{field: value})
 
 
 def test_turn_model_defaults_to_observed_and_accepts_compatibility_aliases(
