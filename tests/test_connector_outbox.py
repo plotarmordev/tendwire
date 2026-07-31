@@ -1754,7 +1754,7 @@ def test_v6_to_current_plan_migration_is_bounded_atomic_and_preserves_jobs(
             ).fetchall()
         }
         foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
-    assert version == store_sqlite.STORE_SCHEMA_VERSION == 21
+    assert version == store_sqlite.STORE_SCHEMA_VERSION == 22
     assert plan_row == (plan["plan_token"], 1, None, "active")
     assert job_count == 2
     assert outbox_count == 3
