@@ -201,6 +201,10 @@ class AcpRuntimeCoordinator:
         self._console_failure_type: str | None = None
         self._console_failed_workers: set[str] = set()
         self._console_failed_claims: dict[str, str] = {}
+        # Exact ACP ownership survives runtime retirement. Preferred mode may
+        # use legacy PTY I/O only after Herdr positively stops publishing this
+        # exact worker identity, never merely because reminting failed.
+        self._published_acp_claims: dict[str, str] = {}
 
     def start(self) -> "AcpRuntimeCoordinator":
         with self._lock:
@@ -437,6 +441,7 @@ class AcpRuntimeCoordinator:
                     and slot.continuity.worker_fingerprint == worker_fingerprint
                 )
                 or self._console_failed_claims.get(worker_id) == worker_fingerprint
+                or self._published_acp_claims.get(worker_id) == worker_fingerprint
             )
 
     def owns_permission_decision(self, decision: Any) -> bool:
@@ -562,6 +567,9 @@ class AcpRuntimeCoordinator:
             with self._lock:
                 self._console_failed_workers.add(worker_id)
                 self._console_failed_claims[worker_id] = (
+                    slot.continuity.worker_fingerprint
+                )
+                self._published_acp_claims[worker_id] = (
                     slot.continuity.worker_fingerprint
                 )
                 self._console_degraded = True
@@ -1036,8 +1044,11 @@ class AcpRuntimeCoordinator:
         current, ambiguities = self._continuity_bindings()
         with self._lock:
             failed_claims = tuple(self._console_failed_claims.items())
+            published_claims = tuple(self._published_acp_claims.items())
         exact_authorities = (
-            self._herdr_authority_claims() if failed_claims else set()
+            self._herdr_authority_claims()
+            if failed_claims or published_claims
+            else set()
         )
         with self._lock:
             stale = [worker_id for worker_id in self._slots if worker_id not in current]
@@ -1045,11 +1056,23 @@ class AcpRuntimeCoordinator:
                 worker_id
                 for worker_id, fingerprint in failed_claims
                 if (worker_id, fingerprint) not in exact_authorities
+                and worker_id not in self._slots
                 and self._console_failed_claims.get(worker_id) == fingerprint
             ]
             for worker_id in disappeared_failures:
                 self._console_failed_workers.discard(worker_id)
-                self._console_failed_claims.pop(worker_id, None)
+                failed_fingerprint = self._console_failed_claims.pop(worker_id, None)
+                if self._published_acp_claims.get(worker_id) == failed_fingerprint:
+                    self._published_acp_claims.pop(worker_id, None)
+            disappeared_published = [
+                worker_id
+                for worker_id, fingerprint in published_claims
+                if (worker_id, fingerprint) not in exact_authorities
+                and worker_id not in self._slots
+                and self._published_acp_claims.get(worker_id) == fingerprint
+            ]
+            for worker_id in disappeared_published:
+                self._published_acp_claims.pop(worker_id, None)
             self._console_degraded = bool(self._console_failed_workers)
             if not self._console_degraded:
                 self._console_failure_type = None
@@ -1086,12 +1109,16 @@ class AcpRuntimeCoordinator:
                 if continuity is None:
                     with self._lock:
                         failed_fingerprint = self._console_failed_claims.get(worker_id)
+                        published_fingerprint = self._published_acp_claims.get(
+                            worker_id
+                        )
+                    claimed_fingerprint = failed_fingerprint or published_fingerprint
                     authority_remains = True
-                    if failed_fingerprint is not None:
+                    if claimed_fingerprint is not None:
                         try:
                             authority_remains = (
                                 worker_id,
-                                failed_fingerprint,
+                                claimed_fingerprint,
                             ) in self._herdr_authority_claims()
                         except Exception:
                             # A failed ownership check cannot safely reopen PTY
@@ -1101,6 +1128,7 @@ class AcpRuntimeCoordinator:
                         if worker_id not in self._slots and not authority_remains:
                             self._console_failed_workers.discard(worker_id)
                             self._console_failed_claims.pop(worker_id, None)
+                            self._published_acp_claims.pop(worker_id, None)
                             self._console_degraded = bool(
                                 self._console_failed_workers
                             )
@@ -1195,6 +1223,9 @@ class AcpRuntimeCoordinator:
         with self._lock:
             displaced = self._slots.get(continuity.worker_id)
             self._slots[continuity.worker_id] = slot
+            self._published_acp_claims[continuity.worker_id] = (
+                continuity.worker_fingerprint
+            )
         if displaced is not None:
             self._stop_runtime(displaced.runtime)
 

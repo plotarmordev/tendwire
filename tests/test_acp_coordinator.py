@@ -836,6 +836,63 @@ def test_first_console_failure_survives_unique_route_ambiguity_and_retirement(
     assert coordinator.status()["healthy"] is False
 
 
+def test_published_claim_survives_unhealthy_runtime_retire_and_failed_remint(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, policy="acp_preferred")
+    worker = _seed(config)
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        reconcile_interval=60.0,
+    )
+    coordinator._state = RuntimeState.RUNNING
+    runtime = SimpleNamespace(
+        status=lambda: SimpleNamespace(healthy=False, failure_type="runtime_failed"),
+        stop=lambda *, timeout: None,
+        _binding=_binding(),
+    )
+    slot = _RuntimeSlot(
+        _binding(),
+        "42",
+        runtime,
+        console=HerdrAcpConsoleEndpoint(42, "console-lease"),
+    )
+    coordinator._slots[worker.id] = slot
+    coordinator._published_acp_claims[worker.id] = worker.fingerprint
+    coordinator._continuity_bindings = (  # type: ignore[method-assign]
+        lambda: ({worker.id: _binding()}, 0)
+    )
+    coordinator._resolve_endpoint = (  # type: ignore[method-assign]
+        lambda _continuity: (_ for _ in ()).throw(
+            AcpCoordinatorError("replacement attach failed")
+        )
+    )
+
+    coordinator._reconcile_locked(strict=False)
+
+    assert worker.id not in coordinator._slots
+    assert coordinator.claims_worker(worker.id, worker.fingerprint) is True
+
+    def forbidden_legacy(_config: Config) -> Any:
+        raise AssertionError("published ACP ownership must survive failed remint")
+
+    envelope = submit_command(
+        config,
+        _request("unhealthy-runtime-failed-remint"),
+        socket_client_factory=forbidden_legacy,
+        acp_prompt_router=coordinator.prompt_route,
+        acp_worker_owner=coordinator.claims_worker,
+    )
+    assert envelope.status == "backend_unavailable"
+    assert envelope.disposition == "no_receipt"
+    assert get_command_request(
+        config.db_path,
+        config.host_id,
+        "unhealthy-runtime-failed-remint",
+    ) is None
+
+
 def test_console_submission_rejects_a_retired_generation_before_store_access(
     tmp_path: Path,
 ) -> None:
@@ -1644,6 +1701,9 @@ def test_reconnect_remints_endpoint_instead_of_replaying_attach_ticket(tmp_path:
     ).start()
     try:
         assert minted == ["one-shot-private-ticket-1"]
+        assert coordinator._published_acp_claims == {
+            "worker-1": "worker-fingerprint"
+        }
         coordinator._reconcile_worker("worker-1", strict=True)
         worker = Worker(
             id="worker-1",
