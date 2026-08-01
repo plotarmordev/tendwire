@@ -16,12 +16,20 @@ import pytest
 from tendwire.backends.acp_coordinator import (
     AcpCoordinatorError,
     AcpRuntimeCoordinator,
+    HerdrAcpConsoleEndpoint,
+    _RuntimeSlot,
     _derived_binding,
+    _console_event_output,
+    _console_permission_selection,
+    _load_console_event_cursor,
+    _load_console_input_cursor,
+    _parse_console_exchange,
     _parse_endpoint,
     _parse_status,
     production_acp_runtime_factory,
 )
 from tendwire.backends.herdr_turns import TurnIngestionScheduler, TurnRefreshResult
+from tendwire.backends.acp_runtime import RuntimeState
 from tendwire.command_submission import submit_acp_command, submit_command
 from tendwire.config import Config
 from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
@@ -30,6 +38,7 @@ from tendwire.store.sqlite import (
     get_command_request,
     init_store,
     list_worker_bindings,
+    record_agent_event,
     save_snapshot,
     upsert_worker_bindings,
 )
@@ -78,6 +87,10 @@ def _endpoint(*, generation: int = 42, lifecycle: str = "acp_owned_ready") -> di
             ],
             "protocol_version": 1,
         },
+        "console": {
+            "generation": generation,
+            "lease": "console-coordinator-private-lease",
+        },
         "worker": {
             "terminal_id": "pane-private",
             "workspace_id": "workspace-private",
@@ -103,6 +116,7 @@ def _status(*, generation: int = 42, lifecycle: str = "acp_owned_attached") -> d
         "session": endpoint["session"],
         "cwd": endpoint["cwd"],
         "lifecycle": lifecycle,
+        "console_lifecycle": "attached",
     }
 
 
@@ -137,6 +151,402 @@ def test_endpoint_requires_explicit_acp_ownership_and_strict_attach_shape(tmp_pa
     wrong_status["worker"]["terminal_id"] = "other-terminal"
     with pytest.raises(AcpCoordinatorError, match="target changed"):
         _parse_status(terminal_binding, wrong_status)
+
+
+def test_console_exchange_requires_floor_and_next_sequence_contract() -> None:
+    result = {
+        "type": "agent_acp_console_exchange",
+        "inputs": [{"sequence": 3, "text": "continue"}],
+        "outputs": [],
+        "input_floor_sequence": 3,
+        "output_floor_sequence": 1,
+        "next_input_sequence": 4,
+        "next_output_sequence": 1,
+    }
+    assert _parse_console_exchange(result, 2) == ((3, "continue"),)
+    missing_next = dict(result)
+    missing_next.pop("next_input_sequence")
+    with pytest.raises(AcpCoordinatorError, match="shape"):
+        _parse_console_exchange(missing_next, 2)
+    lost = dict(result, input_floor_sequence=4)
+    with pytest.raises(AcpCoordinatorError, match="gap"):
+        _parse_console_exchange(lost, 2)
+
+    incomplete = dict(result, inputs=[], next_input_sequence=4)
+    with pytest.raises(AcpCoordinatorError, match="incomplete"):
+        _parse_console_exchange(incomplete, 2)
+
+    output = dict(
+        result,
+        outputs=[
+            {
+                "sequence": 7,
+                "event_id": "event-7",
+                "stream": "assistant",
+                "text": "done",
+            }
+        ],
+        output_floor_sequence=7,
+        next_output_sequence=8,
+    )
+    assert _parse_console_exchange(output, 2) == ((3, "continue"),)
+    malformed_output = dict(output, outputs=[{"sequence": 7, "text": "done"}])
+    with pytest.raises(AcpCoordinatorError, match="output shape"):
+        _parse_console_exchange(malformed_output, 2)
+    wrong_output_next = dict(output, next_output_sequence=9)
+    with pytest.raises(AcpCoordinatorError, match="next output"):
+        _parse_console_exchange(wrong_output_next, 2)
+
+
+def test_console_event_projection_covers_messages_thought_tools_and_plan() -> None:
+    assert _console_event_output("agent_message", {"text_delta": "done"}) == (
+        "assistant",
+        "done",
+    )
+    assert _console_event_output("thought", {"text_delta": "reason"}) == (
+        "thought",
+        "reason",
+    )
+    assert _console_event_output(
+        "tool_call_update", {"snapshot": {"title": "pytest", "status": "completed"}}
+    ) == ("tool", "pytest [completed]")
+    assert _console_event_output(
+        "tool_call_update",
+        {
+            "snapshot": {
+                "title": "Edit source",
+                "status": "completed",
+                "rawInput": {"secret": "not rendered"},
+                "rawOutput": "not rendered",
+                "content": [
+                    {"type": "content", "content": {"type": "text", "text": "done"}},
+                    {
+                        "type": "diff",
+                        "path": "/workspace/source.py",
+                        "oldText": "old",
+                        "newText": "new",
+                    },
+                ],
+            }
+        },
+    ) == (
+        "tool",
+        "Edit source [completed]\ndone\ndiff /workspace/source.py\n- old\n+ new",
+    )
+    assert _console_event_output(
+        "plan", {"entries": [{"content": "verify", "status": "in_progress"}]}
+    ) == ("plan", "[in_progress] verify")
+
+
+def test_console_permission_selection_is_explicit_and_fail_closed() -> None:
+    options = (("1", "Allow once (allow_once)"), ("2", "Reject (reject_once)"))
+    assert _console_permission_selection("1", options) == "1"
+    assert _console_permission_selection("allow", options) == "1"
+    assert _console_permission_selection("deny", options) == "2"
+    assert _console_permission_selection("do something else", options) is None
+
+
+def test_console_cursors_survive_restart_crash_boundaries(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    record_agent_event(
+        config.db_path,
+        config.host_id,
+        kind="extension",
+        source="tendwire-console",
+        worker_id="worker-1",
+        payload={"extension": "tendwire.acp.console_cursor", "sequence": 41},
+        source_session_id="session-a",
+        source_event_id="cursor:41",
+        visibility="private",
+    )
+    record_agent_event(
+        config.db_path,
+        config.host_id,
+        kind="extension",
+        source="tendwire-console",
+        worker_id="worker-1",
+        payload={
+            "extension": "tendwire.acp.console_input_cursor",
+            "generation": 42,
+            "input_sequence": 7,
+        },
+        source_session_id="session-a",
+        source_event_id="input:42:7",
+        visibility="private",
+    )
+    assert _load_console_event_cursor(
+        config.db_path, config.host_id, "worker-1", "session-a"
+    ) == 41
+    assert _load_console_input_cursor(
+        config.db_path, config.host_id, "worker-1", "session-a", 42
+    ) == 7
+    assert _load_console_input_cursor(
+        config.db_path, config.host_id, "worker-1", "session-a", 43
+    ) == 0
+
+
+def test_console_bridge_polls_independently_of_slow_reconcile_interval(
+    tmp_path: Path,
+) -> None:
+    coordinator = AcpRuntimeCoordinator(
+        _config(tmp_path), threading.Event(), reconcile_interval=60.0
+    )
+    ticks: list[float] = []
+
+    def tick() -> None:
+        ticks.append(time.monotonic())
+        if len(ticks) == 3:
+            coordinator._stop.set()
+
+    coordinator._bridge_console_slots = tick  # type: ignore[method-assign]
+    started = time.monotonic()
+    coordinator._run_console_bridge()
+    assert len(ticks) == 3
+    assert ticks[-1] - started < 0.5
+
+
+def test_console_bridge_dispatches_slow_workers_independently(tmp_path: Path) -> None:
+    coordinator = AcpRuntimeCoordinator(
+        _config(tmp_path), threading.Event(), reconcile_interval=60.0
+    )
+    slow_entered = threading.Event()
+    fast_entered = threading.Event()
+    release = threading.Event()
+
+    slow_slot = _RuntimeSlot(
+        _binding(),
+        "42",
+        SimpleNamespace(),
+        console=HerdrAcpConsoleEndpoint(42, "slow-lease"),
+    )
+    fast_slot = _RuntimeSlot(
+        replace(_binding(), worker_id="worker-2"),
+        "43",
+        SimpleNamespace(),
+        console=HerdrAcpConsoleEndpoint(43, "fast-lease"),
+    )
+    coordinator._slots = {"worker-1": slow_slot, "worker-2": fast_slot}
+
+    def bridge(slot: _RuntimeSlot) -> None:
+        if slot is slow_slot:
+            slow_entered.set()
+            assert release.wait(2.0)
+        else:
+            fast_entered.set()
+
+    coordinator._bridge_console_slot = bridge  # type: ignore[method-assign]
+    coordinator._bridge_console_slots()
+    try:
+        assert slow_entered.wait(1.0)
+        assert fast_entered.wait(1.0)
+    finally:
+        release.set()
+        for slot in (slow_slot, fast_slot):
+            thread = slot.console_bridge_thread
+            if thread is not None:
+                thread.join(timeout=1.0)
+
+
+def test_console_failure_remains_degraded_after_slot_disappears(tmp_path: Path) -> None:
+    coordinator = AcpRuntimeCoordinator(
+        _config(tmp_path, policy="acp_required"),
+        threading.Event(),
+        reconcile_interval=60.0,
+    )
+    coordinator._state = RuntimeState.RUNNING
+    slot = _RuntimeSlot(
+        _binding(),
+        "42",
+        SimpleNamespace(),
+        console=HerdrAcpConsoleEndpoint(42, "console-lease"),
+    )
+
+    def fail(_slot: _RuntimeSlot) -> None:
+        raise OSError("console unavailable")
+
+    coordinator._bridge_console_slot = fail  # type: ignore[method-assign]
+    coordinator._bridge_console_slot_supervised(slot)
+    assert coordinator.status()["healthy"] is False
+    coordinator._slots.clear()
+    coordinator._bridge_console_slots()
+    status = coordinator.status()
+    assert status["healthy"] is False
+    assert status["failure_type"] == "OSError"
+
+
+def test_console_submission_rejects_a_retired_generation_before_store_access(
+    tmp_path: Path,
+) -> None:
+    coordinator = AcpRuntimeCoordinator(
+        _config(tmp_path), threading.Event(), reconcile_interval=60.0
+    )
+    coordinator._state = RuntimeState.RUNNING
+    stale = _RuntimeSlot(_binding(), "42", SimpleNamespace())
+    replacement = _RuntimeSlot(_binding(), "43", SimpleNamespace())
+    coordinator._slots["worker-1"] = replacement
+    with pytest.raises(AcpCoordinatorError, match="generation is stale"):
+        coordinator._submit_console_input(stale, 1, "must not cross sessions")
+
+
+def test_console_local_turn_is_suppressed_before_acp_submission_emits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    worker = Worker(
+        id="worker-1",
+        name="Agent",
+        status="active",
+        meta={"stable_key": "wsk1_" + "a" * 64, "stable_key_version": 1},
+    )
+    snapshot = Snapshot(
+        host_id=config.host_id,
+        updated_at="2026-01-01T00:00:00+00:00",
+        workers=[worker],
+    )
+    monkeypatch.setattr(
+        "tendwire.backends.acp_coordinator.latest_snapshot",
+        lambda _path, _host: snapshot,
+    )
+    observed: list[set[str]] = []
+
+    def submit_while_observing(*_args: Any, **_kwargs: Any) -> Any:
+        observed.append(set(slot.console_local_turns or ()))
+        return SimpleNamespace(status="accepted")
+
+    monkeypatch.setattr(
+        "tendwire.command_submission.submit_command", submit_while_observing
+    )
+    continuity = replace(_binding(), worker_fingerprint=worker.fingerprint)
+    runtime = SimpleNamespace(_session_id="session-a")
+    slot = _RuntimeSlot(
+        continuity,
+        "42",
+        runtime,
+        console_local_turns=set(),
+    )
+    coordinator = AcpRuntimeCoordinator(
+        config, threading.Event(), reconcile_interval=60.0
+    )
+
+    assert coordinator._submit_console_input_fenced(slot, 1, "hello") == "instruction"
+    assert len(observed) == 1
+    assert len(observed[0]) == 1
+    assert slot.console_local_turns == observed[0]
+
+
+def test_stop_reports_failed_while_console_submission_thread_is_still_running(
+    tmp_path: Path,
+) -> None:
+    coordinator = AcpRuntimeCoordinator(
+        _config(tmp_path), threading.Event(), reconcile_interval=60.0
+    )
+    coordinator._state = RuntimeState.RUNNING
+    entered = threading.Event()
+    release = threading.Event()
+    executor = ThreadPoolExecutor(max_workers=1)
+
+    def block() -> None:
+        entered.set()
+        assert release.wait(2.0)
+
+    future = executor.submit(block)
+    assert entered.wait(1.0)
+    runtime = SimpleNamespace(stop=lambda *, timeout: None)
+    slot = _RuntimeSlot(
+        _binding(),
+        "42",
+        runtime,
+        console_executor=executor,
+        console_submissions={1: future},
+    )
+    coordinator._slots["worker-1"] = slot
+    try:
+        coordinator.stop(timeout=0.05)
+        status = coordinator.status()
+        assert status["state"] == "failed"
+        assert status["failure_type"] == "AcpRuntimeStopTimeout"
+    finally:
+        release.set()
+        future.result(timeout=1.0)
+
+
+def test_console_input_submission_worker_does_not_block_event_exchange(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    entered = threading.Event()
+    release = threading.Event()
+    exchanges: list[int] = []
+
+    class EndpointClient:
+        def connect(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def agent_acp_console_exchange(self, _target: str, **params: Any) -> Any:
+            exchanges.append(int(params["after_input_sequence"]))
+            return {
+                "type": "agent_acp_console_exchange",
+                "inputs": [{"sequence": 1, "text": "stream while I run"}],
+                "outputs": [],
+                "input_floor_sequence": 1,
+                "output_floor_sequence": 1,
+                "next_input_sequence": 2,
+                "next_output_sequence": 1,
+            }
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        reconcile_interval=60.0,
+    )
+
+    def blocking_submit(_slot: Any, _sequence: int, _text: str) -> str:
+        entered.set()
+        assert release.wait(2.0)
+        return "instruction"
+
+    coordinator._submit_console_input = blocking_submit  # type: ignore[method-assign]
+    runtime = SimpleNamespace(
+        _binding=replace(
+            _binding(),
+            backend="acp",
+            turn_target_kind="acp_session_id",
+            turn_target_value="session-a",
+        )
+    )
+    executor = ThreadPoolExecutor(max_workers=1)
+    slot = _RuntimeSlot(
+        continuity=_binding(),
+        generation="42",
+        runtime=runtime,
+        console=HerdrAcpConsoleEndpoint(42, "coordinator-lease"),
+        console_cursor_loaded=True,
+        console_executor=executor,
+        console_submissions={},
+        console_local_turns=set(),
+    )
+    try:
+        coordinator._bridge_console_slot(slot)
+        assert entered.wait(1.0)
+        started = time.monotonic()
+        coordinator._bridge_console_slot(slot)
+        assert time.monotonic() - started < 0.5
+        assert exchanges == [0, 0]
+        assert slot.console_input_sequence == 0
+    finally:
+        release.set()
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def test_canonical_herdr_acp_contract_fixture_executes_configured_binary(

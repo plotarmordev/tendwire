@@ -1108,7 +1108,12 @@ def test_validate_rejects_a_fingerprint_only_target(action: str) -> None:
     assert error is not None
     assert error["code"] == STATUS_INVALID_REQUEST
     assert "worker_fingerprint" in error["message"]
-    assert error["details"]["allowed"] == ["name", "space_id", "worker_id"]
+    assert error["details"]["allowed"] == [
+        "name",
+        "space_id",
+        "stable_key",
+        "worker_id",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1132,6 +1137,117 @@ def test_validate_accepts_a_fingerprint_beside_a_stable_selector(
     )
 
     assert validate_request(request) is None
+
+
+def test_stable_worker_key_is_a_strict_unique_target_selector() -> None:
+    stable_key = "wsk1_" + ("a" * 64)
+    workers = [
+        Worker(
+            id="old-public-id",
+            name="Coda",
+            status="idle",
+            meta={"stable_key": stable_key, "stable_key_version": 1},
+        ),
+        Worker(
+            id="other-worker",
+            name="Coda",
+            status="idle",
+            meta={"stable_key": "wsk1_" + ("b" * 64), "stable_key_version": 1},
+        ),
+    ]
+
+    resolved, candidates, status = resolve_target(
+        {"stable_key": stable_key, "stable_key_version": 1},
+        workers,
+    )
+
+    assert status == STATUS_RESOLVED
+    assert resolved is not None and resolved["worker_id"] == "old-public-id"
+    assert [candidate["worker_id"] for candidate in candidates] == ["old-public-id"]
+
+
+def test_stable_worker_key_selector_fails_closed_on_duplicate_live_owner() -> None:
+    stable_key = "wsk1_" + ("c" * 64)
+    workers = [
+        Worker(
+            id=f"worker-{index}",
+            name=f"Coda {index}",
+            status="idle",
+            meta={"stable_key": stable_key, "stable_key_version": 1},
+        )
+        for index in (1, 2)
+    ]
+    resolved, candidates, status = resolve_target(
+        {"stable_key": stable_key, "stable_key_version": 1}, workers
+    )
+    assert resolved is None
+    assert status == STATUS_AMBIGUOUS_TARGET
+    assert {item["worker_id"] for item in candidates} == {"worker-1", "worker-2"}
+
+
+def test_stable_worker_key_and_worker_id_must_select_the_same_live_worker() -> None:
+    stable_key = "wsk1_" + ("d" * 64)
+    workers = [
+        Worker(
+            id="worker-a",
+            name="A",
+            status="idle",
+            meta={"stable_key": stable_key, "stable_key_version": 1},
+        ),
+        Worker(id="worker-b", name="B", status="idle"),
+    ]
+    resolved, candidates, status = resolve_target(
+        {
+            "worker_id": "worker-b",
+            "stable_key": stable_key,
+            "stable_key_version": 1,
+        },
+        workers,
+    )
+    assert (resolved, candidates, status) == (None, [], STATUS_NOT_FOUND)
+
+
+def test_stable_worker_key_selector_never_trusts_non_meta_observation_fields() -> None:
+    stable_key = "wsk1_" + ("e" * 64)
+    worker = Worker(id=stable_key, name=stable_key, status="idle", meta={})
+    resolved, candidates, status = resolve_target(
+        {"stable_key": stable_key, "stable_key_version": 1}, [worker]
+    )
+    assert (resolved, candidates, status) == (None, [], STATUS_NOT_FOUND)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {"stable_key": "wsk1_" + ("a" * 64)},
+        {"stable_key_version": 1},
+        {"stable_key": "wsk1_short", "stable_key_version": 1},
+        {"stable_key": "wsk1_" + ("a" * 64), "stable_key_version": 2},
+        {"stable_key": "wsk1_" + ("a" * 64), "stable_key_version": True},
+    ],
+)
+def test_stable_worker_key_target_rejects_partial_or_unsupported_identity(
+    target: dict[str, Any],
+) -> None:
+    request = CommandRequest(action="resolve_target", target=target)
+    error = validate_request(request)
+    assert error is not None
+    assert error["code"] == STATUS_INVALID_REQUEST
+
+
+def test_selector_proof_fences_stable_worker_key_version() -> None:
+    def proof(key: str) -> str:
+        return build_selector_proof(
+            CommandRequest(
+                action="send_instruction",
+                request_id="stable-key-proof",
+                dry_run=False,
+                target={"stable_key": key, "stable_key_version": 1},
+                instruction={"text": "hello"},
+            )
+        )
+
+    assert proof("wsk1_" + ("a" * 64)) != proof("wsk1_" + ("b" * 64))
 
 
 @pytest.mark.parametrize(

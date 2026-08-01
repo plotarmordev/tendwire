@@ -483,6 +483,7 @@ def test_fingerprint_only_target_is_rejected_by_daemon_and_read_only_replay(
     assert response["result"]["error"]["details"]["allowed"] == [
         "name",
         "space_id",
+        "stable_key",
         "worker_id",
     ]
     # The read-only response-loss path cannot resolve it either, and must never

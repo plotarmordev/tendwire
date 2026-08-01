@@ -20,6 +20,10 @@
       ],
       "protocol_version": 1
     },
+    "console": {
+      "generation": 42,
+      "lease": "console-coordinator-private-lease"
+    },
     "worker": {
       "terminal_id": "term_abc",
       "workspace_id": "w1",

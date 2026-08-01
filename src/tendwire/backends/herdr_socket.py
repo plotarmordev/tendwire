@@ -326,6 +326,31 @@ class HerdrSocketClient:
             timeout=timeout,
         )
 
+    def agent_acp_console_exchange(
+        self,
+        target: str,
+        *,
+        generation: int,
+        lease: str,
+        after_input_sequence: int = 0,
+        output: Iterable[Mapping[str, Any]] = (),
+        timeout: float | None = None,
+    ) -> Any:
+        """Exchange pane input and idempotent ACP output as coordinator."""
+        return self.request(
+            "agent.acp_console_exchange",
+            {
+                "target": target,
+                "generation": generation,
+                "lease": lease,
+                "role": "coordinator",
+                "output": [dict(item) for item in output],
+                "after_input_sequence": after_input_sequence,
+                "after_output_sequence": 0,
+            },
+            timeout=timeout,
+        )
+
     def _send_request(
         self,
         method: str,

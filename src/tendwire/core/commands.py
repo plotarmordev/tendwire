@@ -189,7 +189,16 @@ DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES = frozenset(
 )
 
 # Neutral target fields permitted in command requests.
-TARGET_ALLOWED_FIELDS = frozenset({"worker_id", "worker_fingerprint", "space_id", "name"})
+TARGET_ALLOWED_FIELDS = frozenset(
+    {
+        "worker_id",
+        "worker_fingerprint",
+        "space_id",
+        "name",
+        "stable_key",
+        "stable_key_version",
+    }
+)
 
 # Selectors that name a worker durably. A worker_fingerprint is a mutable
 # observation precondition -- "proceed only if the worker still looks like this"
@@ -197,7 +206,9 @@ TARGET_ALLOWED_FIELDS = frozenset({"worker_id", "worker_fingerprint", "space_id"
 # fingerprints would then be indistinguishable to any identity-based idempotency
 # key, letting one request ID claim another worker's stored result. Every target
 # must carry at least one of these.
-TARGET_STABLE_SELECTOR_FIELDS = frozenset({"worker_id", "space_id", "name"})
+TARGET_STABLE_SELECTOR_FIELDS = frozenset(
+    {"worker_id", "space_id", "name", "stable_key"}
+)
 INSTRUCTION_ALLOWED_FIELDS = frozenset({"text"})
 ANSWER_PENDING_PARAM_FIELDS = frozenset(
     {"pending_id", "pending_fingerprint", "choice_id"}
@@ -212,6 +223,7 @@ _FORBIDDEN_REQUEST_COMPACT = frozenset(name.replace("_", "") for name in FORBIDD
 
 MAX_INSTRUCTION_LENGTH = 4096
 _REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}", re.ASCII)
+_STABLE_WORKER_KEY_RE = re.compile(r"wsk1_[0-9a-f]{64}", re.ASCII)
 _TURN_SUBMISSION_ID_RE = re.compile(r"twsub1\.[0-9a-f]{64}", re.ASCII)
 _INSTRUCTION_FINGERPRINT_DOMAIN = b"tendwire.instruction-fingerprint.v1"
 _TURN_SUBMISSION_ID_DOMAIN = b"tendwire.turn-submission-id.v1"
@@ -421,6 +433,27 @@ def _validate_target_shape(target: dict[str, Any] | None) -> dict[str, Any] | No
             STATUS_INVALID_REQUEST,
             f"target contains disallowed fields: {sorted(extra)}",
             details={"field": "target", "disallowed": sorted(extra)},
+        )
+    stable_key_present = "stable_key" in target
+    stable_version_present = "stable_key_version" in target
+    stable_key = target.get("stable_key")
+    stable_version = target.get("stable_key_version")
+    if stable_key_present != stable_version_present:
+        return error_value(
+            STATUS_INVALID_REQUEST,
+            "target stable_key and stable_key_version must be supplied together",
+            details={"field": "target"},
+        )
+    if stable_key_present and (
+        not isinstance(stable_key, str)
+        or _STABLE_WORKER_KEY_RE.fullmatch(stable_key) is None
+        or type(stable_version) is not int
+        or stable_version != 1
+    ):
+        return error_value(
+            STATUS_INVALID_REQUEST,
+            "target stable worker identity is invalid or unsupported",
+            details={"field": "target"},
         )
     if _string_value(target.get("worker_fingerprint")) and not _target_has_stable_selector(
         target
@@ -684,6 +717,8 @@ def build_selector_proof(request: CommandRequest) -> str:
             "worker_id": _string_value(target.get("worker_id")),
             "name": _string_value(target.get("name")),
             "space_id": _optional_string(target.get("space_id")),
+            "stable_key": _string_value(target.get("stable_key")),
+            "stable_key_version": target.get("stable_key_version"),
         }
     payload = {
         "proof_version": SELECTOR_PROOF_VERSION,
@@ -1296,6 +1331,8 @@ def resolve_target(
     name = _string_value(target.get("name"))
     space_id = _optional_string(target.get("space_id"))
     fingerprint = _optional_string(target.get("worker_fingerprint"))
+    stable_key = _string_value(target.get("stable_key"))
+    stable_key_version = target.get("stable_key_version")
 
     # First match by identity/name/space, excluding fingerprint.
     identity_matches: list[Worker] = []
@@ -1305,6 +1342,11 @@ def resolve_target(
         if name and worker.name != name:
             continue
         if space_id is not None and worker.space_id != space_id:
+            continue
+        if stable_key and (
+            worker.meta.get("stable_key") != stable_key
+            or worker.meta.get("stable_key_version") != stable_key_version
+        ):
             continue
         identity_matches.append(worker)
 
