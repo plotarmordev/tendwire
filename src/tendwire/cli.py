@@ -984,6 +984,11 @@ def _restore_cli_content_text(
         and original.get("availability") == "complete"
     ):
         sanitized["text"] = text
+        content_revision = original.get("content_revision")
+        if isinstance(content_revision, str) and re.fullmatch(
+            r"twrev1\.[A-Za-z0-9_-]+", content_revision
+        ):
+            sanitized["content_revision"] = content_revision
 
 
 def _restore_cli_plan_token(
@@ -1007,12 +1012,17 @@ def _restore_cli_plan_token(
         r"twfinal1\.[A-Za-z0-9_-]+", final_identity
     ):
         sanitized["final_identity"] = final_identity
+    content_revision = original.get("content_revision")
+    if isinstance(content_revision, str) and re.fullmatch(
+        r"twrev1\.[A-Za-z0-9_-]+", content_revision
+    ):
+        sanitized["content_revision"] = content_revision
     delivery_key = original.get("key")
     if isinstance(delivery_key, str) and re.fullmatch(
         r"turn-final:revision:twfinal1\.[A-Za-z0-9_-]+", delivery_key
     ):
         sanitized["key"] = delivery_key
-    for nested_key in ("turn", "final", "payload"):
+    for nested_key in ("turn", "final", "payload", "content"):
         nested_original = original.get(nested_key)
         nested_sanitized = sanitized.get(nested_key)
         if isinstance(nested_original, dict) and isinstance(nested_sanitized, dict):

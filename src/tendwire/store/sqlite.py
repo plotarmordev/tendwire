@@ -4359,12 +4359,17 @@ def _restore_presentation_tokens(
     final_identity = original.get("final_identity")
     if _valid_presentation_opaque(final_identity, "twfinal1."):
         sanitized["final_identity"] = str(final_identity)
+    content_revision_value = original.get("content_revision")
+    if _valid_presentation_opaque(content_revision_value, "twrev1."):
+        sanitized["content_revision"] = str(content_revision_value)
     turn_id = original.get("turn_id")
     if _valid_presentation_label(turn_id, prefix="turn-"):
         sanitized["turn_id"] = str(turn_id)
-    nested_turn = original.get("turn")
-    if isinstance(nested_turn, Mapping):
-        clean_nested = sanitized.get("turn")
+    for nested_key in ("turn", "content"):
+        nested_turn = original.get(nested_key)
+        if not isinstance(nested_turn, Mapping):
+            continue
+        clean_nested = sanitized.get(nested_key)
         if not isinstance(clean_nested, dict):
             clean_nested = dict(
                 sanitize_public_mapping(
@@ -4372,7 +4377,7 @@ def _restore_presentation_tokens(
                     backend_neutral=True,
                 )
             )
-            sanitized["turn"] = clean_nested
+            sanitized[nested_key] = clean_nested
         _restore_presentation_tokens(clean_nested, nested_turn)
     return sanitized
 

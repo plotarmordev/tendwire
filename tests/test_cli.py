@@ -909,6 +909,7 @@ def test_cli_turn_content_get_preserves_exact_page_and_params(
     monkeypatch,
 ) -> None:
     page_text = "\n  " + ("界" * 20_000) + "\r\n  "
+    revision = "twrev1.ueLJtVatFOQxa1UePvWId8C01qdrb05FpW_ipSSPHMM"
     calls: list[tuple[str, dict[str, Any]]] = []
 
     class FakeDaemonAPIClient:
@@ -924,7 +925,7 @@ def test_cli_turn_content_get_preserves_exact_page_and_params(
                     "ok": True,
                     "status": "ok",
                     "turn_id": "turn-public",
-                    "content_revision": "twrev1.public",
+                    "content_revision": revision,
                     "field": "assistant_final_text",
                     "availability": "complete",
                     "segment_id": "twseg1.public",
@@ -953,7 +954,7 @@ def test_cli_turn_content_get_preserves_exact_page_and_params(
             "--turn-id",
             "turn-public",
             "--revision",
-            "twrev1.public",
+            revision,
             "--field",
             "assistant_final_text",
             "--cursor",
@@ -966,6 +967,7 @@ def test_cli_turn_content_get_preserves_exact_page_and_params(
     assert code == 0
     assert captured.err == ""
     assert payload["turn_id"] == "turn-public"
+    assert payload["content_revision"] == revision
     assert payload["segment_id"] == "twseg1.public"
     assert payload["text"] == page_text
     assert calls == [
@@ -974,7 +976,7 @@ def test_cli_turn_content_get_preserves_exact_page_and_params(
             {
                 "schema_version": 1,
                 "turn_id": "turn-public",
-                "content_revision": "twrev1.public",
+                "content_revision": revision,
                 "field": "assistant_final_text",
                 "cursor": "twcur1.public",
             },

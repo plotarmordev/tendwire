@@ -735,6 +735,7 @@ def test_daemon_api_versions_turn_list_and_preserves_exact_content_page() -> Non
     turn_calls: list[dict[str, Any]] = []
     page_calls: list[dict[str, Any]] = []
     page_text = "\n  " + ("α" * 20_000) + "  \r\n"
+    revision = "twrev1.ueLJtVatFOQxa1UePvWId8C01qdrb05FpW_ipSSPHMM"
 
     def get_turns(**params: Any) -> dict[str, Any]:
         turn_calls.append(dict(params))
@@ -790,7 +791,7 @@ def test_daemon_api_versions_turn_list_and_preserves_exact_content_page() -> Non
             "ok": True,
             "status": "ok",
             "turn_id": "turn-public",
-            "content_revision": "twrev1.public",
+            "content_revision": revision,
             "field": "assistant_final_text",
             "availability": "complete",
             "segment_id": "twseg1.public",
@@ -821,7 +822,7 @@ def test_daemon_api_versions_turn_list_and_preserves_exact_content_page() -> Non
             "params": {
                 "schema_version": 1,
                 "turn_id": "turn-public",
-                "content_revision": "twrev1.public",
+                "content_revision": revision,
                 "field": "assistant_final_text",
             },
         }
@@ -861,11 +862,12 @@ def test_daemon_api_versions_turn_list_and_preserves_exact_content_page() -> Non
         "since": None,
     }
     assert page["result"]["text"] == page_text
+    assert page["result"]["content_revision"] == revision
     assert page_calls == [
         {
             "schema_version": 1,
             "turn_id": "turn-public",
-            "content_revision": "twrev1.public",
+            "content_revision": revision,
             "field": "assistant_final_text",
         }
     ]

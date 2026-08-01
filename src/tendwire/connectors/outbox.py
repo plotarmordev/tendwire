@@ -124,6 +124,9 @@ def _restore_plan_tokens(clean: dict[str, Any], original: Mapping[str, Any]) -> 
     )
     if final_identity:
         clean["final_identity"] = final_identity
+    content_revision = _revision(original.get("content_revision"))
+    if content_revision:
+        clean["content_revision"] = content_revision
     turn_id = _text(original.get("turn_id"))
     if (
         turn_id.startswith("turn-")
@@ -131,15 +134,17 @@ def _restore_plan_tokens(clean: dict[str, Any], original: Mapping[str, Any]) -> 
         and all(char in _CONNECTOR_NAME_CHARS for char in turn_id)
     ):
         clean["turn_id"] = turn_id
-    nested_turn = original.get("turn")
-    if isinstance(nested_turn, Mapping):
-        clean_nested = clean.get("turn")
+    for nested_key in ("turn", "content"):
+        nested_turn = original.get(nested_key)
+        if not isinstance(nested_turn, Mapping):
+            continue
+        clean_nested = clean.get(nested_key)
         if not isinstance(clean_nested, dict):
             clean_nested = sanitize_public_mapping(
                 nested_turn,
                 backend_neutral=True,
             )
-            clean["turn"] = clean_nested
+            clean[nested_key] = clean_nested
         _restore_plan_tokens(clean_nested, nested_turn)
     return clean
 

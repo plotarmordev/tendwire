@@ -415,6 +415,8 @@ def test_cli_daemon_connector_result_is_sanitized_before_printing(
     capsys,
     monkeypatch,
 ) -> None:
+    revision = "twrev1.ueLJtVatFOQxa1UePvWId8C01qdrb05FpW_ipSSPHMM"
+
     class FakeDaemonAPIClient:
         def __init__(self, socket_path: Any, *, timeout_seconds: float, max_response_bytes: int = 1024 * 1024):
             pass
@@ -437,6 +439,11 @@ def test_cli_daemon_connector_result_is_sanitized_before_printing(
                                 "safe": "kept",
                                 "turn_id": "turn-public-final",
                                 "plan_token": "twplan1.publicPlan",
+                                "content_revision": revision,
+                                "content": {
+                                    "schema_version": 1,
+                                    "content_revision": revision,
+                                },
                                 "chat_id": "sentinel-private-chat",
                                 "raw_payload": "sentinel-private-raw",
                             },
@@ -470,6 +477,11 @@ def test_cli_daemon_connector_result_is_sanitized_before_printing(
         "safe": "kept",
         "turn_id": "turn-public-final",
         "plan_token": "twplan1.publicPlan",
+        "content_revision": revision,
+        "content": {
+            "schema_version": 1,
+            "content_revision": revision,
+        },
     }
     assert "sentinel-private" not in encoded
     assert "raw_payload" not in encoded
@@ -477,6 +489,7 @@ def test_cli_daemon_connector_result_is_sanitized_before_printing(
 
 
 def test_daemon_connector_preserves_public_turn_id_for_final_ready() -> None:
+    revision = "twrev1.ueLJtVatFOQxa1UePvWId8C01qdrb05FpW_ipSSPHMM"
     api = TendwireDaemonAPI(
         get_snapshot=lambda: Snapshot(host_id="host-a"),
         get_health=lambda: {},
@@ -493,6 +506,13 @@ def test_daemon_connector_preserves_public_turn_id_for_final_ready() -> None:
                         "schema_version": 2,
                         "operation": "final_ready",
                         "turn_id": "turn-public-final",
+                        "content_revision": revision,
+                        "content": {
+                            "schema_version": 1,
+                            "content_revision": revision,
+                            "known_incomplete": False,
+                            "fields": {},
+                        },
                         "pane_id": "sentinel-private-pane",
                         "session_id": "sentinel-private-session",
                         "terminal_id": "sentinel-private-terminal",
@@ -512,6 +532,13 @@ def test_daemon_connector_preserves_public_turn_id_for_final_ready() -> None:
         "schema_version": 2,
         "operation": "final_ready",
         "turn_id": "turn-public-final",
+        "content_revision": revision,
+        "content": {
+            "schema_version": 1,
+            "content_revision": revision,
+            "known_incomplete": False,
+            "fields": {},
+        },
     }
     _assert_json_only_and_safe(response)
 

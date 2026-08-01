@@ -176,6 +176,40 @@ def test_poll_leases_sanitized_item_and_skips_duplicate_live_lease(tmp_path: Pat
     _assert_no_forbidden(first)
 
 
+def test_poll_preserves_strict_content_revision_tokens(tmp_path: Path) -> None:
+    db_path = tmp_path / "revision-token.db"
+    revision = "twrev1.ueLJtVatFOQxa1UePvWId8C01qdrb05FpW_ipSSPHMM"
+    _enqueue_final_root(
+        db_path,
+        key_suffix="public",
+        ordering_key="wsk1_public",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "UPDATE connector_outbox SET payload_json = ?",
+            (
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "content_revision": revision,
+                        "content": {
+                            "schema_version": 1,
+                            "content_revision": revision,
+                        },
+                    }
+                ),
+            ),
+        )
+
+    item = ConnectorOutboxAPI(db_path, "host-a").poll(
+        {"name": "turn-final", "limit": 1}
+    )["items"][0]
+
+    assert item["payload"]["content_revision"] == revision
+    assert item["payload"]["content"]["content_revision"] == revision
+    _assert_no_forbidden(item)
+
+
 def test_poll_uses_configured_default_lease_and_explicit_lease_wins(tmp_path: Path) -> None:
     db_path = tmp_path / "lease-default.db"
     _enqueue(db_path, key="default-lease")
