@@ -2730,9 +2730,12 @@ def submit_acp_command(
             if required
             else None
         )
-    binding_fingerprint = str(
-        getattr(route, "binding_fingerprint", "") or ""
-    ).strip()
+    try:
+        binding_fingerprint = str(
+            getattr(route, "binding_fingerprint", "") or ""
+        ).strip()
+    except Exception:  # noqa: BLE001
+        binding_fingerprint = ""
     if not binding_fingerprint:
         if takeover is not None:
             return _request_in_progress(request)

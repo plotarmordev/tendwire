@@ -132,6 +132,20 @@ def test_initialize_capabilities_and_session_lifecycle() -> None:
     assert acp.exit.returncode == 0
 
 
+def test_load_session_accepts_standard_null_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ACP v1 completes load replay with a JSON-RPC null result."""
+
+    with client() as acp:
+        acp.initialize()
+        monkeypatch.setattr(acp, "request", lambda *_args, **_kwargs: None)
+        loaded = acp.load_session("s1", "/tmp/project")
+
+    assert loaded.session_id == "s1"
+    assert loaded.modes is None
+    assert loaded.config_options == ()
+    assert loaded.raw == {}
+
+
 def test_prompt_stream_and_permission_response_can_run_concurrently() -> None:
     with client() as acp:
         acp.initialize()

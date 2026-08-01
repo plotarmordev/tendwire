@@ -2,8 +2,10 @@
 
 This document defines the experimental migration from backend-specific
 transcript readers to Agent Client Protocol (ACP). ACP is not yet Tendwire's
-default. The stock daemon now contains the production coordinator and command
-path, but activates them only for an explicitly Herdr-owned ACP worker.
+default. The stock daemon contains the coordinator and command path, but
+production ACP activation is currently fail-closed until a durable permission
+decision bridge is configured. The coordinator can otherwise attach only an
+explicitly Herdr-owned ACP worker.
 Herdr remains authoritative for workspace, pane, worker identity, process
 liveness, and command routing until the ACP control path is proven separately.
 Tendwire remains authoritative for persistence, reconciliation, public safety,
@@ -30,6 +32,15 @@ The default is `legacy`. In an ACP mode the coordinator asks Herdr for a
 one-shot private endpoint, validates its worker generation and explicit
 `acp_owned_ready` lifecycle, then creates/loads/resumes the ACP session. An
 ordinary live PTY session is never treated as ACP-owned.
+
+ACP `session/request_permission` is synchronous and can authorize destructive
+tools. Tendwire does not yet have the required durable worker/session-correlated
+bridge from a public `answer_decision` command back to the exact request and
+offered `optionId`. The stock production factory therefore raises the redacted
+`AcpPermissionBridgeUnavailable` startup failure for every ACP mode. It must not
+silently cancel permissions while reporting the runtime healthy. Tests and
+embedders may inject an explicit callback into the generic coordinator, but
+that callback is not a production authorization surface.
 
 ## Authority split
 
@@ -208,7 +219,9 @@ must pass before `acp_required` is considered:
 - fallback after adapter failure without regressing existing final delivery;
 - exact worker continuity across Herdr pane moves and agent-session recreation.
 
-The ACP runtime implements prompt submission, cancellation, permission handling,
-per-worker coordination, reconnect, and receipt-backed command routing. ACP
-remains non-default until the cross-repository integration and rollout gates
-above pass against real adapters.
+The ACP runtime implements prompt submission, cancellation, fail-closed
+permission handling, per-worker coordination, reconnect, and receipt-backed
+instruction routing. Interactive permission approval remains a runtime blocker:
+until its durable bridge exists, the stock production factory refuses ACP
+startup. ACP also remains non-default until the cross-repository integration
+and rollout gates above pass against real adapters.

@@ -17,15 +17,28 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Config
-from ..core.models import Worker, WorkerBinding
-from ..store.sqlite import list_worker_bindings, upsert_worker_bindings
+from ..core.models import Worker, WorkerBinding, utc_timestamp
+from ..store.sqlite import (
+    expire_worker_bindings,
+    list_worker_bindings,
+    upsert_worker_bindings,
+)
 from .acp_client import AcpClient
-from .acp_runtime import AcpRuntime, RuntimeState, SessionOpenMode
+from .acp_runtime import (
+    AcpRuntime,
+    PermissionCallback,
+    RuntimeState,
+    SessionOpenMode,
+)
 from .herdr_socket import HerdrSocketClient
 
 
 class AcpCoordinatorError(RuntimeError):
     """The private Herdr ACP endpoint contract or supervisor failed."""
+
+
+class AcpPermissionBridgeUnavailable(AcpCoordinatorError):
+    """Production ACP cannot authorize tools without a durable user decision."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,19 +64,19 @@ class _RuntimeSlot:
 
 
 class _PromptRoute:
-    def __init__(self, owner: "AcpRuntimeCoordinator", worker: Worker) -> None:
+    def __init__(
+        self,
+        owner: "AcpRuntimeCoordinator",
+        worker: Worker,
+        slot: _RuntimeSlot,
+    ) -> None:
         self._owner = owner
         self._worker = worker
+        self._slot = slot
 
     @property
     def binding_fingerprint(self) -> str:
-        slot = self._owner._current_slot(self._worker)
-        binding = getattr(slot.runtime, "_binding", None)
-        return (
-            str(binding.private_fingerprint)
-            if isinstance(binding, WorkerBinding)
-            else ""
-        )
+        return self._owner._route_binding_fingerprint(self._worker, self._slot)
 
     def prompt(
         self,
@@ -72,9 +85,9 @@ class _PromptRoute:
         producer_turn_id: str,
         timeout: float,
     ) -> object:
-        slot = self._owner._current_slot(self._worker)
-        self._owner._require_attached_generation(slot)
-        return slot.runtime.submit_prompt(
+        return self._owner._submit_prompt(
+            self._worker,
+            self._slot,
             text,
             producer_turn_id=producer_turn_id,
             acknowledgement_timeout=timeout,
@@ -98,6 +111,8 @@ class AcpRuntimeCoordinator:
         runtime_factory: RuntimeFactory = AcpRuntime,
         client_factory: ClientFactory = AcpClient,
         reconcile_interval: float | None = None,
+        permission_callback: PermissionCallback | None = None,
+        require_permission_bridge: bool = False,
     ) -> None:
         if config.db_path is None:
             raise ValueError("ACP coordinator requires a sqlite db path")
@@ -108,6 +123,8 @@ class AcpRuntimeCoordinator:
         )
         self._runtime_factory = runtime_factory
         self._client_factory = client_factory
+        self._permission_callback = permission_callback
+        self._require_permission_bridge = bool(require_permission_bridge)
         self._reconcile_interval = max(
             1.0,
             float(
@@ -117,6 +134,11 @@ class AcpRuntimeCoordinator:
             ),
         )
         self._lock = threading.RLock()
+        # Endpoint minting, runtime publication, prompt lease validation, and
+        # shutdown are one private generation transaction. Herdr
+        # tickets are one-shot, so overlapping reconciles cannot be repaired
+        # after the fact by selecting whichever runtime happened to attach.
+        self._reconcile_lock = threading.RLock()
         self._stop = threading.Event()
         self._slots: dict[str, _RuntimeSlot] = {}
         self._thread: threading.Thread | None = None
@@ -130,8 +152,18 @@ class AcpRuntimeCoordinator:
                 return self
             if self._state is not RuntimeState.NEW:
                 raise AcpCoordinatorError("ACP coordinator cannot be restarted")
+            if self._require_permission_bridge and self._permission_callback is None:
+                self._state = RuntimeState.FAILED
+                self._failure_type = "AcpPermissionBridgeUnavailable"
+                raise AcpPermissionBridgeUnavailable(
+                    "durable ACP permission decisions are not configured"
+                )
             self._state = RuntimeState.STARTING
         try:
+            # ACP adapter processes cannot survive this coordinator process.
+            # Revoke any process-owned rows left by an unclean prior exit before
+            # a fresh Herdr generation is allowed to attach.
+            self._expire_orphaned_bindings()
             self._reconcile(strict=self.config.agent_event_source == "acp_required")
         except Exception as exc:
             with self._lock:
@@ -140,6 +172,9 @@ class AcpRuntimeCoordinator:
             self._stop_all()
             raise
         with self._lock:
+            if self._state is not RuntimeState.STARTING or self._stop.is_set():
+                self._state = RuntimeState.STOPPED
+                raise AcpCoordinatorError("ACP coordinator is stopping")
             self._state = RuntimeState.RUNNING
             thread = threading.Thread(
                 target=self._run,
@@ -163,10 +198,24 @@ class AcpRuntimeCoordinator:
                 return
             self._state = RuntimeState.STOPPING
         self._stop.set()
-        self._stop_all(timeout=limit)
+        deadline = time.monotonic() + limit
+        # Wait for endpoint mint/start or prompt lease validation to leave its
+        # critical section before clearing slots. A reconcile that observed
+        # STOPPING stops its provisional runtime instead of publishing it.
+        acquired = self._reconcile_lock.acquire(timeout=limit)
+        if not acquired:
+            with self._lock:
+                self._failure_type = "AcpCoordinatorError"
+            raise AcpCoordinatorError(
+                "ACP coordinator reconciliation did not stop within the deadline"
+            )
+        try:
+            self._stop_all(timeout=max(0.001, deadline - time.monotonic()))
+        finally:
+            self._reconcile_lock.release()
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=limit)
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
         with self._lock:
             if self._state is not RuntimeState.FAILED:
                 self._state = RuntimeState.STOPPED
@@ -216,15 +265,15 @@ class AcpRuntimeCoordinator:
 
     def prompt_route(self, worker: Worker) -> _PromptRoute | None:
         try:
-            self._current_slot(worker)
+            slot = self._current_slot(worker)
         except AcpCoordinatorError:
             # A just-observed worker may not have reached the periodic pass.
             try:
                 self._reconcile_worker(worker.id, strict=False)
-                self._current_slot(worker)
+                slot = self._current_slot(worker)
             except Exception:  # noqa: BLE001
                 return None
-        return _PromptRoute(self, worker)
+        return _PromptRoute(self, worker, slot)
 
     def owns_worker(self, worker_id: str, worker_fingerprint: str) -> bool:
         """Return whether a healthy ACP slot currently owns this exact worker."""
@@ -259,6 +308,14 @@ class AcpRuntimeCoordinator:
                 with self._lock:
                     self._failure_type = type(exc).__name__
 
+    def _require_reconcile_state(self, *, allow_starting: bool) -> None:
+        with self._lock:
+            allowed = {RuntimeState.RUNNING}
+            if allow_starting:
+                allowed.add(RuntimeState.STARTING)
+            if self._state not in allowed or self._stop.is_set():
+                raise AcpCoordinatorError("ACP coordinator is stopping")
+
     def _continuity_bindings(self) -> tuple[dict[str, WorkerBinding], int]:
         bindings = list_worker_bindings(
             Path(self.config.db_path),
@@ -285,6 +342,15 @@ class AcpRuntimeCoordinator:
         return current, ambiguities
 
     def _reconcile(self, *, strict: bool) -> None:
+        with self._reconcile_lock:
+            try:
+                self._require_reconcile_state(allow_starting=True)
+                self._reconcile_locked(strict=strict)
+            finally:
+                if self._stop.is_set():
+                    self._stop_all()
+
+    def _reconcile_locked(self, *, strict: bool) -> None:
         current, ambiguities = self._continuity_bindings()
         with self._lock:
             stale = [worker_id for worker_id in self._slots if worker_id not in current]
@@ -295,6 +361,7 @@ class AcpRuntimeCoordinator:
             for _ in range(ambiguities)
         ]
         for worker_id, continuity in current.items():
+            self._require_reconcile_state(allow_starting=True)
             try:
                 self._reconcile_binding(continuity)
             except Exception as exc:  # noqa: BLE001
@@ -312,13 +379,21 @@ class AcpRuntimeCoordinator:
             raise AcpCoordinatorError("one or more ACP workers failed to attach")
 
     def _reconcile_worker(self, worker_id: str, *, strict: bool) -> None:
-        current, _ambiguities = self._continuity_bindings()
-        continuity = current.get(worker_id)
-        if continuity is None:
-            if strict:
-                raise AcpCoordinatorError("worker has no unique Herdr authority")
-            return
-        self._reconcile_binding(continuity)
+        with self._reconcile_lock:
+            try:
+                self._require_reconcile_state(allow_starting=False)
+                current, _ambiguities = self._continuity_bindings()
+                continuity = current.get(worker_id)
+                if continuity is None:
+                    if strict:
+                        raise AcpCoordinatorError(
+                            "worker has no unique Herdr authority"
+                        )
+                    return
+                self._reconcile_binding(continuity)
+            finally:
+                if self._stop.is_set():
+                    self._stop_all()
 
     def _reconcile_binding(self, continuity: WorkerBinding) -> None:
         with self._lock:
@@ -345,6 +420,11 @@ class AcpRuntimeCoordinator:
                 runtime.stop(timeout=self.config.acp_shutdown_timeout_seconds)
             except Exception:
                 pass
+            raise
+        try:
+            self._require_reconcile_state(allow_starting=True)
+        except Exception:
+            self._stop_runtime(runtime)
             raise
         slot = _RuntimeSlot(continuity, endpoint.generation, runtime)
         with self._lock:
@@ -398,6 +478,53 @@ class AcpRuntimeCoordinator:
             self._retire_worker(slot.continuity.worker_id, expected=slot)
             raise AcpCoordinatorError("ACP worker generation lease is not current")
 
+    def _submit_prompt(
+        self,
+        worker: Worker,
+        slot: _RuntimeSlot,
+        text: str,
+        *,
+        producer_turn_id: str,
+        acknowledgement_timeout: float,
+    ) -> object:
+        """Write through the exact route generation used by the receipt."""
+
+        with self._reconcile_lock:
+            self._require_reconcile_state(allow_starting=False)
+            current = self._current_slot(worker)
+            if current is not slot:
+                raise AcpCoordinatorError("ACP worker route is stale")
+            self._require_attached_generation(slot)
+            if self._current_slot(worker) is not slot:
+                raise AcpCoordinatorError("ACP worker route is stale")
+            # The route lease covers the complete JSON-RPC request frame, not
+            # just status validation. Retirement can proceed as soon as the
+            # runtime acknowledges that the frame is written; turn completion
+            # remains supervised asynchronously by the runtime.
+            return slot.runtime.submit_prompt(
+                text,
+                producer_turn_id=producer_turn_id,
+                acknowledgement_timeout=acknowledgement_timeout,
+            )
+
+    def _route_binding_fingerprint(
+        self,
+        worker: Worker,
+        slot: _RuntimeSlot,
+    ) -> str:
+        """Return authority only while this exact route remains current."""
+
+        with self._reconcile_lock:
+            self._require_reconcile_state(allow_starting=False)
+            if self._current_slot(worker) is not slot:
+                raise AcpCoordinatorError("ACP worker route is stale")
+            binding = getattr(slot.runtime, "_binding", None)
+            return (
+                str(binding.private_fingerprint)
+                if isinstance(binding, WorkerBinding)
+                else ""
+            )
+
     def _build_runtime(
         self,
         continuity: WorkerBinding,
@@ -419,18 +546,32 @@ class AcpRuntimeCoordinator:
             binding = _derived_binding(continuity, endpoint.session_id)
             upsert_worker_bindings(Path(self.config.db_path), [binding])
             callback = None
-        return self._runtime_factory(
-            client,
-            config=self.config,
-            binding=binding,
-            cwd=endpoint.cwd,
-            session_mode=endpoint.session_mode,
-            session_id=endpoint.session_id,
-            stream_generation=endpoint.generation,
-            session_binding_callback=callback,
-            poll_timeout=min(0.25, self.config.acp_request_timeout_seconds),
-            stop_timeout=self.config.acp_shutdown_timeout_seconds,
-        )
+        try:
+            return self._runtime_factory(
+                client,
+                config=self.config,
+                binding=binding,
+                cwd=endpoint.cwd,
+                session_mode=endpoint.session_mode,
+                session_id=endpoint.session_id,
+                stream_generation=endpoint.generation,
+                session_binding_callback=callback,
+                permission_callback=self._permission_callback,
+                poll_timeout=min(0.25, self.config.acp_request_timeout_seconds),
+                stop_timeout=self.config.acp_shutdown_timeout_seconds,
+            )
+        except Exception:
+            try:
+                client.close()
+            except Exception:
+                pass
+            if endpoint.session_mode is not SessionOpenMode.NEW:
+                _expire_derived_binding(
+                    self.config,
+                    binding,
+                    reason="acp_runtime_construction_failed",
+                )
+            raise
 
     def _bind_new_session(
         self,
@@ -455,6 +596,7 @@ class AcpRuntimeCoordinator:
         self._stop_runtime(slot.runtime)
 
     def _stop_runtime(self, runtime: AcpRuntime, *, timeout: float | None = None) -> None:
+        binding = getattr(runtime, "_binding", None)
         try:
             runtime.stop(
                 timeout=(
@@ -465,6 +607,24 @@ class AcpRuntimeCoordinator:
             )
         except Exception:
             pass
+        finally:
+            if isinstance(binding, WorkerBinding) and binding.backend == "acp":
+                _expire_derived_binding(
+                    self.config,
+                    binding,
+                    reason="acp_runtime_retired",
+                )
+
+    def _expire_orphaned_bindings(self) -> None:
+        """Revoke ACP leases that no runtime in this process can own."""
+
+        expire_worker_bindings(
+            Path(self.config.db_path),
+            self.config.host_id,
+            backend="acp",
+            now=utc_timestamp(),
+            reason="acp_coordinator_restarted",
+        )
 
     def _stop_all(self, *, timeout: float | None = None) -> None:
         with self._lock:
@@ -498,7 +658,29 @@ def _derived_binding(
         backend="acp",
         turn_target_kind="acp_session_id",
         turn_target_value=session_id,
+        # The ACP runtime owns this private lease until explicit stop/failure.
+        # Inheriting the observer's short Herdr lease would strand a healthy
+        # attached runtime after the next observation-expiry boundary.
+        expires_at=None,
         private_fingerprint="",
+    )
+
+
+def _expire_derived_binding(
+    config: Config,
+    binding: WorkerBinding,
+    *,
+    reason: str,
+) -> None:
+    if config.db_path is None:  # pragma: no cover - coordinator invariant
+        return
+    expire_worker_bindings(
+        Path(config.db_path),
+        binding.host_id,
+        backend="acp",
+        private_fingerprints=[binding.private_fingerprint],
+        now=binding.observed_at,
+        reason=reason,
     )
 
 
@@ -531,6 +713,38 @@ def _nonempty_text(value: Any, field: str) -> str:
     if len(value) > 4096 or "\x00" in value:
         raise AcpCoordinatorError(f"Herdr ACP endpoint {field} is invalid")
     return value
+
+
+def _require_target_identity(
+    continuity: WorkerBinding,
+    worker: Mapping[str, Any],
+    *,
+    response: str,
+) -> None:
+    """Prove the returned worker still owns the requested Herdr target."""
+
+    direct_fields = {
+        "terminal_id": "terminal_id",
+        "pane_id": "pane_id",
+        "name": "name",
+        "label": "name",
+        "agent": "agent",
+    }
+    field = direct_fields.get(continuity.target_kind)
+    if field is not None:
+        matched = worker.get(field) == continuity.target_value
+    else:
+        # Older Herdr projections can call the terminal identity `agent_id`.
+        # The v1 endpoint contract has no agent_id member, so require that the
+        # authority token still matches one of its immutable identity fields.
+        matched = continuity.target_value in {
+            worker.get("terminal_id"),
+            worker.get("pane_id"),
+            worker.get("name"),
+            worker.get("agent"),
+        }
+    if not matched:
+        raise AcpCoordinatorError(f"Herdr ACP {response} target changed")
 
 
 def _parse_endpoint(
@@ -608,11 +822,10 @@ def _parse_endpoint(
         "generation",
     }:
         raise AcpCoordinatorError("Herdr ACP worker identity shape is invalid")
-    pane_id = _nonempty_text(worker.get("pane_id"), "pane_id")
-    if continuity.target_kind == "pane_id" and pane_id != continuity.target_value:
-        raise AcpCoordinatorError("Herdr ACP pane authority changed")
+    _require_target_identity(continuity, worker, response="endpoint")
     for field in ("terminal_id", "workspace_id", "tab_id", "name", "agent"):
         _nonempty_text(worker.get(field), field)
+    _nonempty_text(worker.get("pane_id"), "pane_id")
     if set(adapter) != {"name", "version"}:
         raise AcpCoordinatorError("Herdr ACP adapter identity shape is invalid")
     _nonempty_text(adapter.get("name"), "adapter name")
@@ -699,11 +912,7 @@ def _parse_status(
         "agent",
     ):
         _nonempty_text(worker.get(field), field)
-    if (
-        continuity.target_kind == "pane_id"
-        and worker.get("pane_id") != continuity.target_value
-    ):
-        raise AcpCoordinatorError("Herdr ACP status pane authority changed")
+    _require_target_identity(continuity, worker, response="status")
     if set(adapter) != {"name", "version"}:
         raise AcpCoordinatorError("Herdr ACP status adapter shape is invalid")
     _nonempty_text(adapter.get("name"), "adapter name")
@@ -730,4 +939,12 @@ def production_acp_runtime_factory(
     stop_event: threading.Event,
 ) -> AcpRuntimeCoordinator:
     """Build the stock daemon's Herdr-backed multi-worker ACP coordinator."""
-    return AcpRuntimeCoordinator(config, stop_event)
+    # ACP permission requests are synchronous and can authorize destructive
+    # tools. Until the daemon has a durable, worker/session-correlated decision
+    # broker, production must refuse ACP modes instead of silently cancelling
+    # requests while reporting the worker healthy.
+    return AcpRuntimeCoordinator(
+        config,
+        stop_event,
+        require_permission_bridge=True,
+    )

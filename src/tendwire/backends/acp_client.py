@@ -504,6 +504,16 @@ class AcpClient:
         )
         params["sessionId"] = _nonempty(session_id, "session_id")
         result = self.request("session/load", params, timeout=timeout)
+        # ACP v1 defines the successful load response as null after all replay
+        # updates have been sent.  Accept a mapping as a compatibility
+        # extension for agents that also return initial session state.
+        if result is None:
+            return SessionResult(
+                session_id,
+                None,
+                (),
+                MappingProxyType({}),
+            )
         raw = _require_mapping(result, "session/load result")
         parsed = _parse_session_result(raw, require_session_id=False)
         return SessionResult(session_id, parsed.modes, parsed.config_options, parsed.raw)

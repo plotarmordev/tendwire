@@ -14,16 +14,21 @@ import pytest
 
 from tendwire.backends.acp_coordinator import (
     AcpCoordinatorError,
+    AcpPermissionBridgeUnavailable,
     AcpRuntimeCoordinator,
+    _derived_binding,
     _parse_endpoint,
+    _parse_status,
+    production_acp_runtime_factory,
 )
 from tendwire.backends.herdr_turns import TurnIngestionScheduler, TurnRefreshResult
-from tendwire.command_submission import submit_command
+from tendwire.command_submission import submit_acp_command, submit_command
 from tendwire.config import Config
 from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
 from tendwire.store.sqlite import (
     get_command_request,
     init_store,
+    list_worker_bindings,
     save_snapshot,
     upsert_worker_bindings,
 )
@@ -116,6 +121,21 @@ def test_endpoint_requires_explicit_acp_ownership_and_strict_attach_shape(tmp_pa
     replayed["endpoint"]["args"][4] = "42"
     with pytest.raises(AcpCoordinatorError, match="inconsistent"):
         _parse_endpoint(config, _binding(), replayed)
+
+    wrong_terminal = _endpoint()
+    wrong_terminal["worker"]["terminal_id"] = "other-terminal"
+    terminal_binding = replace(
+        _binding(),
+        target_kind="terminal_id",
+        target_value="pane-private",
+    )
+    with pytest.raises(AcpCoordinatorError, match="target changed"):
+        _parse_endpoint(config, terminal_binding, wrong_terminal)
+
+    wrong_status = _status()
+    wrong_status["worker"]["terminal_id"] = "other-terminal"
+    with pytest.raises(AcpCoordinatorError, match="target changed"):
+        _parse_status(terminal_binding, wrong_status)
 
 
 def test_canonical_herdr_acp_contract_fixture_executes_configured_binary(
@@ -248,6 +268,41 @@ def test_acp_failure_after_send_started_is_uncertain_and_never_falls_back(tmp_pa
     assert receipt is not None and receipt["state"] == "uncertain"
 
 
+def test_route_authority_failure_is_safe_before_receipt_reservation(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    _seed(config)
+
+    class VanishedRoute:
+        @property
+        def binding_fingerprint(self) -> str:
+            raise AcpCoordinatorError("slot changed")
+
+        def prompt(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("a route without authority must not send")
+
+    assert (
+        submit_acp_command(
+            config,
+            _request("route-race-preferred"),
+            prompt_router=lambda _worker: VanishedRoute(),
+        )
+        is None
+    )
+    required = submit_acp_command(
+        config,
+        _request("route-race-required"),
+        prompt_router=lambda _worker: VanishedRoute(),
+        required=True,
+    )
+    assert required is not None
+    assert required.status == "backend_unavailable"
+    assert get_command_request(
+        config.db_path,
+        config.host_id,
+        "route-race-required",
+    ) is None
+
+
 def test_concurrent_duplicate_acp_command_has_one_external_send(tmp_path: Path) -> None:
     config = _config(tmp_path)
     _seed(config)
@@ -313,6 +368,17 @@ def test_new_and_resumed_endpoint_session_invariants(tmp_path: Path) -> None:
     missing["session"] = {"mode": "resume"}
     with pytest.raises(AcpCoordinatorError, match="session id"):
         _parse_endpoint(config, _binding(), missing)
+
+
+def test_derived_acp_binding_outlives_observation_lease() -> None:
+    continuity = replace(
+        _binding(),
+        observed_at="2026-07-31T00:00:00+00:00",
+        expires_at="2026-07-31T00:00:05+00:00",
+    )
+    derived = _derived_binding(continuity, "session-private")
+    assert derived.expires_at.startswith("9999-")
+    assert derived.private_fingerprint != continuity.private_fingerprint
 
 
 def test_reconnect_remints_endpoint_instead_of_replaying_attach_ticket(tmp_path: Path) -> None:
@@ -401,6 +467,360 @@ def test_reconnect_remints_endpoint_instead_of_replaying_attach_ticket(tmp_path:
             "one-shot-private-ticket-1",
             "one-shot-private-ticket-2",
         ]
+        replaced_route = coordinator.prompt_route(worker)
+        assert replaced_route is not None
+        generation[0] = 44
+        coordinator._reconcile_worker("worker-1", strict=True)
+        with pytest.raises(AcpCoordinatorError, match="stale"):
+            _ = replaced_route.binding_fingerprint
+        with pytest.raises(AcpCoordinatorError, match="stale"):
+            replaced_route.prompt(
+                "must-not-cross-generations",
+                producer_turn_id="producer-3",
+                timeout=1.0,
+            )
+        assert runtimes[-1].prompt_calls == 0
+    finally:
+        coordinator.stop()
+
+
+def test_concurrent_reconcile_mints_only_one_endpoint(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    entered = threading.Event()
+    release = threading.Event()
+    minted = 0
+
+    class EndpointClient:
+        def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
+            nonlocal minted
+            minted += 1
+            entered.set()
+            assert release.wait(2.0)
+            return _endpoint()
+
+        def agent_acp_status(self, _target: Any, *, timeout: float) -> Any:
+            return _status()
+
+        def close(self) -> None:
+            return None
+
+    class Runtime:
+        def __init__(self, _client: Any, **kwargs: Any) -> None:
+            self._binding = kwargs["binding"]
+            self.stopped = False
+
+        def start(self) -> None:
+            return None
+
+        def stop(self, *, timeout: float) -> None:
+            self.stopped = True
+
+        def status(self) -> Any:
+            return SimpleNamespace(healthy=not self.stopped, failure_type=None)
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        client_factory=lambda *_args, **_kwargs: object(),
+        runtime_factory=Runtime,
+        reconcile_interval=60.0,
+    ).start()
+    upsert_worker_bindings(config.db_path, [_binding()])
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(coordinator._reconcile_worker, "worker-1", strict=True)
+            assert entered.wait(1.0)
+            second = pool.submit(coordinator._reconcile_worker, "worker-1", strict=True)
+            release.set()
+            first.result(timeout=2.0)
+            second.result(timeout=2.0)
+        assert minted == 1
+    finally:
+        release.set()
+        coordinator.stop()
+
+
+def test_stop_cannot_leave_inflight_reconcile_runtime_published(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    entered = threading.Event()
+    release = threading.Event()
+    stop_done = threading.Event()
+    runtimes: list[Any] = []
+
+    class EndpointClient:
+        def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
+            entered.set()
+            assert release.wait(2.0)
+            return _endpoint()
+
+        def close(self) -> None:
+            return None
+
+    class Runtime:
+        def __init__(self, _client: Any, **kwargs: Any) -> None:
+            self._binding = kwargs["binding"]
+            self.stopped = False
+            runtimes.append(self)
+
+        def start(self) -> None:
+            return None
+
+        def stop(self, *, timeout: float) -> None:
+            self.stopped = True
+
+        def status(self) -> Any:
+            return SimpleNamespace(healthy=not self.stopped, failure_type=None)
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        client_factory=lambda *_args, **_kwargs: object(),
+        runtime_factory=Runtime,
+        reconcile_interval=60.0,
+    ).start()
+    upsert_worker_bindings(config.db_path, [_binding()])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reconcile = pool.submit(coordinator._reconcile_worker, "worker-1", strict=True)
+        assert entered.wait(1.0)
+
+        def stop() -> None:
+            coordinator.stop()
+            stop_done.set()
+
+        stopping = pool.submit(stop)
+        assert not stop_done.wait(0.1)
+        release.set()
+        with pytest.raises(AcpCoordinatorError, match="stopping"):
+            reconcile.result(timeout=2.0)
+        stopping.result(timeout=2.0)
+    assert coordinator._slots == {}
+    assert runtimes and all(runtime.stopped for runtime in runtimes)
+
+
+def test_prompt_frame_acknowledgement_fences_generation_retirement(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    upsert_worker_bindings(config.db_path, [_binding()])
+    generation = [42]
+    endpoint_calls = 0
+    prompt_entered = threading.Event()
+    prompt_release = threading.Event()
+    runtimes: list[Any] = []
+
+    class EndpointClient:
+        def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
+            nonlocal endpoint_calls
+            endpoint_calls += 1
+            return _endpoint(generation=generation[0])
+
+        def agent_acp_status(self, _target: Any, *, timeout: float) -> Any:
+            return _status(generation=generation[0])
+
+        def close(self) -> None:
+            return None
+
+    class Runtime:
+        def __init__(self, _client: Any, **kwargs: Any) -> None:
+            self._binding = kwargs["binding"]
+            self._binder = kwargs["session_binding_callback"]
+            self.stopped = False
+            runtimes.append(self)
+
+        def start(self) -> None:
+            if self._binder is not None:
+                self._binding = self._binder(
+                    f"session-private-{len(runtimes)}", self._binding
+                )
+
+        def submit_prompt(self, *_args: Any, **_kwargs: Any) -> None:
+            prompt_entered.set()
+            assert prompt_release.wait(2.0)
+
+        def stop(self, *, timeout: float) -> None:
+            self.stopped = True
+
+        def status(self) -> Any:
+            return SimpleNamespace(healthy=not self.stopped, failure_type=None)
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        client_factory=lambda *_args, **_kwargs: object(),
+        runtime_factory=Runtime,
+        reconcile_interval=60.0,
+    ).start()
+    worker = Worker(
+        id="worker-1",
+        name="worker",
+        status="working",
+        fingerprint="worker-fingerprint",
+    )
+    route = coordinator.prompt_route(worker)
+    assert route is not None
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            prompt = pool.submit(
+                route.prompt,
+                "one frame",
+                producer_turn_id="producer-1",
+                timeout=1.0,
+            )
+            assert prompt_entered.wait(1.0)
+            generation[0] = 43
+            reconcile = pool.submit(
+                coordinator._reconcile_worker, "worker-1", strict=True
+            )
+            # A new endpoint cannot be minted and the old transport cannot be
+            # stopped while its request frame is still being acknowledged.
+            assert not reconcile.done()
+            assert endpoint_calls == 1
+            assert not runtimes[0].stopped
+            prompt_release.set()
+            prompt.result(timeout=2.0)
+            reconcile.result(timeout=2.0)
+        assert endpoint_calls == 2
+        assert runtimes[0].stopped
+        assert len(runtimes) == 2
+    finally:
+        prompt_release.set()
+        coordinator.stop()
+
+
+def test_runtime_factory_failure_rolls_back_resumed_binding(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+
+    class EndpointClient:
+        def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
+            endpoint = _endpoint()
+            endpoint["session"] = {"mode": "resume", "id": "session-private"}
+            return endpoint
+
+        def close(self) -> None:
+            return None
+
+    class Client:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = Client()
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        client_factory=lambda *_args, **_kwargs: client,
+        runtime_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("constructor failed with --ticket private")
+        ),
+        reconcile_interval=60.0,
+    ).start()
+    upsert_worker_bindings(config.db_path, [_binding()])
+    try:
+        with pytest.raises(RuntimeError, match="constructor failed"):
+            coordinator._reconcile_worker("worker-1", strict=True)
+        assert client.closed
+        assert list_worker_bindings(config.db_path, config.host_id, backend="acp") == []
+    finally:
+        coordinator.stop()
+
+
+def test_coordinator_start_revokes_orphaned_process_binding(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    orphaned = _derived_binding(_binding(), "orphaned-session")
+    upsert_worker_bindings(config.db_path, [orphaned])
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: object(),
+        client_factory=lambda *_args, **_kwargs: object(),
+        reconcile_interval=60.0,
+    ).start()
+    try:
+        assert list_worker_bindings(
+            config.db_path, config.host_id, backend="acp"
+        ) == []
+    finally:
+        coordinator.stop()
+
+
+def test_production_coordinator_fails_closed_without_permission_bridge(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    coordinator = production_acp_runtime_factory(config, threading.Event())
+
+    with pytest.raises(
+        AcpPermissionBridgeUnavailable,
+        match="durable ACP permission decisions",
+    ):
+        coordinator.start()
+
+    status = coordinator.status()
+    assert status["healthy"] is False
+    assert status["state"] == "failed"
+    assert status["failure_type"] == "AcpPermissionBridgeUnavailable"
+
+
+def test_coordinator_forwards_explicit_permission_bridge(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    upsert_worker_bindings(config.db_path, [_binding()])
+    seen: list[Any] = []
+
+    class EndpointClient:
+        def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
+            return _endpoint()
+
+        def close(self) -> None:
+            return None
+
+    class Runtime:
+        def __init__(self, _client: Any, **kwargs: Any) -> None:
+            seen.append(kwargs["permission_callback"])
+            self._binding = kwargs["binding"]
+
+        def start(self) -> None:
+            return None
+
+        def stop(self, *, timeout: float) -> None:
+            return None
+
+        def status(self) -> Any:
+            return SimpleNamespace(healthy=True, failure_type=None)
+
+    def permission_bridge(_request: Any) -> str | None:
+        return None
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        client_factory=lambda *_args, **_kwargs: object(),
+        runtime_factory=Runtime,
+        permission_callback=permission_bridge,
+        require_permission_bridge=True,
+        reconcile_interval=60.0,
+    ).start()
+    try:
+        assert seen == [permission_bridge]
     finally:
         coordinator.stop()
 

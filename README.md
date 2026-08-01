@@ -573,6 +573,12 @@ same public-safe degraded evidence.
 The stock daemon currently defaults to `legacy`. ACP modes use Herdr's private
 `agent.acp_endpoint` contract and accept only workers explicitly marked
 `acp_owned_ready`; ordinary PTY workers are never attached as sidecars.
+Production ACP startup is currently fail-closed with
+`AcpPermissionBridgeUnavailable`: Tendwire does not yet have a durable,
+worker/session-correlated bridge from `answer_decision` to the exact synchronous
+ACP permission request. The daemon must not silently auto-cancel tool
+permissions while reporting ACP healthy. The generic coordinator callback is
+an embedding/test hook, not a production authorization path.
 `acp_shadow` persists ACP events without projecting them, but no automated
 shadow comparator is implemented. `acp_preferred` falls back only before an ACP
 reservation/send, while `acp_required` fails closed and never starts the legacy
