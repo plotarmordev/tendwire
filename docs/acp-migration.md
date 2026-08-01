@@ -3,9 +3,9 @@
 This document defines the experimental migration from backend-specific
 transcript readers to Agent Client Protocol (ACP). ACP is not yet Tendwire's
 default. The stock daemon contains the coordinator and command path, but
-production ACP activation is currently fail-closed until a durable permission
-decision bridge is configured. The coordinator can otherwise attach only an
-explicitly Herdr-owned ACP worker.
+production ACP activation remains operator-gated on installing a supported ACP
+adapter and explicitly registering shell-only panes as Herdr ACP-owned workers.
+The coordinator never attaches an ordinary PTY worker as a sidecar.
 Herdr remains authoritative for workspace, pane, worker identity, process
 liveness, and command routing until the ACP control path is proven separately.
 Tendwire remains authoritative for persistence, reconciliation, public safety,
@@ -34,13 +34,16 @@ one-shot private endpoint, validates its worker generation and explicit
 ordinary live PTY session is never treated as ACP-owned.
 
 ACP `session/request_permission` is synchronous and can authorize destructive
-tools. Tendwire does not yet have the required durable worker/session-correlated
+tools. The stock production factory enables a durable, worker/session-correlated
 bridge from a public `answer_decision` command back to the exact request and
-offered `optionId`. The stock production factory therefore raises the redacted
-`AcpPermissionBridgeUnavailable` startup failure for every ACP mode. It must not
-silently cancel permissions while reporting the runtime healthy. Tests and
-embedders may inject an explicit callback into the generic coordinator, but
-that callback is not a production authorization surface.
+offered `optionId`. It publishes only a sanitized tool title and numbered
+choices; option IDs, arguments, ACP session IDs, adapter metadata, and raw tool
+payloads remain private. Selection is fenced to the exact worker binding and
+Herdr generation, and is accepted only after the complete JSON-RPC response
+frame is written. Missing, stale, timed-out, or uncertain authority fails
+closed without a second transport attempt. Embedders may instead inject an
+explicit callback into the generic coordinator, but the stock daemon does not
+depend on such a callback.
 
 ## Authority split
 
@@ -205,9 +208,11 @@ the agent protocol.
 
 ## Rollout gates
 
-Promotion remains blocked at the default `legacy` posture. When the missing
-runtime and Herdr prerequisites exist, it may proceed `legacy` -> `acp_shadow`
--> `acp_preferred`. The following
+Promotion remains blocked at the default `legacy` posture until a supported ACP
+adapter is installed, target panes are explicitly registered through Herdr's
+ACP-owned lifecycle, and the integration is exercised against those real
+adapters. Rollout may then proceed `legacy` -> `acp_shadow` -> `acp_preferred`.
+The following
 must pass before `acp_required` is considered:
 
 - no missing or duplicated user/final messages across adapter restarts;
@@ -221,7 +226,7 @@ must pass before `acp_required` is considered:
 
 The ACP runtime implements prompt submission, cancellation, fail-closed
 permission handling, per-worker coordination, reconnect, and receipt-backed
-instruction routing. Interactive permission approval remains a runtime blocker:
-until its durable bridge exists, the stock production factory refuses ACP
-startup. ACP also remains non-default until the cross-repository integration
-and rollout gates above pass against real adapters.
+instruction routing, including durable interactive permission approval. ACP
+remains non-default until supported adapters are installed, workers are
+explicitly registered as ACP-owned, and the cross-repository rollout gates
+above pass against real adapters.
