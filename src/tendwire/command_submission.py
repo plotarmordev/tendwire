@@ -128,6 +128,14 @@ class AcpPromptRoute(Protocol):
 AcpPromptRouter = Callable[[Worker], AcpPromptRoute | None]
 
 
+class AcpPermissionDecisionRouter(Protocol):
+    """Private daemon-owned bridge for one exact ACP permission decision."""
+
+    def owns_permission_decision(self, decision: Any) -> bool: ...
+
+    def answer_permission_decision(self, decision: Any, *, timeout: float) -> None: ...
+
+
 @dataclass(frozen=True)
 class ResolvedCommandTarget:
     worker: Worker
@@ -641,6 +649,7 @@ def _decision_claim_has_exact_route(claim: Any) -> bool:
         and not isinstance(claim.option_count, bool)
         and claim.option_count >= 1
         and isinstance(getattr(claim, "option_refs", None), tuple)
+        and getattr(claim, "route_kind", None) in {"legacy", "acp_permission"}
         and (
             (claim.text is None and bool(claim.option_refs))
             or (
@@ -666,6 +675,7 @@ def _same_decision_route(left: Any, right: Any) -> bool:
             left.option_count,
             left.option_refs,
             left.text,
+            left.route_kind,
         )
         == (
             right.worker_id,
@@ -677,8 +687,14 @@ def _same_decision_route(left: Any, right: Any) -> bool:
             right.option_count,
             right.option_refs,
             right.text,
+            right.route_kind,
         )
     )
+
+
+def _decision_uses_acp_binding(_config: Config, decision: Any) -> bool:
+    """Classify from durable provenance, independent of current liveness."""
+    return getattr(decision, "route_kind", "legacy") == "acp_permission"
 
 
 class PreSendCertainty(Enum):
@@ -2043,6 +2059,13 @@ def _validate_pending_decision(
         )
     if validated.status == "validated" and _decision_claim_has_exact_route(validated):
         return validated
+    if validated.status == "acp_authority_unavailable":
+        return _safe_transient_pre_send(
+            _backend_unavailable(
+                request,
+                "ACP permission authority is temporarily unavailable",
+            )
+        )
     status = {
         "already_claimed": STATUS_ANSWER_IN_PROGRESS,
         "unknown_worker": STATUS_UNKNOWN_WORKER,
@@ -2080,6 +2103,11 @@ def _claim_pending_decision(
     ):
         if _same_decision_route(validated, claim):
             return claim
+    if claim.status == "acp_authority_unavailable":
+        return _backend_unavailable(
+            request,
+            "ACP permission authority is temporarily unavailable",
+        )
     status = {
         "already_claimed": STATUS_ANSWER_IN_PROGRESS,
         "unknown_worker": STATUS_UNKNOWN_WORKER,
@@ -2145,6 +2173,9 @@ def _answer_decision(
     validated: Any,
     reservation: ReservedCommandMutation,
     client: Any,
+    *,
+    acp_permission_router: AcpPermissionDecisionRouter | None = None,
+    acp_handoff: bool = False,
 ) -> CommandEnvelope:
     assert config.db_path is not None
     claim = _claim_pending_decision(config, request, validated)
@@ -2153,6 +2184,18 @@ def _answer_decision(
         if claim.status == STATUS_ANSWER_IN_PROGRESS:
             _abandon_request_reservation(config, request, reservation)
             return _answer_in_progress(request, receipt_reserved=True)
+        if claim.status == STATUS_BACKEND_UNAVAILABLE:
+            if _abandon_request_reservation(config, request, reservation):
+                return claim
+            return _finish_before_send(
+                config,
+                request,
+                reservation,
+                _backend_uncertain(
+                    request,
+                    "ACP permission reservation state is uncertain",
+                ),
+            )
         return _finish_before_send(config, request, reservation, claim)
     claim_token = claim.claim_token
 
@@ -2212,12 +2255,20 @@ def _answer_decision(
         )
 
     try:
-        _submit_decision_calibration(
-            client,
-            started.turn_target_value.strip(),
-            started,
-            timeout=config.herdr_timeout_seconds,
-        )
+        if acp_handoff:
+            if acp_permission_router is None:
+                raise RuntimeError("ACP permission bridge is unavailable")
+            acp_permission_router.answer_permission_decision(
+                started,
+                timeout=config.acp_request_timeout_seconds,
+            )
+        else:
+            _submit_decision_calibration(
+                client,
+                started.turn_target_value.strip(),
+                started,
+                timeout=config.herdr_timeout_seconds,
+            )
     except Exception:  # noqa: BLE001
         return _finish_request(
             config,
@@ -2225,7 +2276,7 @@ def _answer_decision(
             reservation,
             _backend_uncertain(
                 request,
-                "Herdr decision input state is uncertain after send start",
+                "permission decision state is uncertain after send start",
             ),
             expected_state="send_started",
             terminal_state="uncertain",
@@ -2818,6 +2869,7 @@ def _submit_command_v2(
     params: Mapping[str, Any] | str,
     *,
     socket_client_factory: SocketClientFactory | None = None,
+    acp_permission_router: AcpPermissionDecisionRouter | None = None,
 ) -> CommandEnvelope:
     """Submit one command through the authoritative daemon/socket path."""
     payload = params if isinstance(params, str) else _raw_payload_from_mapping(params)
@@ -2983,9 +3035,33 @@ def _submit_command_v2(
         # claim is released or expires.
         return _answer_in_progress(request, receipt_reserved=True)
 
+    acp_handoff = False
+    if answer_pre_send is None and request.action == "answer_decision":
+        acp_binding = _decision_uses_acp_binding(config, validated)
+        if acp_binding:
+            try:
+                acp_handoff = bool(
+                    acp_permission_router is not None
+                    and acp_permission_router.owns_permission_decision(validated)
+                )
+            except Exception:
+                acp_handoff = False
+            if not acp_handoff:
+                unavailable = _backend_unavailable(
+                    request,
+                    "ACP permission authority is temporarily unavailable",
+                )
+                if takeover is not None:
+                    return _request_in_progress(request)
+                return unavailable
+
     client_or_error: Any | CommandEnvelope | None = None
     if answer_pre_send is None and health_error is None:
-        client_or_error = _connect_socket(config, request, socket_client_factory)
+        client_or_error = (
+            object()
+            if acp_handoff
+            else _connect_socket(config, request, socket_client_factory)
+        )
     if isinstance(client_or_error, CommandEnvelope):
         # The socket could not be reached before any transmission -> safe
         # transient. Stay retryable rather than reserving a durable rejection.
@@ -3020,6 +3096,8 @@ def _submit_command_v2(
             validated,
             reservation,
             client_or_error,
+            acp_permission_router=acp_permission_router,
+            acp_handoff=acp_handoff,
         )
     return _answer_pending(
         config,
@@ -3096,6 +3174,7 @@ def submit_command(
     socket_client_factory: SocketClientFactory | None = None,
     acp_prompt_router: AcpPromptRouter | None = None,
     acp_required: bool = False,
+    acp_permission_router: AcpPermissionDecisionRouter | None = None,
 ) -> CommandEnvelope:
     """Submit one command and apply optional response-envelope negotiation."""
     if acp_prompt_router is not None:
@@ -3123,6 +3202,7 @@ def submit_command(
         config,
         params,
         socket_client_factory=socket_client_factory,
+        acp_permission_router=acp_permission_router,
     )
     payload = params if isinstance(params, str) else _raw_payload_from_mapping(params)
     request, parse_error = parse_command_request(payload)

@@ -1219,7 +1219,7 @@ def test_v25_to_v26_retains_legacy_tombstones_as_dedup_only(tmp_path: Path) -> N
         )
         conn.commit()
         store_sqlite._run_migrations(conn)
-        assert conn.execute("PRAGMA user_version").fetchone() == (26,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (27,)
         assert conn.execute(
             "SELECT observed_at FROM agent_event_tombstones WHERE event_id = ?",
             (legacy_event_id,),

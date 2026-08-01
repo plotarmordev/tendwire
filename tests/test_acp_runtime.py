@@ -33,7 +33,7 @@ from tendwire.backends.acp_runtime import (
     SessionOpenMode,
 )
 from tendwire.config import Config
-from tendwire.core.models import WorkerBinding
+from tendwire.core.models import WorkerBinding, utc_timestamp
 from tendwire.store.sqlite import (
     expire_stale_worker_bindings,
     expire_worker_bindings,
@@ -917,7 +917,7 @@ def test_new_rejects_binder_that_overwrites_herdr_continuity(
                     anchor,
                     worker_id="replacement-worker-private",
                     worker_fingerprint="replacement-fingerprint-private",
-                    observed_at="2026-08-01T00:00:00+00:00",
+                    observed_at=utc_timestamp(),
                 )
             ],
         )
@@ -1071,7 +1071,7 @@ def test_replaced_binding_cancels_permission_before_callback_and_is_terminal(
         current,
         worker_id="replacement-worker-private",
         worker_fingerprint="replacement-fingerprint-private",
-        observed_at="2026-08-01T00:00:00+00:00",
+        observed_at=utc_timestamp(),
     )
     upsert_worker_bindings(tmp_path / "bound-events.db", [replacement])
     client.permissions.put(permission())

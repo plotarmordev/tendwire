@@ -145,7 +145,7 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 26
+STORE_SCHEMA_VERSION = 27
 CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 _LEGACY_TURN_CLAIM_HARD_TTL_SECONDS = 86_400
 TURN_CHANGE_RETENTION_DAYS = 7
@@ -408,6 +408,7 @@ class BackendPendingDecisionClaim:
         "decision_not_pending",
         "invalid_selection",
         "unsupported_decision",
+        "acp_authority_unavailable",
         "already_claimed",
     ]
     claim_token: str | None = None
@@ -420,6 +421,7 @@ class BackendPendingDecisionClaim:
     option_count: int | None = None
     option_refs: tuple[str, ...] = ()
     text: str | None = None
+    route_kind: Literal["legacy", "acp_permission"] = "legacy"
 
 
 @dataclass(frozen=True)
@@ -441,6 +443,7 @@ class BackendPendingDecisionSend:
     option_count: int | None = None
     option_refs: tuple[str, ...] = ()
     text: str | None = None
+    route_kind: Literal["legacy", "acp_permission"] = "legacy"
 
 
 @dataclass(frozen=True)
@@ -13531,6 +13534,39 @@ def _migrate_v25_to_v26_conn(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v26_to_v27_conn(conn: sqlite3.Connection) -> None:
+    """Persist private pending-decision transport provenance."""
+    pending_columns = _table_columns(conn, "backend_pending")
+    required_pending_columns = {
+        "revision_digest",
+        "choice_routes_json",
+        "binding_private_fingerprint",
+        "observed_turn_target_value",
+        "observation_state",
+        "freshness",
+        "updated_at",
+    }
+    if not required_pending_columns.issubset(pending_columns):
+        # Some old fixture databases intentionally contain only the v11
+        # command tables. Reconstruct this unrelated family defensively.
+        _migrate_v9_to_v10_conn(conn)
+        pending_columns = _table_columns(conn, "backend_pending")
+    if not _table_columns(conn, "backend_pending_claims"):
+        conn.execute(CREATE_BACKEND_PENDING_CLAIMS_TABLE)
+    if "route_kind" not in pending_columns:
+        conn.execute(
+            "ALTER TABLE backend_pending ADD COLUMN route_kind "
+            "TEXT NOT NULL DEFAULT 'legacy' "
+            "CHECK (route_kind IN ('legacy', 'acp_permission'))"
+        )
+    if "route_kind" not in _table_columns(conn, "backend_pending_claims"):
+        conn.execute(
+            "ALTER TABLE backend_pending_claims ADD COLUMN route_kind "
+            "TEXT NOT NULL DEFAULT 'legacy' "
+            "CHECK (route_kind IN ('legacy', 'acp_permission'))"
+        )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -13558,6 +13594,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(23, 24, _migrate_v23_to_v24_conn),
     Migration(24, 25, _migrate_v24_to_v25_conn),
     Migration(25, 26, _migrate_v25_to_v26_conn),
+    Migration(26, 27, _migrate_v26_to_v27_conn),
 )
 
 
@@ -13594,6 +13631,7 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
             conn.execute(statement)
         conn.execute(CREATE_LEGACY_BACKEND_PENDING_TABLE)
         _migrate_v9_to_v10_conn(conn)
+        _migrate_v26_to_v27_conn(conn)
         conn.execute(CREATE_ATTENTION_LIFECYCLES_TABLE)
         conn.execute(CREATE_TURN_CONTENT_REVISIONS_TABLE)
         conn.execute(CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE)
@@ -21037,10 +21075,14 @@ def apply_backend_pending_observation(
     stale_grace_seconds: float = DEFAULT_PENDING_STALE_GRACE_SECONDS,
     binding_private_fingerprint: str | None = None,
     observed_turn_target_value: str | None = None,
+    binding_authoritative: bool = False,
+    route_kind: Literal["legacy", "acp_permission"] = "legacy",
 ) -> bool:
     """Apply one explicit observation in a short writer transaction."""
     if not _sqlite_store_exists(db_path):
         return False
+    if route_kind not in {"legacy", "acp_permission"}:
+        raise ValueError("invalid backend pending route kind")
     current_time, _ = _pending_observed_time(observed_at)
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
@@ -21058,6 +21100,20 @@ def apply_backend_pending_observation(
                 ),
                 observed_turn_target_value=str(
                     observed_turn_target_value or ""
+                ),
+                binding_authoritative=bool(binding_authoritative),
+            )
+            conn.execute(
+                "UPDATE backend_pending SET route_kind = ? "
+                "WHERE host_id = ? AND worker_id = ? "
+                "AND binding_private_fingerprint = ? "
+                "AND observed_turn_target_value = ?",
+                (
+                    route_kind,
+                    str(host_id),
+                    str(worker_id),
+                    str(binding_private_fingerprint or ""),
+                    str(observed_turn_target_value or ""),
                 ),
             )
             conn.commit()
@@ -21441,9 +21497,10 @@ def _backend_pending_claim_context_conn(
         SELECT private_fingerprint, worker_fingerprint, turn_target_value
         FROM worker_bindings
         WHERE host_id = ? AND worker_id = ? AND worker_fingerprint = ?
-          AND backend = 'herdr' AND turn_target_kind = 'pane_id'
+          AND ((backend = 'herdr' AND turn_target_kind = 'pane_id')
+            OR (backend = 'acp' AND turn_target_kind = 'acp_session_id'))
           AND private_fingerprint = ? AND turn_target_value = ?
-          AND sendable = 1 AND expires_at > ?
+          AND sendable = 1 AND (expires_at IS NULL OR expires_at > ?)
         """,
         (
             str(host_id),
@@ -21756,7 +21813,8 @@ def claim_backend_pending_decision(
                 """
                 SELECT payload_json, choice_routes_json, revision_digest,
                        freshness, binding_private_fingerprint,
-                       observed_turn_target_value, observation_state
+                       observed_turn_target_value, observation_state,
+                       route_kind
                 FROM backend_pending
                 WHERE host_id = ? AND worker_id = ?
                 """,
@@ -21785,13 +21843,16 @@ def claim_backend_pending_decision(
                 observed_at=current_time,
             )
             decision = _decision_from_pending_row(row[0], row[1], row[2])
-            if (
-                context is None
-                or decision is None
-                or decision.get("decision_ref") != str(decision_ref)
-            ):
+            if decision is None or decision.get("decision_ref") != str(decision_ref):
                 conn.rollback()
                 return BackendPendingDecisionClaim("decision_not_pending")
+            if context is None:
+                conn.rollback()
+                return BackendPendingDecisionClaim(
+                    "acp_authority_unavailable"
+                    if str(row[7]) == "acp_permission"
+                    else "decision_not_pending"
+                )
             if int(decision["question_count"]) > 1:
                 conn.rollback()
                 return BackendPendingDecisionClaim("unsupported_decision")
@@ -21839,6 +21900,7 @@ def claim_backend_pending_decision(
                 "option_count": option_count,
                 "option_refs": option_refs,
                 "text": text,
+                "route_kind": str(row[7]),
             }
             if not claim:
                 conn.rollback()
@@ -21850,13 +21912,14 @@ def claim_backend_pending_decision(
                     host_id, worker_id, claim_token, revision_digest, choice_id,
                     picker_ordinal, worker_fingerprint,
                     binding_private_fingerprint, turn_target_value, state,
-                    claimed_at, send_started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, NULL)
+                    claimed_at, send_started_at, route_kind
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, NULL, ?)
                 """,
                 (
                     str(host_id), str(worker_id), token, str(row[2]),
                     _encode_decision_claim_selection(option_refs, text),
                     picker_ordinal, context[2], context[1], context[3], current_time,
+                    str(row[7]),
                 ),
             )
             conn.commit()
@@ -21888,7 +21951,7 @@ def start_backend_pending_decision_send(
                 """
                 SELECT worker_id, revision_digest, choice_id,
                        worker_fingerprint, binding_private_fingerprint,
-                       turn_target_value, state, claimed_at
+                       turn_target_value, state, claimed_at, route_kind
                 FROM backend_pending_claims
                 WHERE host_id = ? AND claim_token = ?
                 """,
@@ -21916,7 +21979,7 @@ def start_backend_pending_decision_send(
                 """
                 SELECT payload_json, choice_routes_json, revision_digest,
                        freshness, binding_private_fingerprint,
-                       observed_turn_target_value
+                       observed_turn_target_value, route_kind
                 FROM backend_pending
                 WHERE host_id = ? AND worker_id = ?
                   AND observation_state = 'open'
@@ -21940,6 +22003,7 @@ def start_backend_pending_decision_send(
                 str(current[2]) != str(row[1])
                 or str(current[4]) != str(row[4])
                 or str(current[5]) != str(row[5])
+                or str(current[6]) != str(row[8])
                 or decision is None
                 or validated_selection is None
             ):
@@ -21956,6 +22020,7 @@ def start_backend_pending_decision_send(
                 "option_count": len(decision["options"]),
                 "option_refs": option_refs,
                 "text": text,
+                "route_kind": str(row[8]),
             }
             if str(row[6]) == "send_started":
                 conn.rollback()

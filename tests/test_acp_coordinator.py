@@ -14,7 +14,6 @@ import pytest
 
 from tendwire.backends.acp_coordinator import (
     AcpCoordinatorError,
-    AcpPermissionBridgeUnavailable,
     AcpRuntimeCoordinator,
     _derived_binding,
     _parse_endpoint,
@@ -758,7 +757,7 @@ def test_coordinator_start_revokes_orphaned_process_binding(tmp_path: Path) -> N
         coordinator.stop()
 
 
-def test_production_coordinator_fails_closed_without_permission_bridge(
+def test_production_coordinator_installs_durable_permission_bridge(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path)
@@ -766,16 +765,12 @@ def test_production_coordinator_fails_closed_without_permission_bridge(
     init_store(config.db_path)
     coordinator = production_acp_runtime_factory(config, threading.Event())
 
-    with pytest.raises(
-        AcpPermissionBridgeUnavailable,
-        match="durable ACP permission decisions",
-    ):
-        coordinator.start()
-
-    status = coordinator.status()
-    assert status["healthy"] is False
-    assert status["state"] == "failed"
-    assert status["failure_type"] == "AcpPermissionBridgeUnavailable"
+    coordinator.start()
+    try:
+        assert coordinator.status()["state"] == "running"
+        assert coordinator._durable_permission_bridge is True
+    finally:
+        coordinator.stop()
 
 
 def test_coordinator_forwards_explicit_permission_bridge(tmp_path: Path) -> None:

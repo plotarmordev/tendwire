@@ -24,6 +24,7 @@ from ..store.sqlite import (
     upsert_worker_bindings,
 )
 from .acp_client import AcpClient
+from .acp_permissions import AcpPermissionBroker
 from .acp_runtime import (
     AcpRuntime,
     PermissionCallback,
@@ -61,6 +62,7 @@ class _RuntimeSlot:
     continuity: WorkerBinding
     generation: str
     runtime: AcpRuntime
+    permission_broker: AcpPermissionBroker | None = None
 
 
 class _PromptRoute:
@@ -113,9 +115,14 @@ class AcpRuntimeCoordinator:
         reconcile_interval: float | None = None,
         permission_callback: PermissionCallback | None = None,
         require_permission_bridge: bool = False,
+        durable_permission_bridge: bool = False,
     ) -> None:
         if config.db_path is None:
             raise ValueError("ACP coordinator requires a sqlite db path")
+        if durable_permission_bridge and permission_callback is not None:
+            raise ValueError(
+                "durable ACP permission bridge cannot use an embedding callback"
+            )
         self.config = config
         self._daemon_stop = stop_event
         self._endpoint_client_factory = (
@@ -125,6 +132,7 @@ class AcpRuntimeCoordinator:
         self._client_factory = client_factory
         self._permission_callback = permission_callback
         self._require_permission_bridge = bool(require_permission_bridge)
+        self._durable_permission_bridge = bool(durable_permission_bridge)
         self._reconcile_interval = max(
             1.0,
             float(
@@ -152,7 +160,11 @@ class AcpRuntimeCoordinator:
                 return self
             if self._state is not RuntimeState.NEW:
                 raise AcpCoordinatorError("ACP coordinator cannot be restarted")
-            if self._require_permission_bridge and self._permission_callback is None:
+            if (
+                self._require_permission_bridge
+                and self._permission_callback is None
+                and not self._durable_permission_bridge
+            ):
                 self._state = RuntimeState.FAILED
                 self._failure_type = "AcpPermissionBridgeUnavailable"
                 raise AcpPermissionBridgeUnavailable(
@@ -285,6 +297,35 @@ class AcpRuntimeCoordinator:
             and slot.runtime.status().healthy
         )
 
+    def owns_permission_decision(self, decision: Any) -> bool:
+        """Return whether one pending decision belongs to an exact live slot."""
+        worker_id = str(getattr(decision, "worker_id", "") or "")
+        with self._lock:
+            slot = self._slots.get(worker_id)
+        if slot is None or slot.permission_broker is None:
+            return False
+        try:
+            self._require_attached_generation(slot)
+            return slot.permission_broker.owns(decision)
+        except Exception:
+            return False
+
+    def answer_permission_decision(self, decision: Any, *, timeout: float) -> None:
+        """Select an offered option and wait for its response-frame write."""
+        worker_id = str(getattr(decision, "worker_id", "") or "")
+        with self._reconcile_lock:
+            self._require_reconcile_state(allow_starting=False)
+            with self._lock:
+                slot = self._slots.get(worker_id)
+            if slot is None or slot.permission_broker is None:
+                raise AcpCoordinatorError("ACP permission route is unavailable")
+            self._require_attached_generation(slot)
+            if not slot.permission_broker.owns(decision):
+                raise AcpCoordinatorError("ACP permission authority changed")
+            # Keep retirement fenced until respond_permission has acknowledged
+            # writing the complete JSON-RPC response frame.
+            slot.permission_broker.answer(decision, timeout=timeout)
+
     def _current_slot(self, worker: Worker) -> _RuntimeSlot:
         with self._lock:
             if self._state is not RuntimeState.RUNNING:
@@ -412,10 +453,12 @@ class AcpRuntimeCoordinator:
         if existing is not None:
             self._retire_worker(continuity.worker_id, expected=existing)
         endpoint = self._resolve_endpoint(continuity)
-        runtime = self._build_runtime(continuity, endpoint)
+        runtime, permission_broker = self._build_runtime(continuity, endpoint)
         try:
             runtime.start()
         except Exception:
+            if permission_broker is not None:
+                permission_broker.close()
             try:
                 runtime.stop(timeout=self.config.acp_shutdown_timeout_seconds)
             except Exception:
@@ -424,9 +467,13 @@ class AcpRuntimeCoordinator:
         try:
             self._require_reconcile_state(allow_starting=True)
         except Exception:
+            if permission_broker is not None:
+                permission_broker.close()
             self._stop_runtime(runtime)
             raise
-        slot = _RuntimeSlot(continuity, endpoint.generation, runtime)
+        slot = _RuntimeSlot(
+            continuity, endpoint.generation, runtime, permission_broker
+        )
         with self._lock:
             displaced = self._slots.get(continuity.worker_id)
             self._slots[continuity.worker_id] = slot
@@ -529,7 +576,7 @@ class AcpRuntimeCoordinator:
         self,
         continuity: WorkerBinding,
         endpoint: HerdrAcpEndpoint,
-    ) -> AcpRuntime:
+    ) -> tuple[AcpRuntime, AcpPermissionBroker | None]:
         client = self._client_factory(
             endpoint.command,
             cwd=endpoint.cwd,
@@ -546,8 +593,19 @@ class AcpRuntimeCoordinator:
             binding = _derived_binding(continuity, endpoint.session_id)
             upsert_worker_bindings(Path(self.config.db_path), [binding])
             callback = None
+        permission_broker = (
+            AcpPermissionBroker(
+                self.config,
+                worker_id=continuity.worker_id,
+                worker_fingerprint=continuity.worker_fingerprint,
+                generation=endpoint.generation,
+                timeout=float(self.config.submission_hard_ttl_seconds),
+            )
+            if self._durable_permission_bridge
+            else None
+        )
         try:
-            return self._runtime_factory(
+            runtime = self._runtime_factory(
                 client,
                 config=self.config,
                 binding=binding,
@@ -556,11 +614,14 @@ class AcpRuntimeCoordinator:
                 session_id=endpoint.session_id,
                 stream_generation=endpoint.generation,
                 session_binding_callback=callback,
-                permission_callback=self._permission_callback,
+                permission_callback=(permission_broker or self._permission_callback),
                 poll_timeout=min(0.25, self.config.acp_request_timeout_seconds),
                 stop_timeout=self.config.acp_shutdown_timeout_seconds,
             )
+            return runtime, permission_broker
         except Exception:
+            if permission_broker is not None:
+                permission_broker.close()
             try:
                 client.close()
             except Exception:
@@ -593,6 +654,8 @@ class AcpRuntimeCoordinator:
             if slot is None or (expected is not None and slot is not expected):
                 return
             self._slots.pop(worker_id, None)
+        if slot.permission_broker is not None:
+            slot.permission_broker.close()
         self._stop_runtime(slot.runtime)
 
     def _stop_runtime(self, runtime: AcpRuntime, *, timeout: float | None = None) -> None:
@@ -639,6 +702,8 @@ class AcpRuntimeCoordinator:
         )
         deadline = time.monotonic() + total
         for slot in slots:
+            if slot.permission_broker is not None:
+                slot.permission_broker.close()
             self._stop_runtime(
                 slot.runtime,
                 timeout=max(0.001, deadline - time.monotonic()),
@@ -939,12 +1004,9 @@ def production_acp_runtime_factory(
     stop_event: threading.Event,
 ) -> AcpRuntimeCoordinator:
     """Build the stock daemon's Herdr-backed multi-worker ACP coordinator."""
-    # ACP permission requests are synchronous and can authorize destructive
-    # tools. Until the daemon has a durable, worker/session-correlated decision
-    # broker, production must refuse ACP modes instead of silently cancelling
-    # requests while reporting the worker healthy.
     return AcpRuntimeCoordinator(
         config,
         stop_event,
         require_permission_bridge=True,
+        durable_permission_bridge=True,
     )

@@ -87,7 +87,20 @@ class AcpRuntimeStatus:
     failure_type: str | None
 
 
-PermissionCallback = Callable[[PermissionRequest], str | None]
+@dataclass(frozen=True, slots=True)
+class PermissionSelection:
+    """One selected option plus transport acknowledgement hooks.
+
+    The callback that selected an option must not report its durable command as
+    accepted until the JSON-RPC response frame has actually been written.
+    """
+
+    option_id: str
+    response_written: Callable[[], None]
+    response_failed: Callable[[BaseException], None]
+
+
+PermissionCallback = Callable[[PermissionRequest], str | PermissionSelection | None]
 IngestorFactory = Callable[..., AcpSessionIngestor]
 
 
@@ -878,15 +891,26 @@ class AcpRuntime:
                     self._permissions_ingested += 1
 
             selected: str | None = None
+            selection: PermissionSelection | None = None
             callback_failure: BaseException | None = None
             if self._permission_callback is not None:
                 try:
                     candidate = self._permission_callback(request)
-                    if candidate is not None and candidate in {
+                    candidate_id = (
+                        candidate.option_id
+                        if isinstance(candidate, PermissionSelection)
+                        else candidate
+                    )
+                    if candidate_id is not None and candidate_id in {
                         option.option_id for option in request.options
                     }:
-                        selected = candidate
-                    elif candidate is not None:
+                        selected = candidate_id
+                        selection = (
+                            candidate
+                            if isinstance(candidate, PermissionSelection)
+                            else None
+                        )
+                    elif candidate_id is not None:
                         with self._state_lock:
                             self._invalid_permission_selections += 1
                 except BaseException as exc:
@@ -900,10 +924,17 @@ class AcpRuntime:
                 with self._state_lock:
                     self._permissions_cancelled += 1
             else:
-                self._client.respond_permission(
-                    request.request_id,
-                    option_id=selected,
-                )
+                try:
+                    self._client.respond_permission(
+                        request.request_id,
+                        option_id=selected,
+                    )
+                except BaseException as exc:
+                    if selection is not None:
+                        selection.response_failed(exc)
+                    raise
+                if selection is not None:
+                    selection.response_written()
                 with self._state_lock:
                     self._permissions_selected += 1
             if callback_failure is not None:

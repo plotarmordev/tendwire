@@ -1449,18 +1449,27 @@ class TendwireDaemon:
         policy = self.config.agent_event_source
         runtime = self._acp_runtime
         route = getattr(runtime, "prompt_route", None)
+        permission_router = (
+            runtime
+            if callable(getattr(runtime, "answer_permission_decision", None))
+            else None
+        )
         if policy == "acp_required" or (
             policy == "acp_preferred" and callable(route)
-        ):
+        ) or permission_router is not None:
             from .command_submission import submit_command
 
             return submit_command(
                 self.config,
                 payload,
                 acp_prompt_router=(
-                    route if callable(route) else lambda _worker: None
+                    route
+                    if policy in {"acp_required", "acp_preferred"}
+                    and callable(route)
+                    else None
                 ),
                 acp_required=policy == "acp_required",
+                acp_permission_router=permission_router,
             )
         return self.hooks.submit_command(self.config, payload)
 
