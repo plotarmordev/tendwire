@@ -2774,6 +2774,43 @@ def test_start_stop_are_idempotent_and_bounded_for_idle_subscription(tmp_path: P
     assert time.monotonic() - started < 2.0
 
 
+def test_start_raises_instead_of_proceeding_with_stale_state_when_not_ready(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    config = _config(tmp_path, "initial-reconcile-timeout")
+    init_store(Path(config.db_path))
+    save_snapshot(
+        Path(config.db_path),
+        project_from_observations(
+            config,
+            workers=[Worker(id="stale-worker", name="Stale Worker", status="waiting")],
+        ),
+    )
+    backend = HerdrEventBackend(
+        config,
+        debounce_seconds=0,
+        reconnect_delay_seconds=0,
+    )
+    assert latest_snapshot(backend.db_path, backend.config.host_id) is not None
+
+    def wait_until_stopped() -> None:
+        backend.stop_event.wait()
+
+    monkeypatch.setattr(backend, "run_forever", wait_until_stopped)
+
+    try:
+        with pytest.raises(
+            HerdrSocketTimeoutError,
+            match="initial Herdr reconciliation timed out",
+        ):
+            backend.start(wait_for_reconcile=True, timeout_seconds=0.01)
+
+        assert backend.ready is False
+    finally:
+        backend.stop()
+
+
 @pytest.mark.parametrize("batched", [False, True], ids=["one-flush-per-event", "one-batch"])
 def test_real_idless_working_idle_working_preserves_every_transition(
     tmp_path: Path,

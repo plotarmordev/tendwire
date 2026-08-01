@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from tendwire import __version__
+from tendwire.backends.herdr_socket import HerdrSocketTimeoutError
 from tendwire.backends.herdr_turns import TurnIngestionScheduler, TurnRefreshResult
 from tendwire.cli import main
 from tendwire.config import Config
@@ -3960,6 +3961,53 @@ def test_daemon_backend_start_failure_stops_backend_without_publishing_socket(
         _assert_private_daemon_failure(caught.value, socket_path)
         assert daemon.server is None
         assert not os.path.lexists(socket_path)
+    finally:
+        daemon.stop()
+
+
+@_UNIX_SOCKET_TEST
+def test_daemon_backend_timeout_never_reaches_acp_startup(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    class TimedOutEventBackend:
+        def start(self, *, wait_for_reconcile: bool) -> None:
+            assert wait_for_reconcile is True
+            calls.append("backend_start")
+            raise HerdrSocketTimeoutError("initial Herdr reconciliation timed out")
+
+        def stop(self) -> None:
+            calls.append("backend_stop")
+
+    def forbidden_acp_factory(_config: Config, _stop_event: threading.Event) -> Any:
+        calls.append("acp_factory")
+        raise AssertionError("ACP startup must not follow a Herdr readiness timeout")
+
+    config = Config(
+        host_id="daemon-host",
+        data_dir=tmp_path,
+        db_path=tmp_path / "backend-timeout.db",
+        socket_path=tmp_path / "backend-timeout.sock",
+        herdr_backend="socket",
+        agent_event_source="acp_preferred",
+    )
+    daemon = TendwireDaemon(
+        config,
+        hooks=DaemonHooks(
+            event_backend_factory=lambda _config, _stop_event: TimedOutEventBackend(),
+            acp_runtime_factory=forbidden_acp_factory,
+        ),
+    )
+
+    try:
+        with pytest.raises(
+            HerdrSocketTimeoutError,
+            match="initial Herdr reconciliation timed out",
+        ):
+            daemon.start()
+
+        assert calls == ["backend_start", "backend_stop"]
+        assert daemon.server is None
+        assert not os.path.lexists(config.socket_path)
     finally:
         daemon.stop()
 

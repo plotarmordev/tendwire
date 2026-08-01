@@ -1008,7 +1008,8 @@ class HerdrEventBackend:
         thread.start()
         if wait_for_reconcile:
             timeout = self.config.herdr_timeout_seconds if timeout_seconds is None else timeout_seconds
-            self._ready.wait(max(0.001, float(timeout)))
+            if not self._ready.wait(max(0.001, float(timeout))):
+                raise HerdrSocketTimeoutError("initial Herdr reconciliation timed out")
 
     def stop(self) -> None:
         self.stop_event.set()
