@@ -16,9 +16,12 @@ command receipts, and connector delivery.
 `TENDWIRE_AGENT_EVENT_SOURCE` controls projection precedence:
 
 - `legacy`: use the existing Herdr/Codex/OMP turn readers only.
-- `acp_shadow`: ingest ACP events
-  durably without projecting them; legacy turns remain authoritative. Automated
-  comparison is not implemented yet.
+- `acp_shadow`: ingest ACP events durably without projecting them. Ordinary
+  legacy workers remain legacy-authoritative. ACP-owned workers are excluded
+  from legacy turn ingestion, and command submission to them fails closed with
+  `backend_unavailable`: shadow is observation-only and does not execute an
+  equivalent prompt on both transports. Automated comparison is not
+  implemented yet.
 - `acp_preferred`: use an explicitly Herdr-owned ACP endpoint when available;
   fall back to legacy only before any ACP command reservation or observable
   send.
@@ -148,10 +151,10 @@ before every prompt and during reconciliation. The reported lifecycle must be
 A mismatch or unavailable status retires the slot before any prompt frame is
 written. Endpoint minting is never used as a status probe.
 
-In `acp_preferred`, the legacy scheduler remains available only for workers not
-currently owned by a healthy ACP slot. It rechecks this exclusion after dequeue
-and immediately before a legacy read, preventing queued legacy work from
-overwriting or duplicating the active ACP worker projection.
+In `acp_shadow` and `acp_preferred`, the legacy scheduler remains available only
+for workers not currently owned by a healthy ACP slot. It rechecks this
+exclusion after dequeue and immediately before a legacy read, preventing queued
+legacy work from overwriting or duplicating the active ACP worker projection.
 
 Disconnect handling is conservative:
 
@@ -212,7 +215,9 @@ Promotion remains blocked at the default `legacy` posture until a supported ACP
 adapter is installed, target panes are explicitly registered through Herdr's
 ACP-owned lifecycle, and the integration is exercised against those real
 adapters. Rollout may then proceed `legacy` -> `acp_shadow` -> `acp_preferred`.
-The following
+Use an isolated `acp_preferred` (or stricter `acp_required`) canary for real
+adapter prompt validation; `acp_shadow` intentionally does not pretend to
+compare equivalent executed traffic. The following
 must pass before `acp_required` is considered:
 
 - no missing or duplicated user/final messages across adapter restarts;

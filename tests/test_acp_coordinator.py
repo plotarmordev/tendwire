@@ -25,6 +25,7 @@ from tendwire.backends.herdr_turns import TurnIngestionScheduler, TurnRefreshRes
 from tendwire.command_submission import submit_acp_command, submit_command
 from tendwire.config import Config
 from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
+from tendwire.daemon import DaemonHooks, TendwireDaemon
 from tendwire.store.sqlite import (
     get_command_request,
     init_store,
@@ -266,6 +267,191 @@ def test_acp_failure_after_send_started_is_uncertain_and_never_falls_back(tmp_pa
         "request-uncertain",
     )
     assert receipt is not None and receipt["state"] == "uncertain"
+
+
+def test_shadow_owned_command_is_observation_only_before_receipt(tmp_path: Path) -> None:
+    config = _config(tmp_path, policy="acp_shadow")
+    worker = replace(_seed(config), status="working")
+    assert config.db_path is not None
+    save_snapshot(
+        config.db_path,
+        Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-07-31T00:00:01+00:00",
+            workers=[worker],
+            backend_health=[
+                BackendHealth(
+                    name="herdr",
+                    status="healthy",
+                    outcome="healthy_non_empty",
+                )
+            ],
+        ),
+    )
+    route = _Route()
+
+    envelope = submit_acp_command(
+        config,
+        _request("shadow-observation-only"),
+        prompt_router=lambda _worker: route,
+        observation_only=True,
+    )
+
+    assert envelope is not None
+    assert envelope.status == "backend_unavailable"
+    assert envelope.disposition == "no_receipt"
+    assert route.calls == []
+    assert get_command_request(
+        config.db_path,
+        config.host_id,
+        "shadow-observation-only",
+    ) is None
+
+
+def test_daemon_shadow_owned_command_never_reaches_legacy_sender(tmp_path: Path) -> None:
+    config = _config(tmp_path, policy="acp_shadow")
+    worker = _seed(config)
+    route = _Route()
+    legacy_calls: list[str] = []
+
+    class Runtime:
+        def prompt_route(self, routed: Worker) -> _Route | None:
+            return route if routed == worker else None
+
+    def legacy_sender(_config: Config, _payload: str) -> Any:
+        legacy_calls.append("calibrate-or-write")
+        raise AssertionError("ACP-owned shadow target must not use legacy PTY I/O")
+
+    daemon = TendwireDaemon(
+        config,
+        hooks=DaemonHooks(submit_command=legacy_sender),
+    )
+    daemon._acp_runtime = Runtime()
+
+    envelope = daemon.submit_command(_request("shadow-daemon-fence"))
+
+    assert envelope.status == "backend_unavailable"
+    assert envelope.disposition == "no_receipt"
+    assert route.calls == []
+    assert legacy_calls == []
+
+
+def test_daemon_shadow_preserves_ordinary_legacy_worker_submission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, policy="acp_shadow")
+    _seed(config)
+    legacy_calls: list[str] = []
+
+    class Runtime:
+        def prompt_route(self, _worker: Worker) -> None:
+            return None
+
+    class LegacyClient:
+        def connect(self) -> "LegacyClient":
+            return self
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any],
+            *,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            del timeout
+            legacy_calls.append(method)
+            if method == "agent.get":
+                return {"result": {"agent": {"pane_id": "pane-private"}}}
+            if method == "agent.prompt":
+                return {
+                    "type": "agent_prompted",
+                    "agent": {"pane_id": "pane-private"},
+                    "delivery": "submitted",
+                }
+            return {"accepted": True, "params": params}
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "tendwire.command_submission._default_socket_client_factory",
+        lambda _config: LegacyClient(),
+    )
+    daemon = TendwireDaemon(config)
+    daemon._acp_runtime = Runtime()
+
+    envelope = daemon.submit_command(_request("shadow-legacy-worker"))
+
+    assert envelope.status == "accepted"
+    assert legacy_calls[-1] == "agent.prompt"
+
+
+def test_daemon_wires_shadow_ownership_fence_into_legacy_scheduler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        _config(tmp_path, policy="acp_shadow"),
+        herdr_backend="cli",
+        socket_path=tmp_path / "shadow.sock",
+    )
+    callback: Any | None = None
+
+    class Runtime:
+        def start(self) -> None:
+            return None
+
+        def stop(self, *, timeout: float) -> None:
+            return None
+
+        def status(self) -> dict[str, Any]:
+            return {"state": "running", "healthy": True}
+
+        def owns_worker(self, worker_id: str, fingerprint: str) -> bool:
+            return worker_id == "worker-1" and fingerprint == "worker-fingerprint"
+
+    class Scheduler:
+        def set_worker_exclusion(self, value: Any) -> None:
+            nonlocal callback
+            callback = value
+
+        def start(self) -> None:
+            return None
+
+        def request_refresh(self) -> None:
+            return None
+
+        def stop(self, *, flush_timeout_seconds: float) -> None:
+            return None
+
+    def observe(_config: Config) -> Snapshot:
+        snapshot = Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-07-31T00:00:00+00:00",
+            workers=[],
+            backend_health=[],
+        )
+        assert config.db_path is not None
+        save_snapshot(config.db_path, snapshot)
+        return snapshot
+
+    daemon = TendwireDaemon(
+        config,
+        hooks=DaemonHooks(
+            observe_initial_snapshot=observe,
+            turn_scheduler_factory=lambda _config: Scheduler(),
+            acp_runtime_factory=lambda _config, _stop: Runtime(),
+        ),
+    )
+    monkeypatch.setattr("tendwire.daemon.UnixSocketJSONServer.start", lambda _self: None)
+    try:
+        daemon.start()
+        assert callable(callback)
+        assert callback("worker-1", "worker-fingerprint") is True
+        assert callback("legacy-worker", "legacy-fingerprint") is False
+    finally:
+        daemon.stop()
 
 
 def test_route_authority_failure_is_safe_before_receipt_reservation(tmp_path: Path) -> None:
@@ -906,8 +1092,12 @@ def test_coordinator_forwards_explicit_permission_bridge(tmp_path: Path) -> None
         coordinator.stop()
 
 
-def test_preferred_legacy_scheduler_excludes_acp_owned_worker(tmp_path: Path) -> None:
-    config = _config(tmp_path)
+@pytest.mark.parametrize("policy", ["acp_shadow", "acp_preferred"])
+def test_acp_owned_worker_is_excluded_from_legacy_scheduler(
+    tmp_path: Path,
+    policy: str,
+) -> None:
+    config = _config(tmp_path, policy=policy)
     assert config.db_path is not None
     init_store(config.db_path)
     upsert_worker_bindings(config.db_path, [_binding()])

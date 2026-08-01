@@ -616,7 +616,7 @@ class TendwireDaemon:
             if self.config.agent_event_source != "acp_required":
                 scheduler = self.hooks.turn_scheduler_factory(self.config)
                 self._turn_scheduler = scheduler
-                if self.config.agent_event_source == "acp_preferred":
+                if self.config.agent_event_source in {"acp_shadow", "acp_preferred"}:
                     owns_worker = getattr(self._acp_runtime, "owns_worker", None)
                     set_exclusion = getattr(scheduler, "set_worker_exclusion", None)
                     if callable(owns_worker) and callable(set_exclusion):
@@ -1455,7 +1455,7 @@ class TendwireDaemon:
             else None
         )
         if policy == "acp_required" or (
-            policy == "acp_preferred" and callable(route)
+            policy in {"acp_shadow", "acp_preferred"} and callable(route)
         ) or permission_router is not None:
             from .command_submission import submit_command
 
@@ -1464,11 +1464,12 @@ class TendwireDaemon:
                 payload,
                 acp_prompt_router=(
                     route
-                    if policy in {"acp_required", "acp_preferred"}
+                    if policy in {"acp_shadow", "acp_required", "acp_preferred"}
                     and callable(route)
                     else None
                 ),
                 acp_required=policy == "acp_required",
+                acp_observation_only=policy == "acp_shadow",
                 acp_permission_router=permission_router,
             )
         return self.hooks.submit_command(self.config, payload)

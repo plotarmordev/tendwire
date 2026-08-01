@@ -582,9 +582,12 @@ after the complete JSON-RPC permission-response frame is written. Missing or
 retired ACP authority fails closed without falling back to PTY input, and
 concurrent answers can produce at most one response.
 `acp_shadow` persists ACP events without projecting them, but no automated
-shadow comparator is implemented. `acp_preferred` falls back only before an ACP
-reservation/send, while `acp_required` fails closed and never starts the legacy
-turn scheduler. None of these modes makes agent thoughts
+shadow comparator is implemented. For ACP-owned workers it is observation-only:
+legacy turn ingestion is excluded and commands fail `backend_unavailable`
+without sending on either transport. Validate real adapter execution with an
+isolated `acp_preferred` or `acp_required` canary. `acp_preferred` falls back
+only before an ACP reservation/send, while `acp_required` fails closed and
+never starts the legacy turn scheduler. None of these modes makes agent thoughts
 public: thought events remain private diagnostic data unless a separate,
 explicit sanitized projection is introduced.
 

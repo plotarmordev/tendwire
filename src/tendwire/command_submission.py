@@ -2687,6 +2687,7 @@ def submit_acp_command(
     *,
     prompt_router: AcpPromptRouter,
     required: bool = False,
+    observation_only: bool = False,
 ) -> CommandEnvelope | None:
     """Submit ``send_instruction`` through a live ACP worker route.
 
@@ -2694,6 +2695,10 @@ def submit_acp_command(
     may safely use the legacy Herdr sender.  Once a receipt reaches
     ``send_started``, every failure is terminally uncertain and this function
     never permits a second transport attempt.
+
+    In observation-only shadow mode a live ACP route is ownership evidence,
+    not a transport. Such a target fails closed before receipt reservation;
+    returning ``None`` would incorrectly fall through to its legacy route.
     """
 
     payload = params if isinstance(params, str) else _raw_payload_from_mapping(params)
@@ -2759,6 +2764,22 @@ def submit_acp_command(
     if takeover is not None and worker.id != takeover.public_worker_id:
         return _duplicate_request(request)
 
+    route: AcpPromptRoute | None = None
+    route_resolved = False
+    if observation_only:
+        route_resolved = True
+        try:
+            route = prompt_router(worker)
+        except Exception:  # noqa: BLE001
+            route = None
+        if route is not None:
+            return _backend_unavailable(
+                request,
+                "ACP shadow is observation-only for ACP-owned workers; use an "
+                "isolated ACP preferred or required canary to validate prompt "
+                "execution",
+            )
+
     permanent_error = _worker_status_error(request, worker) or health_error
     if permanent_error is not None:
         if required:
@@ -2769,10 +2790,11 @@ def submit_acp_command(
             return _finish_before_send(config, request, reservation, permanent_error)
         return None
 
-    try:
-        route = prompt_router(worker)
-    except Exception:  # noqa: BLE001
-        route = None
+    if not route_resolved:
+        try:
+            route = prompt_router(worker)
+        except Exception:  # noqa: BLE001
+            route = None
     if route is None:
         if takeover is not None:
             return _request_in_progress(request)
@@ -3174,6 +3196,7 @@ def submit_command(
     socket_client_factory: SocketClientFactory | None = None,
     acp_prompt_router: AcpPromptRouter | None = None,
     acp_required: bool = False,
+    acp_observation_only: bool = False,
     acp_permission_router: AcpPermissionDecisionRouter | None = None,
 ) -> CommandEnvelope:
     """Submit one command and apply optional response-envelope negotiation."""
@@ -3183,6 +3206,7 @@ def submit_command(
             params,
             prompt_router=acp_prompt_router,
             required=acp_required,
+            observation_only=acp_observation_only,
         )
         if acp_envelope is not None:
             payload = (
