@@ -54,6 +54,10 @@ class AcpConsoleInputGap(AcpCoordinatorError):
     """The bounded Herdr console queue lost unconsumed pane input."""
 
 
+class AcpVisibleConsoleUnavailable(AcpCoordinatorError):
+    """A worker cannot accept new prompts while its pane bridge is lost."""
+
+
 # Herdr's aggregate console queue admission is 768 KiB and its normal control
 # frame is 2 MiB. Keep Tendwire's retained output contribution below 512 KiB
 # so queued pane input and the echoed response retain explicit headroom.
@@ -196,6 +200,7 @@ class AcpRuntimeCoordinator:
         self._console_degraded = False
         self._console_failure_type: str | None = None
         self._console_failed_workers: set[str] = set()
+        self._console_failed_claims: dict[str, str] = {}
 
     def start(self) -> "AcpRuntimeCoordinator":
         with self._lock:
@@ -392,11 +397,17 @@ class AcpRuntimeCoordinator:
     def prompt_route(self, worker: Worker) -> _PromptRoute | None:
         try:
             slot = self._current_slot(worker)
+        except AcpVisibleConsoleUnavailable:
+            # Console loss is a deliberate hard fence, not a stale runtime
+            # that reconciliation should remint synchronously on this command.
+            return None
         except AcpCoordinatorError:
             # A just-observed worker may not have reached the periodic pass.
             try:
                 self._reconcile_worker(worker.id, strict=False)
                 slot = self._current_slot(worker)
+            except AcpVisibleConsoleUnavailable:
+                return None
             except Exception:  # noqa: BLE001
                 return None
         return _PromptRoute(self, worker, slot)
@@ -410,6 +421,23 @@ class AcpRuntimeCoordinator:
             and slot.continuity.worker_fingerprint == worker_fingerprint
             and slot.runtime.status().healthy
         )
+
+    def claims_worker(self, worker_id: str, worker_fingerprint: str) -> bool:
+        """Return whether ACP has published authority for this exact worker.
+
+        Unlike ``owns_worker``, this remains true across a console/runtime
+        outage so preferred mode cannot fall through to legacy pane I/O.
+        """
+
+        with self._lock:
+            slot = self._slots.get(worker_id)
+            return bool(
+                (
+                    slot is not None
+                    and slot.continuity.worker_fingerprint == worker_fingerprint
+                )
+                or self._console_failed_claims.get(worker_id) == worker_fingerprint
+            )
 
     def owns_permission_decision(self, decision: Any) -> bool:
         """Return whether one pending decision belongs to an exact live slot."""
@@ -445,8 +473,18 @@ class AcpRuntimeCoordinator:
             if self._state is not RuntimeState.RUNNING:
                 raise AcpCoordinatorError("ACP coordinator is not running")
             slot = self._slots.get(worker.id)
+            console_failed = worker.id in self._console_failed_workers
         if slot is None:
             raise AcpCoordinatorError("ACP worker route is unavailable")
+        if console_failed:
+            # The visible pane is part of the required transport, not an
+            # optional observer.  Fence every newly resolved route (and every
+            # use of a route resolved before the failure) on the first bridge
+            # loss.  The in-flight ACP turn itself may continue to drain, but
+            # pane and Telegram callers cannot start another headless turn.
+            raise AcpVisibleConsoleUnavailable(
+                "ACP worker visible console is unavailable"
+            )
         if slot.continuity.worker_fingerprint != worker.fingerprint:
             raise AcpCoordinatorError("ACP worker authority is stale")
         if not slot.runtime.status().healthy:
@@ -503,7 +541,13 @@ class AcpRuntimeCoordinator:
                     return
                 slot.console_failures = 0
             with self._lock:
+                # A superseded bridge must not clear the fence for its
+                # replacement.  Recovery requires a successful pass by the
+                # exact slot currently published for this worker.
+                if self._slots.get(worker_id) is not slot:
+                    return
                 self._console_failed_workers.discard(worker_id)
+                self._console_failed_claims.pop(worker_id, None)
                 self._console_degraded = bool(self._console_failed_workers)
                 if not self._console_degraded:
                     self._console_failure_type = None
@@ -517,6 +561,9 @@ class AcpRuntimeCoordinator:
             # runtime. A later pass replays inputs and idempotent outputs.
             with self._lock:
                 self._console_failed_workers.add(worker_id)
+                self._console_failed_claims[worker_id] = (
+                    slot.continuity.worker_fingerprint
+                )
                 self._console_degraded = True
                 self._console_failure_type = type(exc).__name__
             if failure_count >= 3:
@@ -903,6 +950,7 @@ class AcpRuntimeCoordinator:
                 self.config,
                 json.dumps(request, sort_keys=True, separators=(",", ":")),
                 acp_prompt_router=self.prompt_route,
+                acp_worker_owner=self.claims_worker,
                 acp_required=True,
                 acp_observation_only=False,
                 acp_permission_router=self,
@@ -962,6 +1010,19 @@ class AcpRuntimeCoordinator:
         ambiguities = sum(1 for rows in grouped.values() if len(rows) != 1)
         return current, ambiguities
 
+    def _herdr_authority_claims(self) -> set[tuple[str, str]]:
+        """Return exact sendable identities without requiring unique routing."""
+
+        return {
+            (binding.worker_id, binding.worker_fingerprint)
+            for binding in list_worker_bindings(
+                Path(self.config.db_path),
+                self.config.host_id,
+                backend="herdr",
+            )
+            if binding.sendable
+        }
+
     def _reconcile(self, *, strict: bool) -> None:
         with self._reconcile_lock:
             try:
@@ -974,7 +1035,24 @@ class AcpRuntimeCoordinator:
     def _reconcile_locked(self, *, strict: bool) -> None:
         current, ambiguities = self._continuity_bindings()
         with self._lock:
+            failed_claims = tuple(self._console_failed_claims.items())
+        exact_authorities = (
+            self._herdr_authority_claims() if failed_claims else set()
+        )
+        with self._lock:
             stale = [worker_id for worker_id in self._slots if worker_id not in current]
+            disappeared_failures = [
+                worker_id
+                for worker_id, fingerprint in failed_claims
+                if (worker_id, fingerprint) not in exact_authorities
+                and self._console_failed_claims.get(worker_id) == fingerprint
+            ]
+            for worker_id in disappeared_failures:
+                self._console_failed_workers.discard(worker_id)
+                self._console_failed_claims.pop(worker_id, None)
+            self._console_degraded = bool(self._console_failed_workers)
+            if not self._console_degraded:
+                self._console_failure_type = None
         for worker_id in stale:
             self._retire_worker(worker_id)
         failures: list[BaseException] = [
@@ -1006,6 +1084,28 @@ class AcpRuntimeCoordinator:
                 current, _ambiguities = self._continuity_bindings()
                 continuity = current.get(worker_id)
                 if continuity is None:
+                    with self._lock:
+                        failed_fingerprint = self._console_failed_claims.get(worker_id)
+                    authority_remains = True
+                    if failed_fingerprint is not None:
+                        try:
+                            authority_remains = (
+                                worker_id,
+                                failed_fingerprint,
+                            ) in self._herdr_authority_claims()
+                        except Exception:
+                            # A failed ownership check cannot safely reopen PTY
+                            # fallback; the periodic reconcile can retry it.
+                            authority_remains = True
+                    with self._lock:
+                        if worker_id not in self._slots and not authority_remains:
+                            self._console_failed_workers.discard(worker_id)
+                            self._console_failed_claims.pop(worker_id, None)
+                            self._console_degraded = bool(
+                                self._console_failed_workers
+                            )
+                            if not self._console_degraded:
+                                self._console_failure_type = None
                     if strict:
                         raise AcpCoordinatorError(
                             "worker has no unique Herdr authority"
@@ -1278,6 +1378,7 @@ class AcpRuntimeCoordinator:
                 self._retired_slots.append(slot)
                 if not preserve_console_failure:
                     self._console_failed_workers.discard(worker_id)
+                    self._console_failed_claims.pop(worker_id, None)
                     self._console_degraded = bool(self._console_failed_workers)
                     if not self._console_degraded:
                         self._console_failure_type = None

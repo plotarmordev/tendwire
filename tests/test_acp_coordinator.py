@@ -578,6 +578,224 @@ def test_console_failure_remains_degraded_after_slot_disappears(tmp_path: Path) 
     assert status["failure_type"] == "OSError"
 
 
+def test_first_console_failure_immediately_fences_prompt_route_until_success(
+    tmp_path: Path,
+) -> None:
+    coordinator = AcpRuntimeCoordinator(
+        _config(tmp_path, policy="acp_required"),
+        threading.Event(),
+        reconcile_interval=60.0,
+    )
+    coordinator._state = RuntimeState.RUNNING
+    runtime = SimpleNamespace(
+        status=lambda: SimpleNamespace(healthy=True, failure_type=None),
+        _binding=_binding(),
+    )
+    slot = _RuntimeSlot(
+        _binding(),
+        "42",
+        runtime,
+        console=HerdrAcpConsoleEndpoint(42, "console-lease"),
+    )
+    coordinator._slots["worker-1"] = slot
+    worker = Worker(
+        id="worker-1",
+        name="worker",
+        status="idle",
+        fingerprint="worker-fingerprint",
+    )
+    issued_before_loss = coordinator.prompt_route(worker)
+    assert issued_before_loss is not None
+    reconcile_calls = 0
+
+    def unexpected_reconcile(_worker_id: str, *, strict: bool) -> None:
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+
+    coordinator._reconcile_worker = unexpected_reconcile  # type: ignore[method-assign]
+
+    failure_entered = threading.Event()
+    release_failure = threading.Event()
+
+    def fail(_slot: _RuntimeSlot) -> None:
+        failure_entered.set()
+        assert release_failure.wait(2.0)
+        raise OSError("console unavailable")
+
+    coordinator._bridge_console_slot = fail  # type: ignore[method-assign]
+    failed_pass = threading.Thread(
+        target=coordinator._bridge_console_slot_supervised,
+        args=(slot,),
+    )
+    failed_pass.start()
+    assert failure_entered.wait(1.0)
+    release_failure.set()
+    failed_pass.join(timeout=1.0)
+    assert not failed_pass.is_alive()
+
+    assert coordinator.prompt_route(worker) is None
+    assert reconcile_calls == 0
+    with pytest.raises(AcpCoordinatorError, match="visible console"):
+        _ = issued_before_loss.binding_fingerprint
+    assert coordinator.status()["healthy"] is False
+
+    success_entered = threading.Event()
+    release_success = threading.Event()
+
+    def succeed(_slot: _RuntimeSlot) -> None:
+        success_entered.set()
+        assert release_success.wait(2.0)
+
+    coordinator._bridge_console_slot = succeed  # type: ignore[method-assign]
+    successful_pass = threading.Thread(
+        target=coordinator._bridge_console_slot_supervised,
+        args=(slot,),
+    )
+    successful_pass.start()
+    assert success_entered.wait(1.0)
+    # Starting a recovery bridge is not recovery; it must complete one
+    # visible-console exchange before either command ingress can route again.
+    assert coordinator.prompt_route(worker) is None
+    release_success.set()
+    successful_pass.join(timeout=1.0)
+    assert not successful_pass.is_alive()
+
+    assert coordinator.prompt_route(worker) is not None
+    assert reconcile_calls == 0
+    assert coordinator.status()["healthy"] is True
+
+
+def test_superseded_console_success_cannot_clear_replacement_fence(
+    tmp_path: Path,
+) -> None:
+    coordinator = AcpRuntimeCoordinator(
+        _config(tmp_path, policy="acp_required"),
+        threading.Event(),
+        reconcile_interval=60.0,
+    )
+    coordinator._state = RuntimeState.RUNNING
+    runtime = SimpleNamespace(
+        status=lambda: SimpleNamespace(healthy=True, failure_type=None),
+        _binding=_binding(),
+    )
+    old = _RuntimeSlot(
+        _binding(),
+        "42",
+        runtime,
+        console=HerdrAcpConsoleEndpoint(42, "old-lease"),
+    )
+    replacement = _RuntimeSlot(
+        _binding(),
+        "43",
+        runtime,
+        console=HerdrAcpConsoleEndpoint(43, "replacement-lease"),
+    )
+    coordinator._slots["worker-1"] = replacement
+    coordinator._console_failed_workers.add("worker-1")
+    coordinator._console_degraded = True
+    coordinator._bridge_console_slot = lambda _slot: None  # type: ignore[method-assign]
+
+    coordinator._bridge_console_slot_supervised(old)
+    assert "worker-1" in coordinator._console_failed_workers
+    assert coordinator.status()["healthy"] is False
+
+    coordinator._bridge_console_slot_supervised(replacement)
+    assert "worker-1" not in coordinator._console_failed_workers
+    assert coordinator.status()["healthy"] is True
+
+
+def test_failed_remint_retains_exact_acp_claim_and_blocks_preferred_fallback(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, policy="acp_preferred")
+    worker = _seed(config)
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        reconcile_interval=60.0,
+    )
+    coordinator._state = RuntimeState.RUNNING
+    runtime = SimpleNamespace(
+        status=lambda: SimpleNamespace(healthy=True, failure_type=None),
+        stop=lambda *, timeout: None,
+        _binding=_binding(),
+    )
+    slot = _RuntimeSlot(
+        _binding(),
+        "42",
+        runtime,
+        console=HerdrAcpConsoleEndpoint(42, "console-lease"),
+    )
+    coordinator._slots[worker.id] = slot
+
+    def fail_console(_slot: _RuntimeSlot) -> None:
+        raise OSError("console unavailable")
+
+    coordinator._bridge_console_slot = fail_console  # type: ignore[method-assign]
+    coordinator._continuity_bindings = (  # type: ignore[method-assign]
+        lambda: ({worker.id: _binding()}, 0)
+    )
+
+    def fail_remint(_continuity: WorkerBinding) -> None:
+        raise AcpCoordinatorError("replacement attach failed")
+
+    coordinator._reconcile_binding = fail_remint  # type: ignore[method-assign]
+
+    for _attempt in range(3):
+        coordinator._bridge_console_slot_supervised(slot)
+
+    assert worker.id not in coordinator._slots
+    assert coordinator.claims_worker(worker.id, worker.fingerprint) is True
+    assert coordinator.prompt_route(worker) is None
+
+    def forbidden_legacy(_config: Config) -> Any:
+        raise AssertionError("retired ACP claim must not reopen legacy pane I/O")
+
+    envelope = submit_command(
+        config,
+        _request("failed-remint-no-fallback"),
+        socket_client_factory=forbidden_legacy,
+        acp_prompt_router=coordinator.prompt_route,
+        acp_worker_owner=coordinator.claims_worker,
+    )
+    assert envelope.status == "backend_unavailable"
+    assert envelope.disposition == "no_receipt"
+    assert get_command_request(
+        config.db_path,
+        config.host_id,
+        "failed-remint-no-fallback",
+    ) is None
+
+
+def test_failed_claim_clears_only_after_exact_herdr_authority_disappears(
+    tmp_path: Path,
+) -> None:
+    coordinator = AcpRuntimeCoordinator(
+        _config(tmp_path, policy="acp_preferred"),
+        threading.Event(),
+        reconcile_interval=60.0,
+    )
+    coordinator._state = RuntimeState.RUNNING
+    coordinator._console_failed_workers.add("worker-1")
+    coordinator._console_failed_claims["worker-1"] = "worker-fingerprint"
+    coordinator._console_degraded = True
+    coordinator._continuity_bindings = (  # type: ignore[method-assign]
+        lambda: ({}, 1)
+    )
+    coordinator._herdr_authority_claims = (  # type: ignore[method-assign]
+        lambda: {("worker-1", "worker-fingerprint")}
+    )
+
+    coordinator._reconcile_locked(strict=False)
+    assert coordinator.claims_worker("worker-1", "worker-fingerprint") is True
+    assert coordinator.status()["healthy"] is False
+
+    coordinator._herdr_authority_claims = lambda: set()  # type: ignore[method-assign]
+    coordinator._reconcile_locked(strict=False)
+    assert coordinator.claims_worker("worker-1", "worker-fingerprint") is False
+    assert coordinator._console_degraded is False
+
+
 def test_console_submission_rejects_a_retired_generation_before_store_access(
     tmp_path: Path,
 ) -> None:
@@ -884,6 +1102,77 @@ def test_acp_failure_after_send_started_is_uncertain_and_never_falls_back(tmp_pa
     assert receipt is not None and receipt["state"] == "uncertain"
 
 
+def test_preferred_acp_owned_route_loss_fails_closed_without_receipt_or_legacy(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, policy="acp_preferred")
+    worker = _seed(config)
+
+    def forbidden_legacy(_config: Config) -> Any:
+        raise AssertionError("ACP-owned console loss must not reach legacy pane I/O")
+
+    for _attempt in range(2):
+        envelope = submit_command(
+            config,
+            _request("preferred-owned-console-loss"),
+            socket_client_factory=forbidden_legacy,
+            acp_prompt_router=lambda _worker: None,
+            acp_worker_owner=lambda worker_id, fingerprint: (
+                worker_id == worker.id and fingerprint == worker.fingerprint
+            ),
+        )
+        assert envelope.status == "backend_unavailable"
+        assert envelope.disposition == "no_receipt"
+    assert get_command_request(
+        config.db_path,
+        config.host_id,
+        "preferred-owned-console-loss",
+    ) is None
+
+
+def test_preferred_non_acp_worker_still_uses_legacy_sender(tmp_path: Path) -> None:
+    config = _config(tmp_path, policy="acp_preferred")
+    _seed(config)
+    legacy_calls: list[str] = []
+
+    class LegacyClient:
+        def connect(self) -> "LegacyClient":
+            return self
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any],
+            *,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            del timeout
+            legacy_calls.append(method)
+            if method == "agent.get":
+                return {"result": {"agent": {"pane_id": "pane-private"}}}
+            if method == "agent.prompt":
+                return {
+                    "type": "agent_prompted",
+                    "agent": {"pane_id": "pane-private"},
+                    "delivery": "submitted",
+                }
+            return {"accepted": True, "params": params}
+
+        def close(self) -> None:
+            return None
+
+    envelope = submit_command(
+        config,
+        _request("preferred-non-acp-worker"),
+        socket_client_factory=lambda _config: LegacyClient(),
+        acp_prompt_router=lambda _worker: None,
+        acp_worker_owner=lambda _worker_id, _fingerprint: False,
+    )
+
+    assert envelope.status == "accepted"
+    assert legacy_calls[-1] == "agent.prompt"
+
+
 def test_shadow_owned_command_is_observation_only_before_receipt(tmp_path: Path) -> None:
     config = _config(tmp_path, policy="acp_shadow")
     worker = replace(_seed(config), status="working")
@@ -949,6 +1238,41 @@ def test_daemon_shadow_owned_command_never_reaches_legacy_sender(tmp_path: Path)
     assert envelope.disposition == "no_receipt"
     assert route.calls == []
     assert legacy_calls == []
+
+
+def test_daemon_preferred_console_loss_uses_claim_to_block_legacy_sender(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, policy="acp_preferred")
+    worker = _seed(config)
+
+    class Runtime:
+        def prompt_route(self, _worker: Worker) -> None:
+            return None
+
+        def claims_worker(self, worker_id: str, fingerprint: str) -> bool:
+            return worker_id == worker.id and fingerprint == worker.fingerprint
+
+    def forbidden_legacy(_config: Config) -> Any:
+        raise AssertionError("ACP-owned console loss must not use legacy pane I/O")
+
+    monkeypatch.setattr(
+        "tendwire.command_submission._default_socket_client_factory",
+        forbidden_legacy,
+    )
+    daemon = TendwireDaemon(config)
+    daemon._acp_runtime = Runtime()
+
+    envelope = daemon.submit_command(_request("daemon-preferred-console-loss"))
+
+    assert envelope.status == "backend_unavailable"
+    assert envelope.disposition == "no_receipt"
+    assert get_command_request(
+        config.db_path,
+        config.host_id,
+        "daemon-preferred-console-loss",
+    ) is None
 
 
 def test_daemon_shadow_preserves_ordinary_legacy_worker_submission(

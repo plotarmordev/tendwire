@@ -126,6 +126,7 @@ class AcpPromptRoute(Protocol):
 
 
 AcpPromptRouter = Callable[[Worker], AcpPromptRoute | None]
+AcpWorkerOwner = Callable[[str, str], bool]
 
 
 class AcpPermissionDecisionRouter(Protocol):
@@ -2686,6 +2687,7 @@ def submit_acp_command(
     params: Mapping[str, Any] | str,
     *,
     prompt_router: AcpPromptRouter,
+    worker_owner: AcpWorkerOwner | None = None,
     required: bool = False,
     observation_only: bool = False,
 ) -> CommandEnvelope | None:
@@ -2764,6 +2766,20 @@ def submit_acp_command(
     if takeover is not None and worker.id != takeover.public_worker_id:
         return _duplicate_request(request)
 
+    # Preferred mode may fall back only for workers that ACP has never
+    # claimed. Once the coordinator publishes an exact worker generation,
+    # losing its visible console or runtime is an ACP outage, not permission
+    # to inject keys through the legacy PTY path.
+    owned_by_acp = False
+    if worker_owner is not None:
+        try:
+            owned_by_acp = bool(worker_owner(worker.id, worker.fingerprint))
+        except Exception:  # noqa: BLE001
+            # An ownership oracle failure cannot prove that legacy pane I/O is
+            # safe. Prefer a retryable no-send result over crossing transports.
+            owned_by_acp = True
+    route_required = required or owned_by_acp
+
     route: AcpPromptRoute | None = None
     route_resolved = False
     if observation_only:
@@ -2782,7 +2798,7 @@ def submit_acp_command(
 
     permanent_error = _worker_status_error(request, worker) or health_error
     if permanent_error is not None:
-        if required:
+        if route_required:
             canonical = build_canonical_mutation(request, public_worker_id=worker.id)
             reservation = _reserve_canonical_request(config, request, canonical)
             if isinstance(reservation, CommandEnvelope):
@@ -2800,7 +2816,7 @@ def submit_acp_command(
             return _request_in_progress(request)
         return (
             _backend_unavailable(request, "ACP worker route is unavailable")
-            if required
+            if route_required
             else None
         )
     try:
@@ -2814,7 +2830,7 @@ def submit_acp_command(
             return _request_in_progress(request)
         return (
             _backend_unavailable(request, "ACP worker route has no durable authority")
-            if required
+            if route_required
             else None
         )
 
@@ -3195,6 +3211,7 @@ def submit_command(
     *,
     socket_client_factory: SocketClientFactory | None = None,
     acp_prompt_router: AcpPromptRouter | None = None,
+    acp_worker_owner: AcpWorkerOwner | None = None,
     acp_required: bool = False,
     acp_observation_only: bool = False,
     acp_permission_router: AcpPermissionDecisionRouter | None = None,
@@ -3205,6 +3222,7 @@ def submit_command(
             config,
             params,
             prompt_router=acp_prompt_router,
+            worker_owner=acp_worker_owner,
             required=acp_required,
             observation_only=acp_observation_only,
         )

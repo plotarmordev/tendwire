@@ -617,7 +617,9 @@ class TendwireDaemon:
                 scheduler = self.hooks.turn_scheduler_factory(self.config)
                 self._turn_scheduler = scheduler
                 if self.config.agent_event_source in {"acp_shadow", "acp_preferred"}:
-                    owns_worker = getattr(self._acp_runtime, "owns_worker", None)
+                    owns_worker = getattr(self._acp_runtime, "claims_worker", None)
+                    if not callable(owns_worker):
+                        owns_worker = getattr(self._acp_runtime, "owns_worker", None)
                     set_exclusion = getattr(scheduler, "set_worker_exclusion", None)
                     if callable(owns_worker) and callable(set_exclusion):
                         set_exclusion(owns_worker)
@@ -1449,6 +1451,9 @@ class TendwireDaemon:
         policy = self.config.agent_event_source
         runtime = self._acp_runtime
         route = getattr(runtime, "prompt_route", None)
+        worker_owner = getattr(runtime, "claims_worker", None)
+        if not callable(worker_owner):
+            worker_owner = getattr(runtime, "owns_worker", None)
         permission_router = (
             runtime
             if callable(getattr(runtime, "answer_permission_decision", None))
@@ -1467,6 +1472,9 @@ class TendwireDaemon:
                     if policy in {"acp_shadow", "acp_required", "acp_preferred"}
                     and callable(route)
                     else None
+                ),
+                acp_worker_owner=(
+                    worker_owner if callable(worker_owner) else None
                 ),
                 acp_required=policy == "acp_required",
                 acp_observation_only=policy == "acp_shadow",
