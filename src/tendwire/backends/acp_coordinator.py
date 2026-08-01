@@ -1376,9 +1376,16 @@ class AcpRuntimeCoordinator:
                     return
                 self._slots.pop(worker_id, None)
                 self._retired_slots.append(slot)
-                if not preserve_console_failure:
+                # A visible-console failure is an exact sticky ownership
+                # claim. Retirement, ambiguity, and failed reminting must not
+                # reopen legacy PTY fallback while Herdr still publishes that
+                # identity. Only a successful current console pass or the
+                # positive-disappearance path in reconciliation may remove it.
+                if (
+                    not preserve_console_failure
+                    and worker_id not in self._console_failed_claims
+                ):
                     self._console_failed_workers.discard(worker_id)
-                    self._console_failed_claims.pop(worker_id, None)
                     self._console_degraded = bool(self._console_failed_workers)
                     if not self._console_degraded:
                         self._console_failure_type = None

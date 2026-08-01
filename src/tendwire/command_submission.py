@@ -2751,7 +2751,11 @@ def submit_acp_command(
                 request,
                 "Current worker authority is temporarily unavailable",
             )
-            if required
+            # A configured ownership oracle means preferred mode can route
+            # both ACP and never-ACP workers. Without the authoritative
+            # snapshot there is no exact worker identity to ask it about, so
+            # falling through would treat "unknown" as proof of never-ACP.
+            if required or worker_owner is not None
             else None
         )
 

@@ -796,6 +796,46 @@ def test_failed_claim_clears_only_after_exact_herdr_authority_disappears(
     assert coordinator._console_degraded is False
 
 
+def test_first_console_failure_survives_unique_route_ambiguity_and_retirement(
+    tmp_path: Path,
+) -> None:
+    coordinator = AcpRuntimeCoordinator(
+        _config(tmp_path, policy="acp_preferred"),
+        threading.Event(),
+        reconcile_interval=60.0,
+    )
+    coordinator._state = RuntimeState.RUNNING
+    runtime = SimpleNamespace(
+        status=lambda: SimpleNamespace(healthy=True, failure_type=None),
+        stop=lambda *, timeout: None,
+        _binding=_binding(),
+    )
+    slot = _RuntimeSlot(
+        _binding(),
+        "42",
+        runtime,
+        console=HerdrAcpConsoleEndpoint(42, "console-lease"),
+    )
+    coordinator._slots["worker-1"] = slot
+    coordinator._bridge_console_slot = (  # type: ignore[method-assign]
+        lambda _slot: (_ for _ in ()).throw(OSError("console unavailable"))
+    )
+    coordinator._bridge_console_slot_supervised(slot)
+    assert coordinator.claims_worker("worker-1", "worker-fingerprint") is True
+
+    # Two sendable routes make the worker non-unique. The old slot is stale,
+    # but exact Herdr authority remains and therefore so must the ACP claim.
+    coordinator._continuity_bindings = lambda: ({}, 1)  # type: ignore[method-assign]
+    coordinator._herdr_authority_claims = (  # type: ignore[method-assign]
+        lambda: {("worker-1", "worker-fingerprint")}
+    )
+    coordinator._reconcile_locked(strict=False)
+
+    assert "worker-1" not in coordinator._slots
+    assert coordinator.claims_worker("worker-1", "worker-fingerprint") is True
+    assert coordinator.status()["healthy"] is False
+
+
 def test_console_submission_rejects_a_retired_generation_before_store_access(
     tmp_path: Path,
 ) -> None:
@@ -1171,6 +1211,39 @@ def test_preferred_non_acp_worker_still_uses_legacy_sender(tmp_path: Path) -> No
 
     assert envelope.status == "accepted"
     assert legacy_calls[-1] == "agent.prompt"
+
+
+def test_preferred_snapshot_failure_with_owner_oracle_never_falls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, policy="acp_preferred")
+    _seed(config)
+
+    def unavailable_snapshot(_config: Config) -> Snapshot:
+        raise OSError("authority store temporarily unavailable")
+
+    def forbidden_legacy(_config: Config) -> Any:
+        raise AssertionError("unknown ACP ownership must not reach legacy pane I/O")
+
+    monkeypatch.setattr(
+        "tendwire.command_submission._current_snapshot", unavailable_snapshot
+    )
+    envelope = submit_command(
+        config,
+        _request("preferred-authority-read-failure"),
+        socket_client_factory=forbidden_legacy,
+        acp_prompt_router=lambda _worker: None,
+        acp_worker_owner=lambda _worker_id, _fingerprint: False,
+    )
+
+    assert envelope.status == "backend_unavailable"
+    assert envelope.disposition == "no_receipt"
+    assert get_command_request(
+        config.db_path,
+        config.host_id,
+        "preferred-authority-read-failure",
+    ) is None
 
 
 def test_shadow_owned_command_is_observation_only_before_receipt(tmp_path: Path) -> None:
