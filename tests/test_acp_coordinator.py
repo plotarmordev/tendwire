@@ -20,16 +20,21 @@ from tendwire.backends.acp_coordinator import (
     _RuntimeSlot,
     _derived_binding,
     _console_event_output,
+    _bounded_console_output,
+    _console_output_wire_bytes,
+    _fit_console_output_batch,
     _console_permission_selection,
     _load_console_event_cursor,
     _load_console_input_cursor,
     _parse_console_exchange,
     _parse_endpoint,
     _parse_status,
+    _prepare_console_event_cursor,
+    _record_console_submission_outcome,
     production_acp_runtime_factory,
 )
 from tendwire.backends.herdr_turns import TurnIngestionScheduler, TurnRefreshResult
-from tendwire.backends.acp_runtime import RuntimeState
+from tendwire.backends.acp_runtime import RuntimeState, SessionOpenMode
 from tendwire.command_submission import submit_acp_command, submit_command
 from tendwire.config import Config
 from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
@@ -37,6 +42,7 @@ from tendwire.daemon import DaemonHooks, TendwireDaemon
 from tendwire.store.sqlite import (
     get_command_request,
     init_store,
+    list_agent_events,
     list_worker_bindings,
     record_agent_event,
     save_snapshot,
@@ -236,6 +242,11 @@ def test_console_event_projection_covers_messages_thought_tools_and_plan() -> No
     assert _console_event_output(
         "plan", {"entries": [{"content": "verify", "status": "in_progress"}]}
     ) == ("plan", "[in_progress] verify")
+    chunks = [
+        _console_event_output("agent_message", {"text_delta": "hello"}),
+        _console_event_output("agent_message", {"text_delta": " world"}),
+    ]
+    assert "".join(item[1] for item in chunks if item is not None) == "hello world"
 
 
 def test_console_permission_selection_is_explicit_and_fail_closed() -> None:
@@ -285,6 +296,197 @@ def test_console_cursors_survive_restart_crash_boundaries(tmp_path: Path) -> Non
     assert _load_console_input_cursor(
         config.db_path, config.host_id, "worker-1", "session-a", 43
     ) == 0
+
+
+def test_missing_checkpoint_replays_from_zero_including_new_session_start_updates(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    record_agent_event(
+        config.db_path,
+        config.host_id,
+        kind="agent_message",
+        source="acp",
+        worker_id="worker-1",
+        payload={"text_delta": "stored before coordinator checkpoint"},
+        source_session_id="session-resume",
+        source_event_id="agent-before-crash",
+        visibility="private",
+    )
+    assert _prepare_console_event_cursor(
+        config.db_path,
+        config.host_id,
+        "worker-1",
+        "session-resume",
+        session_mode=SessionOpenMode.RESUME,
+        generation=42,
+    ) == 0
+    assert _load_console_event_cursor(
+        config.db_path, config.host_id, "worker-1", "session-resume"
+    ) == 0
+
+    record_agent_event(
+        config.db_path,
+        config.host_id,
+        kind="agent_message",
+        source="acp",
+        worker_id="worker-1",
+        payload={"text_delta": "setup replay"},
+        source_session_id="session-new",
+        source_event_id="agent-during-setup",
+        visibility="private",
+    )
+    baseline = _prepare_console_event_cursor(
+        config.db_path,
+        config.host_id,
+        "worker-1",
+        "session-new",
+        session_mode=SessionOpenMode.NEW,
+        generation=43,
+    )
+    assert baseline == 0
+    assert _load_console_event_cursor(
+        config.db_path, config.host_id, "worker-1", "session-new"
+    ) == baseline
+
+
+def test_console_failure_outcome_is_durable_before_input_ack(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    _record_console_submission_outcome(
+        config.db_path,
+        config.host_id,
+        "worker-1",
+        "session-a",
+        generation=42,
+        input_sequence=7,
+        outcome="error",
+    )
+    # Simulate a crash before the following input-cursor write. The error is
+    # replayable even though Herdr input 7 was not acknowledged yet.
+    assert _load_console_input_cursor(
+        config.db_path, config.host_id, "worker-1", "session-a", 42
+    ) == 0
+    stored = list_agent_events(
+        config.db_path,
+        config.host_id,
+        worker_id="worker-1",
+        source="acp",
+        session_id="session-a",
+    )
+    assert len(stored) == 1
+    assert _console_event_output(stored[0].event.kind, stored[0].event.payload) == (
+        "error",
+        "instruction failed",
+    )
+
+
+def test_console_output_batch_is_utf8_bounded_and_replay_deterministic() -> None:
+    first = _bounded_console_output("event-a", "tool", "😀" * 100_000)
+    second = _bounded_console_output("event-b", "assistant", "β" * 100_000)
+    assert first["text"].encode("utf-8").decode("utf-8") == first["text"]
+    assert "[console output truncated]" in first["text"]
+    budget = _console_output_wire_bytes([first])
+    assert _fit_console_output_batch([first, second], budget=budget) == [first]
+    assert _fit_console_output_batch([first, second], budget=budget) == [first]
+    assert _console_output_wire_bytes([first]) <= budget
+
+
+def test_console_bridge_byte_batches_and_advances_only_published_prefix(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    for index in range(10):
+        record_agent_event(
+            config.db_path,
+            config.host_id,
+            kind="agent_message",
+            source="acp",
+            worker_id="worker-1",
+            payload={"text_delta": "😀" * 40_000},
+            source_session_id="session-a",
+            source_event_id=f"large-agent-chunk-{index}",
+            visibility="private",
+        )
+
+    class EndpointClient:
+        retained: list[dict[str, Any]] = []
+        next_output = 1
+
+        def connect(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def agent_acp_console_exchange(
+            self, _target: str, **params: Any
+        ) -> dict[str, Any]:
+            for item in params["output"]:
+                EndpointClient.retained.append(
+                    {"sequence": EndpointClient.next_output, **dict(item)}
+                )
+                EndpointClient.next_output += 1
+            floor = (
+                EndpointClient.retained[0]["sequence"]
+                if EndpointClient.retained
+                else EndpointClient.next_output
+            )
+            return {
+                "type": "agent_acp_console_exchange",
+                "inputs": [],
+                "outputs": list(EndpointClient.retained),
+                "input_floor_sequence": 1,
+                "output_floor_sequence": floor,
+                "next_input_sequence": 1,
+                "next_output_sequence": EndpointClient.next_output,
+            }
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        reconcile_interval=60.0,
+    )
+    runtime = SimpleNamespace(
+        _binding=replace(
+            _binding(),
+            backend="acp",
+            turn_target_kind="acp_session_id",
+            turn_target_value="session-a",
+        )
+    )
+    executor = ThreadPoolExecutor(max_workers=1)
+    slot = _RuntimeSlot(
+        continuity=_binding(),
+        generation="42",
+        runtime=runtime,
+        console=HerdrAcpConsoleEndpoint(42, "coordinator-lease"),
+        console_cursor_loaded=True,
+        console_executor=executor,
+        console_submissions={},
+        console_local_turns=set(),
+    )
+    try:
+        coordinator._bridge_console_slot(slot)
+        first_cursor = slot.console_event_sequence
+        assert 0 < first_cursor
+        assert len(EndpointClient.retained) < 10
+        assert _console_output_wire_bytes(EndpointClient.retained) <= 512 * 1024
+        # A full retained queue cannot make Tendwire acknowledge the remainder.
+        coordinator._bridge_console_slot(slot)
+        assert slot.console_event_sequence == first_cursor
+        # Once the pane drains, the exact unacknowledged suffix is published.
+        EndpointClient.retained.clear()
+        coordinator._bridge_console_slot(slot)
+        assert slot.console_event_sequence > first_cursor
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def test_console_bridge_polls_independently_of_slow_reconcile_interval(
@@ -575,6 +777,9 @@ def test_canonical_herdr_acp_contract_fixture_executes_configured_binary(
     assert parsed.command[0] == "/opt/herdr/bin/herdr"
     assert parsed.command[1:] == tuple(fixture["result"]["endpoint"]["args"])
     assert parsed.generation == "42"
+    assert parsed.console == HerdrAcpConsoleEndpoint(
+        42, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"
+    )
 
 
 class _Route:

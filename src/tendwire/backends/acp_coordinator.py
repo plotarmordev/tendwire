@@ -54,6 +54,13 @@ class AcpConsoleInputGap(AcpCoordinatorError):
     """The bounded Herdr console queue lost unconsumed pane input."""
 
 
+# Herdr's aggregate console queue admission is 768 KiB and its normal control
+# frame is 2 MiB. Keep Tendwire's retained output contribution below 512 KiB
+# so queued pane input and the echoed response retain explicit headroom.
+_CONSOLE_OUTPUT_QUEUE_BUDGET_BYTES = 512 * 1024
+_CONSOLE_OUTPUT_ITEM_TEXT_BYTES = 128 * 1024
+
+
 @dataclass(frozen=True, slots=True)
 class HerdrAcpEndpoint:
     command: tuple[str, ...]
@@ -597,26 +604,20 @@ class AcpRuntimeCoordinator:
             completed_submissions.append(sequence)
             try:
                 outcome = future.result()
-                if outcome in {"permission", "cancelled"}:
-                    output.append(
-                        {
-                            "event_id": f"console-{outcome}:{console.generation}:{sequence}",
-                            "stream": "status",
-                            "text": (
-                                "permission selection accepted"
-                                if outcome == "permission"
-                                else "active turn cancellation requested"
-                            ),
-                        }
-                    )
-            except Exception as exc:
-                output.append(
-                    {
-                        "event_id": f"console-error:{console.generation}:{sequence}",
-                        "stream": "error",
-                        "text": f"instruction failed ({type(exc).__name__})",
-                    }
-                )
+                durable_outcome = str(outcome)
+            except Exception:
+                # Keep the durable payload deterministic across a retry of the
+                # same request id; exception types can differ across a crash.
+                durable_outcome = "error"
+            _record_console_submission_outcome(
+                Path(self.config.db_path),
+                self.config.host_id,
+                slot.continuity.worker_id,
+                binding.turn_target_value,
+                generation=console.generation,
+                input_sequence=sequence,
+                outcome=durable_outcome,
+            )
             # A terminal command receipt now exists (accepted or rejected), so
             # the next exchange may acknowledge this one Herdr queue item.
             record_agent_event(
@@ -643,51 +644,98 @@ class AcpRuntimeCoordinator:
         if pending is not None:
             decision_ref, _options, prompt = pending
             output.append(
-                {
-                    "event_id": "permission:" + stable_fingerprint(
+                _bounded_console_output(
+                    "permission:" + stable_fingerprint(
                         {
                             "worker_id": slot.continuity.worker_id,
                             "decision_ref": decision_ref,
                         }
                     ),
-                    "stream": "status",
-                    "text": prompt,
-                }
+                    "status",
+                    prompt,
+                )
             )
         consumed_local_turns: set[str] = set()
+        processed_event_sequence = event_sequence
         for stored in events:
             event = stored.event
             if event.kind == "user_message" and event.source_turn_id in local_turns:
                 if event.source_turn_id is not None:
                     consumed_local_turns.add(event.source_turn_id)
+                processed_event_sequence = stored.sequence
                 continue
             rendered = _console_event_output(event.kind, event.payload)
             if rendered is None:
+                processed_event_sequence = stored.sequence
                 continue
             stream, text = rendered
-            output.append(
-                {"event_id": event.event_id, "stream": stream, "text": text}
-            )
+            item = _bounded_console_output(event.event_id, stream, text)
+            if not _console_output_fits(output, item, budget=_CONSOLE_OUTPUT_QUEUE_BUDGET_BYTES):
+                break
+            output.append(item)
+            processed_event_sequence = stored.sequence
         client = self._endpoint_client_factory(self.config)
+        gap_error: AcpConsoleInputGap | None = None
+        inputs: tuple[tuple[int, str], ...] = ()
         try:
             connect = getattr(client, "connect", None)
             if callable(connect):
                 connect()
+            # Probe the retained Herdr output queue before publishing.  Herdr
+            # echoes that queue in its response, so publishing blind can create
+            # a response larger than its 2 MiB control-frame limit.
             result = client.agent_acp_console_exchange(
                 slot.continuity.target_value,
                 generation=console.generation,
                 lease=console.lease,
                 after_input_sequence=input_sequence,
-                output=output,
+                output=(),
                 timeout=self.config.herdr_timeout_seconds,
             )
+            inputs = _parse_console_exchange(result, input_sequence)
+            retained_bytes = _console_exchange_output_bytes(result)
+            publish = _fit_console_output_batch(
+                output,
+                budget=max(0, _CONSOLE_OUTPUT_QUEUE_BUDGET_BYTES - retained_bytes),
+            )
+            if len(publish) < len(output):
+                # Only ACP events after this prefix must be replayed. Synthetic
+                # permission output is first and idempotent, so a full queue may
+                # delay it without advancing any ACP event cursor.
+                published_ids = {item["event_id"] for item in publish}
+                processed_event_sequence = event_sequence
+                consumed_local_turns.clear()
+                for stored in events:
+                    event = stored.event
+                    if event.kind == "user_message" and event.source_turn_id in local_turns:
+                        if event.source_turn_id is not None:
+                            consumed_local_turns.add(event.source_turn_id)
+                        processed_event_sequence = stored.sequence
+                        continue
+                    rendered = _console_event_output(event.kind, event.payload)
+                    if rendered is None:
+                        processed_event_sequence = stored.sequence
+                        continue
+                    if event.event_id not in published_ids:
+                        break
+                    processed_event_sequence = stored.sequence
+            if publish:
+                result = client.agent_acp_console_exchange(
+                    slot.continuity.target_value,
+                    generation=console.generation,
+                    lease=console.lease,
+                    after_input_sequence=input_sequence,
+                    output=publish,
+                    timeout=self.config.herdr_timeout_seconds,
+                )
+                inputs = _parse_console_exchange(result, input_sequence)
+        except AcpConsoleInputGap as exc:
+            gap_error = exc
         finally:
             close = getattr(client, "close", None)
             if callable(close):
                 close()
-        try:
-            inputs = _parse_console_exchange(result, input_sequence)
-        except AcpConsoleInputGap:
+        if gap_error is not None:
             gap_output = [{
                 "event_id": f"console-gap:{console.generation}:{input_sequence}",
                 "stream": "error",
@@ -710,17 +758,17 @@ class AcpRuntimeCoordinator:
                 close = getattr(client, "close", None)
                 if callable(close):
                     close()
-            raise
+            raise gap_error
         with slot.lock:
             if slot.retired:
                 return
             slot.console_input_sequence = input_sequence
             for sequence in completed_submissions:
                 submissions.pop(sequence, None)
-        if events:
+        if processed_event_sequence > event_sequence:
             # Herdr deduplicates output event_id values, so replaying a page
             # after a crash between exchange and this cursor update is safe.
-            next_event_sequence = max(item.sequence for item in events)
+            next_event_sequence = processed_event_sequence
             record_agent_event(
                 Path(self.config.db_path),
                 self.config.host_id,
@@ -1012,11 +1060,13 @@ class AcpRuntimeCoordinator:
             and isinstance(runtime_binding, WorkerBinding)
             and runtime_binding.turn_target_value
         ):
-            console_cursor = _initial_console_event_cursor(
+            console_cursor = _prepare_console_event_cursor(
                 Path(self.config.db_path),
                 self.config.host_id,
                 continuity.worker_id,
                 runtime_binding.turn_target_value,
+                session_mode=endpoint.session_mode,
+                generation=endpoint.console.generation,
             )
             console_cursor_loaded = True
             console_input_cursor = _load_console_input_cursor(
@@ -1792,7 +1842,64 @@ def _console_event_output(
         and payload.get("extension") == "tendwire.acp.prompt_completion"
     ):
         return "status", f"turn {str(payload.get('outcome') or 'complete')}"
+    if (
+        kind == "extension"
+        and payload.get("extension") == "tendwire.acp.console_submission_outcome"
+    ):
+        outcome = payload.get("outcome")
+        if outcome == "permission":
+            return "status", "permission selection accepted"
+        if outcome == "cancelled":
+            return "status", "active turn cancellation requested"
+        if outcome == "error":
+            return "error", "instruction failed"
     return None
+
+
+def _bounded_console_output(event_id: str, stream: str, text: str) -> dict[str, str]:
+    encoded = text.encode("utf-8")
+    if len(encoded) > _CONSOLE_OUTPUT_ITEM_TEXT_BYTES:
+        encoded = encoded[:_CONSOLE_OUTPUT_ITEM_TEXT_BYTES]
+        while True:
+            try:
+                text = encoded.decode("utf-8")
+                break
+            except UnicodeDecodeError as exc:
+                encoded = encoded[: exc.start]
+        text += "\n[console output truncated]"
+    return {"event_id": event_id, "stream": stream, "text": text}
+
+
+def _console_output_wire_bytes(output: list[dict[str, str]]) -> int:
+    return len(
+        json.dumps(output, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def _console_output_fits(
+    output: list[dict[str, str]], item: dict[str, str], *, budget: int
+) -> bool:
+    return _console_output_wire_bytes([*output, item]) <= budget
+
+
+def _fit_console_output_batch(
+    output: list[dict[str, str]], *, budget: int
+) -> list[dict[str, str]]:
+    fitted: list[dict[str, str]] = []
+    for item in output:
+        if not _console_output_fits(fitted, item, budget=budget):
+            break
+        fitted.append(item)
+    return fitted
+
+
+def _console_exchange_output_bytes(value: Any) -> int:
+    assert isinstance(value, Mapping)
+    outputs = value.get("outputs")
+    assert isinstance(outputs, list)
+    return len(
+        json.dumps(outputs, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
 
 
 def _load_console_event_cursor(
@@ -1818,8 +1925,13 @@ def _load_console_event_cursor(
             return cursor if found else None
         for stored in page:
             after = max(after, stored.sequence)
-            value = stored.event.payload.get("sequence")
-            if type(value) is int and value >= 0:
+            payload = stored.event.payload
+            value = payload.get("sequence")
+            if (
+                payload.get("extension") == "tendwire.acp.console_cursor"
+                and type(value) is int
+                and value >= 0
+            ):
                 found = True
                 cursor = max(cursor, value)
         if len(page) < 1000:
@@ -1837,24 +1949,85 @@ def _initial_console_event_cursor(
     )
     if persisted is not None:
         return persisted
-    after = 0
-    latest = 0
-    while True:
-        page = list_agent_events(
-            db_path,
-            host_id,
-            worker_id=worker_id,
-            source="acp",
-            session_id=session_id,
-            after_sequence=after,
-            limit=1000,
-        )
-        if not page:
-            return latest
-        latest = max(latest, max(item.sequence for item in page))
-        after = latest
-        if len(page) < 1000:
-            return latest
+    return 0
+
+
+def _record_console_event_cursor(
+    db_path: Path,
+    host_id: str,
+    worker_id: str,
+    session_id: str,
+    sequence: int,
+    *,
+    source_event_id: str,
+) -> None:
+    record_agent_event(
+        db_path,
+        host_id,
+        kind="extension",
+        source="tendwire-console",
+        worker_id=worker_id,
+        payload={"extension": "tendwire.acp.console_cursor", "sequence": sequence},
+        source_session_id=session_id,
+        source_event_id=source_event_id,
+        visibility="private",
+    )
+
+
+def _prepare_console_event_cursor(
+    db_path: Path,
+    host_id: str,
+    worker_id: str,
+    session_id: str,
+    *,
+    session_mode: SessionOpenMode,
+    generation: int,
+) -> int:
+    persisted = _load_console_event_cursor(db_path, host_id, worker_id, session_id)
+    if persisted is not None:
+        return persisted
+    # A missing checkpoint is never evidence that any stored ACP update was
+    # displayed. Replay from zero for NEW setup updates as well as LOAD/RESUME;
+    # Herdr's stable event ids make the conservative replay idempotent.
+    baseline = 0
+    _record_console_event_cursor(
+        db_path,
+        host_id,
+        worker_id,
+        session_id,
+        baseline,
+        source_event_id=f"baseline:{generation}:{baseline}",
+    )
+    return baseline
+
+
+def _record_console_submission_outcome(
+    db_path: Path,
+    host_id: str,
+    worker_id: str,
+    session_id: str,
+    *,
+    generation: int,
+    input_sequence: int,
+    outcome: str,
+) -> None:
+    record_agent_event(
+        db_path,
+        host_id,
+        kind="extension",
+        source="acp",
+        worker_id=worker_id,
+        payload={
+            "schema_version": 1,
+            "extension": "tendwire.acp.console_submission_outcome",
+            "generation": generation,
+            "input_sequence": input_sequence,
+            "outcome": outcome,
+        },
+        source_session_id=session_id,
+        source_event_id=f"console-outcome:{generation}:{input_sequence}",
+        visibility="private",
+    )
 
 
 def _load_console_input_cursor(

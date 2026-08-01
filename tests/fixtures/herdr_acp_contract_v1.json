@@ -22,7 +22,7 @@
     },
     "console": {
       "generation": 42,
-      "lease": "console-coordinator-private-lease"
+      "lease": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"
     },
     "worker": {
       "terminal_id": "term_abc",
