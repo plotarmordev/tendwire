@@ -209,7 +209,19 @@ class AcpRuntimeCoordinator:
             if self._state is RuntimeState.STOPPED:
                 return
             self._state = RuntimeState.STOPPING
+            slots = tuple(self._slots.values())
         self._stop.set()
+        # A durable permission answer keeps the generation fence until the
+        # complete JSON-RPC response frame is written.  Wake any broker waiters
+        # before waiting for that fence: otherwise a slow/stuck adapter write
+        # can hold ``_reconcile_lock`` for the request timeout (normally much
+        # longer than the coordinator's bounded shutdown deadline).  Closing a
+        # broker is fail-closed; an answer that has not observed a complete
+        # frame becomes uncertain and releases the fence without selecting a
+        # second route.
+        for slot in slots:
+            if slot.permission_broker is not None:
+                slot.permission_broker.close()
         deadline = time.monotonic() + limit
         # Wait for endpoint mint/start or prompt lease validation to leave its
         # critical section before clearing slots. A reconcile that observed

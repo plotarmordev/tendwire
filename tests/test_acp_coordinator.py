@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -600,6 +601,91 @@ def test_stop_cannot_leave_inflight_reconcile_runtime_published(tmp_path: Path) 
         stopping.result(timeout=2.0)
     assert coordinator._slots == {}
     assert runtimes and all(runtime.stopped for runtime in runtimes)
+
+
+def test_stop_closes_permission_waiter_before_generation_fence_deadline(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    upsert_worker_bindings(config.db_path, [_binding()])
+    answer_entered = threading.Event()
+    broker_closed = threading.Event()
+    runtime_stopped = threading.Event()
+
+    class EndpointClient:
+        def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
+            return _endpoint()
+
+        def agent_acp_status(self, _target: Any, *, timeout: float) -> Any:
+            return _status()
+
+        def close(self) -> None:
+            return None
+
+    class Broker:
+        def owns(self, _decision: Any) -> bool:
+            return True
+
+        def answer(self, _decision: Any, *, timeout: float) -> None:
+            del timeout
+            answer_entered.set()
+            assert broker_closed.wait(2.0)
+            raise AcpCoordinatorError("permission bridge closed")
+
+        def close(self) -> None:
+            broker_closed.set()
+
+    broker = Broker()
+
+    class Runtime:
+        def __init__(self, _client: Any, **kwargs: Any) -> None:
+            self._binding = kwargs["binding"]
+            self._binder = kwargs["session_binding_callback"]
+
+        def start(self) -> None:
+            if self._binder is not None:
+                self._binding = self._binder("session-private", self._binding)
+
+        def stop(self, *, timeout: float) -> None:
+            del timeout
+            runtime_stopped.set()
+
+        def status(self) -> Any:
+            return SimpleNamespace(
+                healthy=not runtime_stopped.is_set(),
+                failure_type=None,
+            )
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        client_factory=lambda *_args, **_kwargs: object(),
+        runtime_factory=Runtime,
+        durable_permission_bridge=True,
+        reconcile_interval=60.0,
+    ).start()
+    slot = coordinator._slots["worker-1"]
+    slot.permission_broker = broker  # type: ignore[assignment]
+    decision = SimpleNamespace(worker_id="worker-1")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        answer = pool.submit(
+            coordinator.answer_permission_decision,
+            decision,
+            timeout=30.0,
+        )
+        assert answer_entered.wait(1.0)
+        started = time.monotonic()
+        coordinator.stop(timeout=0.5)
+        assert time.monotonic() - started < 0.5
+        with pytest.raises(AcpCoordinatorError, match="closed"):
+            answer.result(timeout=1.0)
+
+    assert broker_closed.is_set()
+    assert runtime_stopped.is_set()
 
 
 def test_prompt_frame_acknowledgement_fences_generation_retirement(tmp_path: Path) -> None:

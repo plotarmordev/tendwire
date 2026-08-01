@@ -38,6 +38,7 @@ class _Offer:
     selected: int | None = None
     response_state: str = "pending"
     response_error: BaseException | None = None
+    answer_abandoned: bool = False
 
 
 class AcpPermissionBroker:
@@ -186,6 +187,8 @@ class AcpPermissionBroker:
             )
 
     def answer(self, decision: Any, *, timeout: float) -> None:
+        clear_failed = False
+        uncertain = False
         with self._lock:
             offer = self._offer
             if offer is None or not self.owns(decision):
@@ -204,8 +207,21 @@ class AcpPermissionBroker:
                     break
                 offer.condition.wait(remaining)
             if offer.response_state != "written":
-                raise AcpPermissionBrokerError("ACP permission response state is uncertain")
-            self._offer = None
+                # The command receipt is now terminally uncertain.  A late
+                # transport callback must retire the stale public overlay and
+                # its send_started claim, but only after it proves that the
+                # response frame was written (or definitively failed).  Until
+                # then the offer remains fail-closed and cannot be answered a
+                # second time.
+                offer.answer_abandoned = True
+                clear_failed = offer.response_state == "failed"
+                uncertain = True
+            else:
+                self._offer = None
+        if clear_failed:
+            self._clear_offer(offer)
+        if uncertain:
+            raise AcpPermissionBrokerError("ACP permission response state is uncertain")
 
     def close(self) -> None:
         with self._lock:
@@ -217,11 +233,15 @@ class AcpPermissionBroker:
             self._clear_offer(offer)
 
     def _response_complete(self, offer: _Offer, error: BaseException | None) -> None:
+        clear = False
         with offer.condition:
             if self._offer is offer:
                 offer.response_state = "failed" if error is not None else "written"
                 offer.response_error = error
+                clear = error is not None or offer.answer_abandoned
                 offer.condition.notify_all()
+        if clear:
+            self._clear_offer(offer)
 
     def _clear_offer(self, offer: _Offer) -> None:
         with self._lock:

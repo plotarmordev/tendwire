@@ -278,6 +278,80 @@ def test_broker_stop_cancels_waiter_and_closes_public_overlay(tmp_path: Path) ->
     )
 
 
+def test_late_permission_frame_completion_retires_uncertain_overlay(
+    tmp_path: Path,
+) -> None:
+    config, worker, session_id, broker = _setup(tmp_path)
+    selections: list[Any] = []
+
+    def adapter_side() -> None:
+        selections.append(broker(_permission(session_id)))
+
+    adapter = threading.Thread(target=adapter_side)
+    adapter.start()
+    pending = _wait_pending(config, worker.id)
+    router = _Router(broker)
+    result = submit_command(
+        replace(config, acp_request_timeout_seconds=0.01),
+        _answer_request(pending["meta"]["decision"]["decision_ref"]),
+        acp_permission_router=router,
+    )
+    adapter.join(timeout=2)
+    assert not adapter.is_alive()
+    assert len(selections) == 1 and selections[0] is not None
+    assert result.status == "request_state_uncertain"
+
+    # The JSON-RPC writer completes after the durable command deadline.  The
+    # original receipt remains uncertain and cannot be replayed, while the
+    # now-resolved permission prompt is removed instead of becoming a forever
+    # visible, forever-unanswerable overlay.
+    selections[0].response_written()
+    assert config.db_path is not None
+    payload = pending_payload_from_store(config.db_path, config.host_id)
+    assert all(
+        row["worker_id"] != worker.id
+        for row in payload["pending_interactions"]
+    )
+    receipt = get_command_request(
+        config.db_path,
+        config.host_id,
+        "decision-request-1",
+    )
+    assert receipt is not None and receipt["state"] == "uncertain"
+    broker.close()
+
+
+def test_failed_permission_frame_retires_overlay_without_retry(
+    tmp_path: Path,
+) -> None:
+    config, worker, session_id, broker = _setup(tmp_path)
+
+    def adapter_side() -> None:
+        selected = broker(_permission(session_id))
+        assert selected is not None
+        selected.response_failed(OSError("partial private frame"))
+
+    adapter = threading.Thread(target=adapter_side)
+    adapter.start()
+    pending = _wait_pending(config, worker.id)
+    result = submit_command(
+        config,
+        _answer_request(pending["meta"]["decision"]["decision_ref"]),
+        acp_permission_router=_Router(broker),
+    )
+    adapter.join(timeout=2)
+    assert not adapter.is_alive()
+    assert result.status == "request_state_uncertain"
+    assert "private frame" not in json.dumps(result.to_dict())
+    assert config.db_path is not None
+    payload = pending_payload_from_store(config.db_path, config.host_id)
+    assert all(
+        row["worker_id"] != worker.id
+        for row in payload["pending_interactions"]
+    )
+    broker.close()
+
+
 def test_v27_provenance_migration_preserves_stale_pending_state(
     tmp_path: Path,
 ) -> None:
