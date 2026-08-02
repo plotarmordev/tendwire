@@ -3129,5 +3129,13 @@ class HerdrEventBackend:
     def _mark_unhealthy_safe(self, outcome: str) -> Snapshot | None:
         try:
             return self._mark_unhealthy(outcome)
+        except Exception:
+            # Health persistence is secondary to keeping the long-running
+            # observation loop alive.  In particular, another store operation
+            # can briefly hold the secure SQLite parent lock and make this
+            # best-effort write fail closed.  The next loop iteration performs
+            # a complete reconciliation, so retain the in-memory unhealthy
+            # state and let that authoritative retry recover the backend.
+            return None
         finally:
             self._ready.set()

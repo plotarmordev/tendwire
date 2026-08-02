@@ -47,6 +47,7 @@ from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
 from tendwire.core.projector import project_from_observations
 from tendwire.core.turns import PendingObservation
 from tendwire.daemon import DaemonHooks, TendwireDaemon
+from tendwire.local_state import LocalStateErrorCode, local_state_error
 from tendwire.store.sqlite import (
     SnapshotObservationContext,
     SnapshotRetentionPolicy,
@@ -4474,12 +4475,43 @@ def test_mark_unhealthy_safe_sets_ready_even_when_persist_fails(tmp_path: Path, 
 
     monkeypatch.setattr("tendwire.backends.herdr_events.save_snapshot", boom)
 
-    try:
-        backend._mark_unhealthy_safe("protocol_error")
-    except RuntimeError:
-        pass
-
+    assert backend._mark_unhealthy_safe("protocol_error") is None
     assert backend.ready is True
+
+
+def test_run_forever_retries_when_unhealthy_persistence_fails(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    backend = _backend(tmp_path, "retry-after-health-persist-error")
+    reconcile_calls = 0
+    clients_created = 0
+
+    def client_factory(_config: Config) -> object:
+        nonlocal clients_created
+        clients_created += 1
+        return object()
+
+    def reconcile_once(*, client: object) -> None:
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        if reconcile_calls == 1:
+            raise RuntimeError("observation failed")
+        backend.stop_event.set()
+
+    def persist_failure(*_args: Any, **_kwargs: Any) -> None:
+        raise local_state_error(LocalStateErrorCode.OPERATION_FAILED)
+
+    backend.client_factory = client_factory
+    monkeypatch.setattr(backend, "reconcile_once", reconcile_once)
+    monkeypatch.setattr("tendwire.backends.herdr_events.save_snapshot", persist_failure)
+
+    backend.run_forever()
+
+    assert reconcile_calls == 2
+    assert clients_created == 2
+    assert backend.ready is True
+    assert backend.health.outcome == "unknown"
 
 
 def test_protocol_error_health_is_degraded_and_specific(tmp_path: Path) -> None:
