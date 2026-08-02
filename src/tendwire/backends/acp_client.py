@@ -406,6 +406,7 @@ class AcpClient:
         *,
         timeout: float | None = None,
         require_initialized: bool = True,
+        on_writing: Callable[[], None] | None = None,
         on_written: Callable[[], None] | None = None,
     ) -> Any:
         if require_initialized:
@@ -429,6 +430,11 @@ class AcpClient:
         with self._pending_lock:
             self._pending[request_id] = pending
         try:
+            # The durable command receipt must cross send_started at the last
+            # definite no-write boundary. A callback failure here removes the
+            # pending waiter and no ACP frame has touched the transport.
+            if on_writing is not None:
+                on_writing()
             self._write(
                 request_envelope(request_id, method, params),
                 deadline=deadline,
@@ -593,6 +599,7 @@ class AcpClient:
         prompt: str | Sequence[Mapping[str, Any]],
         *,
         timeout: float | None = None,
+        on_send_start: Callable[[], None] | None = None,
         on_submitted: Callable[[], None] | None = None,
     ) -> PromptResult:
         content = list(self.prepare_prompt(prompt))
@@ -609,6 +616,7 @@ class AcpClient:
                 "session/prompt",
                 {"sessionId": session_id, "prompt": content},
                 timeout=self.prompt_timeout if timeout is None else timeout,
+                on_writing=on_send_start,
                 on_written=on_submitted,
             )
             response_received = True

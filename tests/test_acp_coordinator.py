@@ -1124,8 +1124,11 @@ class _Route:
         *,
         producer_turn_id: str,
         timeout: float,
+        on_send_start: Any = None,
     ) -> None:
         self.calls.append((text, producer_turn_id, timeout))
+        if callable(on_send_start):
+            on_send_start()
         if self.failure is not None:
             raise self.failure
 
@@ -1135,6 +1138,20 @@ class _PreparationFailureRoute(_Route):
     def prepare(self):
         raise AcpCoordinatorError("transient generation status failure")
         yield self
+
+
+class _BeforeTransportFailureRoute(_Route):
+    def prompt(
+        self,
+        text: str,
+        *,
+        producer_turn_id: str,
+        timeout: float,
+        on_send_start: Any = None,
+    ) -> None:
+        del on_send_start
+        self.calls.append((text, producer_turn_id, timeout))
+        raise AcpCoordinatorError("visible console route changed before write")
 
 
 def _seed(config: Config) -> Worker:
@@ -1285,6 +1302,48 @@ def test_production_route_checks_generation_before_reserving_receipt(
         config.host_id,
         "request-production-preflight",
     ) is None
+
+
+def test_acp_failure_before_transport_boundary_is_immediately_retryable(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    worker = _seed(config)
+    failed_route = _BeforeTransportFailureRoute()
+
+    first = submit_command(
+        config,
+        _request("request-prewrite-retry"),
+        acp_prompt_router=lambda routed: failed_route if routed == worker else None,
+        acp_required=True,
+    )
+    assert first.status == "backend_unavailable"
+    assert first.disposition == "no_receipt"
+    receipt = get_command_request(
+        config.db_path,
+        config.host_id,
+        "request-prewrite-retry",
+    )
+    assert receipt is not None
+    assert receipt["state"] == "reserved"
+    assert receipt["send_started_at"] is None
+
+    good_route = _Route()
+    second = submit_command(
+        config,
+        _request("request-prewrite-retry"),
+        acp_prompt_router=lambda routed: good_route if routed == worker else None,
+        acp_required=True,
+    )
+    assert second.status == "accepted"
+    assert second.disposition == "terminal_accepted"
+    assert len(good_route.calls) == 1
+    receipt = get_command_request(
+        config.db_path,
+        config.host_id,
+        "request-prewrite-retry",
+    )
+    assert receipt is not None and receipt["state"] == "accepted"
 
 
 def test_preferred_acp_owned_route_loss_fails_closed_without_receipt_or_legacy(
@@ -1653,8 +1712,17 @@ def test_concurrent_duplicate_acp_command_has_one_external_send(tmp_path: Path) 
     release = threading.Event()
 
     class BlockingRoute(_Route):
-        def prompt(self, text: str, *, producer_turn_id: str, timeout: float) -> None:
+        def prompt(
+            self,
+            text: str,
+            *,
+            producer_turn_id: str,
+            timeout: float,
+            on_send_start: Any = None,
+        ) -> None:
             self.calls.append((text, producer_turn_id, timeout))
+            if callable(on_send_start):
+                on_send_start()
             entered.set()
             assert release.wait(1.0)
 

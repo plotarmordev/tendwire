@@ -122,6 +122,7 @@ class AcpPromptRoute(Protocol):
         *,
         producer_turn_id: str,
         timeout: float,
+        on_send_start: Callable[[], None] | None = None,
     ) -> object: ...
 
     # Production routes may expose a context manager that fences their exact
@@ -2851,17 +2852,51 @@ def submit_acp_command(
         reservation = _reserve_canonical_request(config, request, canonical)
         if isinstance(reservation, CommandEnvelope):
             return reservation
-        send_started = _mark_request_send_started(
-            config,
-            request,
-            reservation,
-            binding_fingerprint=binding_fingerprint,
-            worker=worker,
-            instruction_text=_instruction_text(request),
-        )
-        if isinstance(send_started, CommandEnvelope):
-            return send_started
-        if not isinstance(send_started, Mapping):
+
+        send_started: Mapping[str, Any] | None = None
+        send_start_outcome: CommandEnvelope | None = None
+
+        class SendStartRejected(RuntimeError):
+            pass
+
+        def mark_send_started_at_transport_boundary() -> None:
+            nonlocal send_started, send_start_outcome
+            started = _mark_request_send_started(
+                config,
+                request,
+                reservation,
+                binding_fingerprint=binding_fingerprint,
+                worker=worker,
+                instruction_text=_instruction_text(request),
+            )
+            if isinstance(started, CommandEnvelope):
+                send_start_outcome = started
+                raise SendStartRejected
+            if not isinstance(started, Mapping):
+                send_start_outcome = _recover_request(
+                    config, request, reservation.canonical
+                )
+                raise SendStartRejected
+            send_started = started
+
+        def retryable_before_transport() -> CommandEnvelope:
+            abandoned = False
+            if config.db_path is not None:
+                try:
+                    abandoned = abandon_command_request_reservation(
+                        config.db_path,
+                        host_id=config.host_id,
+                        request_id=request.request_id or "",
+                        canonical_fingerprint=reservation.canonical.fingerprint,
+                        owner_token=reservation.owner_token,
+                    )
+                except Exception:  # noqa: BLE001
+                    abandoned = False
+            if abandoned:
+                return _backend_unavailable(
+                    request,
+                    "ACP prompt did not reach its transport boundary",
+                )
             return _recover_request(config, request, reservation.canonical)
 
         try:
@@ -2872,8 +2907,15 @@ def submit_acp_command(
                     request.request_id or "",
                 ),
                 timeout=config.acp_request_timeout_seconds,
+                on_send_start=mark_send_started_at_transport_boundary,
+            )
+        except SendStartRejected:
+            return send_start_outcome or _recover_request(
+                config, request, reservation.canonical
             )
         except Exception:  # noqa: BLE001
+            if send_started is None:
+                return retryable_before_transport()
             return _finish_request(
                 config,
                 request,
@@ -2886,6 +2928,11 @@ def submit_acp_command(
                 expected_state="send_started",
                 terminal_state="uncertain",
             )
+
+        if send_started is None:
+            # A route that claims success without crossing the durable
+            # transport boundary is not an accepted implementation.
+            return retryable_before_transport()
 
         observed_turn: Mapping[str, Any] | None = send_started
         if config.db_path is not None:

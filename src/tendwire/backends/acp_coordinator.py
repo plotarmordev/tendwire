@@ -136,6 +136,7 @@ class _PromptRoute:
         *,
         producer_turn_id: str,
         timeout: float,
+        on_send_start: Callable[[], None] | None = None,
     ) -> object:
         return self._owner._submit_prompt(
             self._worker,
@@ -143,6 +144,7 @@ class _PromptRoute:
             text,
             producer_turn_id=producer_turn_id,
             acknowledgement_timeout=timeout,
+            on_send_start=on_send_start,
             generation_prepared=bool(
                 getattr(self._prepared, "depth", 0)
             ),
@@ -1359,6 +1361,7 @@ class AcpRuntimeCoordinator:
         *,
         producer_turn_id: str,
         acknowledgement_timeout: float,
+        on_send_start: Callable[[], None] | None = None,
         generation_prepared: bool = False,
     ) -> object:
         """Write through the exact route generation used by the receipt."""
@@ -1380,6 +1383,7 @@ class AcpRuntimeCoordinator:
                 text,
                 producer_turn_id=producer_turn_id,
                 acknowledgement_timeout=acknowledgement_timeout,
+                on_send_start=on_send_start,
             )
 
     def _route_binding_fingerprint(

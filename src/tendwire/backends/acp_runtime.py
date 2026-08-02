@@ -156,6 +156,7 @@ class AcpRuntimeClient(Protocol):
         prompt: str | Sequence[Mapping[str, Any]],
         *,
         timeout: float | None = None,
+        on_send_start: Callable[[], None] | None = None,
         on_submitted: Callable[[], None] | None = None,
     ) -> PromptResult: ...
 
@@ -390,6 +391,7 @@ class AcpRuntime:
         producer_turn_id: str | None = None,
         timeout: float | None = None,
         drain_timeout: float | None = None,
+        on_send_start: Callable[[], None] | None = None,
         on_submitted: Callable[[], None] | None = None,
     ) -> PromptResult:
         """Submit one prompt and finalize only after its prior updates drain."""
@@ -420,6 +422,8 @@ class AcpRuntime:
                 raise
             try:
                 prompt_kwargs: dict[str, Any] = {"timeout": timeout}
+                if on_send_start is not None:
+                    prompt_kwargs["on_send_start"] = on_send_start
                 if on_submitted is not None:
                     prompt_kwargs["on_submitted"] = on_submitted
                 result = self._client.prompt(
@@ -472,6 +476,7 @@ class AcpRuntime:
         producer_turn_id: str,
         acknowledgement_timeout: float,
         completion_timeout: float | None = None,
+        on_send_start: Callable[[], None] | None = None,
     ) -> None:
         """Start a prompt and return after its complete frame is written.
 
@@ -493,6 +498,7 @@ class AcpRuntime:
                     prompt,
                     producer_turn_id=producer_turn_id,
                     timeout=completion_timeout,
+                    on_send_start=on_send_start,
                     on_submitted=acknowledged.set,
                 )
             except BaseException as exc:

@@ -403,6 +403,31 @@ def test_absolute_session_paths_are_enforced_before_write() -> None:
             acp.new_session("relative/path")
 
 
+def test_prewrite_callback_failure_emits_no_acp_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReceiptUnavailable(RuntimeError):
+        pass
+
+    with client() as acp:
+        acp.initialize()
+        writes: list[object] = []
+
+        def forbidden_write(*args: object, **kwargs: object) -> None:
+            writes.append((args, kwargs))
+
+        monkeypatch.setattr(acp, "_write", forbidden_write)
+        with pytest.raises(ReceiptUnavailable):
+            acp.request(
+                "session/list",
+                {},
+                on_writing=lambda: (_ for _ in ()).throw(ReceiptUnavailable()),
+            )
+
+        assert writes == []
+        assert acp._pending == {}
+
+
 def test_prompt_content_is_validated_and_gated_by_negotiated_capabilities() -> None:
     with client("baseline") as acp:
         acp.initialize()
