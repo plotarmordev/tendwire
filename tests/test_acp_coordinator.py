@@ -33,13 +33,21 @@ from tendwire.backends.acp_coordinator import (
     _record_console_submission_outcome,
     production_acp_runtime_factory,
 )
-from tendwire.backends.herdr_turns import TurnIngestionScheduler, TurnRefreshResult
 from tendwire.backends.acp_runtime import RuntimeState, SessionOpenMode
+from tendwire.backends.herdr_protocol import HerdrErrorResponse
+from tendwire.backends.herdr_turns import TurnIngestionScheduler, TurnRefreshResult
 from tendwire.command_submission import submit_acp_command, submit_command
 from tendwire.config import Config
-from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
+from tendwire.core.models import (
+    BackendHealth,
+    Snapshot,
+    Worker,
+    WorkerBinding,
+    utc_timestamp,
+)
 from tendwire.daemon import DaemonHooks, TendwireDaemon
 from tendwire.store.sqlite import (
+    expire_worker_bindings,
     get_command_request,
     init_store,
     list_agent_events,
@@ -2232,3 +2240,96 @@ def test_required_zero_workers_is_idle_healthy_then_new_unowned_worker_degrades(
         assert health["failure_type"] == "AcpCoordinatorError"
     finally:
         coordinator.stop()
+
+
+def test_preferred_caches_exact_non_acp_generation_without_endpoint_churn(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, policy="acp_preferred")
+    assert config.db_path is not None
+    init_store(config.db_path)
+    upsert_worker_bindings(config.db_path, [_binding()])
+    endpoint_calls = 0
+
+    class NonAcpClient:
+        def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
+            nonlocal endpoint_calls
+            endpoint_calls += 1
+            raise HerdrErrorResponse(
+                {
+                    "code": "acp_worker_unauthenticated",
+                    "message": "worker is not ACP-owned",
+                },
+                "request-private",
+            )
+
+        def close(self) -> None:
+            return None
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: NonAcpClient(),
+        reconcile_interval=60.0,
+    ).start()
+    try:
+        assert endpoint_calls == 1
+        assert coordinator.status()["healthy"] is True
+        coordinator._reconcile(strict=False)
+        coordinator._reconcile(strict=False)
+        assert endpoint_calls == 1
+        assert coordinator.status()["failure_type"] is None
+
+        changed_at = utc_timestamp()
+        expire_worker_bindings(
+            config.db_path,
+            config.host_id,
+            backend="herdr",
+            private_fingerprints=["herdr-private-binding"],
+            now=changed_at,
+            reason="new-generation",
+        )
+        upsert_worker_bindings(
+            config.db_path,
+            [
+                replace(
+                    _binding(),
+                    private_fingerprint="herdr-private-binding-2",
+                    observed_at=changed_at,
+                )
+            ],
+        )
+        coordinator._reconcile(strict=False)
+        assert endpoint_calls == 2
+    finally:
+        coordinator.stop()
+
+
+def test_required_does_not_cache_non_acp_endpoint_failure(tmp_path: Path) -> None:
+    config = _config(tmp_path, policy="acp_required")
+    assert config.db_path is not None
+    init_store(config.db_path)
+    upsert_worker_bindings(config.db_path, [_binding()])
+    endpoint_calls = 0
+
+    class NonAcpClient:
+        def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
+            nonlocal endpoint_calls
+            endpoint_calls += 1
+            raise HerdrErrorResponse(
+                {"code": "acp_ownership_required", "message": "PTY-owned"},
+                "request-private",
+            )
+
+        def close(self) -> None:
+            return None
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: NonAcpClient(),
+        reconcile_interval=60.0,
+    )
+    with pytest.raises(AcpCoordinatorError, match="failed to attach"):
+        coordinator.start()
+    assert endpoint_calls == 1

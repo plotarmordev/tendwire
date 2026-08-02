@@ -39,6 +39,7 @@ from .acp_runtime import (
     RuntimeState,
     SessionOpenMode,
 )
+from .herdr_protocol import HerdrErrorResponse
 from .herdr_socket import HerdrSocketClient
 
 
@@ -205,6 +206,13 @@ class AcpRuntimeCoordinator:
         # use legacy PTY I/O only after Herdr positively stops publishing this
         # exact worker identity, never merely because reminting failed.
         self._published_acp_claims: dict[str, str] = {}
+        # Optional ACP policies discover workers from the same Herdr binding
+        # stream as legacy PTY agents. Remember an exact worker generation
+        # that positively reported it is not ACP-owned so the periodic pass
+        # does not issue a mutating endpoint-mint request every interval. A
+        # registration/identity change produces a new private binding
+        # fingerprint and therefore becomes probeable immediately.
+        self._optional_endpoint_absences: dict[str, str] = {}
 
     def start(self) -> "AcpRuntimeCoordinator":
         with self._lock:
@@ -1045,6 +1053,12 @@ class AcpRuntimeCoordinator:
         with self._lock:
             failed_claims = tuple(self._console_failed_claims.items())
             published_claims = tuple(self._published_acp_claims.items())
+            for worker_id, fingerprint in tuple(
+                self._optional_endpoint_absences.items()
+            ):
+                binding = current.get(worker_id)
+                if binding is None or binding.private_fingerprint != fingerprint:
+                    self._optional_endpoint_absences.pop(worker_id, None)
         exact_authorities = (
             self._herdr_authority_claims()
             if failed_claims or published_claims
@@ -1084,9 +1098,28 @@ class AcpRuntimeCoordinator:
         ]
         for worker_id, continuity in current.items():
             self._require_reconcile_state(allow_starting=True)
+            with self._lock:
+                existing = self._slots.get(worker_id)
+                optional_absence = (
+                    self._optional_endpoint_absences.get(worker_id)
+                    == continuity.private_fingerprint
+                )
+            if existing is None and optional_absence:
+                continue
             try:
                 self._reconcile_binding(continuity)
             except Exception as exc:  # noqa: BLE001
+                if (
+                    existing is None
+                    and self.config.agent_event_source
+                    in {"acp_shadow", "acp_preferred"}
+                    and _optional_acp_absence(exc)
+                ):
+                    with self._lock:
+                        self._optional_endpoint_absences[worker_id] = (
+                            continuity.private_fingerprint
+                        )
+                    continue
                 failures.append(exc)
                 self._retire_worker(worker_id)
         with self._lock:
@@ -1559,6 +1592,18 @@ def _same_continuity(left: WorkerBinding, right: WorkerBinding) -> bool:
         right.private_fingerprint,
         right.sendable,
     )
+
+
+def _optional_acp_absence(exc: BaseException) -> bool:
+    """Recognize a positive, generation-scoped legacy/non-ACP classification."""
+
+    if not isinstance(exc, HerdrErrorResponse) or not isinstance(exc.error, Mapping):
+        return False
+    return exc.error.get("code") in {
+        "acp_worker_unauthenticated",
+        "acp_ownership_required",
+        "acp_adapter_unsupported",
+    }
 
 
 def _nonempty_text(value: Any, field: str) -> str:
