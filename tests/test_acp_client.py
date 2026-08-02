@@ -413,10 +413,11 @@ def test_prewrite_callback_failure_emits_no_acp_frame(
         acp.initialize()
         writes: list[object] = []
 
-        def forbidden_write(*args: object, **kwargs: object) -> None:
+        def forbidden_write(*args: object, **kwargs: object) -> int:
             writes.append((args, kwargs))
+            return 0
 
-        monkeypatch.setattr(acp, "_write", forbidden_write)
+        monkeypatch.setattr(acp, "_write_chunk", forbidden_write)
         with pytest.raises(ReceiptUnavailable):
             acp.request(
                 "session/list",
@@ -425,6 +426,45 @@ def test_prewrite_callback_failure_emits_no_acp_frame(
             )
 
         assert writes == []
+        assert acp._pending == {}
+
+
+def test_write_lock_timeout_does_not_cross_prewrite_boundary() -> None:
+    with client() as acp:
+        acp.initialize()
+        callbacks: list[str] = []
+        assert acp._write_lock.acquire(timeout=0.1)
+        try:
+            with pytest.raises(AcpRequestTimeoutError, match="waiting to write"):
+                acp.request(
+                    "session/list",
+                    {},
+                    timeout=0.01,
+                    on_writing=lambda: callbacks.append("started"),
+                )
+        finally:
+            acp._write_lock.release()
+
+        assert callbacks == []
+        assert acp._pending == {}
+
+
+def test_unwritable_transport_does_not_cross_prewrite_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with client() as acp:
+        acp.initialize()
+        callbacks: list[str] = []
+        monkeypatch.setattr(acp, "_wait_writable", lambda _fd, _timeout: False)
+        with pytest.raises(AcpRequestTimeoutError, match="writing ACP frame"):
+            acp.request(
+                "session/list",
+                {},
+                timeout=0.01,
+                on_writing=lambda: callbacks.append("started"),
+            )
+
+        assert callbacks == []
         assert acp._pending == {}
 
 

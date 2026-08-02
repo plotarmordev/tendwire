@@ -430,14 +430,10 @@ class AcpClient:
         with self._pending_lock:
             self._pending[request_id] = pending
         try:
-            # The durable command receipt must cross send_started at the last
-            # definite no-write boundary. A callback failure here removes the
-            # pending waiter and no ACP frame has touched the transport.
-            if on_writing is not None:
-                on_writing()
             self._write(
                 request_envelope(request_id, method, params),
                 deadline=deadline,
+                on_writing=on_writing,
             )
             if on_written is not None:
                 on_written()
@@ -953,6 +949,7 @@ class AcpClient:
         envelope: Mapping[str, Any],
         *,
         deadline: float | None = None,
+        on_writing: Callable[[], None] | None = None,
     ) -> None:
         payload = encode_message(envelope, max_frame_bytes=self.max_frame_bytes)
         if deadline is None:
@@ -969,6 +966,7 @@ class AcpClient:
                 fd = process.stdin.fileno()
                 remaining = memoryview(payload)
                 bytes_written = 0
+                write_started = False
                 while remaining:
                     wait = deadline - time.monotonic()
                     if wait <= 0:
@@ -979,6 +977,16 @@ class AcpClient:
                         raise AcpRequestTimeoutError(
                             "timed out writing ACP frame to agent"
                         )
+                    # Cross the durable send boundary only after the write
+                    # lock is held and the transport reports writable. A
+                    # timeout waiting for either condition has written zero
+                    # bytes and remains safely retryable. The callback still
+                    # runs before the first write, so a process crash cannot
+                    # leave an externally visible frame without a receipt.
+                    if not write_started:
+                        if on_writing is not None:
+                            on_writing()
+                        write_started = True
                     try:
                         written = self._write_chunk(fd, remaining)
                     except BlockingIOError:
