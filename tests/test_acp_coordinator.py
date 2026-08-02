@@ -293,6 +293,12 @@ def test_console_cursors_survive_restart_crash_boundaries(tmp_path: Path) -> Non
     assert _load_console_input_cursor(
         config.db_path, config.host_id, "worker-1", "session-a", 42
     ) == 7
+    # The visible Herdr input queue survives an ACP adapter remint. Its cursor
+    # is owned by worker generation 42, so a replacement session must recover
+    # the already acknowledged input rather than reporting a false gap.
+    assert _load_console_input_cursor(
+        config.db_path, config.host_id, "worker-1", "session-b", 42
+    ) == 7
     assert _load_console_input_cursor(
         config.db_path, config.host_id, "worker-1", "session-a", 43
     ) == 0

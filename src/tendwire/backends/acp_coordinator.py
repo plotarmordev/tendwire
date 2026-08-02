@@ -2173,9 +2173,14 @@ def _load_console_input_cursor(
     db_path: Path,
     host_id: str,
     worker_id: str,
-    session_id: str,
+    _session_id: str,
     generation: int,
 ) -> int:
+    # Herdr owns the visible input queue at the worker generation, not at an
+    # adapter session. A NEW adapter session can be reminted after a bridge
+    # failure while Herdr retains the same console generation and sequence.
+    # Recovering only from the reminted session would reset this cursor to zero
+    # and turn every retained input into a permanent false gap.
     after = 0
     cursor = 0
     while True:
@@ -2184,7 +2189,6 @@ def _load_console_input_cursor(
             host_id,
             worker_id=worker_id,
             source="tendwire-console",
-            session_id=session_id,
             after_sequence=after,
             limit=1000,
         )
