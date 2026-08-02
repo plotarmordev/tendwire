@@ -1035,7 +1035,16 @@ class HerdrEventBackend:
                     self._turn_api_supported = False
                     self.reconcile_once(client=client)
                     reconciled = True
-                    self._replay_turns_after_reconcile(client)
+                    # Herdr ordinary RPC connections are one-shot. Keep this
+                    # future subscription client out of pane.turns entirely;
+                    # each replay request uses its own short-lived client.
+                    if callable(getattr(client, "pane_turns", None)) or callable(
+                        getattr(client, "request", None)
+                    ):
+                        self._replay_turns_after_reconcile()
+                    else:
+                        self._turn_api_probed = True
+                        self._turn_api_supported = False
                     if self.stop_event.is_set():
                         break
                     if hasattr(client, "connect"):
@@ -1048,7 +1057,7 @@ class HerdrEventBackend:
                     # Events concurrent with it are buffered by the socket
                     # client and become harmless watermark-deduped duplicates.
                     if self._turn_api_supported:
-                        self._replay_turns_after_reconcile(client)
+                        self._replay_turns_after_reconcile()
                     self._ready.set()
                     self._read_event_stream(client, stream.subscription_id)
                 finally:
@@ -1318,6 +1327,30 @@ class HerdrEventBackend:
             )
         return _pane_turns_replay(value, pane_id)
 
+    def _call_pane_turns_isolated(
+        self,
+        pane_id: str,
+        *,
+        since: int,
+        expected_epoch: int | None,
+        allow_uncorrelated: bool = False,
+    ) -> HerdrPaneTurnsReplay:
+        """Call one pane.turns RPC on a fresh, always-closed client."""
+        client = self.client_factory(self.config)
+        try:
+            if hasattr(client, "connect"):
+                client.connect()
+            return self._call_pane_turns(
+                client,
+                pane_id,
+                since=since,
+                expected_epoch=expected_epoch,
+                allow_uncorrelated=allow_uncorrelated,
+            )
+        finally:
+            if hasattr(client, "close"):
+                client.close()
+
     def _record_turn_diagnostic(
         self,
         code: str,
@@ -1534,7 +1567,7 @@ class HerdrEventBackend:
 
     def _probe_turn_api(
         self,
-        client: Any,
+        client: Any | None,
         pane_id: str,
         watermark: HerdrTurnWatermark | None,
     ) -> tuple[
@@ -1543,13 +1576,19 @@ class HerdrEventBackend:
         HerdrErrorResponse | AttributeError | None,
     ]:
         """Probe pane.turns once without treating pane-scoped errors as absence."""
-        if not callable(getattr(client, "pane_turns", None)) and not callable(
-            getattr(client, "request", None)
-        ):
+        if client is not None and not callable(
+            getattr(client, "pane_turns", None)
+        ) and not callable(getattr(client, "request", None)):
             return False, None, None
         try:
-            replay = self._call_pane_turns(
-                client,
+            call = self._call_pane_turns_isolated if client is None else (
+                lambda current_pane_id, **kwargs: self._call_pane_turns(
+                    client,
+                    current_pane_id,
+                    **kwargs,
+                )
+            )
+            replay = call(
                 pane_id,
                 since=watermark.last_turn if watermark is not None else 0,
                 expected_epoch=watermark.turn_epoch if watermark is not None else None,
@@ -1559,24 +1598,30 @@ class HerdrEventBackend:
             if self._turn_api_method_unsupported(exc):
                 return False, None, None
             return True, None, exc
-        except AttributeError as exc:
-            return True, None, exc
+        except AttributeError:
+            return False, None, None
         return True, replay, None
 
     def _consume_pane_replay(
         self,
-        client: Any,
+        client: Any | None,
         pane_id: str,
         watermark: HerdrTurnWatermark | None,
         *,
         replay: HerdrPaneTurnsReplay | None = None,
         error: HerdrErrorResponse | AttributeError | None = None,
     ) -> None:
+        call = self._call_pane_turns_isolated if client is None else (
+            lambda current_pane_id, **kwargs: self._call_pane_turns(
+                client,
+                current_pane_id,
+                **kwargs,
+            )
+        )
         try:
             if error is not None:
                 raise error
-            current_replay = replay or self._call_pane_turns(
-                client,
+            current_replay = replay or call(
                 pane_id,
                 since=watermark.last_turn if watermark is not None else 0,
                 expected_epoch=watermark.turn_epoch if watermark is not None else None,
@@ -1586,8 +1631,7 @@ class HerdrEventBackend:
             message = self._herdr_error_message(exc)
             if code == "turn_epoch_mismatch":
                 try:
-                    current_replay = self._call_pane_turns(
-                        client,
+                    current_replay = call(
                         pane_id,
                         since=0,
                         expected_epoch=None,
@@ -1610,8 +1654,7 @@ class HerdrEventBackend:
                 return
             if code == "invalid_params" and "newer than current turn" in message:
                 try:
-                    current_replay = self._call_pane_turns(
-                        client,
+                    current_replay = call(
                         pane_id,
                         since=0,
                         expected_epoch=None,
@@ -1644,7 +1687,7 @@ class HerdrEventBackend:
             return
         self._consume_replay(current_replay, watermark)
 
-    def _replay_turns_after_reconcile(self, client: Any) -> None:
+    def _replay_turns_after_reconcile(self, client: Any | None = None) -> None:
         """Probe pane.turns once, then replay each pane independently."""
         if self.stop_event.is_set():
             return

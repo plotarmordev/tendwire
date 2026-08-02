@@ -2870,6 +2870,9 @@ def test_start_timeout_cancels_remaining_per_pane_replay_and_joins_worker(
         def close(self) -> None:
             return None
 
+        def pane_turns(self, _params: Mapping[str, Any], **_kwargs: Any) -> Any:
+            raise AssertionError("the patched replay hooks own this test")
+
     backend = HerdrEventBackend(
         config,
         client_factory=lambda _config: Client(),
@@ -6385,6 +6388,228 @@ def test_turn_api_run_loop_closes_probe_to_subscribe_completion_race(
     )
     assert watermark is not None
     assert (watermark.turn_epoch, watermark.last_turn) == (7, 1)
+
+
+def test_turn_api_run_loop_keeps_stream_client_exclusive_and_replay_calls_one_shot(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, "turn-api-one-shot-connections")
+    init_store(Path(config.db_path))
+    first_pane = _turn_api_pane()
+    second_pane = {
+        **_turn_api_pane(),
+        "pane_id": "w123456789abcde:pB",
+        "terminal_id": "terminal-turn-api-b",
+    }
+    operations: list[str] = []
+    subscribed = threading.Event()
+    second_post_replay_started = threading.Event()
+    release_second_post_replay = threading.Event()
+    per_pane_calls = {first_pane["pane_id"]: 0, second_pane["pane_id"]: 0}
+    replay_clients: list[Any] = []
+
+    class SubscriptionClient(_StaticClient):
+        def __init__(self) -> None:
+            super().__init__(
+                workspaces=[{"id": "w123456789abcde", "name": "Build"}],
+                panes=[first_pane, second_pane],
+            )
+            self.pane_turn_calls = 0
+
+        def connect(self) -> None:
+            operations.append("stream.connect")
+
+        def close(self) -> None:
+            operations.append("stream.close")
+
+        def pane_turns(self, _params: Mapping[str, Any], **_kwargs: Any) -> Any:
+            self.pane_turn_calls += 1
+            raise AssertionError("the subscription client must never carry pane.turns")
+
+        def subscribe(
+            self,
+            _method: str,
+            _params: Mapping[str, Any],
+            **_kwargs: Any,
+        ) -> Any:
+            operations.append("subscribe")
+            subscribed.set()
+            return SimpleNamespace(subscription_id="one-shot-stream")
+
+        def read_event(
+            self,
+            _subscription_id: str,
+            *,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            assert backend.ready is True
+            backend.stop_event.set()
+            raise HerdrSocketTimeoutError("idle")
+
+    class OneShotReplayClient:
+        def __init__(self) -> None:
+            self.connected = False
+            self.closed = False
+            self.calls = 0
+
+        def connect(self) -> None:
+            assert self.connected is False
+            self.connected = True
+
+        def close(self) -> None:
+            self.closed = True
+
+        def pane_turns(
+            self,
+            params: Mapping[str, Any],
+            **_kwargs: Any,
+        ) -> Any:
+            assert self.connected is True
+            assert self.closed is False
+            self.calls += 1
+            assert self.calls == 1, "ordinary Herdr RPC connections are one-shot"
+            pane_id = str(params["pane_id"])
+            per_pane_calls[pane_id] += 1
+            phase = "pre" if per_pane_calls[pane_id] == 1 else "post"
+            operations.append(f"{phase}:{pane_id}")
+            if phase == "post" and pane_id == second_pane["pane_id"]:
+                second_post_replay_started.set()
+                assert release_second_post_replay.wait(1)
+            records = [_turn_record(1)] if phase == "post" else []
+            return {
+                "turns": {
+                    "pane_id": pane_id,
+                    "turn_epoch": 7,
+                    "records": records,
+                    "truncated": False,
+                    "oldest_available": 1 if records else None,
+                }
+            }
+
+    stream_client = SubscriptionClient()
+
+    def client_factory(_config: Config) -> Any:
+        if not replay_clients and not operations:
+            return stream_client
+        client = OneShotReplayClient()
+        replay_clients.append(client)
+        return client
+
+    backend = HerdrEventBackend(
+        config,
+        client_factory=client_factory,
+        debounce_seconds=0,
+        reconnect_delay_seconds=0,
+        turn_completion_processor=lambda *_args, **_kwargs: SimpleNamespace(
+            status="unchanged"
+        ),
+    )
+    thread = threading.Thread(target=backend.run_forever, daemon=True)
+    thread.start()
+
+    assert subscribed.wait(1)
+    assert second_post_replay_started.wait(1)
+    assert backend.ready is False
+    assert stream_client.pane_turn_calls == 0
+
+    release_second_post_replay.set()
+    thread.join(timeout=2)
+
+    assert thread.is_alive() is False
+    assert backend.ready is True
+    assert len(replay_clients) == 4
+    assert all(client.calls == 1 for client in replay_clients)
+    assert all(client.connected is True and client.closed is True for client in replay_clients)
+    replay_order = [
+        operation
+        for operation in operations
+        if operation == "subscribe" or operation.startswith(("pre:", "post:"))
+    ]
+    assert replay_order == [
+        f"pre:{first_pane['pane_id']}",
+        f"pre:{second_pane['pane_id']}",
+        "subscribe",
+        f"post:{first_pane['pane_id']}",
+        f"post:{second_pane['pane_id']}",
+    ]
+
+
+def test_turn_api_production_retry_uses_another_short_lived_client(
+    tmp_path: Path,
+) -> None:
+    backend = _turn_api_backend(
+        tmp_path,
+        "turn-api-isolated-retry",
+        lambda *_args, **_kwargs: SimpleNamespace(status="unchanged"),
+    )
+    pane_id = _turn_api_pane()["pane_id"]
+    set_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=2,
+    )
+    backend._turn_api_probed = True
+    backend._turn_api_supported = True
+    clients: list[Any] = []
+
+    class RetryClient:
+        def __init__(self, ordinal: int) -> None:
+            self.ordinal = ordinal
+            self.connected = False
+            self.closed = False
+            self.calls = 0
+
+        def connect(self) -> None:
+            self.connected = True
+
+        def close(self) -> None:
+            self.closed = True
+
+        def pane_turns(
+            self,
+            params: Mapping[str, Any],
+            **_kwargs: Any,
+        ) -> Any:
+            self.calls += 1
+            assert self.calls == 1
+            if self.ordinal == 1:
+                assert params["expected_epoch"] == 7
+                raise HerdrErrorResponse(
+                    {"code": "turn_epoch_mismatch", "message": "epoch changed"},
+                    "isolated-retry",
+                )
+            assert params == {"pane_id": pane_id, "since": 0}
+            return {
+                "turns": {
+                    "pane_id": pane_id,
+                    "turn_epoch": 8,
+                    "records": [_turn_record(1, epoch=8)],
+                    "truncated": False,
+                    "oldest_available": 1,
+                }
+            }
+
+    def client_factory(_config: Config) -> RetryClient:
+        client = RetryClient(len(clients) + 1)
+        clients.append(client)
+        return client
+
+    backend.client_factory = client_factory
+    backend._replay_turns_after_reconcile()
+
+    assert len(clients) == 2
+    assert all(client.calls == 1 for client in clients)
+    assert all(client.connected is True and client.closed is True for client in clients)
+    watermark = get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+    )
+    assert watermark is not None
+    assert (watermark.turn_epoch, watermark.last_turn) == (8, 1)
+    assert watermark.last_completeness_break_reason == "turn_epoch_mismatch"
 
 
 def test_turn_api_restart_replays_exactly_the_missed_turn(tmp_path: Path) -> None:
