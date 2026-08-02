@@ -18,6 +18,7 @@ from tendwire.backends.acp_coordinator import (
     AcpRuntimeCoordinator,
     HerdrAcpConsoleEndpoint,
     _RuntimeSlot,
+    _CONSOLE_BRIDGE_INTERVAL_SECONDS,
     _derived_binding,
     _console_event_output,
     _bounded_console_output,
@@ -148,7 +149,6 @@ def test_endpoint_requires_explicit_acp_ownership_and_strict_attach_shape(tmp_pa
     replayed["endpoint"]["args"][4] = "42"
     with pytest.raises(AcpCoordinatorError, match="inconsistent"):
         _parse_endpoint(config, _binding(), replayed)
-
     wrong_terminal = _endpoint()
     wrong_terminal["worker"]["terminal_id"] = "other-terminal"
     terminal_binding = replace(
@@ -518,7 +518,8 @@ def test_console_bridge_polls_independently_of_slow_reconcile_interval(
     started = time.monotonic()
     coordinator._run_console_bridge()
     assert len(ticks) == 3
-    assert ticks[-1] - started < 0.5
+    assert 0.25 <= _CONSOLE_BRIDGE_INTERVAL_SECONDS <= 0.5
+    assert ticks[-1] - started < 3.5 * _CONSOLE_BRIDGE_INTERVAL_SECONDS
 
 
 def test_console_bridge_dispatches_slow_workers_independently(tmp_path: Path) -> None:

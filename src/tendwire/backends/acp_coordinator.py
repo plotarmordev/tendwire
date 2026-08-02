@@ -64,6 +64,11 @@ class AcpVisibleConsoleUnavailable(AcpCoordinatorError):
 # so queued pane input and the echoed response retain explicit headroom.
 _CONSOLE_OUTPUT_QUEUE_BUDGET_BYTES = 512 * 1024
 _CONSOLE_OUTPUT_ITEM_TEXT_BYTES = 128 * 1024
+# Three idle ACP panes previously produced roughly 30 control exchanges per
+# second on the Raspberry Pi. A 500 ms cadence keeps pane input/output latency
+# sub-second while leaving enough server capacity for delivery and health API
+# traffic. Active prompts continue independently inside their ACP runtimes.
+_CONSOLE_BRIDGE_INTERVAL_SECONDS = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,7 +521,7 @@ class AcpRuntimeCoordinator:
                     self._failure_type = type(exc).__name__
 
     def _run_console_bridge(self) -> None:
-        while not self._stop.wait(0.1):
+        while not self._stop.wait(_CONSOLE_BRIDGE_INTERVAL_SECONDS):
             if self._daemon_stop.is_set():
                 return
             self._bridge_console_slots()
