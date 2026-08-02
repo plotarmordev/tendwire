@@ -124,6 +124,12 @@ class AcpPromptRoute(Protocol):
         timeout: float,
     ) -> object: ...
 
+    # Production routes may expose a context manager that fences their exact
+    # generation from the final authority check through the prompt-frame
+    # acknowledgement.  Test and third-party routes remain compatible without
+    # it; submit_acp_command probes this method dynamically.
+    def prepare(self) -> Any: ...
+
 
 AcpPromptRouter = Callable[[Worker], AcpPromptRoute | None]
 AcpWorkerOwner = Callable[[str, str], bool]
@@ -2823,87 +2829,118 @@ def submit_acp_command(
             if route_required
             else None
         )
-    try:
-        binding_fingerprint = str(
-            getattr(route, "binding_fingerprint", "") or ""
-        ).strip()
-    except Exception:  # noqa: BLE001
-        binding_fingerprint = ""
-    if not binding_fingerprint:
-        if takeover is not None:
-            return _request_in_progress(request)
-        return (
-            _backend_unavailable(request, "ACP worker route has no durable authority")
-            if route_required
-            else None
-        )
+    def submit_through(active_route: AcpPromptRoute) -> CommandEnvelope | None:
+        try:
+            binding_fingerprint = str(
+                getattr(active_route, "binding_fingerprint", "") or ""
+            ).strip()
+        except Exception:  # noqa: BLE001
+            binding_fingerprint = ""
+        if not binding_fingerprint:
+            if takeover is not None:
+                return _request_in_progress(request)
+            return (
+                _backend_unavailable(
+                    request, "ACP worker route has no durable authority"
+                )
+                if route_required
+                else None
+            )
 
-    canonical = build_canonical_mutation(request, public_worker_id=worker.id)
-    reservation = _reserve_canonical_request(config, request, canonical)
-    if isinstance(reservation, CommandEnvelope):
-        return reservation
-    send_started = _mark_request_send_started(
-        config,
-        request,
-        reservation,
-        binding_fingerprint=binding_fingerprint,
-        worker=worker,
-        instruction_text=_instruction_text(request),
-    )
-    if isinstance(send_started, CommandEnvelope):
-        return send_started
-    if not isinstance(send_started, Mapping):
-        return _recover_request(config, request, reservation.canonical)
-
-    try:
-        route.prompt(
-            _instruction_text(request),
-            producer_turn_id=turn_submission_id(
-                config.host_id,
-                request.request_id or "",
-            ),
-            timeout=config.acp_request_timeout_seconds,
+        canonical = build_canonical_mutation(request, public_worker_id=worker.id)
+        reservation = _reserve_canonical_request(config, request, canonical)
+        if isinstance(reservation, CommandEnvelope):
+            return reservation
+        send_started = _mark_request_send_started(
+            config,
+            request,
+            reservation,
+            binding_fingerprint=binding_fingerprint,
+            worker=worker,
+            instruction_text=_instruction_text(request),
         )
-    except Exception:  # noqa: BLE001
+        if isinstance(send_started, CommandEnvelope):
+            return send_started
+        if not isinstance(send_started, Mapping):
+            return _recover_request(config, request, reservation.canonical)
+
+        try:
+            active_route.prompt(
+                _instruction_text(request),
+                producer_turn_id=turn_submission_id(
+                    config.host_id,
+                    request.request_id or "",
+                ),
+                timeout=config.acp_request_timeout_seconds,
+            )
+        except Exception:  # noqa: BLE001
+            return _finish_request(
+                config,
+                request,
+                reservation,
+                _instruction_uncertain_envelope(
+                    request,
+                    worker,
+                    verdict="unknown",
+                ),
+                expected_state="send_started",
+                terminal_state="uncertain",
+            )
+
+        observed_turn: Mapping[str, Any] | None = send_started
+        if config.db_path is not None:
+            try:
+                refreshed = linked_turn_for_submission(
+                    config.db_path,
+                    host_id=config.host_id,
+                    request_id=request.request_id or "",
+                )
+            except Exception:  # noqa: BLE001
+                refreshed = None
+            if isinstance(refreshed, Mapping):
+                observed_turn = refreshed
+        accepted = _accepted_send_envelope(
+            request,
+            worker,
+            observed_turn,
+            submission_verdict="submitted",
+        )
         return _finish_request(
             config,
             request,
             reservation,
-            _instruction_uncertain_envelope(
-                request,
-                worker,
-                verdict="unknown",
-            ),
+            accepted,
             expected_state="send_started",
-            terminal_state="uncertain",
+            terminal_state="accepted",
         )
 
-    observed_turn: Mapping[str, Any] | None = send_started
-    if config.db_path is not None:
-        try:
-            refreshed = linked_turn_for_submission(
-                config.db_path,
-                host_id=config.host_id,
-                request_id=request.request_id or "",
+    prepare_route = getattr(route, "prepare", None)
+    if not callable(prepare_route):
+        return submit_through(route)
+
+    # Enter the generation fence before reserving a receipt. A failed status
+    # check is therefore a retryable no-receipt outcome, never a fabricated
+    # send_started ambiguity. Keep the context active until the ACP client has
+    # acknowledged writing the complete prompt frame.
+    try:
+        preparation = prepare_route()
+        active_route = preparation.__enter__()
+    except Exception:  # noqa: BLE001 - no receipt or transport exists yet
+        if takeover is not None:
+            return _request_in_progress(request)
+        return (
+            _backend_unavailable(
+                request, "ACP worker route could not be prepared"
             )
-        except Exception:  # noqa: BLE001
-            refreshed = None
-        if isinstance(refreshed, Mapping):
-            observed_turn = refreshed
-    accepted = _accepted_send_envelope(
-        request,
-        worker,
-        observed_turn,
-        submission_verdict="submitted",
-    )
-    return _finish_request(
-        config,
-        request,
-        reservation,
-        accepted,
-        expected_state="send_started",
-        terminal_state="accepted",
-    )
+            if route_required
+            else None
+        )
+    if active_route is None:
+        active_route = route
+    try:
+        return submit_through(active_route)
+    finally:
+        preparation.__exit__(None, None, None)
 
 
 def _submit_command_v2(

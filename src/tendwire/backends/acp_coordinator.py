@@ -13,6 +13,7 @@ import json
 import threading
 import time
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -123,6 +124,7 @@ class _PromptRoute:
         self._owner = owner
         self._worker = worker
         self._slot = slot
+        self._prepared = threading.local()
 
     @property
     def binding_fingerprint(self) -> str:
@@ -141,7 +143,28 @@ class _PromptRoute:
             text,
             producer_turn_id=producer_turn_id,
             acknowledgement_timeout=timeout,
+            generation_prepared=bool(
+                getattr(self._prepared, "depth", 0)
+            ),
         )
+
+    @contextmanager
+    def prepare(self):
+        """Fence one exact generation before its durable send receipt exists."""
+
+        with self._owner._reconcile_lock:
+            self._owner._require_reconcile_state(allow_starting=False)
+            if self._owner._current_slot(self._worker) is not self._slot:
+                raise AcpCoordinatorError("ACP worker route is stale")
+            self._owner._require_attached_generation(self._slot)
+            if self._owner._current_slot(self._worker) is not self._slot:
+                raise AcpCoordinatorError("ACP worker route is stale")
+            depth = int(getattr(self._prepared, "depth", 0))
+            self._prepared.depth = depth + 1
+            try:
+                yield self
+            finally:
+                self._prepared.depth = depth
 
 
 EndpointClientFactory = Callable[[Config], Any]
@@ -1336,6 +1359,7 @@ class AcpRuntimeCoordinator:
         *,
         producer_turn_id: str,
         acknowledgement_timeout: float,
+        generation_prepared: bool = False,
     ) -> object:
         """Write through the exact route generation used by the receipt."""
 
@@ -1344,7 +1368,8 @@ class AcpRuntimeCoordinator:
             current = self._current_slot(worker)
             if current is not slot:
                 raise AcpCoordinatorError("ACP worker route is stale")
-            self._require_attached_generation(slot)
+            if not generation_prepared:
+                self._require_attached_generation(slot)
             if self._current_slot(worker) is not slot:
                 raise AcpCoordinatorError("ACP worker route is stale")
             # The route lease covers the complete JSON-RPC request frame, not

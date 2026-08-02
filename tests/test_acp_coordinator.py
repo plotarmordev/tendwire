@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1129,6 +1130,13 @@ class _Route:
             raise self.failure
 
 
+class _PreparationFailureRoute(_Route):
+    @contextmanager
+    def prepare(self):
+        raise AcpCoordinatorError("transient generation status failure")
+        yield self
+
+
 def _seed(config: Config) -> Worker:
     assert config.db_path is not None
     init_store(config.db_path)
@@ -1210,6 +1218,73 @@ def test_acp_failure_after_send_started_is_uncertain_and_never_falls_back(tmp_pa
         "request-uncertain",
     )
     assert receipt is not None and receipt["state"] == "uncertain"
+
+
+def test_acp_generation_preflight_failure_is_retryable_before_receipt(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    worker = _seed(config)
+    route = _PreparationFailureRoute()
+
+    envelope = submit_command(
+        config,
+        _request("request-preflight-retry"),
+        acp_prompt_router=lambda routed: route if routed == worker else None,
+        acp_required=True,
+    )
+
+    assert envelope.status == "backend_unavailable"
+    assert envelope.disposition == "no_receipt"
+    assert route.calls == []
+    assert get_command_request(
+        config.db_path,
+        config.host_id,
+        "request-preflight-retry",
+    ) is None
+
+
+def test_production_route_checks_generation_before_reserving_receipt(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    worker = _seed(config)
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        reconcile_interval=60.0,
+    )
+    coordinator._state = RuntimeState.RUNNING
+    runtime = SimpleNamespace(
+        status=lambda: SimpleNamespace(healthy=True, failure_type=None),
+        _binding=_binding(),
+    )
+    coordinator._slots[worker.id] = _RuntimeSlot(
+        _binding(),
+        "42",
+        runtime,
+    )
+    coordinator._require_attached_generation = (  # type: ignore[method-assign]
+        lambda _slot: (_ for _ in ()).throw(
+            AcpCoordinatorError("transient Herdr status timeout")
+        )
+    )
+
+    envelope = submit_command(
+        config,
+        _request("request-production-preflight"),
+        acp_prompt_router=coordinator.prompt_route,
+        acp_worker_owner=coordinator.claims_worker,
+        acp_required=True,
+    )
+
+    assert envelope.status == "backend_unavailable"
+    assert envelope.disposition == "no_receipt"
+    assert get_command_request(
+        config.db_path,
+        config.host_id,
+        "request-production-preflight",
+    ) is None
 
 
 def test_preferred_acp_owned_route_loss_fails_closed_without_receipt_or_legacy(
