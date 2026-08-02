@@ -33,12 +33,13 @@ from tendwire.backends.acp_runtime import (
     SessionOpenMode,
 )
 from tendwire.config import Config
-from tendwire.core.models import WorkerBinding, utc_timestamp
+from tendwire.core.models import Snapshot, Worker, WorkerBinding, utc_timestamp
 from tendwire.store.sqlite import (
     expire_stale_worker_bindings,
     expire_worker_bindings,
     list_agent_events,
     list_worker_bindings,
+    save_snapshot,
     upsert_worker_bindings,
 )
 
@@ -169,6 +170,7 @@ class FakeIngestor:
         self.load_resets = 0
         self.update_failure: BaseException | None = None
         self.permission_failure: BaseException | None = None
+        self.completion_failure: BaseException | None = None
         persisted = SimpleNamespace(status="inserted")
         self.update_result: object = SimpleNamespace(
             event=persisted,
@@ -221,6 +223,8 @@ class FakeIngestor:
     ) -> object:
         self.completions += 1
         self.completion_reasons.append(stop_reason)
+        if self.completion_failure is not None:
+            raise self.completion_failure
         return self.completion_result
 
 
@@ -741,6 +745,7 @@ def test_new_callback_can_stop_runtime_without_lifecycle_deadlock(
 
 def test_prompt_rechecks_binding_before_remote_send(tmp_path: Path) -> None:
     client = FakeClient()
+    ingestor = FakeIngestor()
     db_path = tmp_path / "events.db"
     continuity = continuity_binding()
     upsert_worker_bindings(db_path, [continuity])
@@ -750,7 +755,7 @@ def test_prompt_rechecks_binding_before_remote_send(tmp_path: Path) -> None:
         binding=continuity,
         cwd=tmp_path,
         session_binding_callback=binding_callback(db_path),
-        ingestor=FakeIngestor(),  # type: ignore[arg-type]
+        ingestor=ingestor,  # type: ignore[arg-type]
         poll_timeout=0.01,
         stop_timeout=0.5,
     ).start()
@@ -766,6 +771,8 @@ def test_prompt_rechecks_binding_before_remote_send(tmp_path: Path) -> None:
     with pytest.raises(AcpRuntimeBindingError):
         service.prompt("must not send", producer_turn_id="producer-private")
     assert [call[0] for call in client.calls].count("prompt") == 0
+    assert ingestor.started == []
+    assert ingestor.completions == 0
 
 
 def test_new_requires_explicit_session_binder_before_launch(tmp_path: Path) -> None:
@@ -1421,7 +1428,8 @@ def test_prompt_transport_failure_cancels_and_makes_runtime_terminal(
 
     assert raised.value is failure
     assert ingestor.started == ["producer-private"]
-    assert ingestor.completions == 0
+    assert ingestor.completions == 1
+    assert ingestor.completion_reasons == [StopReason.CANCELLED]
     assert ("cancel", ("session-private",), {}) in client.calls
     assert service.status().cancellation_requests == 1
     assert service.status().state is RuntimeState.FAILED
@@ -1431,7 +1439,104 @@ def test_prompt_transport_failure_cancels_and_makes_runtime_terminal(
         service.stop()
 
 
-def test_invalid_prompt_response_never_marks_complete_and_propagates(
+def test_prompt_failure_preserves_original_when_cancel_finalization_fails(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    original = AcpRequestTimeoutError("prompt timed out")
+    client.prompt_failure = original
+    ingestor = FakeIngestor()
+    ingestor.completion_failure = OSError("completion unavailable")
+    service = runtime(tmp_path, client, ingestor).start()
+
+    with pytest.raises(AcpRequestTimeoutError) as raised:
+        service.prompt("question", producer_turn_id="producer-private")
+
+    assert raised.value is original
+    assert ingestor.completions == 1
+    assert ingestor.completion_reasons == [StopReason.CANCELLED]
+    assert service.status().failure_type == "AcpRequestTimeoutError"
+
+
+def test_prompt_failure_drains_queued_updates_before_cancelled_completion(
+    tmp_path: Path,
+) -> None:
+    actions: list[str] = []
+
+    class UpdatingFailureClient(FakeClient):
+        def prompt(self, session_id: str, prompt: object, **kwargs: Any) -> object:
+            self.calls.append(("prompt", (session_id, prompt), kwargs))
+            self.events.put(update())
+            raise AcpRequestTimeoutError("prompt timed out")
+
+    class OrderedIngestor(FakeIngestor):
+        def ingest_update(self, raw: object, **kwargs: Any) -> object:
+            outcome = super().ingest_update(raw, **kwargs)
+            actions.append("update")
+            return outcome
+
+        def mark_prompt_complete(
+            self,
+            stop_reason: StopReason = StopReason.END_TURN,
+        ) -> object:
+            actions.append("complete")
+            return super().mark_prompt_complete(stop_reason)
+
+    client = UpdatingFailureClient()
+    ingestor = OrderedIngestor()
+    service = runtime(tmp_path, client, ingestor).start()
+
+    with pytest.raises(AcpRequestTimeoutError):
+        service.prompt("question", producer_turn_id="producer-private")
+
+    assert actions == ["update", "complete"]
+    assert ingestor.completion_reasons == [StopReason.CANCELLED]
+
+
+def test_prompt_transport_failure_materializes_one_cancelled_final_projection(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    failure = AcpRequestTimeoutError("prompt timed out")
+    client.prompt_failure = failure
+    current = binding()
+    service = bound_runtime(tmp_path, client, current)
+    save_snapshot(
+        tmp_path / "bound-events.db",
+        Snapshot(
+            host_id="host-a",
+            updated_at=utc_timestamp(),
+            workers=[
+                Worker(
+                    id=current.worker_id,
+                    name="worker-public",
+                    status="active",
+                    fingerprint=current.worker_fingerprint,
+                )
+            ],
+        ),
+    )
+    service.start()
+
+    with pytest.raises(AcpRequestTimeoutError) as raised:
+        service.prompt("question", producer_turn_id="producer-private")
+
+    assert raised.value is failure
+    with sqlite3.connect(tmp_path / "bound-events.db") as conn:
+        turns = conn.execute(
+            "SELECT payload_json FROM turns WHERE host_id = ?",
+            ("host-a",),
+        ).fetchall()
+        revisions = conn.execute(
+            "SELECT final_state, assistant_final_text "
+            "FROM turn_content_revisions WHERE host_id = ? AND is_current = 1",
+            ("host-a",),
+        ).fetchall()
+    assert len(turns) == 1
+    assert revisions == [("complete", "[ACP prompt cancelled]")]
+
+
+def test_invalid_prompt_response_cancels_and_finalizes_open_turn(
     tmp_path: Path,
 ) -> None:
     client = FakeClient()
@@ -1441,7 +1546,9 @@ def test_invalid_prompt_response_never_marks_complete_and_propagates(
 
     with pytest.raises(AcpRuntimeProtocolError, match="invalid response"):
         service.prompt("question", producer_turn_id="producer-private")
-    assert ingestor.completions == 0
+    assert ("cancel", ("session-private",), {}) in client.calls
+    assert ingestor.completions == 1
+    assert ingestor.completion_reasons == [StopReason.CANCELLED]
     assert service.status().state is RuntimeState.FAILED
     with pytest.raises(AcpRuntimeProtocolError):
         service.stop()

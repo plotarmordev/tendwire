@@ -27,6 +27,7 @@ from .acp_protocol import (
     RequestId,
     SessionResult,
     SessionUpdate,
+    StopReason,
 )
 
 
@@ -433,10 +434,7 @@ class AcpRuntime:
                 # prompt cannot be retried safely: late updates would otherwise
                 # be attributed to the next turn. Best-effort cancellation
                 # contains the remote work and the runtime becomes terminal.
-                try:
-                    self._cancel_session(session_id)
-                except BaseException:
-                    pass
+                self._close_failed_prompt(session_id, ingestor)
                 self._record_failure(exc)
                 raise
             if not isinstance(result, PromptResult):
@@ -445,6 +443,7 @@ class AcpRuntime:
                 )
                 with self._state_lock:
                     self._prompts_failed += 1
+                self._close_failed_prompt(session_id, ingestor)
                 self._record_failure(error)
                 raise error
 
@@ -1001,6 +1000,41 @@ class AcpRuntime:
         self._client.cancel(session_id)
         with self._state_lock:
             self._cancellation_requests += 1
+
+    def _close_failed_prompt(
+        self,
+        session_id: str,
+        ingestor: AcpSessionIngestor,
+    ) -> None:
+        """Best-effort cancel and durable closure after ``begin_prompt``.
+
+        The original prompt exception remains authoritative even if either
+        cleanup operation fails.  ``mark_prompt_complete`` is idempotent, so
+        this method cannot create a second completion for an already closed
+        turn.
+        """
+
+        try:
+            self._cancel_session(session_id)
+        except BaseException:
+            pass
+        try:
+            # The prompt response (including an invalid one) can overtake the
+            # consumer thread after earlier session/update frames were queued.
+            # Preserve those updates in the failed turn before writing its
+            # terminal marker. A late post-cancel update remains harmless:
+            # the ingestor rejects turn-scoped updates after completion.
+            self._wait_for_event_idle(self._stop_timeout)
+        except BaseException:
+            pass
+        try:
+            with self._ingest_lock:
+                completion = ingestor.mark_prompt_complete(
+                    StopReason.CANCELLED
+                )
+                _raise_for_binding_rejection(completion)
+        except BaseException:
+            pass
 
     def _record_failure(self, failure: BaseException) -> None:
         self._release_derived_binding(reason="acp_runtime_failed")

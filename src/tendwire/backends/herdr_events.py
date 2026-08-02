@@ -40,12 +40,15 @@ from ..store.sqlite import (
     SnapshotRetentionPolicy,
     expire_stale_worker_bindings,
     expire_worker_bindings,
+    get_herdr_turn_refresh_retry,
     get_herdr_turn_watermark,
+    herdr_turn_refresh_retry_due,
     latest_snapshot,
     list_worker_bindings,
     maybe_run_automatic_store_maintenance,
     record_herdr_turn_completeness_break,
     record_herdr_turn_completion,
+    record_herdr_turn_refresh_retry,
     save_snapshot,
     set_herdr_turn_watermark,
     upsert_worker_bindings,
@@ -153,6 +156,20 @@ _TURN_REFRESH_EVENT_NAMES = frozenset(
     }
 )
 _COMPLETED_TURN_REFRESH_STATUSES = frozenset({"updated", "unchanged", "missing"})
+_RETRYABLE_COMPLETED_TURN_REFRESH_STATUSES = frozenset(
+    {
+        "binding_ambiguous",
+        "binding_missing",
+        "failed",
+        "stale_binding",
+        "store_unavailable",
+        "timeout",
+    }
+)
+_COMPLETED_TURN_REFRESH_MAX_RETRY_AGE_SECONDS = 5 * 60
+_COMPLETED_TURN_REFRESH_MAX_ATTEMPTS = 8
+_COMPLETED_TURN_REFRESH_RETRY_BASE_DELAY_SECONDS = 1
+_COMPLETED_TURN_REFRESH_RETRY_MAX_DELAY_SECONDS = 30
 
 
 class HerdrEventBackendError(Exception):
@@ -806,6 +823,7 @@ class HerdrEventBackend:
         self._last_cap_status_at: str | None = None
         self._automatic_maintenance_status: dict[str, Any] | None = None
         self._next_reconcile_monotonic: float | None = None
+        self._next_turn_replay_monotonic: float | None = None
         self._subscription_pane_ids: list[str] = []
         self._turn_api_probed = False
         self._turn_api_supported = False
@@ -1128,15 +1146,37 @@ class HerdrEventBackend:
         self._next_reconcile_monotonic = time.monotonic() + self.reconcile_interval_seconds
 
     def _run_periodic_reconcile_if_due(self, client: Any | None = None) -> None:
-        if self.reconcile_interval_seconds <= 0:
-            return
+        current = time.monotonic()
         due_at = self._next_reconcile_monotonic
-        if due_at is None:
+        reconcile_due = (
+            self.reconcile_interval_seconds > 0
+            and due_at is not None
+            and current >= due_at
+        )
+        turn_replay_due = (
+            self._next_turn_replay_monotonic is not None
+            and current >= self._next_turn_replay_monotonic
+        )
+        if self.reconcile_interval_seconds > 0 and due_at is None:
             self._schedule_next_reconcile()
+        if not reconcile_due and not turn_replay_due:
             return
-        if time.monotonic() < due_at:
-            return
-        self.reconcile_once(client=client)
+        if reconcile_due:
+            self.reconcile_once(client=client)
+        if self._turn_api_supported:
+            # Completion refreshes intentionally leave their watermark behind
+            # while a worker binding is still settling. Periodic snapshot
+            # reconciliation must therefore also replay the durable Herdr turn
+            # ledger; otherwise a retryable completion would not be revisited
+            # until the subscription happened to disconnect.
+            self._next_turn_replay_monotonic = None
+            self._replay_turns_after_reconcile()
+
+    def _schedule_turn_replay(self, delay_seconds: float) -> None:
+        candidate = time.monotonic() + max(0.0, float(delay_seconds))
+        due_at = self._next_turn_replay_monotonic
+        if due_at is None or candidate < due_at:
+            self._next_turn_replay_monotonic = candidate
 
     def _pending_event_count(self) -> int:
         with self._lock:
@@ -1474,6 +1514,21 @@ class HerdrEventBackend:
         if record.turn <= watermark.last_turn:
             return
         if record.turn != watermark.last_turn + 1:
+            # A later live notification is not evidence of ledger loss while
+            # the exact next completion is durably waiting for refresh. Leave
+            # ordering intact; pane.turns replay will revisit the blocker.
+            pending_predecessor = get_herdr_turn_refresh_retry(
+                self.db_path,
+                self.config.host_id,
+                record.pane_id,
+                turn_epoch=record.turn_epoch,
+                turn=watermark.last_turn + 1,
+            )
+            if (
+                pending_predecessor is not None
+                and pending_predecessor.status == "pending"
+            ):
+                return
             self._record_completeness_break(
                 HerdrPaneTurnsReplay(
                     pane_id=record.pane_id,
@@ -1485,9 +1540,53 @@ class HerdrEventBackend:
                 "live_gap",
             )
             return
+        existing_retry = get_herdr_turn_refresh_retry(
+            self.db_path,
+            self.config.host_id,
+            record.pane_id,
+            turn_epoch=record.turn_epoch,
+            turn=record.turn,
+        )
+        if existing_retry is not None and existing_retry.status == "escalated":
+            # Escalation and watermark advancement are separate durable writes.
+            # If the process stopped between them, finalize provenance without
+            # rerunning the known-poison refresh or losing the terminal marker.
+            self._record_turn_diagnostic(
+                "herdr_turn_completion_refresh_escalated_recovered",
+                record.pane_id,
+                status=existing_retry.refresh_status,
+            )
+            record_herdr_turn_completion(
+                self.db_path,
+                self.config.host_id,
+                record.pane_id,
+                turn_epoch=record.turn_epoch,
+                turn=record.turn,
+                outcome=record.outcome,
+                completed_unix_ms=record.completed_unix_ms,
+                message=record.message,
+                message_truncated=record.message_truncated,
+                agent_session_path=record.agent_session_path,
+                worker_id=None,
+                refreshed_turn_id=None,
+                preserve_refresh_retry=True,
+            )
+            return
+        if not herdr_turn_refresh_retry_due(
+            self.db_path,
+            self.config.host_id,
+            record.pane_id,
+            turn_epoch=record.turn_epoch,
+            turn=record.turn,
+        ):
+            self._schedule_turn_replay(
+                _COMPLETED_TURN_REFRESH_RETRY_BASE_DELAY_SECONDS
+            )
+            return
         status, worker_id, refreshed_turn_id = self._completion_processor_result(
             record
         )
+        preserve_refresh_retry = False
         if status not in _COMPLETED_TURN_REFRESH_STATUSES:
             self._record_turn_diagnostic(
                 "herdr_turn_completion_refresh_skipped",
@@ -1495,6 +1594,39 @@ class HerdrEventBackend:
                 status=status or "unknown",
             )
             refreshed_turn_id = None
+            if status in _RETRYABLE_COMPLETED_TURN_REFRESH_STATUSES:
+                retry = record_herdr_turn_refresh_retry(
+                    self.db_path,
+                    self.config.host_id,
+                    record.pane_id,
+                    turn_epoch=record.turn_epoch,
+                    turn=record.turn,
+                    refresh_status=status,
+                    base_delay_seconds=(
+                        _COMPLETED_TURN_REFRESH_RETRY_BASE_DELAY_SECONDS
+                    ),
+                    max_delay_seconds=(
+                        _COMPLETED_TURN_REFRESH_RETRY_MAX_DELAY_SECONDS
+                    ),
+                    max_retry_age_seconds=(
+                        _COMPLETED_TURN_REFRESH_MAX_RETRY_AGE_SECONDS
+                    ),
+                    max_attempts=_COMPLETED_TURN_REFRESH_MAX_ATTEMPTS,
+                )
+                if retry.status == "pending":
+                    retry_delay = min(
+                        _COMPLETED_TURN_REFRESH_RETRY_MAX_DELAY_SECONDS,
+                        _COMPLETED_TURN_REFRESH_RETRY_BASE_DELAY_SECONDS
+                        * (2 ** min(retry.attempt_count - 1, 30)),
+                    )
+                    self._schedule_turn_replay(retry_delay)
+                    return
+                preserve_refresh_retry = True
+                self._record_turn_diagnostic(
+                    "herdr_turn_completion_refresh_escalated",
+                    record.pane_id,
+                    status=status,
+                )
         record_herdr_turn_completion(
             self.db_path,
             self.config.host_id,
@@ -1508,6 +1640,7 @@ class HerdrEventBackend:
             agent_session_path=record.agent_session_path,
             worker_id=worker_id,
             refreshed_turn_id=refreshed_turn_id,
+            preserve_refresh_retry=preserve_refresh_retry,
         )
 
     def _consume_replay(
@@ -1538,6 +1671,15 @@ class HerdrEventBackend:
             return
         for record in replay.records:
             self._process_turn_record(record)
+            current = get_herdr_turn_watermark(
+                self.db_path,
+                self.config.host_id,
+                replay.pane_id,
+            )
+            if current is None or current.last_turn < record.turn:
+                # Preserve strict same-pane ordering: a pending refresh blocks
+                # later records in this replay, but never another pane.
+                return
 
     @classmethod
     def _turn_api_method_unsupported(cls, exc: HerdrErrorResponse) -> bool:

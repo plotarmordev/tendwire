@@ -145,7 +145,7 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 27
+STORE_SCHEMA_VERSION = 28
 CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 _LEGACY_TURN_CLAIM_HARD_TTL_SECONDS = 86_400
 TURN_CHANGE_RETENTION_DAYS = 7
@@ -522,6 +522,23 @@ class HerdrTurnWatermark:
     last_completeness_break_reason: str | None
     last_completeness_break_at: str | None
     updated_at: str
+
+
+@dataclass(frozen=True)
+class HerdrTurnRefreshRetry:
+    """Durable local retry state for one Herdr completion refresh."""
+
+    host_id: str
+    pane_id: str
+    turn_epoch: int
+    turn: int
+    status: Literal["pending", "escalated"]
+    refresh_status: str
+    first_seen_at: str
+    last_attempt_at: str
+    next_attempt_at: str | None
+    attempt_count: int
+    escalated_at: str | None
 
 
 @dataclass(frozen=True)
@@ -1534,10 +1551,47 @@ CREATE TABLE IF NOT EXISTS herdr_turn_completions (
 );
 """
 
+CREATE_HERDR_TURN_REFRESH_RETRIES_TABLE = """
+CREATE TABLE IF NOT EXISTS herdr_turn_refresh_retries (
+    host_id TEXT NOT NULL,
+    pane_id TEXT NOT NULL,
+    turn_epoch INTEGER NOT NULL CHECK (turn_epoch >= 0),
+    turn INTEGER NOT NULL CHECK (turn >= 0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'escalated')),
+    refresh_status TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_attempt_at TEXT NOT NULL,
+    next_attempt_at TEXT,
+    attempt_count INTEGER NOT NULL CHECK (attempt_count >= 1),
+    escalated_at TEXT,
+    PRIMARY KEY (host_id, pane_id, turn_epoch, turn),
+    CHECK (
+        (
+            status = 'pending'
+            AND next_attempt_at IS NOT NULL
+            AND escalated_at IS NULL
+        )
+        OR
+        (
+            status = 'escalated'
+            AND next_attempt_at IS NULL
+            AND escalated_at IS NOT NULL
+        )
+    )
+);
+"""
+
 CREATE_HERDR_TURN_INDEXES = (
     (
         "CREATE INDEX IF NOT EXISTS idx_herdr_turn_completions_worker "
         "ON herdr_turn_completions(host_id, worker_id, turn_epoch, turn)"
+    ),
+)
+
+CREATE_HERDR_TURN_REFRESH_RETRY_INDEXES = (
+    (
+        "CREATE INDEX IF NOT EXISTS idx_herdr_turn_refresh_retries_due "
+        "ON herdr_turn_refresh_retries(host_id, status, next_attempt_at)"
     ),
 )
 
@@ -13572,6 +13626,13 @@ def _migrate_v26_to_v27_conn(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_v27_to_v28_conn(conn: sqlite3.Connection) -> None:
+    """Persist bounded Herdr completion-refresh retries and escalation."""
+    conn.execute(CREATE_HERDR_TURN_REFRESH_RETRIES_TABLE)
+    for statement in CREATE_HERDR_TURN_REFRESH_RETRY_INDEXES:
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -13600,6 +13661,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(24, 25, _migrate_v24_to_v25_conn),
     Migration(25, 26, _migrate_v25_to_v26_conn),
     Migration(26, 27, _migrate_v26_to_v27_conn),
+    Migration(27, 28, _migrate_v27_to_v28_conn),
 )
 
 
@@ -13654,6 +13716,7 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         conn.execute(CREATE_TURN_SUPERSESSIONS_TABLE)
         conn.execute(CREATE_HERDR_TURN_WATERMARKS_TABLE)
         conn.execute(CREATE_HERDR_TURN_COMPLETIONS_TABLE)
+        conn.execute(CREATE_HERDR_TURN_REFRESH_RETRIES_TABLE)
         conn.execute(CREATE_AGENT_EVENTS_TABLE)
         conn.execute(CREATE_AGENT_EVENT_TOMBSTONES_TABLE)
         for statement in CREATE_COMMAND_RECEIPT_INDEXES:
@@ -13676,6 +13739,8 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         for statement in CREATE_TURN_SUPERSESSION_INDEXES:
             conn.execute(statement)
         for statement in CREATE_HERDR_TURN_INDEXES:
+            conn.execute(statement)
+        for statement in CREATE_HERDR_TURN_REFRESH_RETRY_INDEXES:
             conn.execute(statement)
         for statement in CREATE_AGENT_EVENT_INDEXES:
             conn.execute(statement)
@@ -14377,6 +14442,210 @@ def latest_turn_id_for_worker(
     return str(row[0]) if row is not None else None
 
 
+def _herdr_turn_refresh_retry_from_row(
+    row: tuple[Any, ...],
+) -> HerdrTurnRefreshRetry:
+    return HerdrTurnRefreshRetry(
+        host_id=str(row[0]),
+        pane_id=str(row[1]),
+        turn_epoch=int(row[2]),
+        turn=int(row[3]),
+        status=str(row[4]),  # type: ignore[arg-type]
+        refresh_status=str(row[5]),
+        first_seen_at=str(row[6]),
+        last_attempt_at=str(row[7]),
+        next_attempt_at=str(row[8]) if row[8] is not None else None,
+        attempt_count=int(row[9]),
+        escalated_at=str(row[10]) if row[10] is not None else None,
+    )
+
+
+def get_herdr_turn_refresh_retry(
+    db_path: Path | str,
+    host_id: str,
+    pane_id: str,
+    *,
+    turn_epoch: int,
+    turn: int,
+) -> HerdrTurnRefreshRetry | None:
+    """Return durable completion-refresh retry state, if any."""
+    epoch = _herdr_turn_counter(turn_epoch, "turn_epoch")
+    turn_number = _herdr_turn_counter(turn, "turn")
+    if not _sqlite_store_exists(db_path):
+        return None
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            """
+            SELECT
+                host_id, pane_id, turn_epoch, turn, status, refresh_status,
+                first_seen_at, last_attempt_at, next_attempt_at,
+                attempt_count, escalated_at
+            FROM herdr_turn_refresh_retries
+            WHERE host_id = ? AND pane_id = ? AND turn_epoch = ? AND turn = ?
+            """,
+            (str(host_id), str(pane_id), epoch, turn_number),
+        ).fetchone()
+    return _herdr_turn_refresh_retry_from_row(row) if row is not None else None
+
+
+def herdr_turn_refresh_retry_due(
+    db_path: Path | str,
+    host_id: str,
+    pane_id: str,
+    *,
+    turn_epoch: int,
+    turn: int,
+    now: str | None = None,
+) -> bool:
+    """Return whether an absent/pending retry may run under the local clock.
+
+    A backwards local-clock jump makes the retry immediately due. Combined
+    with the durable attempt ceiling this cannot leave a pane wedged waiting
+    for a wall clock to catch up.
+    """
+    retry = get_herdr_turn_refresh_retry(
+        db_path,
+        host_id,
+        pane_id,
+        turn_epoch=turn_epoch,
+        turn=turn,
+    )
+    if retry is None:
+        return True
+    if retry.status == "escalated" or retry.next_attempt_at is None:
+        return False
+    current = _connector_datetime(now or utc_timestamp())
+    last_attempt = _connector_datetime(retry.last_attempt_at)
+    next_attempt = _connector_datetime(retry.next_attempt_at)
+    return current < last_attempt or current >= next_attempt
+
+
+def record_herdr_turn_refresh_retry(
+    db_path: Path | str,
+    host_id: str,
+    pane_id: str,
+    *,
+    turn_epoch: int,
+    turn: int,
+    refresh_status: str,
+    now: str | None = None,
+    base_delay_seconds: int = 1,
+    max_delay_seconds: int = 30,
+    max_retry_age_seconds: int = 300,
+    max_attempts: int = 8,
+) -> HerdrTurnRefreshRetry:
+    """Record one failed refresh attempt with bounded durable backoff."""
+    epoch = _herdr_turn_counter(turn_epoch, "turn_epoch")
+    turn_number = _herdr_turn_counter(turn, "turn")
+    normalized_status = str(refresh_status).strip()
+    if not normalized_status or len(normalized_status) > 128:
+        raise ValueError("refresh_status must contain at most 128 characters")
+    bounds = (base_delay_seconds, max_delay_seconds, max_retry_age_seconds)
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in bounds
+    ):
+        raise ValueError("retry delays and age must be nonnegative integers")
+    if max_delay_seconds < base_delay_seconds:
+        raise ValueError("max_delay_seconds must be at least base_delay_seconds")
+    if (
+        isinstance(max_attempts, bool)
+        or not isinstance(max_attempts, int)
+        or max_attempts < 1
+    ):
+        raise ValueError("max_attempts must be a positive integer")
+    current_dt = _connector_datetime(now or utc_timestamp())
+    current = current_dt.isoformat()
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                """
+                SELECT
+                    host_id, pane_id, turn_epoch, turn, status,
+                    refresh_status, first_seen_at, last_attempt_at,
+                    next_attempt_at, attempt_count, escalated_at
+                FROM herdr_turn_refresh_retries
+                WHERE host_id = ? AND pane_id = ? AND turn_epoch = ? AND turn = ?
+                """,
+                (str(host_id), str(pane_id), epoch, turn_number),
+            ).fetchone()
+            if row is not None and str(row[4]) == "escalated":
+                conn.commit()
+                return _herdr_turn_refresh_retry_from_row(row)
+            first_seen = str(row[6]) if row is not None else current
+            attempt_count = (int(row[9]) if row is not None else 0) + 1
+            age_seconds = max(
+                0.0,
+                (current_dt - _connector_datetime(first_seen)).total_seconds(),
+            )
+            escalated = (
+                attempt_count >= max_attempts
+                or age_seconds >= max_retry_age_seconds
+            )
+            # Anchor backoff at the later of the current and last local sample.
+            # The due predicate explicitly detects rollback, while this avoids
+            # persisting decreasing attempt timestamps.
+            attempt_dt = current_dt
+            if row is not None:
+                attempt_dt = max(attempt_dt, _connector_datetime(str(row[7])))
+            delay = min(
+                max_delay_seconds,
+                base_delay_seconds * (2 ** min(attempt_count - 1, 30)),
+            )
+            next_attempt = (
+                None
+                if escalated
+                else (attempt_dt + timedelta(seconds=delay)).isoformat()
+            )
+            escalated_at = attempt_dt.isoformat() if escalated else None
+            conn.execute(
+                """
+                INSERT INTO herdr_turn_refresh_retries (
+                    host_id, pane_id, turn_epoch, turn, status,
+                    refresh_status, first_seen_at, last_attempt_at,
+                    next_attempt_at, attempt_count, escalated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(host_id, pane_id, turn_epoch, turn) DO UPDATE SET
+                    status = excluded.status,
+                    refresh_status = excluded.refresh_status,
+                    last_attempt_at = excluded.last_attempt_at,
+                    next_attempt_at = excluded.next_attempt_at,
+                    attempt_count = excluded.attempt_count,
+                    escalated_at = excluded.escalated_at
+                """,
+                (
+                    str(host_id),
+                    str(pane_id),
+                    epoch,
+                    turn_number,
+                    "escalated" if escalated else "pending",
+                    normalized_status,
+                    first_seen,
+                    attempt_dt.isoformat(),
+                    next_attempt,
+                    attempt_count,
+                    escalated_at,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    retry = get_herdr_turn_refresh_retry(
+        db_path,
+        host_id,
+        pane_id,
+        turn_epoch=epoch,
+        turn=turn_number,
+    )
+    if retry is None:
+        raise StoreSchemaError("herdr_turn_refresh_retry_unavailable")
+    return retry
+
+
 def record_herdr_turn_completion(
     db_path: Path | str,
     host_id: str,
@@ -14392,6 +14661,7 @@ def record_herdr_turn_completion(
     worker_id: str | None,
     refreshed_turn_id: str | None,
     observed_at: str | None = None,
+    preserve_refresh_retry: bool = False,
 ) -> HerdrTurnWatermark:
     """Store completion provenance and advance its replay watermark atomically."""
     epoch = _herdr_turn_counter(turn_epoch, "turn_epoch")
@@ -14411,6 +14681,8 @@ def record_herdr_turn_completion(
         str,
     ):
         raise ValueError("agent_session_path must be text or None")
+    if not isinstance(preserve_refresh_retry, bool):
+        raise ValueError("preserve_refresh_retry must be a boolean")
     current = observed_at or utc_timestamp()
     with _connect(db_path) as conn:
         _ensure_schema(conn)
@@ -14476,6 +14748,15 @@ def record_herdr_turn_completion(
                 """,
                 (str(host_id), str(pane_id), epoch, turn_number, current),
             )
+            if not preserve_refresh_retry:
+                conn.execute(
+                    """
+                    DELETE FROM herdr_turn_refresh_retries
+                    WHERE host_id = ? AND pane_id = ?
+                      AND turn_epoch = ? AND turn = ? AND status = 'pending'
+                    """,
+                    (str(host_id), str(pane_id), epoch, turn_number),
+                )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -19162,6 +19443,17 @@ def cleanup_herdr_turn_retention(
                 ).fetchall()
             ]
             completion_ids = completion_pool[:bounded_batch]
+            completion_retry_keys = []
+            if completion_ids:
+                placeholders = ",".join("?" for _ in completion_ids)
+                completion_retry_keys = conn.execute(
+                    f"""
+                    SELECT host_id, pane_id, turn_epoch, turn
+                    FROM herdr_turn_completions
+                    WHERE rowid IN ({placeholders})
+                    """,
+                    completion_ids,
+                ).fetchall()
             remaining_budget = bounded_batch - len(completion_ids)
             watermark_params = {
                 **params,
@@ -19212,10 +19504,25 @@ def cleanup_herdr_turn_retention(
                         """,
                         completion_ids,
                     )
+                    conn.executemany(
+                        """
+                        DELETE FROM herdr_turn_refresh_retries
+                        WHERE host_id = ? AND pane_id = ?
+                          AND turn_epoch = ? AND turn = ?
+                        """,
+                        completion_retry_keys,
+                    )
                 if watermark_keys:
                     conn.executemany(
                         """
                         DELETE FROM herdr_turn_watermarks
+                        WHERE host_id = ? AND pane_id = ?
+                        """,
+                        watermark_keys,
+                    )
+                    conn.executemany(
+                        """
+                        DELETE FROM herdr_turn_refresh_retries
                         WHERE host_id = ? AND pane_id = ?
                         """,
                         watermark_keys,

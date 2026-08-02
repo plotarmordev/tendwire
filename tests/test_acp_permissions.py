@@ -373,7 +373,7 @@ def test_v27_provenance_migration_preserves_stale_pending_state(
         conn.commit()
     store_sqlite.init_store(db_path)
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone() == (27,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (28,)
         assert conn.execute(
             "SELECT freshness, route_kind FROM backend_pending"
         ).fetchone() == ("stale", "legacy")

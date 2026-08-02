@@ -52,7 +52,9 @@ from tendwire.store.sqlite import (
     SnapshotObservationContext,
     SnapshotRetentionPolicy,
     apply_backend_pending_observation,
+    get_herdr_turn_refresh_retry,
     get_herdr_turn_watermark,
+    herdr_turn_refresh_retry_due,
     init_store,
     latest_snapshot,
     list_attention_items,
@@ -61,6 +63,7 @@ from tendwire.store.sqlite import (
     maybe_run_automatic_store_maintenance,
     merge_turn_content,
     pending_payload_from_store,
+    record_herdr_turn_refresh_retry,
     save_snapshot,
     set_herdr_turn_watermark,
     turns_payload_from_store,
@@ -93,6 +96,22 @@ _PUBLIC_JSON_FORBIDDEN_KEYS = {
     "private_fingerprint",
 }
 _PUBLIC_JSON_FORBIDDEN_COMPACT = {key.replace("_", "") for key in _PUBLIC_JSON_FORBIDDEN_KEYS}
+
+
+def _force_herdr_turn_refresh_retry_due(
+    backend: HerdrEventBackend,
+    pane_id: str,
+    turn: int,
+) -> None:
+    with closing(sqlite3.connect(str(backend.db_path))) as conn, conn:
+        conn.execute(
+            """
+            UPDATE herdr_turn_refresh_retries
+            SET next_attempt_at = '1970-01-01T00:00:00+00:00'
+            WHERE host_id = ? AND pane_id = ? AND turn = ?
+            """,
+            (backend.config.host_id, pane_id, turn),
+        )
 
 
 def _assert_no_public_json_forbidden(value: Any, path: str = "$") -> None:
@@ -4420,6 +4439,163 @@ def test_periodic_reconcile_uses_config_and_zero_disables_it(tmp_path: Path) -> 
     assert enabled.operational_status["last_reconcile_at"] is not None
 
 
+def test_periodic_reconcile_replays_supported_turn_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = Config(
+        host_id="periodic-turn-replay",
+        data_dir=tmp_path,
+        db_path=tmp_path / "periodic-turn-replay.db",
+        herdr_backend="socket",
+        reconcile_interval_seconds=0.001,
+    )
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(config, debounce_seconds=0)
+    backend._turn_api_supported = True
+    replays: list[bool] = []
+    monkeypatch.setattr(
+        backend,
+        "_replay_turns_after_reconcile",
+        lambda: replays.append(True),
+    )
+    backend._next_reconcile_monotonic = time.monotonic() - 1
+
+    backend._run_periodic_reconcile_if_due(_initial_pane_client())
+
+    assert replays == [True]
+
+
+def test_periodic_reconcile_recovers_retry_without_stream_disconnect(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def process(_config: Config, _pane_id: str, **_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(
+            status="binding_missing" if calls == 1 else "updated",
+            worker_id="claude",
+            refreshed_turn_id=None if calls == 1 else "periodic-public-turn",
+        )
+
+    config = Config(
+        host_id="periodic-live-turn-retry",
+        data_dir=tmp_path,
+        db_path=tmp_path / "periodic-live-turn-retry.db",
+        herdr_backend="socket",
+        reconcile_interval_seconds=300,
+    )
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(
+        config,
+        debounce_seconds=0,
+        reconnect_delay_seconds=0,
+        turn_completion_processor=process,
+    )
+    pane = _turn_api_pane()
+    pane_id = pane["pane_id"]
+    reconcile_client = _StaticClient(
+        workspaces=[{"id": "w123456789abcde", "name": "Build"}],
+        panes=[pane],
+    )
+    backend.reconcile_once(client=reconcile_client)
+    set_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=0,
+    )
+    record = herdr_events._turn_completion_record(
+        {"pane": pane, **_turn_record(1)}
+    )
+    backend._process_turn_record(record)
+    assert calls == 1
+    assert backend._next_turn_replay_monotonic is not None
+    _force_herdr_turn_refresh_retry_due(backend, pane_id, 1)
+    backend._turn_api_probed = True
+    backend._turn_api_supported = True
+
+    class ReplayClient:
+        def connect(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def pane_turns(self, params: Mapping[str, Any], **_kwargs: Any) -> Any:
+            assert params == {
+                "pane_id": pane_id,
+                "since": 0,
+                "expected_epoch": 7,
+            }
+            return {
+                "turns": {
+                    "pane_id": pane_id,
+                    "turn_epoch": 7,
+                    "records": [_turn_record(1)],
+                    "truncated": False,
+                    "oldest_available": 1,
+                }
+            }
+
+    backend.client_factory = lambda _config: ReplayClient()
+    backend._next_reconcile_monotonic = time.monotonic() + 300
+    backend._next_turn_replay_monotonic = time.monotonic() - 1
+    backend._run_periodic_reconcile_if_due(reconcile_client)
+
+    watermark = get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+    )
+    assert calls == 2
+    assert watermark is not None and watermark.last_turn == 1
+    assert reconcile_client.calls == [
+        "workspace.list",
+        "tab.list",
+        "pane.list",
+        "agent.list",
+    ]
+
+
+def test_refresh_retry_ignores_producer_time_and_survives_clock_rollback(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "local-retry-clock.db"
+    init_store(db_path)
+    retry = record_herdr_turn_refresh_retry(
+        db_path,
+        "local-clock-host",
+        "pane-clock",
+        turn_epoch=1,
+        turn=1,
+        refresh_status="binding_missing",
+        now="2026-08-02T00:00:10+00:00",
+    )
+
+    assert retry.first_seen_at == "2026-08-02T00:00:10+00:00"
+    assert retry.attempt_count == 1
+    assert not herdr_turn_refresh_retry_due(
+        db_path,
+        "local-clock-host",
+        "pane-clock",
+        turn_epoch=1,
+        turn=1,
+        now="2026-08-02T00:00:10.500000+00:00",
+    )
+    assert herdr_turn_refresh_retry_due(
+        db_path,
+        "local-clock-host",
+        "pane-clock",
+        turn_epoch=1,
+        turn=1,
+        now="2026-08-01T23:59:00+00:00",
+    )
+
+
 def test_debounce_batches_until_flush_and_shutdown_flushes(tmp_path: Path) -> None:
     backend = _backend(tmp_path, "debounce", debounce_seconds=60)
     backend.reconcile_once(client=_initial_pane_client())
@@ -5995,11 +6171,12 @@ def test_turn_completion_late_attaches_final_after_idle_event_wins_race(
         "store_unavailable",
     ],
 )
-def test_default_completion_processor_nonterminal_status_advances_with_diagnostic(
+def test_default_completion_processor_retryable_status_preserves_watermark(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     refresh_status: str,
 ) -> None:
+    monkeypatch.setattr(herdr_events.time, "time", lambda: 1_700_000_000.1)
     backend = _backend(tmp_path, f"default-composition-{refresh_status}")
     backend.reconcile_once(
         client=_StaticClient(
@@ -6061,7 +6238,7 @@ def test_default_completion_processor_nonterminal_status_advances_with_diagnosti
         backend.config.host_id,
         pane_id,
     )
-    assert watermark is not None and watermark.last_turn == 1
+    assert watermark is not None and watermark.last_turn == 0
     assert backend.operational_status["turn_completion_diagnostics"] == {
         f"herdr_turn_completion_refresh_skipped:{refresh_status}": 1
     }
@@ -6073,12 +6250,398 @@ def test_default_completion_processor_nonterminal_status_advances_with_diagnosti
             WHERE host_id = ? AND pane_id = ?
             """,
             (backend.config.host_id, pane_id),
+        ).fetchall() == []
+
+
+def test_completion_binding_race_replays_once_after_binding_appears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(herdr_events.time, "time", lambda: 1_700_000_000.1)
+    config = Config(
+        host_id="turn-api-binding-race",
+        data_dir=tmp_path,
+        db_path=tmp_path / "turn-api-binding-race.db",
+        herdr_backend="socket",
+        herdr_bin="turn-adapter",
+        herdr_timeout_seconds=0.5,
+    )
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(
+        config,
+        debounce_seconds=0,
+        reconnect_delay_seconds=0,
+    )
+    pane = _turn_api_pane()
+    pane_id = pane["pane_id"]
+    backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "w123456789abcde", "name": "Build"}],
+            panes=[pane],
+        )
+    )
+    set_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=0,
+    )
+
+    original_list_worker_bindings = herdr_turns.list_worker_bindings
+    monkeypatch.setattr(
+        herdr_turns,
+        "list_worker_bindings",
+        lambda *_args, **_kwargs: [],
+    )
+    event_data = {"pane": pane, **_turn_record(1)}
+    assert backend.queue_event_envelope(
+        {"event": "pane.turn_completed", "data": event_data}
+    )
+
+    watermark = get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+    )
+    assert watermark is not None and watermark.last_turn == 0
+
+    final_payload = {
+        "result": {
+            "turn": {
+                "available": True,
+                "user_text": "binding race prompt",
+                "assistant_final_text": "binding race response",
+                "complete": True,
+                "has_open_turn": False,
+                "source_turn_id": "binding-race-turn",
+            }
+        }
+    }
+    adapter_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        adapter_calls.append(args)
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps(final_payload),
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        herdr_turns,
+        "list_worker_bindings",
+        original_list_worker_bindings,
+    )
+    monkeypatch.setattr(herdr_turns.subprocess, "run", fake_run)
+    record = herdr_events._turn_completion_record(event_data)
+    _force_herdr_turn_refresh_retry_due(backend, pane_id, 1)
+    backend._process_turn_record(record)
+    backend._process_turn_record(record)
+
+    watermark = get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+    )
+    assert watermark is not None and watermark.last_turn == 1
+    assert len(adapter_calls) == 1
+    with closing(sqlite3.connect(str(backend.db_path))) as conn, conn:
+        completion_rows = conn.execute(
+            """
+            SELECT turn, refreshed_turn_id
+            FROM herdr_turn_completions
+            WHERE host_id = ? AND pane_id = ?
+            """,
+            (backend.config.host_id, pane_id),
+        ).fetchall()
+        final_ready_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM connector_outbox
+            WHERE host_id = ?
+              AND connector = 'turn-final'
+              AND delivery_kind = 'final_ready'
+            """,
+            (backend.config.host_id,),
+        ).fetchone()[0]
+    assert len(completion_rows) == 1
+    assert completion_rows[0][0] == 1
+    assert completion_rows[0][1]
+    assert final_ready_count == 1
+
+
+def test_completed_turn_missing_content_remains_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _backend(tmp_path, "default-composition-missing")
+    backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "w123456789abcde", "name": "Build"}],
+            panes=[_turn_api_pane()],
+        )
+    )
+    pane_id = _turn_api_pane()["pane_id"]
+    set_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=0,
+    )
+    monkeypatch.setattr(
+        herdr_turns,
+        "_refresh_turn_binding",
+        lambda *_args, **_kwargs: herdr_turns.TurnRefreshResult("missing", 0),
+    )
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.turn_completed",
+            "data": {"pane": _turn_api_pane(), **_turn_record(1)},
+        }
+    )
+
+    watermark = get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+    )
+    assert watermark is not None and watermark.last_turn == 1
+    assert backend.operational_status["turn_completion_diagnostics"] == {}
+    with closing(sqlite3.connect(str(backend.db_path))) as conn, conn:
+        assert conn.execute(
+            """
+            SELECT turn, refreshed_turn_id
+            FROM herdr_turn_completions
+            WHERE host_id = ? AND pane_id = ?
+            """,
+            (backend.config.host_id, pane_id),
         ).fetchall() == [(1, None)]
+
+
+def test_poison_completion_escalates_then_later_same_pane_turn_advances(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def process(_config: Config, _pane_id: str, **_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls <= herdr_events._COMPLETED_TURN_REFRESH_MAX_ATTEMPTS:
+            return SimpleNamespace(
+                status="failed",
+                worker_id="claude",
+                refreshed_turn_id=None,
+            )
+        return SimpleNamespace(
+            status="updated",
+            worker_id="claude",
+            refreshed_turn_id=f"public-turn-{calls}",
+        )
+
+    backend = _turn_api_backend(tmp_path, "turn-api-poison", process)
+    pane_id = _turn_api_pane()["pane_id"]
+    set_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=0,
+    )
+
+    poison_record = herdr_events._turn_completion_record(
+        {"pane": _turn_api_pane(), **_turn_record(1)}
+    )
+    for attempt in range(herdr_events._COMPLETED_TURN_REFRESH_MAX_ATTEMPTS):
+        if attempt:
+            _force_herdr_turn_refresh_retry_due(backend, pane_id, 1)
+        backend._process_turn_record(poison_record)
+    backend._process_turn_record(
+        herdr_events._turn_completion_record(
+            {"pane": _turn_api_pane(), **_turn_record(2)}
+        )
+    )
+
+    watermark = get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+    )
+    assert watermark is not None and watermark.last_turn == 2
+    assert backend.operational_status["turn_completion_diagnostics"] == {
+        "herdr_turn_completion_refresh_skipped:failed": (
+            herdr_events._COMPLETED_TURN_REFRESH_MAX_ATTEMPTS
+        ),
+        "herdr_turn_completion_refresh_escalated:failed": 1,
+    }
+    retry = get_herdr_turn_refresh_retry(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        turn=1,
+    )
+    assert retry is not None
+    assert retry.status == "escalated"
+    assert retry.attempt_count == herdr_events._COMPLETED_TURN_REFRESH_MAX_ATTEMPTS
+    assert retry.escalated_at is not None
+    with closing(sqlite3.connect(str(backend.db_path))) as conn, conn:
+        assert conn.execute(
+            """
+            SELECT turn, refreshed_turn_id
+            FROM herdr_turn_completions
+            WHERE host_id = ? AND pane_id = ?
+            ORDER BY turn
+            """,
+            (backend.config.host_id, pane_id),
+        ).fetchall() == [
+            (
+                1,
+                None,
+            ),
+            (
+                2,
+                f"public-turn-{herdr_events._COMPLETED_TURN_REFRESH_MAX_ATTEMPTS + 1}",
+            ),
+        ]
+
+
+def test_retryable_completion_watermark_survives_backend_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(herdr_events.time, "time", lambda: 1_700_000_000.1)
+    first = _turn_api_backend(
+        tmp_path,
+        "turn-api-retry-restart",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="binding_missing",
+            worker_id=None,
+            refreshed_turn_id=None,
+        ),
+    )
+    pane_id = _turn_api_pane()["pane_id"]
+    set_herdr_turn_watermark(
+        first.db_path,
+        first.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=0,
+    )
+    record = herdr_events._turn_completion_record(
+        {"pane": _turn_api_pane(), **_turn_record(1)}
+    )
+    first._process_turn_record(record)
+    before_restart = get_herdr_turn_watermark(
+        first.db_path,
+        first.config.host_id,
+        pane_id,
+    )
+    assert before_restart is not None and before_restart.last_turn == 0
+
+    calls = 0
+
+    def process_after_restart(
+        _config: Config,
+        _pane_id: str,
+        **_kwargs: Any,
+    ) -> Any:
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(
+            status="updated",
+            worker_id="claude",
+            refreshed_turn_id="public-turn-after-restart",
+        )
+
+    restarted = HerdrEventBackend(
+        first.config,
+        debounce_seconds=0,
+        reconnect_delay_seconds=0,
+        turn_completion_processor=process_after_restart,
+    )
+    _force_herdr_turn_refresh_retry_due(restarted, pane_id, 1)
+    restarted._process_turn_record(record)
+    restarted._process_turn_record(record)
+
+    after_restart = get_herdr_turn_watermark(
+        restarted.db_path,
+        restarted.config.host_id,
+        pane_id,
+    )
+    assert after_restart is not None and after_restart.last_turn == 1
+    assert calls == 1
+    with closing(sqlite3.connect(str(restarted.db_path))) as conn, conn:
+        assert conn.execute(
+            """
+            SELECT turn, refreshed_turn_id
+            FROM herdr_turn_completions
+            WHERE host_id = ? AND pane_id = ?
+            """,
+            (restarted.config.host_id, pane_id),
+        ).fetchall() == [(1, "public-turn-after-restart")]
+
+
+def test_restart_finishes_escalation_written_before_completion_watermark(
+    tmp_path: Path,
+) -> None:
+    processor_calls = 0
+
+    def process(_config: Config, _pane_id: str, **_kwargs: Any) -> Any:
+        nonlocal processor_calls
+        processor_calls += 1
+        return SimpleNamespace(status="failed")
+
+    backend = _turn_api_backend(
+        tmp_path,
+        "turn-api-escalation-crash-boundary",
+        process,
+    )
+    pane_id = _turn_api_pane()["pane_id"]
+    set_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=0,
+    )
+    retry = record_herdr_turn_refresh_retry(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        turn=1,
+        refresh_status="failed",
+        max_attempts=1,
+    )
+    assert retry.status == "escalated"
+
+    backend._process_turn_record(
+        herdr_events._turn_completion_record(
+            {"pane": _turn_api_pane(), **_turn_record(1)}
+        )
+    )
+
+    watermark = get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+    )
+    assert processor_calls == 0
+    assert watermark is not None and watermark.last_turn == 1
+    assert backend.operational_status["turn_completion_diagnostics"] == {
+        "herdr_turn_completion_refresh_escalated_recovered:failed": 1
+    }
 
 
 def test_replay_timeout_on_one_pane_does_not_block_other_panes_or_subscribe(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(herdr_events.time, "time", lambda: 1_700_000_000.1)
     pane_a = _turn_api_pane()
     pane_b = {
         **_turn_api_pane(),
@@ -6143,13 +6706,18 @@ def test_replay_timeout_on_one_pane_does_not_block_other_panes_or_subscribe(
 
     assert set(processed) == {pane_a["pane_id"], pane_b["pane_id"]}
     assert len(client.subscriptions) == 1
-    for pane in (pane_a, pane_b):
-        watermark = get_herdr_turn_watermark(
-            backend.db_path,
-            backend.config.host_id,
-            pane["pane_id"],
-        )
-        assert watermark is not None and watermark.last_turn == 1
+    timed_out = get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_a["pane_id"],
+    )
+    completed = get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_b["pane_id"],
+    )
+    assert timed_out is not None and timed_out.last_turn == 0
+    assert completed is not None and completed.last_turn == 1
 
 
 def test_first_probe_pane_not_found_skips_only_that_pane(tmp_path: Path) -> None:
