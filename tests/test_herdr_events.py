@@ -2807,8 +2807,124 @@ def test_start_raises_instead_of_proceeding_with_stale_state_when_not_ready(
             backend.start(wait_for_reconcile=True, timeout_seconds=0.01)
 
         assert backend.ready is False
+        assert backend.running is False
+        assert backend._thread is None
     finally:
         backend.stop()
+
+
+def test_start_defaults_to_dedicated_initial_reconcile_timeout(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    config = Config(
+        host_id="initial-reconcile-budget",
+        data_dir=tmp_path,
+        db_path=tmp_path / "initial-reconcile-budget.db",
+        herdr_backend="socket",
+        herdr_timeout_seconds=0.25,
+        herdr_initial_reconcile_timeout_seconds=42,
+    )
+    backend = HerdrEventBackend(config, debounce_seconds=0, reconnect_delay_seconds=0)
+    waited: list[float] = []
+
+    class NeverReady:
+        def clear(self) -> None:
+            return None
+
+        def is_set(self) -> bool:
+            return False
+
+        def wait(self, timeout: float | None = None) -> bool:
+            assert timeout is not None
+            waited.append(timeout)
+            return False
+
+    backend._ready = NeverReady()  # type: ignore[assignment]
+    monkeypatch.setattr(backend, "run_forever", backend.stop_event.wait)
+
+    try:
+        with pytest.raises(HerdrSocketTimeoutError):
+            backend.start(wait_for_reconcile=True)
+        assert waited == [42.0]
+        assert config.herdr_timeout_seconds == 0.25
+    finally:
+        backend.stop()
+
+
+def test_start_timeout_cancels_remaining_per_pane_replay_and_joins_worker(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    config = Config(
+        host_id="initial-reconcile-cancel",
+        data_dir=tmp_path,
+        db_path=tmp_path / "initial-reconcile-cancel.db",
+        herdr_backend="socket",
+        herdr_timeout_seconds=0.1,
+        herdr_initial_reconcile_timeout_seconds=0.01,
+    )
+    init_store(Path(config.db_path))
+
+    class Client:
+        def close(self) -> None:
+            return None
+
+    backend = HerdrEventBackend(
+        config,
+        client_factory=lambda _config: Client(),
+        debounce_seconds=0,
+        reconnect_delay_seconds=0,
+    )
+    consumed: list[str] = []
+    replay_started = threading.Event()
+
+    class ReadinessGate:
+        def clear(self) -> None:
+            return None
+
+        def is_set(self) -> bool:
+            return False
+
+        def set(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> bool:
+            assert replay_started.wait(1.0)
+            return False
+
+    backend._ready = ReadinessGate()  # type: ignore[assignment]
+
+    def reconcile_once(*, client: Any) -> None:
+        backend._subscription_pane_ids = ["pane-1", "pane-2"]
+
+    def probe_turn_api(
+        client: Any,
+        pane_id: str,
+        watermark: Any,
+    ) -> tuple[bool, None, None]:
+        return True, None, None
+
+    def consume_pane_replay(
+        client: Any,
+        pane_id: str,
+        watermark: Any,
+        **kwargs: Any,
+    ) -> None:
+        consumed.append(pane_id)
+        replay_started.set()
+        time.sleep(0.05)
+
+    monkeypatch.setattr(backend, "reconcile_once", reconcile_once)
+    monkeypatch.setattr(backend, "_probe_turn_api", probe_turn_api)
+    monkeypatch.setattr(backend, "_consume_pane_replay", consume_pane_replay)
+
+    with pytest.raises(HerdrSocketTimeoutError):
+        backend.start(wait_for_reconcile=True)
+
+    assert consumed == ["pane-1"]
+    assert backend.running is False
+    assert backend._thread is None
 
 
 @pytest.mark.parametrize("batched", [False, True], ids=["one-flush-per-event", "one-batch"])

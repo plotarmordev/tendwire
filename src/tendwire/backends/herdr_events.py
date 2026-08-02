@@ -1007,8 +1007,13 @@ class HerdrEventBackend:
         self._thread = thread
         thread.start()
         if wait_for_reconcile:
-            timeout = self.config.herdr_timeout_seconds if timeout_seconds is None else timeout_seconds
+            timeout = (
+                self.config.herdr_initial_reconcile_timeout_seconds
+                if timeout_seconds is None
+                else timeout_seconds
+            )
             if not self._ready.wait(max(0.001, float(timeout))):
+                self.stop()
                 raise HerdrSocketTimeoutError("initial Herdr reconciliation timed out")
 
     def stop(self) -> None:
@@ -1016,8 +1021,9 @@ class HerdrEventBackend:
         self.flush()
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=max(1.0, self.config.herdr_timeout_seconds))
-        self._thread = None
+            thread.join(timeout=max(1.0, self.config.herdr_timeout_seconds + 1.0))
+        if thread is None or not thread.is_alive():
+            self._thread = None
 
     def run_forever(self) -> None:
         while not self.stop_event.is_set():
@@ -1640,6 +1646,8 @@ class HerdrEventBackend:
 
     def _replay_turns_after_reconcile(self, client: Any) -> None:
         """Probe pane.turns once, then replay each pane independently."""
+        if self.stop_event.is_set():
+            return
         pane_ids = tuple(self._subscription_pane_ids)
         if not pane_ids:
             self._turn_api_probed = True
@@ -1657,6 +1665,8 @@ class HerdrEventBackend:
         probe_replay: HerdrPaneTurnsReplay | None = None
         probe_error: HerdrErrorResponse | AttributeError | None = None
         if not self._turn_api_probed:
+            if self.stop_event.is_set():
+                return
             probe_pane_id = pane_ids[0]
             supported, probe_replay, probe_error = self._probe_turn_api(
                 client,
@@ -1668,6 +1678,8 @@ class HerdrEventBackend:
         if not self._turn_api_supported:
             return
         for pane_id in pane_ids:
+            if self.stop_event.is_set():
+                return
             self._consume_pane_replay(
                 client,
                 pane_id,

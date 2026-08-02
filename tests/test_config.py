@@ -17,6 +17,7 @@ from tendwire.config import (
     DEFAULT_COMMAND_RECEIPT_RETENTION_COUNT,
     DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS,
     DEFAULT_COMMAND_RETRY_HORIZON_SECONDS,
+    DEFAULT_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS,
     DEFAULT_SUBMISSION_HARD_TTL_SECONDS,
     DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS,
     DEFAULT_TURN_MODEL,
@@ -30,6 +31,46 @@ from tendwire.config import (
     Config,
     load_config,
 )
+
+
+def test_initial_reconcile_timeout_is_distinct_and_configurable(monkeypatch) -> None:
+    monkeypatch.delenv(
+        "TENDWIRE_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS",
+        raising=False,
+    )
+    defaults = load_config(herdr_timeout_seconds="2.5")
+    assert defaults.herdr_timeout_seconds == 2.5
+    assert (
+        defaults.herdr_initial_reconcile_timeout_seconds
+        == DEFAULT_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS
+        == 120.0
+    )
+
+    monkeypatch.setenv("TENDWIRE_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS", "45")
+    environment = load_config(herdr_timeout_seconds="1.5")
+    explicit = load_config(
+        herdr_timeout_seconds="0.75",
+        herdr_initial_reconcile_timeout_seconds="90",
+    )
+
+    assert environment.herdr_timeout_seconds == 1.5
+    assert environment.herdr_initial_reconcile_timeout_seconds == 45.0
+    assert explicit.herdr_timeout_seconds == 0.75
+    assert explicit.herdr_initial_reconcile_timeout_seconds == 90.0
+
+
+@pytest.mark.parametrize("value", ["", "invalid", "0", "-1", "inf", "nan"])
+def test_initial_reconcile_timeout_rejects_invalid_environment(
+    monkeypatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("TENDWIRE_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS", value)
+
+    with pytest.raises(
+        ValueError,
+        match="herdr_initial_reconcile_timeout_seconds must be a finite positive number",
+    ):
+        load_config()
 
 
 def test_acp_event_source_defaults_to_legacy_with_thoughts_disabled(

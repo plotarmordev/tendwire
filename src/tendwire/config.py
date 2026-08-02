@@ -26,6 +26,7 @@ DEFAULT_ACP_THOUGHT_POLICY = "disabled"
 DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS = 30.0
 DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 DEFAULT_ACP_MAX_FRAME_BYTES = 8 * 1024 * 1024
+DEFAULT_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS = 120.0
 DEFAULT_EVENT_DEBOUNCE_SECONDS = 0.05
 DEFAULT_RECONCILE_INTERVAL_SECONDS = 300.0
 DEFAULT_EVENT_RETENTION_DAYS = 7
@@ -71,6 +72,9 @@ class Config:
     db_path: Path | None = None
     socket_path: Path | None = None
     herdr_timeout_seconds: float = 5.0
+    herdr_initial_reconcile_timeout_seconds: float = (
+        DEFAULT_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS
+    )
     herdr_backend: str = "cli"
     turn_model: str = DEFAULT_TURN_MODEL
     agent_event_source: str = DEFAULT_AGENT_EVENT_SOURCE
@@ -123,8 +127,22 @@ class Config:
             normalized_socket_group = str(self.socket_group).strip()
             object.__setattr__(self, "socket_group", normalized_socket_group or None)
 
-        if self.herdr_timeout_seconds <= 0:
-            raise ValueError("herdr_timeout_seconds must be positive")
+        object.__setattr__(
+            self,
+            "herdr_timeout_seconds",
+            _positive_finite_float(
+                self.herdr_timeout_seconds,
+                "herdr_timeout_seconds",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "herdr_initial_reconcile_timeout_seconds",
+            _positive_finite_float(
+                self.herdr_initial_reconcile_timeout_seconds,
+                "herdr_initial_reconcile_timeout_seconds",
+            ),
+        )
         backend = str(self.herdr_backend or "").strip().lower()
         if backend not in HERDR_BACKENDS:
             allowed = ", ".join(sorted(HERDR_BACKENDS))
@@ -490,6 +508,7 @@ def load_config(
     socket_path: str | Path | None = None,
     socket_group: str | None = None,
     herdr_timeout_seconds: float | str | None = None,
+    herdr_initial_reconcile_timeout_seconds: float | str | None = None,
     herdr_backend: str | None = None,
     turn_model: str | None = None,
     agent_event_source: str | None = None,
@@ -586,6 +605,11 @@ def load_config(
         db_path=resolved_db_path,
         socket_path=resolved_socket_path,
         herdr_timeout_seconds=resolved_herdr_timeout_seconds,
+        herdr_initial_reconcile_timeout_seconds=_resolve_value(
+            herdr_initial_reconcile_timeout_seconds,
+            "TENDWIRE_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS",
+            DEFAULT_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS,
+        ),
         herdr_backend=resolved_herdr_backend,
         turn_model=_resolve_value(
             turn_model,

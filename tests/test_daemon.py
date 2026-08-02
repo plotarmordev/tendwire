@@ -4013,6 +4013,46 @@ def test_daemon_backend_timeout_never_reaches_acp_startup(tmp_path: Path) -> Non
 
 
 @_UNIX_SOCKET_TEST
+def test_daemon_default_backend_keeps_startup_and_rpc_timeouts_distinct(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[float, float]] = []
+
+    def time_out_start(self: Any, *, wait_for_reconcile: bool) -> None:
+        assert wait_for_reconcile is True
+        captured.append(
+            (
+                self.config.herdr_timeout_seconds,
+                self.config.herdr_initial_reconcile_timeout_seconds,
+            )
+        )
+        raise HerdrSocketTimeoutError("initial Herdr reconciliation timed out")
+
+    monkeypatch.setattr(
+        "tendwire.backends.herdr_events.HerdrEventBackend.start",
+        time_out_start,
+    )
+    config = Config(
+        host_id="daemon-distinct-timeouts",
+        data_dir=tmp_path,
+        db_path=tmp_path / "daemon-distinct-timeouts.db",
+        socket_path=tmp_path / "daemon-distinct-timeouts.sock",
+        herdr_backend="socket",
+        herdr_timeout_seconds=0.25,
+        herdr_initial_reconcile_timeout_seconds=17,
+    )
+    daemon = TendwireDaemon(config)
+
+    try:
+        with pytest.raises(HerdrSocketTimeoutError):
+            daemon.start()
+        assert captured == [(0.25, 17.0)]
+    finally:
+        daemon.stop()
+
+
+@_UNIX_SOCKET_TEST
 def test_daemon_scheduler_start_failure_detaches_callback_and_cleans_components(
     tmp_path: Path,
 ) -> None:
