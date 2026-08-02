@@ -43,11 +43,9 @@ from tendwire.core.models import (
     Snapshot,
     Worker,
     WorkerBinding,
-    utc_timestamp,
 )
 from tendwire.daemon import DaemonHooks, TendwireDaemon
 from tendwire.store.sqlite import (
-    expire_worker_bindings,
     get_command_request,
     init_store,
     list_agent_events,
@@ -2250,11 +2248,28 @@ def test_preferred_caches_exact_non_acp_generation_without_endpoint_churn(
     init_store(config.db_path)
     upsert_worker_bindings(config.db_path, [_binding()])
     endpoint_calls = 0
+    status_calls = 0
+    registered = False
 
     class NonAcpClient:
         def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
             nonlocal endpoint_calls
             endpoint_calls += 1
+            if registered:
+                return _endpoint()
+            raise HerdrErrorResponse(
+                {
+                    "code": "acp_worker_unauthenticated",
+                    "message": "worker is not ACP-owned",
+                },
+                "request-private",
+            )
+
+        def agent_acp_status(self, _target: Any, *, timeout: float) -> Any:
+            nonlocal status_calls
+            status_calls += 1
+            if registered:
+                return _status(lifecycle="acp_owned_ready")
             raise HerdrErrorResponse(
                 {
                     "code": "acp_worker_unauthenticated",
@@ -2266,10 +2281,26 @@ def test_preferred_caches_exact_non_acp_generation_without_endpoint_churn(
         def close(self) -> None:
             return None
 
+    class Runtime:
+        def __init__(self, _client: Any, **kwargs: Any) -> None:
+            self._binding = kwargs["binding"]
+            self.stopped = False
+
+        def start(self) -> None:
+            return None
+
+        def stop(self, *, timeout: float) -> None:
+            self.stopped = True
+
+        def status(self) -> Any:
+            return SimpleNamespace(healthy=not self.stopped, failure_type=None)
+
     coordinator = AcpRuntimeCoordinator(
         config,
         threading.Event(),
         endpoint_client_factory=lambda _config: NonAcpClient(),
+        client_factory=lambda *_args, **_kwargs: object(),
+        runtime_factory=Runtime,
         reconcile_interval=60.0,
     ).start()
     try:
@@ -2278,29 +2309,14 @@ def test_preferred_caches_exact_non_acp_generation_without_endpoint_churn(
         coordinator._reconcile(strict=False)
         coordinator._reconcile(strict=False)
         assert endpoint_calls == 1
+        assert status_calls == 2
         assert coordinator.status()["failure_type"] is None
 
-        changed_at = utc_timestamp()
-        expire_worker_bindings(
-            config.db_path,
-            config.host_id,
-            backend="herdr",
-            private_fingerprints=["herdr-private-binding"],
-            now=changed_at,
-            reason="new-generation",
-        )
-        upsert_worker_bindings(
-            config.db_path,
-            [
-                replace(
-                    _binding(),
-                    private_fingerprint="herdr-private-binding-2",
-                    observed_at=changed_at,
-                )
-            ],
-        )
+        registered = True
         coordinator._reconcile(strict=False)
         assert endpoint_calls == 2
+        assert status_calls == 3
+        assert "worker-1" in coordinator._slots
     finally:
         coordinator.stop()
 

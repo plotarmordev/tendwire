@@ -209,9 +209,10 @@ class AcpRuntimeCoordinator:
         # Optional ACP policies discover workers from the same Herdr binding
         # stream as legacy PTY agents. Remember an exact worker generation
         # that positively reported it is not ACP-owned so the periodic pass
-        # does not issue a mutating endpoint-mint request every interval. A
-        # registration/identity change produces a new private binding
-        # fingerprint and therefore becomes probeable immediately.
+        # does not issue a mutating endpoint-mint request every interval.
+        # Cached workers are checked with the non-ticketing status method, so
+        # a later ACP registration becomes attachable immediately without
+        # relying on mutable observation fingerprints.
         self._optional_endpoint_absences: dict[str, str] = {}
 
     def start(self) -> "AcpRuntimeCoordinator":
@@ -1053,11 +1054,9 @@ class AcpRuntimeCoordinator:
         with self._lock:
             failed_claims = tuple(self._console_failed_claims.items())
             published_claims = tuple(self._published_acp_claims.items())
-            for worker_id, fingerprint in tuple(
-                self._optional_endpoint_absences.items()
-            ):
+            for worker_id in tuple(self._optional_endpoint_absences):
                 binding = current.get(worker_id)
-                if binding is None or binding.private_fingerprint != fingerprint:
+                if binding is None:
                     self._optional_endpoint_absences.pop(worker_id, None)
         exact_authorities = (
             self._herdr_authority_claims()
@@ -1100,12 +1099,28 @@ class AcpRuntimeCoordinator:
             self._require_reconcile_state(allow_starting=True)
             with self._lock:
                 existing = self._slots.get(worker_id)
-                optional_absence = (
-                    self._optional_endpoint_absences.get(worker_id)
-                    == continuity.private_fingerprint
-                )
+                optional_absence = worker_id in self._optional_endpoint_absences
             if existing is None and optional_absence:
-                continue
+                try:
+                    status = self._resolve_status(continuity)
+                except Exception as exc:  # noqa: BLE001
+                    if _optional_acp_absence(exc):
+                        with self._lock:
+                            self._optional_endpoint_absences[worker_id] = (
+                                continuity.worker_fingerprint
+                            )
+                        continue
+                    failures.append(exc)
+                    continue
+                if status.lifecycle != "acp_owned_ready":
+                    failures.append(
+                        AcpCoordinatorError(
+                            "ACP worker is attached without a local runtime"
+                        )
+                    )
+                    continue
+                with self._lock:
+                    self._optional_endpoint_absences.pop(worker_id, None)
             try:
                 self._reconcile_binding(continuity)
             except Exception as exc:  # noqa: BLE001
@@ -1117,7 +1132,7 @@ class AcpRuntimeCoordinator:
                 ):
                     with self._lock:
                         self._optional_endpoint_absences[worker_id] = (
-                            continuity.private_fingerprint
+                            continuity.worker_fingerprint
                         )
                     continue
                 failures.append(exc)
