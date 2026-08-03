@@ -312,6 +312,7 @@ def _factory(calls: list[dict[str, Any]], *, raises: BaseException | None = None
 def _expected_submit_calls(
     target: str = "agent-secret",
     *,
+    resolved_target: str = "pane-secret",
     text: str = "hello",
     timeout_ms: int = 5000,
 ) -> list[dict[str, Any]]:
@@ -320,7 +321,7 @@ def _expected_submit_calls(
         {
             "method": "agent.prompt",
             "params": {
-                "target": target,
+                "target": resolved_target,
                 "text": text,
                 "wait": {"until": ["working"], "timeout_ms": timeout_ms},
             },
@@ -1715,7 +1716,10 @@ def test_submit_command_terminal_binding_resolves_pane_and_submits_input(tmp_pat
     envelope = submit_command(config, _request(), socket_client_factory=_factory(calls, pane_id="pane-private"))
 
     assert envelope.status == STATUS_ACCEPTED
-    assert calls == _expected_submit_calls("term-secret")
+    assert calls == _expected_submit_calls(
+        "term-secret",
+        resolved_target="pane-private",
+    )
     public_json = json.dumps(envelope.to_dict())
     assert "term-secret" not in public_json
     assert "pane-private" not in public_json
@@ -4485,6 +4489,11 @@ def test_terminal_id_agent_list_identical_duplicates_converge_and_send_succeeds(
                     "read": {"text": _REALISTIC_VISIBLE_PANE},
                 }
             if method == "agent.prompt":
+                if params.get("target") != "w1:p1":
+                    raise HerdrErrorResponse(
+                        {"code": "agent_not_found", "message": "target not found"},
+                        "req-2",
+                    )
                 return {
                     "type": "agent_prompted",
                     "agent": {"pane_id": "w1:p1"},
@@ -4505,7 +4514,7 @@ def test_terminal_id_agent_list_identical_duplicates_converge_and_send_succeeds(
         {
             "method": "agent.prompt",
             "params": {
-                "target": "term-dup",
+                "target": "w1:p1",
                 "text": "hello",
                 "wait": {"until": ["working"], "timeout_ms": 5000},
             },

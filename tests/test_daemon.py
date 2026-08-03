@@ -5025,7 +5025,7 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
             {
                 "method": "agent.prompt",
                 "params": {
-                    "target": "agent-private",
+                    "target": "pane-private",
                     "text": "hello",
                     "wait": {"until": ["working"], "timeout_ms": 5000},
                 },

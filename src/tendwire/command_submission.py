@@ -1127,7 +1127,6 @@ class ReservedCommandMutation:
 class PreparedInstructionMutation:
     client: Any
     pane_id: str
-    target_value: str
     binding_fingerprint: str
 
 
@@ -1188,7 +1187,6 @@ def _prepare_instruction(
     return PreparedInstructionMutation(
         client=client,
         pane_id=pane_or_error,
-        target_value=str(resolved.binding.target_value),
         binding_fingerprint=binding_fingerprint,
     )
 
@@ -1749,7 +1747,11 @@ def _submit_instruction(
                 prepared.client,
                 "agent.prompt",
                 {
-                    "target": prepared.target_value,
+                    # Herdr 0.7.5 deliberately restricts agent.prompt to a
+                    # current pane id or a unique live agent name. Private
+                    # bindings may instead be keyed by terminal id, so use the
+                    # pane resolved and validated during the pre-send phase.
+                    "target": prepared.pane_id,
                     "text": _instruction_text(request),
                     "wait": {
                         "until": ["working"],
