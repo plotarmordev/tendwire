@@ -673,6 +673,47 @@ def test_new_acp_binding_survives_herdr_refresh_and_normal_stop(
     assert released[0].reason == "acp_runtime_stopped"
 
 
+def test_new_session_binding_accepts_concurrent_herdr_lease_refresh(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    db_path = tmp_path / "events.db"
+    continuity = continuity_binding()
+    upsert_worker_bindings(db_path, [continuity])
+
+    def bind_after_refresh(session_id: str, anchor: WorkerBinding) -> WorkerBinding:
+        refreshed = replace(
+            anchor,
+            observed_at="2098-01-01T00:00:00+00:00",
+            expires_at="9999-12-31T23:59:59+00:00",
+        )
+        upsert_worker_bindings(db_path, [refreshed])
+        return binding_callback(db_path)(session_id, anchor)
+
+    service = AcpRuntime(
+        client,  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=continuity,
+        cwd=tmp_path,
+        session_binding_callback=bind_after_refresh,
+        ingestor=FakeIngestor(),  # type: ignore[arg-type]
+        poll_timeout=0.01,
+        stop_timeout=0.5,
+    ).start()
+    try:
+        assert service.status().healthy
+        current = list_worker_bindings(db_path, "host-a", backend="herdr")
+        assert current == [
+            replace(
+                continuity,
+                observed_at="2098-01-01T00:00:00+00:00",
+                expires_at="9999-12-31T23:59:59+00:00",
+            )
+        ]
+    finally:
+        service.stop()
+
+
 @pytest.mark.parametrize("failure_mode", ("raise", "bad_return"))
 def test_new_cleans_binding_persisted_by_failed_callback(
     tmp_path: Path,

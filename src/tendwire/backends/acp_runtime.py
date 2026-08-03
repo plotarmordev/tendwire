@@ -884,7 +884,19 @@ class AcpRuntime:
             expected.host_id,
             backend=expected.backend,
         )
-        if expected not in current:
+        # Herdr may refresh only the observation lease while an ACP endpoint
+        # is being initialized.  That does not change routing authority and
+        # must not invalidate the in-flight generation transaction.  Every
+        # identity and routing field remains exact; process-owned ACP rows are
+        # still checked byte-for-byte so their revocation cannot be masked.
+        if expected.backend == "herdr":
+            present = any(
+                _same_binding_authority(item, expected)
+                for item in current
+            )
+        else:
+            present = expected in current
+        if not present:
             raise AcpRuntimeBindingError("ACP worker binding is not current")
 
     def _start_consumer(self) -> None:
@@ -1167,6 +1179,36 @@ def _runtime_client_capabilities(
             "ACP runtime cannot advertise unsupported client capabilities"
         )
     return {}
+
+
+def _same_binding_authority(left: WorkerBinding, right: WorkerBinding) -> bool:
+    """Compare durable route authority while ignoring observer lease refreshes."""
+
+    return (
+        left.host_id,
+        left.worker_id,
+        left.worker_fingerprint,
+        left.backend,
+        left.target_kind,
+        left.target_value,
+        left.turn_target_kind,
+        left.turn_target_value,
+        left.sendable,
+        left.reason,
+        left.private_fingerprint,
+    ) == (
+        right.host_id,
+        right.worker_id,
+        right.worker_fingerprint,
+        right.backend,
+        right.target_kind,
+        right.target_value,
+        right.turn_target_kind,
+        right.turn_target_value,
+        right.sendable,
+        right.reason,
+        right.private_fingerprint,
+    )
 
 
 def _raise_for_binding_rejection(outcome: object) -> None:

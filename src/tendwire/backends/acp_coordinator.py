@@ -1651,6 +1651,11 @@ def _derived_binding(
         backend="acp",
         turn_target_kind="acp_session_id",
         turn_target_value=session_id,
+        # This row is established by the current Tendwire process, not by the
+        # Herdr observation that supplied continuity.  Reusing the observer's
+        # timestamp can lose the upsert to a newer expired row left by the
+        # previous process and make an otherwise valid restart fail closed.
+        observed_at=utc_timestamp(),
         # The ACP runtime owns this private lease until explicit stop/failure.
         # Inheriting the observer's short Herdr lease would strand a healthy
         # attached runtime after the next observation-expiry boundary.

@@ -1903,6 +1903,7 @@ def test_derived_acp_binding_outlives_observation_lease() -> None:
     )
     derived = _derived_binding(continuity, "session-private")
     assert derived.expires_at.startswith("9999-")
+    assert derived.observed_at > continuity.observed_at
     assert derived.private_fingerprint != continuity.private_fingerprint
 
 
