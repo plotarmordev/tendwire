@@ -1944,7 +1944,7 @@ def test_observed_lazy_delta_sweep_links_first_poll_after_observation(
     ]
     candidate_calls_after_observation = candidate_calls
 
-    turn_delta_payload_from_store(
+    linked_page = turn_delta_payload_from_store(
         db_path,
         "host-a",
         now=datetime.fromisoformat(
@@ -1956,6 +1956,16 @@ def test_observed_lazy_delta_sweep_links_first_poll_after_observation(
     assert _submission_rows(db_path) == [
         ("observed-live-timeline", "linked", observed_turn_id)
     ]
+    linked_turn = next(
+        change["turn"]
+        for change in linked_page["changes"]
+        if change.get("op") == "upsert"
+        and change.get("turn_id") == observed_turn_id
+    )
+    assert linked_turn["submission_id"] == turn_submission_id(
+        "host-a", "observed-live-timeline"
+    )
+    assert linked_turn["submission_state"] == "linked"
     with sqlite3.connect(str(db_path)) as conn:
         linked_at = conn.execute(
             """

@@ -24204,7 +24204,8 @@ _TURN_DELTA_PROJECTION_SELECT = """
     CASE WHEN revisions.final_state != 'absent'
               AND NOT (revisions.final_state = 'complete'
                        AND revisions.final_char_length BETWEEN 1 AND :text_max)
-         THEN substr(revisions.assistant_final_text, 1, :preview_max) END
+         THEN substr(revisions.assistant_final_text, 1, :preview_max) END,
+    linked_submission.submission_id, linked_submission.state
 """
 
 
@@ -24217,7 +24218,8 @@ def _turn_delta_projection(
         revision, user_state, user_char_length, user_byte_length, user_page_count,
         user_inline, user_preview, final_state, final_char_length,
         final_byte_length, final_page_count, final_inline, final_preview,
-    ) = row[:18]
+        submission_id, submission_state,
+    ) = row[:20]
     try:
         loaded = json.loads(str(payload_json or "{}"))
     except (TypeError, json.JSONDecodeError):
@@ -24260,6 +24262,9 @@ def _turn_delta_projection(
                 str(turn_id), legacy_user, legacy_final,
                 user_state=legacy_user_state, final_state=legacy_final_state,
             ))
+    if submission_id is not None and submission_state == "linked":
+        item["submission_id"] = str(submission_id)
+        item["submission_state"] = "linked"
     item["schema_version"] = TURN_DELTA_PROJECTION_SCHEMA_VERSION
     return item, dict(loaded)
 
@@ -24313,6 +24318,8 @@ def _turn_delta_descriptor_only(projected: Mapping[str, Any]) -> dict[str, Any]:
         "superseded_by_turn_id",
         "superseded_at",
         "fingerprint",
+        "submission_id",
+        "submission_state",
     )
     bounded = {key: projected[key] for key in descriptor_keys if key in projected}
     raw_content = projected.get("content")
@@ -24526,6 +24533,10 @@ def _turn_delta_payload_from_store(
                       ON revisions.host_id = turns.host_id
                      AND revisions.turn_id = turns.turn_id
                      AND revisions.is_current = 1
+                    LEFT JOIN turn_submissions AS linked_submission
+                      ON linked_submission.host_id = turns.host_id
+                     AND linked_submission.linked_turn_id = turns.turn_id
+                     AND linked_submission.state = 'linked'
                     WHERE turns.host_id = :host_id
                       AND turns.list_sequence <= :insertion_high
                       AND COALESCE(json_extract(turns.payload_json, '$.superseded_at'), '') = ''
@@ -24576,13 +24587,17 @@ def _turn_delta_payload_from_store(
                       ON revisions.host_id = turns.host_id
                      AND revisions.turn_id = turns.turn_id
                      AND revisions.is_current = 1
+                    LEFT JOIN turn_submissions AS linked_submission
+                      ON linked_submission.host_id = turns.host_id
+                     AND linked_submission.linked_turn_id = turns.turn_id
+                     AND linked_submission.state = 'linked'
                     ORDER BY positioned.seq, positioned.turn_id
                 """, params).fetchall()
             if work_counters is not None:
                 if mode == "changes":
                     work_counters.journal_queries += 1
                     work_counters.journal_rows_scanned += (
-                        int(rows[0][21]) if rows else 0
+                        int(rows[0][23]) if rows else 0
                     )
                 work_counters.projection_queries += 1
                 work_counters.projection_rows_read += len(rows)
@@ -24604,9 +24619,9 @@ def _turn_delta_payload_from_store(
             worker, sequence, turn_id = str(row[3]), int(row[4]), str(row[2])
             changed_at = str(row[1] or utc_timestamp())
         else:
-            worker, sequence, turn_id = "", int(row[18]), str(row[19])
-            changed_at = str(row[20] or utc_timestamp())
-        projected, raw_payload = _turn_delta_projection(tuple(row[:18]))
+            worker, sequence, turn_id = "", int(row[20]), str(row[21])
+            changed_at = str(row[22] or utc_timestamp())
+        projected, raw_payload = _turn_delta_projection(tuple(row[:20]))
         tombstoned = bool(str(raw_payload.get("superseded_at") or "").strip())
         if mode == "changes" and (
             row[2] is None or tombstoned or projected is None
@@ -24661,7 +24676,7 @@ def _turn_delta_payload_from_store(
         "checkpoint": checkpoint,
         "aggregate": {
             "journal_rows_scanned": (
-                int(rows[0][21]) if mode == "changes" and rows else 0
+                int(rows[0][23]) if mode == "changes" and rows else 0
             ),
             "projection_rows_read": len(rows),
             "changes_returned": len(changes),
