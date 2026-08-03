@@ -2914,8 +2914,16 @@ def submit_acp_command(
         try:
             use_steering = False
             steer = getattr(active_route, "steer", None)
-            if _target_state_at_send(worker) == "active" and callable(steer):
+            if callable(steer):
                 try:
+                    # The ACP runtime is authoritative about whether this
+                    # exact session currently has an appendable prompt.  A
+                    # Herdr snapshot can briefly remain idle after the ACP
+                    # prompt has started; requiring both signals opens a
+                    # second session/prompt that the adapter serializes behind
+                    # the live turn, so its submission acknowledgement can
+                    # never arrive in time.  An actually idle runtime reports
+                    # supports_steering=False and keeps the normal prompt path.
                     use_steering = (
                         getattr(active_route, "supports_steering", False) is True
                     )

@@ -1322,19 +1322,21 @@ def test_acp_command_uses_durable_receipt_and_duplicate_does_not_resend(tmp_path
     assert "acp-private-binding" not in json.dumps(first.to_dict())
 
 
-def test_active_acp_worker_uses_advertised_steering_instead_of_second_prompt(
+@pytest.mark.parametrize("observed_status", ["idle", "active"])
+def test_live_acp_route_uses_advertised_steering_despite_observer_lag(
     tmp_path: Path,
+    observed_status: str,
 ) -> None:
     config = _config(tmp_path)
     worker = _seed(config)
     assert config.db_path is not None
-    active = replace(worker, status="active")
+    observed = replace(worker, status=observed_status)
     save_snapshot(
         config.db_path,
         Snapshot(
             host_id=config.host_id,
             updated_at="2026-07-31T00:00:01+00:00",
-            workers=[active],
+            workers=[observed],
             backend_health=[
                 BackendHealth(
                     name="herdr",
@@ -1350,7 +1352,7 @@ def test_active_acp_worker_uses_advertised_steering_instead_of_second_prompt(
     envelope = submit_command(
         config,
         _request("request-active-steer"),
-        acp_prompt_router=lambda routed: route if routed.id == active.id else None,
+        acp_prompt_router=lambda routed: route if routed.id == observed.id else None,
         acp_required=True,
     )
 
