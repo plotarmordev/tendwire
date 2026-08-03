@@ -248,6 +248,79 @@ class AcpSessionIngestor:
             self._local_prompt_recorded = True
         return result
 
+    def can_append_prompt(self) -> bool:
+        """Return whether a steering input can join the current logical turn."""
+
+        return self._source_turn_id is not None and not self._turn_complete
+
+    def append_prompt(
+        self,
+        prompt: Sequence[Mapping[str, Any]],
+        *,
+        producer_turn_id: str,
+    ) -> AcpIngestionResult:
+        """Durably append one steering input to the current ACP turn."""
+
+        if not isinstance(producer_turn_id, str) or not producer_turn_id.strip():
+            raise ValueError("producer_turn_id must be non-empty text")
+        if not self.can_append_prompt():
+            raise RuntimeError("ACP steering requires an active turn")
+        blocks = [dict(block) for block in prompt]
+        if not blocks:
+            raise ValueError("prompt must contain at least one content block")
+        checkpoint = self.projector.checkpoint_session(self.session_id)
+        prior_turn_state = self._turn_state()
+        text = "\n".join(
+            str(block.get("text"))
+            for block in blocks
+            if block.get("type") == "text" and isinstance(block.get("text"), str)
+        )
+        producer = producer_turn_id.strip()
+        source_event_id = "steer-input:" + stable_fingerprint(
+            {"producer_turn": producer}
+        )
+        try:
+            canonical = self.projector.normalize_session_update(
+                {
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": self.session_id,
+                        "update": {
+                            "sessionUpdate": "user_message_chunk",
+                            "messageId": source_event_id,
+                            "content": {"type": "text", "text": text},
+                        },
+                    },
+                },
+                source_event_id=source_event_id,
+                replay=False,
+            )
+            if canonical is None:
+                raise RuntimeError("outgoing ACP steering input was duplicated")
+            payload = canonical.get("payload")
+            if not isinstance(payload, Mapping):
+                raise RuntimeError("outgoing ACP steering projection is invalid")
+            canonical = {
+                **canonical,
+                "payload": {
+                    **payload,
+                    "prompt_content": deepcopy(blocks),
+                    "outgoing": True,
+                    "steering": True,
+                },
+            }
+        except BaseException:
+            self._restore_speculation(checkpoint, prior_turn_state)
+            raise
+        result = self._accept(
+            canonical,
+            checkpoint=checkpoint,
+            prior_turn_state=prior_turn_state,
+        )
+        if result.event is not None and result.event.status != "binding_changed":
+            self._local_prompt_recorded = True
+        return result
+
     def reset_after_load(self) -> None:
         """Drop replay turn assembly before accepting a new active prompt."""
 

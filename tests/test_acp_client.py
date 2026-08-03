@@ -21,6 +21,7 @@ from tendwire.backends.acp_protocol import (
     SessionUpdate,
     SessionUpdateKind,
     StopReason,
+    SteeringOutcome,
 )
 
 
@@ -176,6 +177,31 @@ def test_prompt_stream_and_permission_response_can_run_concurrently() -> None:
         assert not thread.is_alive()
         assert not failure
         assert outcome[0].stop_reason is StopReason.END_TURN
+
+
+def test_advertised_steering_extension_is_capability_gated() -> None:
+    with client("steering") as acp:
+        acp.initialize()
+        acp.new_session("/tmp/project")
+        acp.next_update(timeout=1)
+        assert acp.steering_supported
+        callbacks: list[str] = []
+        result = acp.steer_session(
+            "s-new",
+            "live input",
+            on_send_start=lambda: callbacks.append("started"),
+            on_submitted=lambda: callbacks.append("submitted"),
+        )
+        assert result.outcome is SteeringOutcome.INJECTED
+        assert callbacks == ["started", "submitted"]
+        echoed = acp.next_update(timeout=1)
+        assert echoed.update_kind is SessionUpdateKind.USER_MESSAGE_CHUNK
+
+    with client() as acp:
+        acp.initialize()
+        assert not acp.steering_supported
+        with pytest.raises(AcpCapabilityError, match="steering"):
+            acp.steer_session("s1", "no capability")
 
 
 def test_ordered_session_event_api_preserves_cross_kind_reader_order() -> None:

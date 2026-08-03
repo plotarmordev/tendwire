@@ -1118,6 +1118,10 @@ class _Route:
         self.failure = failure
         self.calls: list[tuple[str, str, float]] = []
 
+    @property
+    def supports_steering(self) -> bool:
+        return False
+
     def prompt(
         self,
         text: str,
@@ -1152,6 +1156,30 @@ class _BeforeTransportFailureRoute(_Route):
         del on_send_start
         self.calls.append((text, producer_turn_id, timeout))
         raise AcpCoordinatorError("visible console route changed before write")
+
+
+class _SteeringRoute(_Route):
+    def __init__(self, outcome: str = "injected") -> None:
+        super().__init__()
+        self.outcome = outcome
+        self.steering_calls: list[tuple[str, str, float]] = []
+
+    @property
+    def supports_steering(self) -> bool:
+        return True
+
+    def steer(
+        self,
+        text: str,
+        *,
+        producer_turn_id: str,
+        timeout: float,
+        on_send_start: Any = None,
+    ) -> object:
+        self.steering_calls.append((text, producer_turn_id, timeout))
+        if callable(on_send_start):
+            on_send_start()
+        return SimpleNamespace(outcome=self.outcome)
 
 
 def _seed(config: Config) -> Worker:
@@ -1213,6 +1241,92 @@ def test_acp_command_uses_durable_receipt_and_duplicate_does_not_resend(tmp_path
     receipt = get_command_request(config.db_path, config.host_id, "request-1")
     assert receipt is not None and receipt["state"] == "accepted"
     assert "acp-private-binding" not in json.dumps(first.to_dict())
+
+
+def test_active_acp_worker_uses_advertised_steering_instead_of_second_prompt(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    worker = _seed(config)
+    assert config.db_path is not None
+    active = replace(worker, status="active")
+    save_snapshot(
+        config.db_path,
+        Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-07-31T00:00:01+00:00",
+            workers=[active],
+            backend_health=[
+                BackendHealth(
+                    name="herdr",
+                    status="healthy",
+                    outcome="healthy_non_empty",
+                )
+            ],
+        ),
+    )
+    upsert_worker_bindings(config.db_path, [_binding()])
+    route = _SteeringRoute()
+
+    envelope = submit_command(
+        config,
+        _request("request-active-steer"),
+        acp_prompt_router=lambda routed: route if routed.id == active.id else None,
+        acp_required=True,
+    )
+
+    assert envelope.status == "accepted"
+    assert envelope.disposition == "terminal_accepted"
+    assert route.calls == []
+    assert len(route.steering_calls) == 1
+    receipt = get_command_request(
+        config.db_path,
+        config.host_id,
+        "request-active-steer",
+    )
+    assert receipt is not None and receipt["state"] == "accepted"
+
+
+def test_definite_acp_steering_failure_is_rejected_not_uncertain(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    worker = _seed(config)
+    assert config.db_path is not None
+    active = replace(worker, status="active")
+    save_snapshot(
+        config.db_path,
+        Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-07-31T00:00:01+00:00",
+            workers=[active],
+            backend_health=[
+                BackendHealth(
+                    name="herdr",
+                    status="healthy",
+                    outcome="healthy_non_empty",
+                )
+            ],
+        ),
+    )
+    upsert_worker_bindings(config.db_path, [_binding()])
+    route = _SteeringRoute("failed")
+
+    envelope = submit_command(
+        config,
+        _request("request-active-steer-failed"),
+        acp_prompt_router=lambda _routed: route,
+        acp_required=True,
+    )
+
+    assert envelope.status == "rejected"
+    assert envelope.disposition == "terminal_rejected"
+    receipt = get_command_request(
+        config.db_path,
+        config.host_id,
+        "request-active-steer-failed",
+    )
+    assert receipt is not None and receipt["state"] == "rejected"
 
 
 def test_acp_failure_after_send_started_is_uncertain_and_never_falls_back(tmp_path: Path) -> None:

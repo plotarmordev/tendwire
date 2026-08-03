@@ -98,6 +98,11 @@ for line in sys.stdin:
                 ),
                 "agentInfo": {"name": "fake", "version": "1.0"},
                 **(
+                    {"_meta": {"steering": {"supported": True}}}
+                    if MODE == "steering"
+                    else {}
+                ),
+                **(
                     {
                         "authMethods": [
                             {},
@@ -230,6 +235,13 @@ for line in sys.stdin:
             }
         )
         pending_permission_ids.add(900)
+    elif method == "_session/steering":
+        update(
+            params["sessionId"],
+            "user_message_chunk",
+            content=params["prompt"][0],
+        )
+        response(request_id, {"outcome": "injected"})
     elif method == "session/cancel":
         if MODE == "cancel_race" and pending_prompt_id is not None:
             send(

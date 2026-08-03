@@ -82,6 +82,14 @@ class StopReason(str, Enum):
     CANCELLED = "cancelled"
 
 
+class SteeringOutcome(str, Enum):
+    """Outcome returned by the capability-gated Codex ACP steering extension."""
+
+    INJECTED = "injected"
+    STARTED_NEW_TURN = "startedNewTurn"
+    FAILED = "failed"
+
+
 class PermissionOptionKind(str, Enum):
     ALLOW_ONCE = "allow_once"
     ALLOW_ALWAYS = "allow_always"
@@ -245,6 +253,12 @@ class SessionPage:
 @dataclass(frozen=True, slots=True)
 class PromptResult:
     stop_reason: StopReason
+    raw: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class SteeringResult:
+    outcome: SteeringOutcome
     raw: Mapping[str, Any]
 
 

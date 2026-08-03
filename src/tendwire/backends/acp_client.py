@@ -45,6 +45,8 @@ from .acp_protocol import (
     SessionResult,
     SessionUpdate,
     StopReason,
+    SteeringOutcome,
+    SteeringResult,
     decode_json_line,
     encode_message,
     error_envelope,
@@ -238,6 +240,17 @@ class AcpClient:
     @property
     def initialize_result(self) -> InitializeResult | None:
         return self._initialize_result
+
+    @property
+    def steering_supported(self) -> bool:
+        """Whether the agent explicitly advertised the steering extension."""
+
+        initialized = self._initialize_result
+        if initialized is None:
+            return False
+        meta = initialized.raw.get("_meta")
+        steering = meta.get("steering") if isinstance(meta, Mapping) else None
+        return isinstance(steering, Mapping) and steering.get("supported") is True
 
     @property
     def failure(self) -> BaseException | None:
@@ -632,6 +645,44 @@ class AcpClient:
         except (ValueError, TypeError) as exc:
             raise AcpEnvelopeError("session/prompt returned an invalid stopReason") from exc
         return PromptResult(parsed_reason, MappingProxyType(dict(raw)))
+
+    def steer_session(
+        self,
+        session_id: str,
+        prompt: str | Sequence[Mapping[str, Any]],
+        *,
+        timeout: float | None = None,
+        on_send_start: Callable[[], None] | None = None,
+        on_submitted: Callable[[], None] | None = None,
+    ) -> SteeringResult:
+        """Inject input into an active turn through an advertised extension.
+
+        ``codex-acp`` serializes these requests per session and either injects
+        into the live turn or starts a new turn after the prior one drains.
+        The method is never used unless the initialize response opted in.
+        """
+
+        if not self.steering_supported:
+            raise AcpCapabilityError("agent did not advertise steering capability")
+        content = list(self.prepare_prompt(prompt))
+        result = self.request(
+            "_session/steering",
+            {
+                "sessionId": _nonempty(session_id, "session_id"),
+                "prompt": content,
+            },
+            timeout=timeout,
+            on_writing=on_send_start,
+            on_written=on_submitted,
+        )
+        raw = _require_mapping(result, "_session/steering result")
+        try:
+            outcome = SteeringOutcome(raw.get("outcome"))
+        except (TypeError, ValueError) as exc:
+            raise AcpEnvelopeError(
+                "_session/steering returned an invalid outcome"
+            ) from exc
+        return SteeringResult(outcome, MappingProxyType(dict(raw)))
 
     def prepare_prompt(
         self,

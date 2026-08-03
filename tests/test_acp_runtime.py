@@ -22,6 +22,8 @@ from tendwire.backends.acp_protocol import (
     SessionUpdate,
     SessionUpdateKind,
     StopReason,
+    SteeringOutcome,
+    SteeringResult,
 )
 from tendwire.backends.acp_runtime import (
     AcpRuntime,
@@ -64,6 +66,11 @@ class FakeClient:
         self.restored_session_result: SessionResult | None = None
         self.closed = False
         self.close_calls = 0
+        self.steering_supported = False
+        self.steering_result = SteeringResult(
+            SteeringOutcome.INJECTED,
+            {"outcome": "injected"},
+        )
 
     def initialize(self, **kwargs: Any) -> object:
         self.calls.append(("initialize", (), kwargs))
@@ -106,6 +113,16 @@ class FakeClient:
         if isinstance(prompt, str):
             return ({"type": "text", "text": prompt},)
         return tuple(dict(block) for block in prompt)  # type: ignore[arg-type]
+
+    def steer_session(self, session_id: str, prompt: object, **kwargs: Any) -> object:
+        self.calls.append(("steer", (session_id, prompt), kwargs))
+        on_send_start = kwargs.get("on_send_start")
+        if callable(on_send_start):
+            on_send_start()
+        on_submitted = kwargs.get("on_submitted")
+        if callable(on_submitted):
+            on_submitted()
+        return self.steering_result
 
     def cancel(self, session_id: str) -> None:
         self.calls.append(("cancel", (session_id,), {}))
@@ -171,6 +188,8 @@ class FakeIngestor:
         self.update_failure: BaseException | None = None
         self.permission_failure: BaseException | None = None
         self.completion_failure: BaseException | None = None
+        self.appended: list[tuple[object, str]] = []
+        self.appendable = True
         persisted = SimpleNamespace(status="inserted")
         self.update_result: object = SimpleNamespace(
             event=persisted,
@@ -213,6 +232,13 @@ class FakeIngestor:
         producer_turn_id: str | None = None,
     ) -> object:
         return self.start_turn(producer_turn_id=producer_turn_id)
+
+    def can_append_prompt(self) -> bool:
+        return self.appendable
+
+    def append_prompt(self, prompt: object, *, producer_turn_id: str) -> object:
+        self.appended.append((prompt, producer_turn_id))
+        return self.update_result
 
     def reset_after_load(self) -> None:
         self.load_resets += 1
@@ -1219,6 +1245,29 @@ def test_submit_prompt_acknowledges_frame_before_end_of_turn(tmp_path: Path) -> 
     client.release.set()
     wait_until(lambda: service.status().prompts_completed == 1)
     service.stop()
+
+
+def test_submit_steering_records_input_at_transport_boundary(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.steering_supported = True
+    ingestor = FakeIngestor()
+    service = runtime(tmp_path, client, ingestor).start()
+    try:
+        callbacks: list[str] = []
+        result = service.submit_steering(
+            "live follow-up",
+            producer_turn_id="producer-steer",
+            acknowledgement_timeout=0.25,
+            on_send_start=lambda: callbacks.append("started"),
+        )
+        assert result.outcome is SteeringOutcome.INJECTED
+        assert callbacks == ["started"]
+        assert len(ingestor.appended) == 1
+        assert ingestor.appended[0][1] == "producer-steer"
+        assert [call[0] for call in client.calls].count("prompt") == 0
+        assert [call[0] for call in client.calls].count("steer") == 1
+    finally:
+        service.stop()
 
 
 def test_ignored_update_does_not_increment_persisted_counter(tmp_path: Path) -> None:

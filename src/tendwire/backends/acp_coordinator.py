@@ -150,6 +150,28 @@ class _PromptRoute:
             ),
         )
 
+    @property
+    def supports_steering(self) -> bool:
+        return self._owner._supports_steering(self._worker, self._slot)
+
+    def steer(
+        self,
+        text: str,
+        *,
+        producer_turn_id: str,
+        timeout: float,
+        on_send_start: Callable[[], None] | None = None,
+    ) -> object:
+        return self._owner._submit_steering(
+            self._worker,
+            self._slot,
+            text,
+            producer_turn_id=producer_turn_id,
+            acknowledgement_timeout=timeout,
+            on_send_start=on_send_start,
+            generation_prepared=bool(getattr(self._prepared, "depth", 0)),
+        )
+
     @contextmanager
     def prepare(self):
         """Fence one exact generation before its durable send receipt exists."""
@@ -1380,6 +1402,41 @@ class AcpRuntimeCoordinator:
             # runtime acknowledges that the frame is written; turn completion
             # remains supervised asynchronously by the runtime.
             return slot.runtime.submit_prompt(
+                text,
+                producer_turn_id=producer_turn_id,
+                acknowledgement_timeout=acknowledgement_timeout,
+                on_send_start=on_send_start,
+            )
+
+    def _supports_steering(self, worker: Worker, slot: _RuntimeSlot) -> bool:
+        try:
+            return self._current_slot(worker) is slot and slot.runtime.can_steer()
+        except Exception:
+            return False
+
+    def _submit_steering(
+        self,
+        worker: Worker,
+        slot: _RuntimeSlot,
+        text: str,
+        *,
+        producer_turn_id: str,
+        acknowledgement_timeout: float,
+        on_send_start: Callable[[], None] | None = None,
+        generation_prepared: bool = False,
+    ) -> object:
+        """Steer the exact attached generation used by the receipt."""
+
+        with self._reconcile_lock:
+            self._require_reconcile_state(allow_starting=False)
+            current = self._current_slot(worker)
+            if current is not slot:
+                raise AcpCoordinatorError("ACP worker route is stale")
+            if not generation_prepared:
+                self._require_attached_generation(slot)
+            if self._current_slot(worker) is not slot or not slot.runtime.can_steer():
+                raise AcpCoordinatorError("ACP steering route is unavailable")
+            return slot.runtime.submit_steering(
                 text,
                 producer_turn_id=producer_turn_id,
                 acknowledgement_timeout=acknowledgement_timeout,

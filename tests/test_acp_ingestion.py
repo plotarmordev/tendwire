@@ -535,6 +535,60 @@ def test_live_prompt_echo_is_suppressed_but_load_replay_user_message_is_retained
     assert list_public_agent_events(db_path, "host-a") == ()
 
 
+def test_steering_prompt_appends_to_active_turn_without_resetting_identity(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "events.db"
+    events: list[AgentEvent] = []
+    turns: list[dict[str, object]] = []
+
+    def append(
+        _path: Path | str,
+        _host: str,
+        event: AgentEvent,
+        **_kwargs,
+    ) -> AppendBoundAgentEventResult:
+        events.append(event)
+        return _appended(len(events), event)
+
+    def apply(_path: Path | str, _host: str, _worker: str, content, **_kwargs):
+        turns.append(dict(content))
+        return TurnRefreshApplyResult(len(turns), False)
+
+    binding = _binding()
+    ingestor = AcpSessionIngestor(
+        _config(db_path),
+        session_id="session-a",
+        stream_generation="generation-a",
+        binding=binding,
+        persist_event=_persist(append, apply),
+    )
+    begun = ingestor.begin_prompt(
+        ({"type": "text", "text": "initial"},),
+        producer_turn_id="producer-initial",
+    )
+    source_turn_id = ingestor.source_turn_id
+    steered = ingestor.append_prompt(
+        ({"type": "text", "text": "live follow-up"},),
+        producer_turn_id="producer-steer",
+    )
+
+    assert begun.event is not None
+    assert steered.event is not None
+    assert events[1].payload["steering"] is True
+    assert ingestor.source_turn_id == source_turn_id
+    content = ingestor.projector.project_turn_content("session-a")
+    assert content["user_text"] == "initial\n\nlive follow-up"
+
+    ingestor.mark_prompt_complete()
+    assert not ingestor.can_append_prompt()
+    with pytest.raises(RuntimeError, match="active turn"):
+        ingestor.append_prompt(
+            ({"type": "text", "text": "too late"},),
+            producer_turn_id="producer-late",
+        )
+
+
 @pytest.mark.parametrize(
     ("update_kind", "fields"),
     [

@@ -131,6 +131,18 @@ class AcpPromptRoute(Protocol):
     # it; submit_acp_command probes this method dynamically.
     def prepare(self) -> Any: ...
 
+    @property
+    def supports_steering(self) -> bool: ...
+
+    def steer(
+        self,
+        text: str,
+        *,
+        producer_turn_id: str,
+        timeout: float,
+        on_send_start: Callable[[], None] | None = None,
+    ) -> object: ...
+
 
 AcpPromptRouter = Callable[[Worker], AcpPromptRoute | None]
 AcpWorkerOwner = Callable[[str, str], bool]
@@ -2900,7 +2912,17 @@ def submit_acp_command(
             return _recover_request(config, request, reservation.canonical)
 
         try:
-            active_route.prompt(
+            use_steering = False
+            steer = getattr(active_route, "steer", None)
+            if _target_state_at_send(worker) == "active" and callable(steer):
+                try:
+                    use_steering = (
+                        getattr(active_route, "supports_steering", False) is True
+                    )
+                except Exception:
+                    use_steering = False
+            submit = steer if use_steering else active_route.prompt
+            route_result = submit(
                 _instruction_text(request),
                 producer_turn_id=turn_submission_id(
                     config.host_id,
@@ -2909,6 +2931,35 @@ def submit_acp_command(
                 timeout=config.acp_request_timeout_seconds,
                 on_send_start=mark_send_started_at_transport_boundary,
             )
+            if use_steering:
+                raw_outcome = getattr(route_result, "outcome", None)
+                steering_outcome = getattr(raw_outcome, "value", raw_outcome)
+                if steering_outcome == "failed":
+                    return _finish_request(
+                        config,
+                        request,
+                        reservation,
+                        _instruction_rejected_envelope(
+                            request,
+                            worker,
+                            verdict="steering_failed",
+                        ),
+                        expected_state="send_started",
+                        terminal_state="rejected",
+                    )
+                if steering_outcome not in {"injected", "startedNewTurn"}:
+                    return _finish_request(
+                        config,
+                        request,
+                        reservation,
+                        _instruction_uncertain_envelope(
+                            request,
+                            worker,
+                            verdict="unknown",
+                        ),
+                        expected_state="send_started",
+                        terminal_state="uncertain",
+                    )
         except SendStartRejected:
             return send_start_outcome or _recover_request(
                 config, request, reservation.canonical

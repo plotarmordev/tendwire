@@ -28,6 +28,7 @@ from .acp_protocol import (
     SessionResult,
     SessionUpdate,
     StopReason,
+    SteeringResult,
 )
 
 
@@ -165,6 +166,19 @@ class AcpRuntimeClient(Protocol):
         prompt: str | Sequence[Mapping[str, Any]],
     ) -> tuple[Mapping[str, Any], ...]: ...
 
+    @property
+    def steering_supported(self) -> bool: ...
+
+    def steer_session(
+        self,
+        session_id: str,
+        prompt: str | Sequence[Mapping[str, Any]],
+        *,
+        timeout: float | None = None,
+        on_send_start: Callable[[], None] | None = None,
+        on_submitted: Callable[[], None] | None = None,
+    ) -> SteeringResult: ...
+
     def cancel(self, session_id: str) -> None: ...
 
     def next_session_event(
@@ -282,6 +296,7 @@ class AcpRuntime:
         self._lifecycle_lock = threading.RLock()
         self._ingest_lock = threading.Lock()
         self._prompt_lock = threading.Lock()
+        self._steering_lock = threading.Lock()
         self._idle_condition = threading.Condition(self._state_lock)
         self._stop_event = threading.Event()
         self._threads: tuple[threading.Thread, ...] = ()
@@ -532,6 +547,61 @@ class AcpRuntime:
                     "ACP prompt submission acknowledgement timed out"
                 )
             acknowledged.wait(min(remaining, 0.01))
+
+    def can_steer(self) -> bool:
+        """Return whether this runtime can append to a live ACP turn."""
+
+        try:
+            supported = getattr(self._client, "steering_supported", False) is True
+        except Exception:
+            supported = False
+        if not supported:
+            return False
+        with self._state_lock:
+            if self._state is not RuntimeState.RUNNING or self._failure is not None:
+                return False
+        with self._ingest_lock:
+            ingestor = self._ingestor
+            can_append = getattr(ingestor, "can_append_prompt", None)
+            return bool(callable(can_append) and can_append())
+
+    def submit_steering(
+        self,
+        prompt: str | Sequence[Mapping[str, Any]],
+        *,
+        producer_turn_id: str,
+        acknowledgement_timeout: float,
+        on_send_start: Callable[[], None] | None = None,
+    ) -> SteeringResult:
+        """Inject one input into the current turn through ACP steering."""
+
+        if acknowledgement_timeout <= 0:
+            raise ValueError("acknowledgement_timeout must be positive")
+        if not isinstance(producer_turn_id, str) or not producer_turn_id.strip():
+            raise ValueError("producer_turn_id must be non-empty text")
+        with self._steering_lock:
+            self.raise_if_failed()
+            session_id, ingestor = self._running_components()
+            prepared = _prepare_prompt_content(self._client, prompt)
+            if not self.can_steer():
+                raise AcpRuntimeStateError("ACP steering is unavailable")
+
+            def start_and_record() -> None:
+                if on_send_start is not None:
+                    on_send_start()
+                with self._ingest_lock:
+                    result = ingestor.append_prompt(
+                        prepared,
+                        producer_turn_id=producer_turn_id.strip(),
+                    )
+                    _raise_for_binding_rejection(result)
+
+            return self._client.steer_session(
+                session_id,
+                prepared,
+                timeout=acknowledgement_timeout,
+                on_send_start=start_and_record,
+            )
 
     def cancel(self) -> None:
         """Cancel the active session and any permission requests pending in it."""
