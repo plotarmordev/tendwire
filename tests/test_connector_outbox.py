@@ -176,6 +176,21 @@ def test_poll_leases_sanitized_item_and_skips_duplicate_live_lease(tmp_path: Pat
     _assert_no_forbidden(first)
 
 
+def test_final_ready_poll_exposes_durable_source_age(tmp_path: Path) -> None:
+    db_path = tmp_path / "final-created-at.db"
+    key = _enqueue_final_root(
+        db_path,
+        key_suffix="created_at",
+        ordering_key="wsk1_created_at",
+    )
+    api = ConnectorOutboxAPI(db_path, "host-a")
+
+    item = api.poll({"name": "turn-final", "limit": 1})["items"][0]
+
+    assert item["key"] == key
+    assert item["created_at"] == "2026-01-01T00:00:00+00:00"
+
+
 def test_poll_preserves_strict_content_revision_tokens(tmp_path: Path) -> None:
     db_path = tmp_path / "revision-token.db"
     revision = "twrev1.ueLJtVatFOQxa1UePvWId8C01qdrb05FpW_ipSSPHMM"

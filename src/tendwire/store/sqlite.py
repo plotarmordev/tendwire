@@ -6779,7 +6779,8 @@ def poll_connector_outbox(
                     outbox.id,
                     outbox.delivery_key,
                     outbox.payload_json,
-                    outbox.private_state_json
+                    outbox.private_state_json,
+                    outbox.created_at
                 FROM connector_outbox AS outbox
                 WHERE outbox.host_id = ?
                   AND outbox.connector = ?
@@ -7037,6 +7038,7 @@ def poll_connector_outbox(
                         "leased_until": lease_expires_at,
                         "ref": public_ref,
                         "available_at": current_time,
+                        "created_at": str(row[4] or ""),
                         "payload": _restore_presentation_tokens(
                             sanitize_public_mapping(
                                 _json_object(row[2]),

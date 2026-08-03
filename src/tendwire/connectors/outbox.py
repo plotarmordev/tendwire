@@ -437,16 +437,18 @@ class ConnectorOutboxAPI:
             if not ref:
                 continue
             clean_payload = _clean_mapping(item.get("payload"))
-            clean_item = sanitize_public_value(
-                {
-                    "ref": ref,
-                    "key": str(item.get("key") or ""),
-                    "attempt": int(item.get("attempt") or 0),
-                    "leased_until": str(item.get("leased_until") or ""),
-                    "available_at": str(item.get("available_at") or ""),
-                    "payload": clean_payload,
-                }
-            )
+            public_item = {
+                "ref": ref,
+                "key": str(item.get("key") or ""),
+                "attempt": int(item.get("attempt") or 0),
+                "leased_until": str(item.get("leased_until") or ""),
+                "available_at": str(item.get("available_at") or ""),
+                "payload": clean_payload,
+            }
+            created_at = str(item.get("created_at") or "")
+            if name == _TURN_FINAL_NAME and created_at:
+                public_item["created_at"] = created_at
+            clean_item = sanitize_public_value(public_item)
             if isinstance(clean_item, dict):
                 item_key = str(item.get("key") or "")
                 if item_key.startswith(_FINAL_KEY_PREFIX):
