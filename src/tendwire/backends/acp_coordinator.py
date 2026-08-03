@@ -1501,7 +1501,12 @@ class AcpRuntimeCoordinator:
                 cwd=endpoint.cwd,
                 session_mode=endpoint.session_mode,
                 session_id=endpoint.session_id,
-                stream_generation=endpoint.generation,
+                # Herdr's generation authenticates the worker lease and can
+                # remain stable across several freshly minted adapter
+                # transports.  AcpRuntime deliberately creates a new stream
+                # nonce when this argument is omitted; reusing the Herdr
+                # generation would make synthetic notification identities
+                # collide after a Tendwire restart.
                 session_binding_callback=callback,
                 permission_callback=(permission_broker or self._permission_callback),
                 poll_timeout=min(0.25, self.config.acp_request_timeout_seconds),

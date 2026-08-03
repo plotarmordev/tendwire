@@ -1932,6 +1932,10 @@ def test_reconnect_remints_endpoint_instead_of_replaying_attach_ticket(tmp_path:
 
     class Runtime:
         def __init__(self, _client: Any, **kwargs: Any) -> None:
+            # The endpoint generation fences Herdr authority, but must not be
+            # reused as the ACP transport stream generation. AcpRuntime owns a
+            # fresh nonce for every adapter process.
+            assert "stream_generation" not in kwargs
             self._binding = kwargs["binding"]
             self.stopped = False
             self.prompt_calls = 0
