@@ -1311,6 +1311,77 @@ def test_submit_steering_records_input_at_transport_boundary(tmp_path: Path) -> 
         service.stop()
 
 
+def test_submit_steering_retries_definite_non_application_once(tmp_path: Path) -> None:
+    class FailOnceSteeringClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.steering_supported = True
+            self.steering_attempts = 0
+
+        def steer_session(
+            self, session_id: str, prompt: object, **kwargs: Any
+        ) -> SteeringResult:
+            self.calls.append(("steer", (session_id, prompt), kwargs))
+            self.steering_attempts += 1
+            on_send_start = kwargs.get("on_send_start")
+            if callable(on_send_start):
+                on_send_start()
+            outcome = (
+                SteeringOutcome.FAILED
+                if self.steering_attempts == 1
+                else SteeringOutcome.INJECTED
+            )
+            return SteeringResult(outcome, {"outcome": outcome.value})
+
+    client = FailOnceSteeringClient()
+    ingestor = FakeIngestor()
+    service = runtime(tmp_path, client, ingestor).start()
+    try:
+        callbacks: list[str] = []
+        result = service.submit_steering(
+            "live retry follow-up",
+            producer_turn_id="producer-steer-retry",
+            acknowledgement_timeout=0.25,
+            on_send_start=lambda: callbacks.append("started"),
+        )
+        assert result.outcome is SteeringOutcome.INJECTED
+        assert callbacks == ["started"]
+        assert len(ingestor.appended) == 1
+        assert ingestor.appended[0][1] == "producer-steer-retry"
+        assert [call[0] for call in client.calls].count("steer") == 2
+        assert client.calls[-1][2].get("on_send_start") is None
+        assert 0 < client.calls[-1][2]["timeout"] <= 0.25
+    finally:
+        service.stop()
+
+
+def test_submit_steering_returns_second_definite_failure_without_third_attempt(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    client.steering_supported = True
+    client.steering_result = SteeringResult(
+        SteeringOutcome.FAILED,
+        {"outcome": SteeringOutcome.FAILED.value},
+    )
+    ingestor = FakeIngestor()
+    service = runtime(tmp_path, client, ingestor).start()
+    try:
+        callbacks: list[str] = []
+        result = service.submit_steering(
+            "live failed follow-up",
+            producer_turn_id="producer-steer-failed",
+            acknowledgement_timeout=0.25,
+            on_send_start=lambda: callbacks.append("started"),
+        )
+        assert result.outcome is SteeringOutcome.FAILED
+        assert callbacks == ["started"]
+        assert len(ingestor.appended) == 1
+        assert [call[0] for call in client.calls].count("steer") == 2
+    finally:
+        service.stop()
+
+
 def test_ignored_update_does_not_increment_persisted_counter(tmp_path: Path) -> None:
     client = FakeClient()
     ingestor = FakeIngestor()

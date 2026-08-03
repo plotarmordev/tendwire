@@ -28,6 +28,7 @@ from .acp_protocol import (
     SessionResult,
     SessionUpdate,
     StopReason,
+    SteeringOutcome,
     SteeringResult,
 )
 
@@ -596,11 +597,30 @@ class AcpRuntime:
                     )
                     _raise_for_binding_rejection(result)
 
-            return self._client.steer_session(
+            deadline = time.monotonic() + acknowledgement_timeout
+            result = self._client.steer_session(
                 session_id,
                 prepared,
                 timeout=acknowledgement_timeout,
                 on_send_start=start_and_record,
+            )
+            if result.outcome is not SteeringOutcome.FAILED:
+                return result
+
+            # The steering extension defines ``failed`` as a definite
+            # non-application outcome.  Retrying once is therefore safe and
+            # prevents a transient adapter/app-server race from turning a
+            # live Telegram message into a terminal drop.  The durable input
+            # and transport-boundary callback were already recorded by the
+            # first attempt, so the retry deliberately omits the callback and
+            # stays inside the caller's original acknowledgement budget.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return result
+            return self._client.steer_session(
+                session_id,
+                prepared,
+                timeout=remaining,
             )
 
     def cancel(self) -> None:

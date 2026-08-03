@@ -489,6 +489,7 @@ _PUBLIC_SUBMISSION_VERDICTS = frozenset(
         "agent_prompt_unsubmitted",
         "agent_input_pending",
         "agent_prompt_stalled",
+        "steering_failed",
         "unknown",
     }
 )

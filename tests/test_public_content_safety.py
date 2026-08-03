@@ -375,6 +375,9 @@ def test_public_submission_verdict_is_closed_vocabulary() -> None:
     assert sanitize_public_value({"submission_verdict": "agent_not_ready"}) == {
         "submission_verdict": "agent_not_ready"
     }
+    assert sanitize_public_value({"submission_verdict": "steering_failed"}) == {
+        "submission_verdict": "steering_failed"
+    }
     assert sanitize_public_value(
         {"submission_verdict": "agent_target_ambiguous"}
     ) == {"submission_verdict": "agent_target_ambiguous"}
