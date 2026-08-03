@@ -5621,12 +5621,27 @@ def _mark_exhausted_presentation_plans_conn(
         SET state = 'failed'
         WHERE plans.host_id = ?
           {connector_clause}
-          AND plans.state IN ('active', 'waiting_predecessor')
-          AND EXISTS (
-              SELECT 1
-              FROM turn_presentation_jobs AS jobs
-              JOIN connector_outbox AS outbox ON outbox.id = jobs.outbox_id
-              WHERE jobs.plan_id = plans.id AND outbox.status = 'dead_letter'
+          AND (
+              (
+                  plans.state IN ('active', 'waiting_predecessor')
+                  AND EXISTS (
+                      SELECT 1
+                      FROM turn_presentation_jobs AS jobs
+                      JOIN connector_outbox AS outbox
+                        ON outbox.id = jobs.outbox_id
+                      WHERE jobs.plan_id = plans.id
+                        AND outbox.status = 'dead_letter'
+                  )
+              )
+              OR (
+                  plans.state = 'preparing'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM connector_outbox AS source
+                      WHERE source.id = plans.source_outbox_id
+                        AND source.status = 'dead_letter'
+                  )
+              )
           )
         """,
         params,
@@ -5775,6 +5790,25 @@ def prepare_connector_plan_commit(
                         "plan_token": str(plan_token),
                         "state": plan_state,
                         "job_count": materialized_job_count,
+                        "generation": int(plan[7]),
+                    }
+                )
+            if plan_state in {"failed", "superseded"}:
+                # A source final can exhaust before commit materializes any
+                # child jobs. Preserve terminal idempotency so a recovering
+                # connector can abandon that zero-job plan instead of retrying
+                # a now-stale source reference forever.
+                conn.commit()
+                return _presentation_response(
+                    {
+                        "schema_version": _PRESENTATION_SCHEMA_VERSION,
+                        "ok": True,
+                        "status": "ok",
+                        "host_id": str(host_id),
+                        "name": str(name),
+                        "plan_token": str(plan_token),
+                        "state": plan_state,
+                        "job_count": 0,
                         "generation": int(plan[7]),
                     }
                 )
@@ -7539,6 +7573,15 @@ def _connector_update_ref(
                 outbox_status=outbox_status,
                 now=current_time,
             )
+            if outbox_status == _CONNECTOR_EXHAUSTED_OUTBOX_STATUS:
+                # The exhausted row can be either a materialized plan job or
+                # the final-ready source anchor of a still-preparing plan.
+                _mark_exhausted_presentation_plans_conn(
+                    conn,
+                    host_id=str(host_id),
+                    name=str(name),
+                    now=current_time,
+                )
             conn.commit()
             return _connector_response(
                 ok=True,

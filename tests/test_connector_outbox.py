@@ -1960,6 +1960,92 @@ def test_prepare_commit_rolls_back_all_materialization_on_injected_failure(
     assert outbox_count == linked_count == 0
 
 
+def test_exhausted_source_fails_zero_job_preparing_plan_idempotently(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "prepare-source-exhausted.db"
+    turn_id, revision = _canonical_turn(db_path, final_text="abcdefgh")
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, delivery_kind,
+                turn_id, content_revision, ordering_key, status,
+                payload_json, private_state_json, created_at, updated_at
+            ) VALUES (
+                'host-a', 'turn-final', ?, 'final_ready', ?, ?,
+                'wsk1_source_exhausted', 'queued', '{}', '{}', ?, ?
+            )
+            """,
+            (
+                "turn-final:revision:twfinal1." + ("s" * 64),
+                turn_id,
+                revision,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+    api = ConnectorOutboxAPI(db_path, "host-a", max_attempts=1)
+    source = api.poll({"name": "turn-final", "limit": 1})["items"][0]
+    begun = api.prepare(
+        {
+            "schema_version": 1,
+            "action": "begin",
+            "name": "turn-final",
+            "turn_id": turn_id,
+            "content_revision": revision,
+            "presentation_version": "turn-present-v27",
+            "part_count": 1,
+            "source_ref": source["ref"],
+        }
+    )
+    token = begun["plan_token"]
+    assert _put_final_part(
+        api,
+        plan_token=token,
+        ordinal=0,
+        start=0,
+        end=8,
+    )["ok"] is True
+
+    exhausted = api.fail(
+        {
+            "name": "turn-final",
+            "ref": source["ref"],
+            "delay_seconds": 0,
+        }
+    )
+    repeated_commit = api.prepare(
+        {
+            "schema_version": 1,
+            "action": "commit",
+            "name": "turn-final",
+            "plan_token": token,
+            "source_ref": source["ref"],
+        }
+    )
+
+    assert exhausted["status"] == "attempts_exhausted"
+    assert repeated_commit["ok"] is True
+    assert repeated_commit["state"] == "failed"
+    assert repeated_commit["job_count"] == 0
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT state FROM turn_presentation_plans WHERE plan_token = ?",
+            (token,),
+        ).fetchone()[0] == "failed"
+        assert conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM turn_presentation_jobs
+            WHERE plan_id = (
+                SELECT id FROM turn_presentation_plans WHERE plan_token = ?
+            ) AND outbox_id IS NOT NULL
+            """,
+            (token,),
+        ).fetchone()[0] == 0
+
+
 def test_prepare_commit_rechecks_current_revision_and_creates_no_jobs_on_conflict(
     tmp_path: Path,
 ) -> None:
