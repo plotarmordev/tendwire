@@ -646,6 +646,66 @@ def test_read_private_turn_emits_open_turn_from_open_fields(monkeypatch) -> None
     assert content["source_turn_id"] == "prompt-open"
 
 
+def test_read_private_turn_terminalizes_structured_api_error(monkeypatch) -> None:
+    config = Config(host_id="turn-host", herdr_bin="herdr", herdr_timeout_seconds=2)
+    payload = {
+        "result": {
+            "turn": {
+                "available": True,
+                "turn_id": "prompt-error",
+                "user_text": "Please answer this.",
+                "assistant_final_text": "",
+                "complete": False,
+                "api_error": {
+                    "code": "rate_limit_error",
+                    "text": "You've hit your weekly limit. Try again after the reset.",
+                },
+            }
+        }
+    }
+
+    monkeypatch.setattr(herdr_turns.subprocess, "run", _run_returning(payload))
+    content = herdr_turns._read_private_turn(config, "pane-1")
+
+    assert content is not None
+    assert content["source_turn_id"] == "prompt-error"
+    assert content["assistant_final_text"] == (
+        "You've hit your weekly limit. Try again after the reset."
+    )
+    assert content.get("assistant_stream_text") is None
+    assert content["complete"] is True
+    assert content["has_open_turn"] is False
+
+
+def test_read_private_turn_terminalizes_open_fields_api_error(monkeypatch) -> None:
+    config = Config(host_id="turn-host", herdr_bin="herdr", herdr_timeout_seconds=2)
+    payload = {
+        "result": {
+            "turn": {
+                "available": True,
+                "complete": True,
+                "has_open_turn": True,
+                "turn_id": "older",
+                "user_text": "older prompt",
+                "assistant_final_text": "older answer",
+                "open_turn_id": "prompt-error",
+                "open_user_text": "current prompt",
+                "api_error": {"code": "overloaded_error", "text": "Provider overloaded."},
+            }
+        }
+    }
+
+    monkeypatch.setattr(herdr_turns.subprocess, "run", _run_returning(payload))
+    content = herdr_turns._read_private_turn(config, "pane-1")
+
+    assert content is not None
+    assert content["source_turn_id"] == "prompt-error"
+    assert content["user_text"] == "current prompt"
+    assert content["assistant_final_text"] == "Provider overloaded."
+    assert content["complete"] is True
+    assert content["has_open_turn"] is False
+
+
 def test_open_turn_and_its_completion_share_source_turn_id(monkeypatch) -> None:
     """The open turn (prompt-open) and its later completion must share the id so
     a working card edits into the final instead of duplicating."""

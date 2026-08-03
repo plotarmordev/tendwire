@@ -635,6 +635,21 @@ def _public_turn_pending_projection(
     }
 
 
+def _backend_terminal_error_text(turn: Mapping[str, Any]) -> str | None:
+    """Return a bounded public final for a structured terminal adapter error."""
+
+    error = turn.get("api_error")
+    if not isinstance(error, Mapping):
+        return None
+    text = redact_private_prompt_text(error.get("text"), max_chars=600)
+    if text:
+        return text
+    code = redact_private_prompt_text(error.get("code"), max_chars=120)
+    if code:
+        return f"The agent ended this turn with an API error ({code})."
+    return "The agent ended this turn with an API error."
+
+
 class _TurnReadTimeout(Exception):
     """Fixed internal timeout signal; never serialized with private details."""
 
@@ -747,6 +762,15 @@ def _read_private_turn(
             turn.get("assistant_stream_text"),
             open_turn_id,
         )
+        terminal_error = _backend_terminal_error_text(turn)
+        if opened is not None and terminal_error:
+            opened = {
+                **dict(opened),
+                "assistant_stream_text": None,
+                "assistant_final_text": terminal_error,
+                "complete": True,
+                "has_open_turn": False,
+            }
         if raise_timeout:
             opened_data = dict(opened or {})
             opened_data.update(pending_projection)
@@ -756,6 +780,16 @@ def _read_private_turn(
         return opened
 
     content = {key: turn.get(key) for key in _TURN_CONTENT_KEYS if key in turn}
+    terminal_error = _backend_terminal_error_text(turn)
+    if terminal_error:
+        content.update(
+            {
+                "assistant_stream_text": None,
+                "assistant_final_text": terminal_error,
+                "complete": True,
+                "has_open_turn": False,
+            }
+        )
     content.update(pending_projection)
     if raise_timeout:
         content["_backend_pending_observation"] = pending_observation
