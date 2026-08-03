@@ -55,6 +55,10 @@ class AcpPermissionBridgeUnavailable(AcpCoordinatorError):
 class AcpConsoleInputGap(AcpCoordinatorError):
     """The bounded Herdr console queue lost unconsumed pane input."""
 
+    def __init__(self, message: str, *, recovery_after_sequence: int) -> None:
+        super().__init__(message)
+        self.recovery_after_sequence = recovery_after_sequence
+
 
 class AcpVisibleConsoleUnavailable(AcpCoordinatorError):
     """A worker cannot accept new prompts while its pane bridge is lost."""
@@ -851,6 +855,53 @@ class AcpRuntimeCoordinator:
             close = getattr(client, "close", None)
             if callable(close):
                 close()
+        if gap_error is not None:
+            if self.config.acp_console_input_policy == "live_only":
+                # The operator explicitly chose live traffic over recovery of
+                # a partially discarded backlog. Persist the tail watermark
+                # before acknowledging it, then make one fresh exchange so an
+                # input arriving after the probe is still delivered.
+                input_sequence = max(
+                    input_sequence,
+                    gap_error.recovery_after_sequence,
+                )
+                record_agent_event(
+                    Path(self.config.db_path),
+                    self.config.host_id,
+                    kind="extension",
+                    source="tendwire-console",
+                    worker_id=slot.continuity.worker_id,
+                    payload={
+                        "extension": "tendwire.acp.console_input_cursor",
+                        "generation": console.generation,
+                        "input_sequence": input_sequence,
+                        "recovery": "live_only",
+                    },
+                    source_session_id=binding.turn_target_value,
+                    source_event_id=(
+                        f"input-live-baseline:{console.generation}:{input_sequence}"
+                    ),
+                    visibility="private",
+                )
+                client = self._endpoint_client_factory(self.config)
+                try:
+                    connect = getattr(client, "connect", None)
+                    if callable(connect):
+                        connect()
+                    result = client.agent_acp_console_exchange(
+                        slot.continuity.target_value,
+                        generation=console.generation,
+                        lease=console.lease,
+                        after_input_sequence=input_sequence,
+                        output=(),
+                        timeout=self.config.herdr_timeout_seconds,
+                    )
+                    inputs = _parse_console_exchange(result, input_sequence)
+                finally:
+                    close = getattr(client, "close", None)
+                    if callable(close):
+                        close()
+                gap_error = None
         if gap_error is not None:
             gap_output = [{
                 "event_id": f"console-gap:{console.generation}:{input_sequence}",
@@ -2009,7 +2060,10 @@ def _parse_console_exchange(
     ):
         raise AcpCoordinatorError("Herdr ACP console exchange floors are invalid")
     if input_floor > after_sequence + 1:
-        raise AcpConsoleInputGap("Herdr ACP console input floor has a gap")
+        raise AcpConsoleInputGap(
+            "Herdr ACP console input floor has a gap",
+            recovery_after_sequence=next_input - 1,
+        )
     parsed: list[tuple[int, str]] = []
     expected = after_sequence + 1
     for item in raw_inputs:
@@ -2024,14 +2078,18 @@ def _parse_console_exchange(
             or not text.strip()
         ):
             if type(sequence) is int and sequence > expected:
-                raise AcpConsoleInputGap("Herdr ACP console input sequence has a gap")
+                raise AcpConsoleInputGap(
+                    "Herdr ACP console input sequence has a gap",
+                    recovery_after_sequence=next_input - 1,
+                )
             raise AcpCoordinatorError("Herdr ACP console input sequence is invalid")
         parsed.append((sequence, text))
         expected += 1
     if next_input != expected:
         if next_input > expected:
             raise AcpConsoleInputGap(
-                "Herdr ACP console input response is incomplete"
+                "Herdr ACP console input response is incomplete",
+                recovery_after_sequence=next_input - 1,
             )
         raise AcpCoordinatorError(
             "Herdr ACP console next input sequence is invalid"

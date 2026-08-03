@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from tendwire.backends.acp_coordinator import (
+    AcpConsoleInputGap,
     AcpCoordinatorError,
     AcpRuntimeCoordinator,
     HerdrAcpConsoleEndpoint,
@@ -182,8 +183,9 @@ def test_console_exchange_requires_floor_and_next_sequence_contract() -> None:
     with pytest.raises(AcpCoordinatorError, match="shape"):
         _parse_console_exchange(missing_next, 2)
     lost = dict(result, input_floor_sequence=4)
-    with pytest.raises(AcpCoordinatorError, match="gap"):
+    with pytest.raises(AcpConsoleInputGap, match="gap") as raised:
         _parse_console_exchange(lost, 2)
+    assert raised.value.recovery_after_sequence == 3
 
     incomplete = dict(result, inputs=[], next_input_sequence=4)
     with pytest.raises(AcpCoordinatorError, match="incomplete"):
@@ -209,6 +211,83 @@ def test_console_exchange_requires_floor_and_next_sequence_contract() -> None:
     wrong_output_next = dict(output, next_output_sequence=9)
     with pytest.raises(AcpCoordinatorError, match="next output"):
         _parse_console_exchange(wrong_output_next, 2)
+
+
+def test_live_only_console_policy_skips_lost_backlog_to_current_tail(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        acp_console_input_policy="live_only",
+    )
+    assert config.db_path is not None
+    init_store(config.db_path)
+    exchanges: list[int] = []
+
+    class EndpointClient:
+        def agent_acp_console_exchange(
+            self,
+            _target: Any,
+            *,
+            generation: int,
+            lease: str,
+            after_input_sequence: int,
+            output: Any,
+            timeout: float,
+        ) -> dict[str, Any]:
+            exchanges.append(after_input_sequence)
+            return {
+                "type": "agent_acp_console_exchange",
+                "inputs": (
+                    [
+                        {"sequence": 3, "text": "historical one"},
+                        {"sequence": 4, "text": "historical two"},
+                    ]
+                    if after_input_sequence == 0
+                    else []
+                ),
+                "outputs": [],
+                "input_floor_sequence": 3,
+                "output_floor_sequence": 1,
+                "next_input_sequence": 5,
+                "next_output_sequence": 1,
+            }
+
+        def close(self) -> None:
+            return None
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        reconcile_interval=60.0,
+    )
+    binding = replace(
+        _binding(),
+        backend="acp",
+        turn_target_kind="acp_session_id",
+        turn_target_value="session-a",
+        private_fingerprint="",
+    )
+    slot = _RuntimeSlot(
+        continuity=_binding(),
+        generation="42",
+        runtime=SimpleNamespace(_binding=binding),
+        console=HerdrAcpConsoleEndpoint(42, "coordinator-lease"),
+        console_cursor_loaded=True,
+    )
+
+    coordinator._bridge_console_slot(slot)
+
+    assert exchanges == [0, 4]
+    assert slot.console_input_sequence == 4
+    assert _load_console_input_cursor(
+        config.db_path,
+        config.host_id,
+        "worker-1",
+        "session-a",
+        42,
+    ) == 4
 
 
 def test_console_event_projection_covers_messages_thought_tools_and_plan() -> None:

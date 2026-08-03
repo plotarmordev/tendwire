@@ -10,6 +10,7 @@ import pytest
 
 from tendwire.config import (
     DEFAULT_ACP_MAX_FRAME_BYTES,
+    DEFAULT_ACP_CONSOLE_INPUT_POLICY,
     DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS,
     DEFAULT_ACP_THOUGHT_POLICY,
@@ -82,6 +83,7 @@ def test_acp_event_source_defaults_to_legacy_with_thoughts_disabled(
         "TENDWIRE_ACP_REQUEST_TIMEOUT_SECONDS",
         "TENDWIRE_ACP_SHUTDOWN_TIMEOUT_SECONDS",
         "TENDWIRE_ACP_MAX_FRAME_BYTES",
+        "TENDWIRE_ACP_CONSOLE_INPUT_POLICY",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -92,6 +94,7 @@ def test_acp_event_source_defaults_to_legacy_with_thoughts_disabled(
     assert config.acp_request_timeout_seconds == DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS == 30.0
     assert config.acp_shutdown_timeout_seconds == DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS == 5.0
     assert config.acp_max_frame_bytes == DEFAULT_ACP_MAX_FRAME_BYTES == 8 * 1024 * 1024
+    assert config.acp_console_input_policy == DEFAULT_ACP_CONSOLE_INPUT_POLICY == "preserve"
 
 
 def test_acp_configuration_uses_explicit_before_environment(monkeypatch) -> None:
@@ -100,6 +103,7 @@ def test_acp_configuration_uses_explicit_before_environment(monkeypatch) -> None
     monkeypatch.setenv("TENDWIRE_ACP_REQUEST_TIMEOUT_SECONDS", "11")
     monkeypatch.setenv("TENDWIRE_ACP_SHUTDOWN_TIMEOUT_SECONDS", "3")
     monkeypatch.setenv("TENDWIRE_ACP_MAX_FRAME_BYTES", "4096")
+    monkeypatch.setenv("TENDWIRE_ACP_CONSOLE_INPUT_POLICY", "live_only")
 
     environment = load_config()
     explicit = load_config(
@@ -108,6 +112,7 @@ def test_acp_configuration_uses_explicit_before_environment(monkeypatch) -> None
         acp_request_timeout_seconds="7.5",
         acp_shutdown_timeout_seconds="2.5",
         acp_max_frame_bytes="8192",
+        acp_console_input_policy="preserve",
     )
 
     assert environment.agent_event_source == "acp_shadow"
@@ -115,11 +120,19 @@ def test_acp_configuration_uses_explicit_before_environment(monkeypatch) -> None
     assert environment.acp_request_timeout_seconds == 11.0
     assert environment.acp_shutdown_timeout_seconds == 3.0
     assert environment.acp_max_frame_bytes == 4096
+    assert environment.acp_console_input_policy == "live_only"
     assert explicit.agent_event_source == "acp_required"
     assert explicit.acp_thought_policy == "disabled"
     assert explicit.acp_request_timeout_seconds == 7.5
     assert explicit.acp_shutdown_timeout_seconds == 2.5
     assert explicit.acp_max_frame_bytes == 8192
+    assert explicit.acp_console_input_policy == "preserve"
+
+
+@pytest.mark.parametrize("value", ["", "drop", "future"])
+def test_acp_console_input_policy_rejects_unknown_values(value: str) -> None:
+    with pytest.raises(ValueError, match="acp_console_input_policy must be one of"):
+        Config(acp_console_input_policy=value)
 
 
 @pytest.mark.parametrize("value", ["", "acp", "preferred", "future"])

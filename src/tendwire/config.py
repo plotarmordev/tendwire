@@ -20,9 +20,11 @@ AGENT_EVENT_SOURCES = frozenset(
     {"legacy", "acp_shadow", "acp_preferred", "acp_required"}
 )
 ACP_THOUGHT_POLICIES = frozenset({"disabled", "private_summary", "private_all"})
+ACP_CONSOLE_INPUT_POLICIES = frozenset({"preserve", "live_only"})
 DEFAULT_TURN_MODEL = "observed"
 DEFAULT_AGENT_EVENT_SOURCE = "legacy"
 DEFAULT_ACP_THOUGHT_POLICY = "disabled"
+DEFAULT_ACP_CONSOLE_INPUT_POLICY = "preserve"
 DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS = 30.0
 DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 DEFAULT_ACP_MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -79,6 +81,7 @@ class Config:
     turn_model: str = DEFAULT_TURN_MODEL
     agent_event_source: str = DEFAULT_AGENT_EVENT_SOURCE
     acp_thought_policy: str = DEFAULT_ACP_THOUGHT_POLICY
+    acp_console_input_policy: str = DEFAULT_ACP_CONSOLE_INPUT_POLICY
     acp_request_timeout_seconds: float = DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS
     acp_shutdown_timeout_seconds: float = DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS
     acp_max_frame_bytes: int = DEFAULT_ACP_MAX_FRAME_BYTES
@@ -168,6 +171,19 @@ class Config:
             allowed = ", ".join(sorted(ACP_THOUGHT_POLICIES))
             raise ValueError(f"acp_thought_policy must be one of: {allowed}")
         object.__setattr__(self, "acp_thought_policy", acp_thought_policy)
+        acp_console_input_policy = str(
+            self.acp_console_input_policy or ""
+        ).strip().lower()
+        if acp_console_input_policy not in ACP_CONSOLE_INPUT_POLICIES:
+            allowed = ", ".join(sorted(ACP_CONSOLE_INPUT_POLICIES))
+            raise ValueError(
+                f"acp_console_input_policy must be one of: {allowed}"
+            )
+        object.__setattr__(
+            self,
+            "acp_console_input_policy",
+            acp_console_input_policy,
+        )
         object.__setattr__(
             self,
             "acp_request_timeout_seconds",
@@ -513,6 +529,7 @@ def load_config(
     turn_model: str | None = None,
     agent_event_source: str | None = None,
     acp_thought_policy: str | None = None,
+    acp_console_input_policy: str | None = None,
     acp_request_timeout_seconds: float | str | None = None,
     acp_shutdown_timeout_seconds: float | str | None = None,
     acp_max_frame_bytes: int | str | None = None,
@@ -625,6 +642,11 @@ def load_config(
             acp_thought_policy,
             "TENDWIRE_ACP_THOUGHT_POLICY",
             DEFAULT_ACP_THOUGHT_POLICY,
+        ),
+        acp_console_input_policy=_resolve_value(
+            acp_console_input_policy,
+            "TENDWIRE_ACP_CONSOLE_INPUT_POLICY",
+            DEFAULT_ACP_CONSOLE_INPUT_POLICY,
         ),
         acp_request_timeout_seconds=_resolve_value(
             acp_request_timeout_seconds,
