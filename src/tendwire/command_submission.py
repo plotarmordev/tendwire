@@ -171,11 +171,6 @@ def _backend_unavailable(
 
 
 def _backend_health_error(config: Config, request: CommandRequest, snapshot: Snapshot) -> CommandEnvelope | None:
-    if config.herdr_backend != "socket":
-        return _backend_unavailable(
-            request,
-            "Herdr socket backend is not enabled",
-        )
     health = _backend_health(snapshot)
     if health.status != "healthy":
         return _backend_unavailable(

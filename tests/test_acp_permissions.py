@@ -44,7 +44,6 @@ def _config(tmp_path: Path) -> Config:
         host_id="cmd-host",
         data_dir=tmp_path,
         db_path=tmp_path / "commands.db",
-        herdr_backend="socket",
     )
 
 

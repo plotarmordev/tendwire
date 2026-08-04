@@ -63,7 +63,6 @@ def _config(tmp_path: Path) -> Config:
         host_id="acp-host",
         data_dir=tmp_path,
         db_path=tmp_path / "tendwire.db",
-        herdr_backend="socket",
         herdr_bin="herdr",
     )
 
@@ -1927,7 +1926,25 @@ def test_coordinator_start_revokes_orphaned_process_binding(tmp_path: Path) -> N
 
 def test_production_coordinator_installs_durable_permission_bridge(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class EmptyLifecycleClient:
+        def workspace_list(self, *, timeout: float) -> list[Any]:
+            return []
+
+        def pane_list(self, *, timeout: float) -> list[Any]:
+            return []
+
+        def agent_list(self, *, timeout: float) -> list[Any]:
+            return []
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "tendwire.backends.acp_coordinator._default_endpoint_client_factory",
+        lambda _config: EmptyLifecycleClient(),
+    )
     config = _config(tmp_path)
     assert config.db_path is not None
     init_store(config.db_path)

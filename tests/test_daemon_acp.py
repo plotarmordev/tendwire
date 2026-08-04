@@ -73,7 +73,6 @@ def _config(tmp_path: Path) -> Config:
         data_dir=tmp_path,
         db_path=tmp_path / "daemon.db",
         socket_path=tmp_path / "daemon.sock",
-        herdr_backend="cli",
         acp_shutdown_timeout_seconds=1.25,
     )
 
@@ -88,16 +87,11 @@ def _hooks(
     def initialize(path: Path) -> None:
         calls.append("init_store")
         init_store(path)
-
-    def observe(_config: Config) -> Snapshot:
-        calls.append("observe")
         snapshot = _snapshot()
         save_snapshot(config.db_path, snapshot)
-        return snapshot
 
     return DaemonHooks(
         init_store=initialize,
-        observe_initial_snapshot=observe,
         acp_supervisor_factory=supervisor_factory,
     )
 
@@ -111,7 +105,7 @@ def test_daemon_requires_an_acp_supervisor_before_binding_socket(tmp_path: Path)
         daemon.start()
 
     assert not config.socket_path.exists()
-    assert calls == ["init_store", "observe"]
+    assert calls == ["init_store"]
 
 
 def test_daemon_starts_required_acp_and_exposes_only_public_health(
@@ -136,7 +130,7 @@ def test_daemon_starts_required_acp_and_exposes_only_public_health(
         assert health["acp"]["state"] == "running"
         assert health["acp"]["counters"]["updates_ingested"] == 7
         assert "sentinel-private" not in json.dumps(health)
-        assert calls[:3] == ["init_store", "observe", "acp_start"]
+        assert calls[:2] == ["init_store", "acp_start"]
     finally:
         daemon.stop()
 

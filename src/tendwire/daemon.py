@@ -464,12 +464,6 @@ def _default_init_store(
     init_store(db_path, **kwargs)
 
 
-def _default_observe_initial_snapshot(config: Config) -> Snapshot:
-    from .cli import observe_public_snapshot
-
-    return observe_public_snapshot(config, store_snapshot=True)
-
-
 def _default_acp_supervisor_factory(config: Config, stop_event: threading.Event) -> Any:
     from .backends.acp_coordinator import production_acp_supervisor_factory
 
@@ -481,8 +475,6 @@ class DaemonHooks:
     """Dependency injection points for deterministic daemon tests."""
 
     init_store: Callable[[Path], None] = _default_init_store
-    observe_initial_snapshot: Callable[[Config], Snapshot] = _default_observe_initial_snapshot
-    event_backend_factory: Callable[[Config, threading.Event], Any] | None = None
     acp_supervisor_factory: Callable[[Config, threading.Event], Any | None] | None = (
         _default_acp_supervisor_factory
     )
@@ -507,7 +499,6 @@ class TendwireDaemon:
         self.started_at = utc_timestamp()
         self._snapshot: Snapshot | None = None
         self._server: UnixSocketJSONServer | None = None
-        self._event_backend: Any | None = None
         self._acp_supervisor: Any | None = None
         self._acp_startup_failure_type: str | None = None
         self._stop_lock = threading.Lock()
@@ -554,13 +545,15 @@ class TendwireDaemon:
             else:
                 self.hooks.init_store(Path(self.config.db_path))
             self._connector_periodic_tick()
-            if self.config.herdr_backend == "socket":
-                self._snapshot = self._start_socket_event_backend()
-            else:
-                self._snapshot = self.hooks.observe_initial_snapshot(self.config)
-                self._after_snapshot_saved()
-
             self._start_acp_supervisor()
+            from .store.sqlite import latest_snapshot
+
+            self._snapshot = latest_snapshot(
+                Path(self.config.db_path), self.config.host_id
+            )
+            if self._snapshot is None:
+                raise RuntimeError("ACP supervisor did not publish a lifecycle snapshot")
+            self._after_snapshot_saved()
 
             api = TendwireDaemonAPI(
                 get_snapshot=self.get_snapshot,
@@ -590,16 +583,9 @@ class TendwireDaemon:
 
         except Exception:
             self.stop_event.set()
-            backend = self._event_backend
             supervisor = self._acp_supervisor
             self._acp_supervisor = None
             self._stop_acp_supervisor(supervisor)
-            self._event_backend = None
-            if backend is not None:
-                try:
-                    backend.stop()
-                except Exception:
-                    pass
             self._server = None
             if server is not None:
                 try:
@@ -633,10 +619,8 @@ class TendwireDaemon:
         with self._stop_lock:
             self.stop_event.set()
             server = self._server
-            backend = self._event_backend
             supervisor = self._acp_supervisor
             self._server = None
-            self._event_backend = None
             self._acp_supervisor = None
 
         if server is not None:
@@ -646,19 +630,6 @@ class TendwireDaemon:
                 pass
 
         self._stop_acp_supervisor(supervisor)
-
-        if backend is not None:
-            flush = getattr(backend, "flush", None)
-            if callable(flush):
-                try:
-                    flush()
-                except Exception:
-                    pass
-        if backend is not None:
-            try:
-                backend.stop()
-            except Exception:
-                pass
 
     def _start_acp_supervisor(self) -> None:
         """Start the required ACP supervisor and fail the daemon closed."""
@@ -767,6 +738,10 @@ class TendwireDaemon:
             "healthy": healthy,
             "state": state,
             "failure_type": failure_type,
+            "last_reconcile_at": _valid_observation_timestamp(
+                field("last_reconcile_at")
+            ),
+            "worker_count": _nonnegative_int(field("worker_count")),
             "counters": counters,
         }
 
@@ -860,44 +835,6 @@ class TendwireDaemon:
             }
         else:
             self._automatic_maintenance_status = maintenance_status
-
-    def _start_socket_event_backend(self) -> Snapshot:
-        if self.hooks.event_backend_factory is None:
-            from .backends.herdr_events import HerdrEventBackend
-
-            backend = HerdrEventBackend(self.config, stop_event=self.stop_event)
-        else:
-            backend = self.hooks.event_backend_factory(self.config, self.stop_event)
-        self._event_backend = backend
-        backend.start(wait_for_reconcile=True)
-        from .store.sqlite import SnapshotObservationContext, latest_snapshot, save_snapshot
-
-        snapshot = latest_snapshot(Path(self.config.db_path), self.config.host_id)
-        if snapshot is not None:
-            return snapshot
-        from .backends.herdr_cli import herdr_backend_health
-        from .core.projector import project_from_observations
-
-        backend_health = (
-            backend.health.to_backend_health()
-            if hasattr(backend, "health")
-            else herdr_backend_health("unknown")
-        )
-        snapshot = project_from_observations(
-            self.config,
-            backend_health=[backend_health],
-        )
-        save_snapshot(
-            Path(self.config.db_path),
-            snapshot,
-            turn_model=DEFAULT_TURN_MODEL,
-            observation=SnapshotObservationContext(
-                authority="none",
-                observed_at=_valid_observation_timestamp(backend_health.observed_at),
-            ),
-        )
-        self._after_snapshot_saved()
-        return snapshot
 
     def get_snapshot(self) -> Snapshot:
         if self.config.db_path is not None:
@@ -1015,11 +952,14 @@ class TendwireDaemon:
             and command_requests_valid
             and maintenance_valid
         )
-        backend_runtime: dict[str, Any] = {}
-        if self._event_backend is not None and hasattr(self._event_backend, "operational_status"):
-            status_value = getattr(self._event_backend, "operational_status")
-            if isinstance(status_value, Mapping):
-                backend_runtime = dict(status_value)
+        acp_health = self._acp_supervisor_health()
+        backend_runtime: dict[str, Any] = {
+            "status": "healthy" if acp_health["healthy"] else "degraded",
+            "outcome": "healthy_non_empty" if acp_health.get("worker_count", 0) else "empty_healthy",
+            "ready": acp_health["healthy"],
+            "running": acp_health.get("state") == "running",
+            "last_reconcile_at": acp_health.get("last_reconcile_at"),
+        }
         backend_maintenance = backend_runtime.get("automatic_maintenance")
         runtime_maintenance = (
             backend_maintenance
@@ -1059,7 +999,6 @@ class TendwireDaemon:
             or stored_last_snapshot_at
             or snapshot.updated_at
         )
-        acp_health = self._acp_supervisor_health()
         payload = {
             "schema_version": 1,
             "status": (
@@ -1113,10 +1052,8 @@ class TendwireDaemon:
             "acp": acp_health,
             "pending_ingestion": pending_ingestion,
             "limits": {
-                "event_debounce_seconds": self.config.event_debounce_seconds,
                 "reconcile_interval_seconds": self.config.reconcile_interval_seconds,
                 "event_retention_days": self.config.event_retention_days,
-                "output_excerpt_chars": self.config.output_excerpt_chars,
                 "max_workers": self.config.max_workers,
                 "max_outbox_attempts": self.config.max_outbox_attempts,
                 "outbox_claim_ttl_seconds": self.config.connector_claim_ttl_seconds,
