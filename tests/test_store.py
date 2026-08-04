@@ -8834,7 +8834,7 @@ def test_compact_store_dry_run_reports_low_headroom_without_mutating(
     assert _tree_metadata(tmp_path) == before
 
 
-def test_compact_store_requires_current_v9_without_migrating(
+def test_compact_store_requires_current_schema_without_rebuilding(
     tmp_path: Path,
 ) -> None:
     db_path, _private_payload = _seed_compaction_fixture(tmp_path)

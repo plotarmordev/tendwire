@@ -68,12 +68,11 @@ from tendwire.store.sqlite import (
     get_command_request,
     init_store,
     latest_snapshot,
-    merge_backend_pending,
-    merge_turn_content,
     pending_payload_from_store,
     save_snapshot,
     upsert_worker_bindings,
 )
+from .store_helpers import apply_test_backend_pending, apply_test_turn_refresh
 
 
 _PUBLIC_JSON_FORBIDDEN_KEYS = {
@@ -469,7 +468,7 @@ def test_daemon_pending_matches_shared_durable_projection_and_fingerprint(
         recompute_pending_content_fingerprint(degraded)
         != baseline["content_fingerprint"]
     )
-    merge_backend_pending(
+    apply_test_backend_pending(
         db_path,
         snapshot.host_id,
         "worker-1",
@@ -657,7 +656,7 @@ def test_pending_store_projection_reads_snapshot_and_overlay_atomically(
     )
     init_store(db_path)
     save_snapshot(db_path, snapshot_a)
-    merge_backend_pending(
+    apply_test_backend_pending(
         db_path,
         config.host_id,
         "worker-1",
@@ -689,7 +688,7 @@ def test_pending_store_projection_reads_snapshot_and_overlay_atomically(
         try:
             assert allow_writer.wait(timeout=5)
             save_snapshot(db_path, snapshot_b)
-            merge_backend_pending(
+            apply_test_backend_pending(
                 db_path,
                 config.host_id,
                 "worker-1",
@@ -4610,7 +4609,7 @@ def test_isolated_daemon_survives_deterministic_real_wal_retirement_without_reso
             )
         ],
     )
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         config.host_id,
         worker.id,
