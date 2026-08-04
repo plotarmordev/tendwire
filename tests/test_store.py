@@ -6686,7 +6686,7 @@ def test_store_v8_maintenance_schema_singleton_and_ordered_indexes(
     assert created == ("created_at", "host_id", "id")
 
 
-def test_current_v28_schema_gate_and_second_init_have_no_mutation_or_wal_setting(
+def test_current_v29_schema_gate_and_second_init_have_no_mutation_or_wal_setting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6732,6 +6732,71 @@ def test_current_v28_schema_gate_and_second_init_have_no_mutation_or_wal_setting
         statement.startswith("PRAGMA USER_VERSION =")
         for statement in normalized
     )
+
+
+def test_base_v28_schema_is_loudly_reset_without_removed_store_objects(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db_path = tmp_path / "base-v28-reset.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE herdr_turn_watermarks (
+                host_id TEXT NOT NULL,
+                pane_id TEXT NOT NULL,
+                last_turn INTEGER NOT NULL
+            );
+            INSERT INTO herdr_turn_watermarks VALUES ('host-a', 'pane-private', 7);
+            CREATE TABLE agent_event_tombstones (
+                host_id TEXT NOT NULL,
+                event_id TEXT NOT NULL
+            );
+            INSERT INTO agent_event_tombstones VALUES ('host-a', 'event-private');
+            CREATE TABLE backend_pending (
+                sentinel TEXT NOT NULL,
+                route_kind TEXT NOT NULL DEFAULT 'legacy'
+            );
+            INSERT INTO backend_pending VALUES ('pending-private', 'legacy');
+            CREATE TABLE command_receipts (
+                sentinel TEXT NOT NULL,
+                legacy_collision INTEGER NOT NULL DEFAULT 0,
+                legacy_collision_count INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO command_receipts VALUES ('receipt-private', 1, 2);
+            PRAGMA user_version = 28;
+            """
+        )
+
+    with caplog.at_level(logging.WARNING, logger=store_sqlite.__name__):
+        init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        assert _user_version(conn) == 29
+        object_names = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+        assert "herdr_turn_watermarks" not in object_names
+        assert "agent_event_tombstones" not in object_names
+        assert "route_kind" not in {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(backend_pending)")
+        }
+        receipt_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(command_receipts)")
+        }
+        assert "legacy_collision" not in receipt_columns
+        assert "legacy_collision_count" not in receipt_columns
+        assert conn.execute("SELECT COUNT(*) FROM backend_pending").fetchone() == (0,)
+        assert conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone() == (0,)
+
+    message = caplog.records[-1].getMessage()
+    assert "previous_version=28" in message
+    assert "target_version=29" in message
+    assert "table:herdr_turn_watermarks" in message
+    assert "table:agent_event_tombstones" in message
 
 
 def _create_discarded_schema(db_path: Path, version: int) -> None:
@@ -6808,8 +6873,10 @@ def test_newer_schema_is_loudly_discarded_and_recreated(
 
     with sqlite3.connect(str(db_path)) as conn:
         assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION
-    assert "previous_version=29" in caplog.records[-1].getMessage()
-    assert "table:discarded_data" in caplog.records[-1].getMessage()
+    message = caplog.records[-1].getMessage()
+    assert f"previous_version={store_sqlite.STORE_SCHEMA_VERSION + 1}" in message
+    assert f"target_version={store_sqlite.STORE_SCHEMA_VERSION}" in message
+    assert "table:discarded_data" in message
 
 
 def test_v0_with_application_objects_is_loudly_discarded_and_recreated(

@@ -46,7 +46,17 @@ def apply_test_backend_pending(
         clean = sanitize_public_mapping(pending)
         choices = tuple(
             PendingObservedChoice(
-                choice_id=str(choice.get("choice_id") or choice.get("id") or ordinal),
+                choice_id=(
+                    "choice-"
+                    + stable_fingerprint(
+                        {
+                            "domain": "test.pending-choice.v1",
+                            "ordinal": ordinal,
+                            "choice": choice,
+                        },
+                        length=24,
+                    )
+                ),
                 label=str(choice.get("label") or "Option"),
                 picker_ordinal=ordinal,
             )

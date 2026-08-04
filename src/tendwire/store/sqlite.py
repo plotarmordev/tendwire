@@ -141,7 +141,7 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 28
+STORE_SCHEMA_VERSION = 29
 CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 TURN_CHANGE_RETENTION_DAYS = 7
 TURN_CHANGE_RETENTION_COUNT = 100_000
@@ -10221,7 +10221,7 @@ def _rebuild_current_schema_conn(
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Open v28 unchanged or explicitly replace any other schema."""
+    """Open v29 unchanged or explicitly replace any other schema."""
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if version == STORE_SCHEMA_VERSION:
         return
