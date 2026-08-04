@@ -75,7 +75,6 @@ HERDR_BACKEND = "herdr"
 _MUTATING_ACTIONS = frozenset(
     {"send_instruction", "answer_pending", "answer_decision"}
 )
-_LEGACY_V0_REPLAY_WORKER_ID = "legacy-v0-replay-only"
 _DISALLOWED_SEND_STATUSES = frozenset({"closed", "failed", "unknown"})
 _AMBIGUOUS_BINDING_REASONS = frozenset({"duplicate_backend_target", "not_unique"})
 
@@ -521,11 +520,6 @@ def _receipt_is_canonical(
     )
     if not common_identity:
         return False
-    if version == 0:
-        return (
-            receipt.get("legacy_collision") is False
-            and receipt.get("canonical_fingerprint") == request.payload_fingerprint()
-        )
     return (
         version == canonical.canonical_version
         and receipt.get("canonical_fingerprint") == canonical.fingerprint
@@ -566,33 +560,9 @@ def _stored_terminal_envelope(
     try:
         if type(schema_version) is not int:
             raise ValueError("stored envelope schema_version must be an exact integer")
-        if schema_version == COMMAND_ENVELOPE_SCHEMA_VERSION:
-            envelope = CommandEnvelope.from_dict(data)
-        elif schema_version == 1:
-            legacy_fields = {
-                "schema_version",
-                "action",
-                "request_id",
-                "ok",
-                "dry_run",
-                "status",
-                "result",
-                "error",
-                "warnings",
-            }
-            if set(data) != legacy_fields:
-                raise ValueError("legacy envelope has an invalid field set")
-            upgraded = dict(data)
-            upgraded["schema_version"] = COMMAND_ENVELOPE_SCHEMA_VERSION
-            upgraded["disposition"] = expected_disposition
-            envelope = CommandEnvelope.from_dict(upgraded)
-            roundtrip = envelope.to_dict()
-            roundtrip.pop("disposition")
-            roundtrip["schema_version"] = 1
-            if roundtrip != data:
-                raise ValueError("legacy envelope is not an exact public roundtrip")
-        else:
+        if schema_version != COMMAND_ENVELOPE_SCHEMA_VERSION:
             raise ValueError("unsupported stored envelope schema")
+        envelope = CommandEnvelope.from_dict(data)
     except (TypeError, ValueError):
         return _backend_uncertain(request, malformed)
 
@@ -1546,11 +1516,6 @@ def _proven_replay_worker_id(
     stored = receipt.get("public_worker_id")
     stored_worker_id = stored if isinstance(stored, str) and stored else ""
 
-    # A v0 receipt is validated against the exact raw request payload, which
-    # already pins the original selector spelling. It needs no resolution, and
-    # a changed payload fails its canonical check rather than replaying here.
-    if version == 0:
-        return stored_worker_id or _LEGACY_V0_REPLAY_WORKER_ID
     if not stored_worker_id:
         return _receipt_malformed(request)
     if request.action == "answer_decision":
@@ -1577,7 +1542,7 @@ def _proven_replay_worker_id(
 
     # 3. Only a current, healthy observation can prove that a different spelling
     #    names the same canonical worker. A degraded one proves nothing, and a
-    #    legacy receipt carries no proof to fall back on.
+    #    receipt without a proof has no fallback evidence.
     if not allow_current_authority:
         return None
     try:
@@ -1630,10 +1595,6 @@ def _receipt_authority(
     if state in {"accepted", "rejected", "uncertain"}:
         if replay.status == STATUS_DUPLICATE_REQUEST:
             # A changed canonical mutation never rewrites the original receipt.
-            return replay
-        if receipt.get("canonical_version") == 0:
-            # Legacy evidence cannot be re-expressed as a canonical v1 row, so
-            # replay it as read instead of inventing one.
             return replay
         return _reserve_terminal_replay(config, request, canonical, receipt, replay)
     if replay.status != STATUS_PENDING:
