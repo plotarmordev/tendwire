@@ -18,13 +18,13 @@ from tendwire.store.sqlite import (
     cleanup_acknowledged_final_retention,
     init_store,
     inspect_connector_outbox,
-    merge_turn_content,
     maybe_run_automatic_store_maintenance,
     SnapshotRetentionPolicy,
     reclaim_expired_connector_leases,
     save_snapshot,
     store_status,
 )
+from .store_helpers import apply_test_turn_refresh
 
 
 FINAL_NAME = "turn-final"
@@ -303,7 +303,7 @@ def _deliver_final(
     text: str,
     observed_at: str,
 ) -> str:
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         "worker-1",
@@ -534,7 +534,7 @@ def test_turn_final_fail_and_defer_keep_public_reason_contract_private(
     db_path = tmp_path / "turn-final-reason-codes.db"
     host_id = "reason-code-host"
     _snapshot, api = _new_delivery_store(db_path, host_id)
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         "worker-1",
@@ -1065,7 +1065,7 @@ def test_same_owner_churn_preserves_detached_ack_tombstone(
     worker_b = owner_snapshot(STABLE_KEY, "worker-tombstone-b", "space-tombstone-b", 2)
     assert worker_b.workers[0].fingerprint != worker_a.workers[0].fingerprint
     assert save_snapshot(db_path, worker_b) is True
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         "worker-tombstone-b",
@@ -1105,7 +1105,7 @@ def test_same_owner_churn_preserves_detached_ack_tombstone(
 
     init_store(db_path)
     assert save_snapshot(db_path, worker_b) is True
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         "worker-tombstone-b",
@@ -1149,7 +1149,7 @@ def test_same_owner_churn_preserves_detached_ack_tombstone(
         4,
     )
     assert save_snapshot(db_path, owner_k2) is True
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         "worker-tombstone-b",

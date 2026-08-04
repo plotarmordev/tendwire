@@ -172,43 +172,10 @@ def test_stale_binding_writes_neither_journal_nor_projection(tmp_path: Path) -> 
     assert _counts(config.db_path) == (0, 0)
 
 
-def test_tombstoned_replay_can_repair_projection_without_reinserting_event(
-    tmp_path: Path,
-) -> None:
-    config, binding = _store(tmp_path)
-    event = _event(binding, observed_at="2020-01-01T00:00:00+00:00")
-    inserted = append_agent_event_and_apply_turn_for_binding(
-        config.db_path,
-        config.host_id,
-        event,
-        expected_binding=binding,
-    )
-    assert inserted.event.status == "inserted"
-    cleanup = cleanup_agent_event_retention(
-        config.db_path,
-        config.host_id,
-        retention_days=1,
-        now="2026-07-31T00:00:00+00:00",
-    )
-    assert cleanup["tombstoned"] == 1
-    assert len(list_agent_events(config.db_path, config.host_id)) == 0
-
-    repaired = append_agent_event_and_apply_turn_for_binding(
-        config.db_path,
-        config.host_id,
-        event,
-        expected_binding=binding,
-        content=_content(),
-    )
-    assert repaired.event.status == "replayed"
-    assert repaired.turn is not None
-    assert _counts(config.db_path) == (0, 1)
 
 
-@pytest.mark.parametrize("retire_original", (False, True))
 def test_replay_cannot_supersede_newer_turn_or_requeue_connector(
     tmp_path: Path,
-    retire_original: bool,
 ) -> None:
     config, binding = _store(tmp_path, stable_owner=True)
     old = _event(
@@ -227,14 +194,6 @@ def test_replay_cannot_supersede_newer_turn_or_requeue_connector(
         content=_content(complete=True, source_turn_id="turn-old", text="old"),
     )
     assert first.event.status == "inserted"
-    if retire_original:
-        assert cleanup_agent_event_retention(
-            config.db_path,
-            config.host_id,
-            retention_days=1,
-            now="2021-01-01T00:00:00+00:00",
-        )["tombstoned"] == 1
-
     new = _event(
         binding,
         observed_at="2026-01-01T00:00:00+00:00",
@@ -264,7 +223,6 @@ def test_replay_cannot_supersede_newer_turn_or_requeue_connector(
         replace(old, observed_at="2030-01-01T00:00:00+00:00"),
         expected_binding=binding,
         content=_content(complete=True, source_turn_id="turn-old", text="old"),
-        observed_at="2040-01-01T00:00:00+00:00",
     )
 
     assert replayed.event.status == "replayed"
@@ -277,10 +235,8 @@ def test_replay_cannot_supersede_newer_turn_or_requeue_connector(
         ).fetchall() == outbox_before
 
 
-@pytest.mark.parametrize("retire_original", (False, True))
 def test_replay_repairs_only_absent_projection_with_original_authority_time(
     tmp_path: Path,
-    retire_original: bool,
 ) -> None:
     config, binding = _store(tmp_path, stable_owner=True)
     event = _event(binding, observed_at="2020-01-01T00:00:00+00:00")
@@ -291,21 +247,12 @@ def test_replay_repairs_only_absent_projection_with_original_authority_time(
         expected_binding=binding,
     )
     assert inserted.event.status == "inserted"
-    if retire_original:
-        assert cleanup_agent_event_retention(
-            config.db_path,
-            config.host_id,
-            retention_days=1,
-            now="2021-01-01T00:00:00+00:00",
-        )["tombstoned"] == 1
-
     repaired = append_agent_event_and_apply_turn_for_binding(
         config.db_path,
         config.host_id,
         replace(event, observed_at="2030-01-01T00:00:00+00:00"),
         expected_binding=binding,
         content=_content(complete=True),
-        observed_at="2040-01-01T00:00:00+00:00",
     )
     assert repaired.event.status == "replayed"
     assert repaired.turn is not None and repaired.turn.updated == 1
@@ -337,34 +284,6 @@ def test_replay_repairs_only_absent_projection_with_original_authority_time(
         ).fetchall() == outbox_before
 
 
-def test_legacy_tombstone_without_authority_time_cannot_repair(tmp_path: Path) -> None:
-    config, binding = _store(tmp_path)
-    event = _event(binding, observed_at="2020-01-01T00:00:00+00:00")
-    append_agent_event_and_apply_turn_for_binding(
-        config.db_path,
-        config.host_id,
-        event,
-        expected_binding=binding,
-    )
-    cleanup_agent_event_retention(
-        config.db_path,
-        config.host_id,
-        retention_days=1,
-        now="2021-01-01T00:00:00+00:00",
-    )
-    with sqlite3.connect(config.db_path) as conn:
-        conn.execute("UPDATE agent_event_tombstones SET observed_at = NULL")
-
-    replayed = append_agent_event_and_apply_turn_for_binding(
-        config.db_path,
-        config.host_id,
-        event,
-        expected_binding=binding,
-        content=_content(complete=True),
-    )
-    assert replayed.event.status == "replayed"
-    assert replayed.turn is None
-    assert _counts(config.db_path) == (0, 0)
 
 
 def test_replay_repair_respects_binding_fence_and_rolls_back(tmp_path: Path) -> None:

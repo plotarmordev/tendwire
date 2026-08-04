@@ -68,12 +68,11 @@ from tendwire.store.sqlite import (
     get_command_request,
     init_store,
     latest_snapshot,
-    merge_backend_pending,
-    merge_turn_content,
     pending_payload_from_store,
     save_snapshot,
     upsert_worker_bindings,
 )
+from .store_helpers import apply_test_backend_pending, apply_test_turn_refresh
 
 
 _PUBLIC_JSON_FORBIDDEN_KEYS = {
@@ -305,74 +304,6 @@ def test_daemon_api_required_methods_are_public_safe() -> None:
     _assert_no_public_json_forbidden(command_response)
 
 
-def test_daemon_answer_pending_response_is_recursively_public_safe() -> None:
-    snapshot = _public_snapshot()
-    request = CommandRequest(
-        action="answer_pending",
-        request_id="answer-public",
-        dry_run=False,
-        params={
-            "pending_id": "pending-" + ("a" * 24),
-            "pending_fingerprint": "b" * 24,
-            "choice_id": "choice-" + ("c" * 24),
-        },
-    )
-    api = TendwireDaemonAPI(
-        get_snapshot=lambda: snapshot,
-        get_health=lambda: {"schema_version": 1, "status": "ok"},
-        submit_command=lambda _params: CommandEnvelope.from_result(
-            request,
-            ok=True,
-            status=STATUS_ACCEPTED,
-            disposition=DISPOSITION_TERMINAL_ACCEPTED,
-            result={
-                "target": {
-                    "worker_id": "worker-public",
-                    "pane_id": "sentinel-private-pane",
-                    "private_binding": "sentinel-private-binding",
-                },
-                "pending": {
-                    "id": "pending-" + ("a" * 24),
-                    "fingerprint": "b" * 24,
-                    "decision_id": "sentinel-private-decision",
-                },
-                "choice": {
-                    "choice_id": "choice-" + ("c" * 24),
-                    "tool_id": "sentinel-private-tool",
-                    "raw_payload": "sentinel-private-option",
-                },
-                "delivery_state": "submitted",
-                "transport_state": "submitted",
-                "observed_pending_state": "pending_observation",
-            },
-        ),
-    )
-
-    response = api.dispatch(
-        {
-            "method": "command.submit",
-            "params": request.to_dict(),
-        }
-    )
-    result = response["result"]["result"]
-
-    assert response["schema_version"] == 1
-    assert response["ok"] is True
-    assert response["result"]["schema_version"] == 2
-    assert response["result"]["disposition"] == DISPOSITION_TERMINAL_ACCEPTED
-    assert result == {
-        "target": {"worker_id": "worker-public"},
-        "pending": {
-            "id": "pending-" + ("a" * 24),
-            "fingerprint": "b" * 24,
-        },
-        "choice": {"choice_id": "choice-" + ("c" * 24)},
-        "delivery_state": "submitted",
-        "transport_state": "submitted",
-        "observed_pending_state": "pending_observation",
-    }
-    assert "sentinel-private" not in json.dumps(response, sort_keys=True)
-    _assert_no_public_json_forbidden(response)
 
 
 @pytest.mark.parametrize(
@@ -537,7 +468,7 @@ def test_daemon_pending_matches_shared_durable_projection_and_fingerprint(
         recompute_pending_content_fingerprint(degraded)
         != baseline["content_fingerprint"]
     )
-    merge_backend_pending(
+    apply_test_backend_pending(
         db_path,
         snapshot.host_id,
         "worker-1",
@@ -725,7 +656,7 @@ def test_pending_store_projection_reads_snapshot_and_overlay_atomically(
     )
     init_store(db_path)
     save_snapshot(db_path, snapshot_a)
-    merge_backend_pending(
+    apply_test_backend_pending(
         db_path,
         config.host_id,
         "worker-1",
@@ -757,7 +688,7 @@ def test_pending_store_projection_reads_snapshot_and_overlay_atomically(
         try:
             assert allow_writer.wait(timeout=5)
             save_snapshot(db_path, snapshot_b)
-            merge_backend_pending(
+            apply_test_backend_pending(
                 db_path,
                 config.host_id,
                 "worker-1",
@@ -1000,7 +931,6 @@ def test_daemon_turn_list_is_store_projection_only(
             "limit": 17,
             "cursor": "twlist1.public",
             "since": None,
-            "turn_model": "observed",
         }
         for call in projection_calls
     )
@@ -2188,7 +2118,6 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         policy: Any,
         agent_event_host_id: str | None = None,
         agent_event_retention_days: int | None = None,
-        turn_model: str = "legacy",
         acknowledged_final_retention_days: int = 30,
         acknowledged_final_retention_count: int = 4096,
         command_retry_horizon_seconds: int = 604_800,
@@ -2198,7 +2127,6 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         now: str | None = None,
     ) -> dict[str, Any]:
         assert now is None
-        assert turn_model == "observed"
         calls.append(
             (
                 path,
@@ -4681,7 +4609,7 @@ def test_isolated_daemon_survives_deterministic_real_wal_retirement_without_reso
             )
         ],
     )
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         config.host_id,
         worker.id,

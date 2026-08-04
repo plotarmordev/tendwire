@@ -273,9 +273,7 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
             "batch_size": 5,
             "examined": 0,
             "deleted": 0,
-            "tombstoned": 0,
             "remaining_candidates": False,
-            "replay_identity_retained": True,
         },
         "final_retention": {
             "examined": 0,
@@ -296,23 +294,6 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
             "examined": 0,
             "stale_active": 0,
             "deleted": 0,
-            "remaining_candidates": False,
-        },
-        "herdr_turns": {
-            "schema_version": 1,
-            "ok": True,
-            "status": "ok",
-            "scope": "database",
-            "host_id": None,
-            "dry_run": False,
-            "retention_days": 36500,
-            "retention_count": 100,
-            "cutoff_at": "1926-02-04T00:00:00+00:00",
-            "batch_size": 5,
-            "examined": 0,
-            "deleted": 0,
-            "deleted_completions": 0,
-            "deleted_watermarks": 0,
             "remaining_candidates": False,
         },
         "batch_size": 5,
@@ -378,18 +359,6 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
     assert cleanup["snapshots"]["examined"] == 0
     assert cleanup["outbox"]["updated"] == 0
     assert cleanup["turn_content"]["examined"] == 0
-    assert cleanup["herdr_turns"] == {
-        "dry_run": True,
-        "retention_days": 30,
-        "retention_count": 4096,
-        "cutoff_at": "2025-12-11T00:00:00+00:00",
-        "batch_size": 100,
-        "examined": 0,
-        "deleted": 0,
-        "deleted_completions": 0,
-        "deleted_watermarks": 0,
-        "remaining_candidates": False,
-    }
     assert cleanup["command_requests"] == {
         "ok": True,
         "status": "ok",

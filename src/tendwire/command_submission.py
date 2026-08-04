@@ -73,7 +73,7 @@ from .store.sqlite import (
 
 HERDR_BACKEND = "herdr"
 _MUTATING_ACTIONS = frozenset(
-    {"send_instruction", "answer_pending", "answer_decision"}
+    {"send_instruction", "answer_decision"}
 )
 _DISALLOWED_SEND_STATUSES = frozenset({"closed", "failed", "unknown"})
 _AMBIGUOUS_BINDING_REASONS = frozenset({"duplicate_backend_target", "not_unique"})
@@ -98,10 +98,9 @@ class AcpPromptRoute(Protocol):
         on_send_start: Callable[[], None] | None = None,
     ) -> object: ...
 
-    # Production routes may expose a context manager that fences their exact
-    # generation from the final authority check through the prompt-frame
-    # acknowledgement.  Test and third-party routes remain compatible without
-    # it; submit_acp_command probes this method dynamically.
+    # Routes may expose a context manager that fences their exact generation
+    # from the final authority check through the prompt-frame acknowledgement.
+    # Routes without it retain the final authority checks around submission.
     def prepare(self) -> Any: ...
 
     @property
@@ -363,7 +362,6 @@ def _decision_claim_has_exact_route(claim: Any) -> bool:
         and not isinstance(claim.option_count, bool)
         and claim.option_count >= 1
         and isinstance(getattr(claim, "option_refs", None), tuple)
-        and getattr(claim, "route_kind", None) in {"legacy", "acp_permission"}
         and (
             (claim.text is None and bool(claim.option_refs))
             or (
@@ -389,7 +387,6 @@ def _same_decision_route(left: Any, right: Any) -> bool:
             left.option_count,
             left.option_refs,
             left.text,
-            left.route_kind,
         )
         == (
             right.worker_id,
@@ -401,14 +398,8 @@ def _same_decision_route(left: Any, right: Any) -> bool:
             right.option_count,
             right.option_refs,
             right.text,
-            right.route_kind,
         )
     )
-
-
-def _decision_uses_acp_binding(_config: Config, decision: Any) -> bool:
-    """Classify from durable provenance, independent of current liveness."""
-    return getattr(decision, "route_kind", "legacy") == "acp_permission"
 
 
 class PreSendCertainty(Enum):
@@ -639,9 +630,8 @@ def _envelope_from_receipt(
         "state",
         "status",
         "result_json",
-        "legacy_collision",
     }
-    if not required.issubset(receipt) or receipt.get("legacy_collision") is not False:
+    if not required.issubset(receipt):
         return _backend_uncertain(
             request,
             "stored request receipt is malformed; not retrying mutation",
@@ -705,7 +695,6 @@ def _reserve_canonical_request(
             public_worker_id=canonical.public_worker_id,
             pending_result_json=envelope_to_receipt_json(pending),
             selector_proof=_selector_proof(request),
-            legacy_raw_payload_fingerprint=request.payload_fingerprint(),
         )
     except Exception:  # noqa: BLE001
         try:
@@ -902,7 +891,6 @@ def _reserve_terminal_replay(
             # proven equivalence with a different one, and overwriting it would
             # strand a later retry of the request as it was actually issued.
             selector_proof=_stored_selector_proof(previous_receipt),
-            legacy_raw_payload_fingerprint=request.payload_fingerprint(),
             event_payload=_transition_payload(
                 request,
                 worker_id=canonical.public_worker_id,
@@ -1569,8 +1557,6 @@ def _receipt_authority(
     stored reservation was abandoned before any send and the normal path may
     re-drive it.
     """
-    if receipt.get("legacy_collision") is not False:
-        return _receipt_malformed(request)
     if receipt.get("action") != request.action:
         return _duplicate_request(request)
 
@@ -1723,8 +1709,6 @@ def replay_command_receipt(
         return None
     if not isinstance(receipt, Mapping):
         return None
-    if receipt.get("legacy_collision") is not False:
-        return _receipt_malformed(request)
     if receipt.get("action") != request.action:
         return _duplicate_request(request)
     proven = _proven_replay_worker_id(
@@ -2053,11 +2037,6 @@ def _submit_command_v2(
         return _execute_non_mutating(config, request)
     if request.dry_run:
         return _mutation_dry_run(request)
-    if request.action == "answer_pending":
-        return _backend_unavailable(
-            request,
-            "legacy pane choices are unavailable; use an ACP permission decision",
-        )
     if request.action == "send_instruction":
         # Valid live instructions are consumed by submit_acp_command before this
         # shared parser path. Never expose a second command transport.
@@ -2117,16 +2096,6 @@ def _submit_command_v2(
         return _answer_in_progress(request, receipt_reserved=True)
 
     if answer_pre_send is None:
-        if not _decision_uses_acp_binding(config, validated):
-            unavailable = _backend_unavailable(
-                request,
-                "legacy permission decisions are unavailable; ACP authority is required",
-            )
-            return (
-                _request_in_progress(request)
-                if takeover is not None
-                else unavailable
-            )
         try:
             owns_decision = bool(
                 acp_permission_router is not None

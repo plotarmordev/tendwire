@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..config import DEFAULT_TURN_MODEL, Config
+from ..config import Config
 from ..core.agent_events import AgentEvent, agent_event
 from ..core.models import WorkerBinding, stable_fingerprint
 from ..store.sqlite import (
@@ -416,8 +416,6 @@ class AcpSessionIngestor:
                 marker,
                 expected_binding=self.binding,
                 content=content,
-                observed_at=marker.observed_at,
-                turn_model=DEFAULT_TURN_MODEL,
             )
         except BaseException:
             self._restore_speculation(checkpoint, prior_turn_state)
@@ -508,8 +506,6 @@ class AcpSessionIngestor:
                 event,
                 expected_binding=self.binding,
                 content=projection,
-                observed_at=event.observed_at,
-                turn_model=DEFAULT_TURN_MODEL,
             )
         except BaseException:
             self._restore_speculation(checkpoint, prior_turn_state)

@@ -19,11 +19,11 @@ from tendwire.store.sqlite import (
     init_store,
     latest_snapshot,
     list_worker_bindings,
-    merge_turn_content,
     save_snapshot,
     turns_payload_from_store,
     upsert_worker_bindings,
 )
+from .store_helpers import apply_test_turn_refresh
 
 
 HOST_ID = "snapshot-retention-host"
@@ -147,7 +147,7 @@ def _assert_continuity_integrity(db_path: Path) -> None:
     with sqlite3.connect(str(db_path)) as conn:
         assert conn.execute("PRAGMA user_version").fetchone() == (
             store_sqlite.STORE_SCHEMA_VERSION,
-        ) == (28,)
+        )
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         current_counts = conn.execute(
             """
@@ -170,7 +170,7 @@ def _merge_continuity_final(
     worker_id: str,
     observed_at: str,
 ) -> dict[str, Any]:
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         worker_id,
@@ -325,7 +325,7 @@ def _empty_snapshot(db_path: Path, *, second: int) -> Snapshot:
 def _seed_complete_final(db_path: Path, snapshot: Snapshot) -> tuple[str, str]:
     init_store(db_path)
     save_snapshot(db_path, snapshot)
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         WORKER_ID,
@@ -489,7 +489,7 @@ def test_missing_identity_merge_persists_nonpollable_hold_on_current_placeholder
     init_store(db_path)
     assert save_snapshot(db_path, snapshot) is True
 
-    changed = merge_turn_content(
+    changed = apply_test_turn_refresh(
         db_path,
         HOST_ID,
         WORKER_ID,
@@ -546,7 +546,7 @@ def test_worker_id_reuse_binds_each_root_to_immutable_stable_key(
     )
     init_store(db_path)
     save_snapshot(db_path, first)
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         WORKER_ID,
@@ -577,7 +577,7 @@ def test_worker_id_reuse_binds_each_root_to_immutable_stable_key(
     )
     assert second.workers[0].fingerprint != first.workers[0].fingerprint
     save_snapshot(db_path, second)
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         WORKER_ID,
@@ -660,7 +660,7 @@ def test_same_source_content_isolated_across_owner_change_and_restart(
         "complete": True,
         "has_open_turn": False,
     }
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         WORKER_ID,
@@ -689,7 +689,7 @@ def test_same_source_content_isolated_across_owner_change_and_restart(
 
     second = owner_snapshot(STABLE_KEY_B, 2)
     assert save_snapshot(db_path, second) is True
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         WORKER_ID,
@@ -698,7 +698,7 @@ def test_same_source_content_isolated_across_owner_change_and_restart(
     ) == 1
     init_store(db_path)
     assert save_snapshot(db_path, second) is True
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         WORKER_ID,
@@ -757,7 +757,7 @@ def test_missing_owner_replay_holds_without_overwriting_existing_owner_root(
         "complete": True,
         "has_open_turn": False,
     }
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         WORKER_ID,
@@ -777,7 +777,7 @@ def test_missing_owner_replay_holds_without_overwriting_existing_owner_root(
         timestamp=datetime(2026, 1, 1, 0, 0, 2, tzinfo=timezone.utc),
     )
     assert save_snapshot(db_path, missing) is True
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         WORKER_ID,
@@ -786,7 +786,7 @@ def test_missing_owner_replay_holds_without_overwriting_existing_owner_root(
     ) == 1
     init_store(db_path)
     assert save_snapshot(db_path, missing) is True
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         WORKER_ID,
@@ -934,7 +934,7 @@ def test_snapshot_omission_preserves_observed_source_provenance(
     original = _snapshot(db_path)
     init_store(db_path)
     save_snapshot(db_path, original)
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         WORKER_ID,
@@ -1094,7 +1094,7 @@ def test_same_owner_exact_source_survives_worker_fingerprint_space_and_source_ch
     assert first.workers[0].fingerprint != second.workers[0].fingerprint
     assert save_snapshot(db_path, second) is True
     upsert_worker_bindings(db_path, [_private_binding(second, PRIVATE_ROUTE_B)])
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         "worker-b",
@@ -1142,7 +1142,7 @@ def test_same_owner_exact_source_survives_worker_fingerprint_space_and_source_ch
 
     init_store(db_path)
     assert save_snapshot(db_path, second) is True
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         "worker-b",

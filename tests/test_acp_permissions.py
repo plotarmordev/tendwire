@@ -422,31 +422,6 @@ def test_failed_permission_frame_retires_overlay_without_retry(
     broker.close()
 
 
-def test_v27_provenance_migration_preserves_stale_pending_state(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "v26.db"
-    with sqlite3.connect(db_path) as conn:
-        store_sqlite._run_migrations(conn, target_version=26)
-        conn.execute(
-            """
-            INSERT INTO backend_pending (
-                host_id, worker_id, payload_json, observed_at,
-                revision_digest, choice_routes_json,
-                binding_private_fingerprint, observed_turn_target_value,
-                observation_state, freshness, updated_at
-            ) VALUES ('host', 'worker', '{}', '2026-01-01T00:00:00+00:00',
-                      '', '{}', '', '', 'failed', 'stale',
-                      '2026-01-01T00:00:00+00:00')
-            """
-        )
-        conn.commit()
-    store_sqlite.init_store(db_path)
-    with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone() == (28,)
-        assert conn.execute(
-            "SELECT freshness, route_kind FROM backend_pending"
-        ).fetchone() == ("stale", "legacy")
 
 
 def test_daemon_routes_acp_permission_answers_without_a_prompt_route(

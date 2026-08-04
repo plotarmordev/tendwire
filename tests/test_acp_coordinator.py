@@ -1077,6 +1077,10 @@ def _seed(config: Config) -> Worker:
         name="worker",
         status="idle",
         fingerprint="worker-fingerprint",
+        meta={
+            "stable_key": "wsk1_" + ("a" * 64),
+            "stable_key_version": 1,
+        },
     )
     save_snapshot(
         config.db_path,

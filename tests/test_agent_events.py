@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import sqlite3
 import threading
 import time
@@ -21,6 +20,8 @@ from tendwire.core.agent_events import (
 )
 from tendwire.core.models import WorkerBinding
 from tendwire.store import sqlite as store_sqlite
+
+from .store_helpers import record_test_agent_event, read_public_test_agent_events
 
 
 # Exact production table shapes from schema v22 and v23.  These fixtures do
@@ -181,9 +182,9 @@ def test_append_is_ordered_and_replay_is_idempotent(tmp_path: Path) -> None:
     first = _message_event(sequence=10)
     second = _message_event(sequence=11, text="world")
 
-    inserted = store_sqlite.append_agent_event(db_path, "host-1", first)
-    replayed = store_sqlite.append_agent_event(db_path, "host-1", first)
-    later = store_sqlite.append_agent_event(db_path, "host-1", second)
+    inserted = record_test_agent_event(db_path, "host-1", first)
+    replayed = record_test_agent_event(db_path, "host-1", first)
+    later = record_test_agent_event(db_path, "host-1", second)
 
     assert inserted.inserted is True
     assert replayed.inserted is False
@@ -201,10 +202,10 @@ def test_deterministic_identity_rejects_changed_replay(tmp_path: Path) -> None:
     original = _message_event(sequence=4, text="original")
     corrupt_replay = _message_event(sequence=4, text="changed")
     assert original.event_id == corrupt_replay.event_id
-    store_sqlite.append_agent_event(db_path, "host-1", original)
+    record_test_agent_event(db_path, "host-1", original)
 
     with pytest.raises(AgentEventIdentityConflict):
-        store_sqlite.append_agent_event(db_path, "host-1", corrupt_replay)
+        record_test_agent_event(db_path, "host-1", corrupt_replay)
 
     stored = store_sqlite.list_agent_events(db_path, "host-1")
     assert len(stored) == 1
@@ -235,9 +236,9 @@ def test_source_identity_reuse_cannot_evade_conflict_by_changing_kind_or_sequenc
         payload={"text": "hello"},
     )
     assert original_with_id.event_id == changed_kind.event_id
-    store_sqlite.append_agent_event(db_path, "host-1", original_with_id)
+    record_test_agent_event(db_path, "host-1", original_with_id)
     with pytest.raises(AgentEventIdentityConflict):
-        store_sqlite.append_agent_event(db_path, "host-1", changed_kind)
+        record_test_agent_event(db_path, "host-1", changed_kind)
 
     changed_sequence_kind = agent_event(
         kind="plan",
@@ -248,9 +249,9 @@ def test_source_identity_reuse_cannot_evade_conflict_by_changing_kind_or_sequenc
         payload={"entries": []},
     )
     assert original.event_id == changed_sequence_kind.event_id
-    store_sqlite.append_agent_event(db_path, "host-2", original)
+    record_test_agent_event(db_path, "host-2", original)
     with pytest.raises(AgentEventIdentityConflict):
-        store_sqlite.append_agent_event(db_path, "host-2", changed_sequence_kind)
+        record_test_agent_event(db_path, "host-2", changed_sequence_kind)
 
 
 def test_private_ids_and_payload_never_enter_public_projection(tmp_path: Path) -> None:
@@ -270,7 +271,7 @@ def test_private_ids_and_payload_never_enter_public_projection(tmp_path: Path) -
             "cwd": "/home/smith/private-repository",
         },
     )
-    store_sqlite.append_agent_event(db_path, "host-1", event)
+    record_test_agent_event(db_path, "host-1", event)
 
     private = store_sqlite.list_agent_events(
         db_path,
@@ -279,7 +280,7 @@ def test_private_ids_and_payload_never_enter_public_projection(tmp_path: Path) -
     )
     assert private[0].event.source_item_id == "item-secret"
     assert private[0].event.payload["cwd"] == "/home/smith/private-repository"
-    public = store_sqlite.list_public_agent_events(db_path, "host-1")
+    public = read_public_test_agent_events(db_path, "host-1")
     assert public[0]["payload"] == {"text": "safe status"}
     encoded = repr(public[0])
     assert "session-secret" not in encoded
@@ -310,8 +311,8 @@ def test_thought_events_are_private_and_not_publicly_listed(tmp_path: Path) -> N
         source_sequence=1,
         payload={"text": "reasoning summary"},
     )
-    store_sqlite.append_agent_event(db_path, "host-1", thought)
-    assert store_sqlite.list_public_agent_events(db_path, "host-1") == ()
+    record_test_agent_event(db_path, "host-1", thought)
+    assert read_public_test_agent_events(db_path, "host-1") == ()
     assert store_sqlite.list_agent_events(db_path, "host-1")[0].event.payload == {
         "text": "reasoning summary"
     }
@@ -339,8 +340,8 @@ def test_tool_and_plan_events_are_private_only(kind: str, tmp_path: Path) -> Non
         payload={"content": [{"type": "text", "text": "private tool data"}]},
     )
     db_path = tmp_path / f"{kind}.db"
-    store_sqlite.append_agent_event(db_path, "host-1", event)
-    assert store_sqlite.list_public_agent_events(db_path, "host-1") == ()
+    record_test_agent_event(db_path, "host-1", event)
+    assert read_public_test_agent_events(db_path, "host-1") == ()
     assert "private tool data" in repr(
         store_sqlite.list_agent_events(db_path, "host-1")
     )
@@ -363,8 +364,8 @@ def test_queries_filter_worker_session_turn_and_cursor(tmp_path: Path) -> None:
         source_sequence=2,
         payload={"entries": [{"content": "test", "status": "pending"}]},
     )
-    first_result = store_sqlite.append_agent_event(db_path, "host-1", first)
-    store_sqlite.append_agent_event(db_path, "host-1", second)
+    first_result = record_test_agent_event(db_path, "host-1", first)
+    record_test_agent_event(db_path, "host-1", second)
 
     assert len(
         store_sqlite.list_agent_events(db_path, "host-1", worker_id="worker-1")
@@ -463,7 +464,7 @@ def test_journal_payload_is_adapter_neutral_and_preserves_namespaced_extensions(
         source_event_id="extension-event",
         payload=payload,
     )
-    store_sqlite.append_agent_event(tmp_path / "store.db", "host-1", event)
+    record_test_agent_event(tmp_path / "store.db", "host-1", event)
     stored = store_sqlite.list_agent_events(tmp_path / "store.db", "host-1")
     assert stored[0].event.source == "org.example.agent/v2"
     assert stored[0].event.payload == payload
@@ -509,25 +510,18 @@ def test_observed_at_is_strict_aware_and_canonical_utc() -> None:
         )
 
 
-def test_store_rejects_noncanonical_public_projection(tmp_path: Path) -> None:
-    event = _message_event(sequence=1)
-    tampered = replace(event, public_payload={"session_id": "private-session"})
-    with pytest.raises(ValueError, match="canonical agent event contract"):
-        store_sqlite.append_agent_event(tmp_path / "store.db", "host-1", tampered)
-
-
 def test_store_fails_closed_when_public_projection_is_corrupted(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "store.db"
-    store_sqlite.append_agent_event(db_path, "host-1", _message_event(sequence=1))
+    record_test_agent_event(db_path, "host-1", _message_event(sequence=1))
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             "UPDATE agent_events SET public_payload_json = ?",
             ('{"cwd":"/home/private","text":"safe"}',),
         )
     with pytest.raises(store_sqlite.StoreSchemaError, match="invalid_agent_event_row"):
-        store_sqlite.list_public_agent_events(db_path, "host-1")
+        read_public_test_agent_events(db_path, "host-1")
 
 
 def test_host_scoping_and_concurrent_replay_are_isolated(tmp_path: Path) -> None:
@@ -538,14 +532,14 @@ def test_host_scoping_and_concurrent_replay_are_isolated(tmp_path: Path) -> None
     with ThreadPoolExecutor(max_workers=8) as executor:
         results = list(
             executor.map(
-                lambda _: store_sqlite.append_agent_event(db_path, "host-1", event),
+                lambda _: record_test_agent_event(db_path, "host-1", event),
                 range(24),
             )
         )
     assert sum(result.inserted for result in results) == 1
     assert len({result.sequence for result in results}) == 1
 
-    other = store_sqlite.append_agent_event(db_path, "host-2", event)
+    other = record_test_agent_event(db_path, "host-2", event)
     assert other.inserted is True
     assert len(store_sqlite.list_agent_events(db_path, "host-1")) == 1
     assert len(store_sqlite.list_agent_events(db_path, "host-2")) == 1
@@ -554,76 +548,13 @@ def test_host_scoping_and_concurrent_replay_are_isolated(tmp_path: Path) -> None
         store_sqlite.list_agent_events(db_path, "   ")
 
 
-def test_binding_guard_and_event_append_are_one_atomic_operation(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "store.db"
-    binding = WorkerBinding(
-        host_id="host-1",
-        worker_id="worker-1",
-        worker_fingerprint="worker-fingerprint-1",
-        backend="herdr",
-        target_kind="pane",
-        target_value="pane-1",
-        turn_target_kind="pane",
-        turn_target_value="pane-1",
-        sendable=True,
-        observed_at="2026-07-31T00:00:00+00:00",
-        expires_at="9999-12-31T23:59:59+00:00",
-        private_fingerprint="private-binding-generation-1",
-    )
-    store_sqlite.upsert_worker_bindings(db_path, [binding])
-    event = _message_event(sequence=1)
-
-    inserted = store_sqlite.append_agent_event_for_binding(
-        db_path,
-        "host-1",
-        event,
-        expected_binding=binding,
-    )
-    replayed = store_sqlite.append_agent_event_for_binding(
-        db_path,
-        "host-1",
-        event,
-        expected_binding=binding,
-    )
-    assert (inserted.status, inserted.inserted, inserted.sequence) == (
-        "inserted",
-        True,
-        replayed.sequence,
-    )
-    assert (replayed.status, replayed.inserted) == ("replayed", False)
-
-    replacement = replace(
-        binding,
-        worker_id="worker-replacement",
-        worker_fingerprint="worker-fingerprint-2",
-        observed_at="2026-07-31T00:00:01+00:00",
-    )
-    store_sqlite.upsert_worker_bindings(db_path, [replacement])
-    rejected_event = _message_event(sequence=2, text="must not persist")
-    rejected = store_sqlite.append_agent_event_for_binding(
-        db_path,
-        "host-1",
-        rejected_event,
-        expected_binding=binding,
-    )
-    assert (rejected.status, rejected.sequence, rejected.inserted) == (
-        "binding_changed",
-        None,
-        False,
-    )
-    assert [
-        stored.event.payload["text"]
-        for stored in store_sqlite.list_agent_events(db_path, "host-1")
-    ] == ["hello"]
 
 
 def test_database_constraints_and_indexes_cover_public_and_source_identity(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "store.db"
-    store_sqlite.append_agent_event(db_path, "host-1", _message_event(sequence=1))
+    record_test_agent_event(db_path, "host-1", _message_event(sequence=1))
     with sqlite3.connect(db_path) as conn:
         indexes = {
             str(row[1]) for row in conn.execute("PRAGMA index_list(agent_events)")
@@ -645,7 +576,7 @@ def test_database_constraints_and_indexes_cover_public_and_source_identity(
             )
 
 
-def test_retention_removes_private_payload_but_preserves_replay_identity(
+def test_retention_removes_private_payload_without_replay_state(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "store.db"
@@ -657,8 +588,8 @@ def test_retention_removes_private_payload_but_preserves_replay_identity(
         _message_event(sequence=2, text="recent", visibility="private"),
         observed_at="2026-07-30T00:00:00+00:00",
     )
-    inserted = store_sqlite.append_agent_event(db_path, "host-1", old)
-    store_sqlite.append_agent_event(db_path, "host-1", recent)
+    inserted = record_test_agent_event(db_path, "host-1", old)
+    record_test_agent_event(db_path, "host-1", recent)
 
     result = store_sqlite.cleanup_agent_event_retention(
         db_path,
@@ -667,23 +598,19 @@ def test_retention_removes_private_payload_but_preserves_replay_identity(
         now="2026-07-31T00:00:00+00:00",
     )
 
-    assert result["deleted"] == result["tombstoned"] == 1
+    assert result["deleted"] == 1
+    assert "tombstoned" not in result
     assert [item.event.payload["text"] for item in store_sqlite.list_agent_events(db_path, "host-1")] == ["recent"]
     with sqlite3.connect(db_path) as conn:
-        tombstone = conn.execute(
-            "SELECT sequence, length(replay_fingerprint) "
-            "FROM agent_event_tombstones WHERE host_id = ? AND event_id = ?",
-            ("host-1", old.event_id),
-        ).fetchone()
         encoded = "\n".join(conn.iterdump())
-    assert tombstone == (inserted.sequence, 64)
+    assert "agent_event_tombstones" not in encoded
     assert "private historical payload" not in encoded
 
-    replay = store_sqlite.append_agent_event(db_path, "host-1", old)
-    assert replay.inserted is False
-    assert replay.sequence == inserted.sequence
+    replay = record_test_agent_event(db_path, "host-1", old)
+    assert replay.inserted is True
+    assert replay.sequence > inserted.sequence
     with pytest.raises(AgentEventIdentityConflict):
-        store_sqlite.append_agent_event(
+        record_test_agent_event(
             db_path,
             "host-1",
             _message_event(sequence=1, text="changed", visibility="private"),
@@ -720,28 +647,7 @@ def test_retention_streams_metadata_for_exact_16_mib_private_row(
         payload=payload,
         observed_at="2026-06-01T00:00:00+00:00",
     )
-    store_sqlite.append_agent_event(db_path, "host-1", event)
-    replay_contract = {
-        "event_id": event.event_id,
-        "kind": event.kind,
-        "source": event.source,
-        "worker_id": event.worker_id,
-        "visibility": event.visibility,
-        "source_session_id": event.source_session_id,
-        "source_turn_id": event.source_turn_id,
-        "source_item_id": event.source_item_id,
-        "source_message_id": event.source_message_id,
-        "source_event_id": event.source_event_id,
-        "source_sequence": event.source_sequence,
-        "payload_fingerprint": event.payload_fingerprint,
-        "public_payload_fingerprint": hashlib.sha256(
-            store_sqlite._canonical_json(event.public_payload).encode("utf-8")
-        ).hexdigest(),
-    }
-    expected_fingerprint = hashlib.sha256(
-        store_sqlite._canonical_json(replay_contract).encode("utf-8")
-    ).hexdigest()
-
+    record_test_agent_event(db_path, "host-1", event)
     assert "private_payload_json" not in (
         store_sqlite._AGENT_EVENT_RETENTION_SELECT.lower()
     )
@@ -760,14 +666,13 @@ def test_retention_streams_metadata_for_exact_16_mib_private_row(
     _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
     tracemalloc.stop()
 
-    assert result["deleted"] == result["tombstoned"] == 1
+    assert result["deleted"] == 1
     assert peak_bytes < 8 * 1024 * 1024
     with sqlite3.connect(db_path) as conn:
         assert conn.execute(
-            "SELECT replay_fingerprint FROM agent_event_tombstones "
-            "WHERE host_id = ? AND event_id = ?",
-            ("host-1", event.event_id),
-        ).fetchone() == (expected_fingerprint,)
+            "SELECT COUNT(*) FROM agent_events WHERE host_id = ?",
+            ("host-1",),
+        ).fetchone() == (0,)
 
 
 def test_automatic_maintenance_retires_agent_events_only_when_due(
@@ -782,8 +687,8 @@ def test_automatic_maintenance_retires_agent_events_only_when_due(
         _message_event(sequence=2, text="recent", visibility="private"),
         observed_at="2026-01-31T23:00:00+00:00",
     )
-    store_sqlite.append_agent_event(db_path, "host-1", old)
-    store_sqlite.append_agent_event(db_path, "host-1", recent)
+    record_test_agent_event(db_path, "host-1", old)
+    record_test_agent_event(db_path, "host-1", recent)
     policy = store_sqlite.SnapshotRetentionPolicy(
         retention_days=30,
         retention_count=100,
@@ -802,7 +707,7 @@ def test_automatic_maintenance_retires_agent_events_only_when_due(
         _message_event(sequence=3, text="late old", visibility="private"),
         observed_at="2026-01-02T00:00:00+00:00",
     )
-    store_sqlite.append_agent_event(db_path, "host-1", late_old)
+    record_test_agent_event(db_path, "host-1", late_old)
     not_due = store_sqlite.maybe_run_automatic_store_maintenance(
         db_path,
         policy=policy,
@@ -828,10 +733,10 @@ def test_automatic_maintenance_retires_agent_events_only_when_due(
         item.event.payload["text"]
         for item in store_sqlite.list_agent_events(db_path, "host-1")
     ] == ["recent"]
-    replay = store_sqlite.append_agent_event(db_path, "host-1", old)
-    assert replay.inserted is False
+    replay = record_test_agent_event(db_path, "host-1", old)
+    assert replay.inserted is True
     with pytest.raises(AgentEventIdentityConflict):
-        store_sqlite.append_agent_event(
+        record_test_agent_event(
             db_path,
             "host-1",
             _message_event(sequence=1, text="changed", visibility="private"),
@@ -840,30 +745,27 @@ def test_automatic_maintenance_retires_agent_events_only_when_due(
 
 def test_automatic_agent_retention_failure_does_not_advance_cadence(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db_path = tmp_path / "automatic-agent-rollback.db"
     old = replace(
         _message_event(sequence=1, visibility="private"),
         observed_at="2026-01-01T00:00:00+00:00",
     )
-    inserted = store_sqlite.append_agent_event(db_path, "host-1", old)
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO agent_event_tombstones (
-                host_id, event_id, sequence, replay_fingerprint, retired_at
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                "host-1",
-                old.event_id,
-                inserted.sequence,
-                "0" * 64,
-                "2026-01-02T00:00:00+00:00",
-            ),
-        )
+    record_test_agent_event(db_path, "host-1", old)
+    original_cleanup = store_sqlite._cleanup_agent_event_retention_conn
 
-    with pytest.raises(sqlite3.IntegrityError):
+    def fail_after_cleanup(*args: object, **kwargs: object) -> dict[str, object]:
+        original_cleanup(*args, **kwargs)
+        raise RuntimeError("controlled retention failure")
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "_cleanup_agent_event_retention_conn",
+        fail_after_cleanup,
+    )
+
+    with pytest.raises(RuntimeError, match="controlled retention failure"):
         store_sqlite.maybe_run_automatic_store_maintenance(
             db_path,
             policy=store_sqlite.SnapshotRetentionPolicy(
@@ -884,7 +786,7 @@ def test_automatic_agent_retention_failure_does_not_advance_cadence(
         assert conn.execute("SELECT COUNT(*) FROM agent_events").fetchone() == (1,)
 
 
-def test_retention_conflict_rolls_back_and_serializes_concurrent_append(
+def test_retention_cleanup_serializes_concurrent_append_and_both_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -893,22 +795,20 @@ def test_retention_conflict_rolls_back_and_serializes_concurrent_append(
         _message_event(sequence=1, visibility="private"),
         observed_at="2026-01-01T00:00:00+00:00",
     )
-    store_sqlite.append_agent_event(db_path, "host-1", old)
+    record_test_agent_event(db_path, "host-1", old)
     entered = threading.Event()
     release = threading.Event()
-    original = store_sqlite._agent_event_retention_candidate
+    original_cleanup = store_sqlite._cleanup_agent_event_retention_conn
 
-    def blocking_candidate(
-        row: tuple[object, ...],
-    ) -> tuple[str, str, int, str, str]:
+    def blocking_cleanup(*args: object, **kwargs: object) -> dict[str, object]:
         entered.set()
         assert release.wait(timeout=5)
-        return original(row)
+        return original_cleanup(*args, **kwargs)
 
     monkeypatch.setattr(
         store_sqlite,
-        "_agent_event_retention_candidate",
-        blocking_candidate,
+        "_cleanup_agent_event_retention_conn",
+        blocking_cleanup,
     )
     with ThreadPoolExecutor(max_workers=2) as executor:
         cleanup = executor.submit(
@@ -920,7 +820,7 @@ def test_retention_conflict_rolls_back_and_serializes_concurrent_append(
         )
         assert entered.wait(timeout=5)
         append = executor.submit(
-            store_sqlite.append_agent_event,
+            record_test_agent_event,
             db_path,
             "host-1",
             _message_event(sequence=2, text="new", visibility="private"),
@@ -931,422 +831,15 @@ def test_retention_conflict_rolls_back_and_serializes_concurrent_append(
         assert cleanup.result(timeout=5)["deleted"] == 1
         assert append.result(timeout=5).inserted is True
 
-
-def test_retention_tombstone_conflict_rolls_back_active_event(tmp_path: Path) -> None:
-    db_path = tmp_path / "retention-rollback.db"
-    old = replace(
-        _message_event(sequence=1, visibility="private"),
-        observed_at="2026-01-01T00:00:00+00:00",
-    )
-    inserted = store_sqlite.append_agent_event(db_path, "host-1", old)
+    assert [
+        item.event.payload["text"]
+        for item in store_sqlite.list_agent_events(db_path, "host-1")
+    ] == ["new"]
     with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO agent_event_tombstones (
-                host_id, event_id, sequence, replay_fingerprint, retired_at
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                "host-1",
-                old.event_id,
-                inserted.sequence,
-                "0" * 64,
-                "2026-01-02T00:00:00+00:00",
-            ),
-        )
-
-    with pytest.raises(sqlite3.IntegrityError):
-        store_sqlite.cleanup_agent_event_retention(
-            db_path,
-            "host-1",
-            retention_days=7,
-            now="2026-02-01T00:00:00+00:00",
-        )
-
-    assert store_sqlite.list_agent_events(db_path, "host-1")[0].event == old
-    with sqlite3.connect(db_path) as conn:
-        assert conn.execute(
-            "SELECT replay_fingerprint FROM agent_event_tombstones "
-            "WHERE host_id = ? AND event_id = ?",
-            ("host-1", old.event_id),
-        ).fetchone() == ("0" * 64,)
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_journal_accepts_acp_sized_private_text(tmp_path: Path) -> None:
     event = _message_event(sequence=1, text="x" * (64 * 1024), visibility="private")
-    result = store_sqlite.append_agent_event(tmp_path / "store.db", "host-1", event)
+    result = record_test_agent_event(tmp_path / "store.db", "host-1", event)
     assert result.inserted is True
-
-
-def test_v23_to_v24_preserves_populated_journal_sequence(tmp_path: Path) -> None:
-    db_path = tmp_path / "v23-populated.db"
-    event = _message_event(sequence=81, text="x" * (60 * 1024), visibility="private")
-    with sqlite3.connect(db_path) as conn:
-        store_sqlite._run_migrations(conn, target_version=23)
-        conn.execute(
-            """
-            INSERT INTO agent_events (
-                sequence, host_id, event_id, kind, source, worker_id,
-                visibility, source_session_id, source_turn_id,
-                source_item_id, source_message_id, source_event_id,
-                source_sequence, observed_at, payload_fingerprint,
-                private_payload_json, public_payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                123,
-                "host-1",
-                event.event_id,
-                event.kind,
-                event.source,
-                event.worker_id,
-                event.visibility,
-                event.source_session_id,
-                event.source_turn_id,
-                event.source_item_id,
-                event.source_message_id,
-                event.source_event_id,
-                event.source_sequence,
-                event.observed_at,
-                event.payload_fingerprint,
-                store_sqlite._canonical_json(event.payload),
-                store_sqlite._canonical_json(event.public_payload),
-            ),
-        )
-        conn.commit()
-        store_sqlite._run_migrations(conn)
-        assert conn.execute("PRAGMA user_version").fetchone() == (
-            store_sqlite.STORE_SCHEMA_VERSION,
-        )
-        assert conn.execute(
-            "SELECT sequence FROM agent_events WHERE event_id = ?",
-            (event.event_id,),
-        ).fetchone() == (123,)
-        assert conn.execute(
-            "SELECT COUNT(*) FROM agent_event_tombstones"
-        ).fetchone() == (0,)
-
-    later = _message_event(sequence=82, text="later", visibility="private")
-    assert store_sqlite.append_agent_event(db_path, "host-1", later).sequence == 124
-
-
-def test_v24_to_v25_privatises_populated_tool_and_plan_rows(tmp_path: Path) -> None:
-    db_path = tmp_path / "v24-public-tools.db"
-    kinds = ("tool_call", "tool_call_update", "plan")
-    events = [
-        agent_event(
-            kind=kind,
-            source="acp",
-            worker_id="worker-1",
-            source_session_id="private-session",
-            source_sequence=index,
-            payload={"content": [{"type": "text", "text": f"private-{kind}"}]},
-            observed_at="2026-07-31T00:00:00+00:00",
-        )
-        for index, kind in enumerate(kinds, 1)
-    ]
-    with sqlite3.connect(db_path) as conn:
-        store_sqlite._run_migrations(conn, target_version=24)
-        conn.execute("DROP TABLE IF EXISTS agent_events")
-        conn.execute(
-            store_sqlite.CREATE_AGENT_EVENTS_TABLE.replace(
-                """kind NOT IN (
-            'thought', 'tool_call', 'tool_call_update', 'plan', 'extension'
-        ) OR visibility = 'private'""",
-                "kind NOT IN ('thought', 'extension') OR visibility = 'private'",
-            )
-        )
-        for sequence, event in enumerate(events, 41):
-            conn.execute(
-                """
-                INSERT INTO agent_events (
-                    sequence, host_id, event_id, kind, source, worker_id,
-                    visibility, source_session_id, source_turn_id,
-                    source_item_id, source_message_id, source_event_id,
-                    source_sequence, observed_at, payload_fingerprint,
-                    private_payload_json, public_payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    sequence,
-                    "host-1",
-                    event.event_id,
-                    event.kind,
-                    event.source,
-                    event.worker_id,
-                    "public",
-                    event.source_session_id,
-                    event.source_turn_id,
-                    event.source_item_id,
-                    event.source_message_id,
-                    event.source_event_id,
-                    event.source_sequence,
-                    event.observed_at,
-                    event.payload_fingerprint,
-                    store_sqlite._canonical_json(event.payload),
-                    store_sqlite._canonical_json(event.payload),
-                ),
-            )
-        conn.commit()
-        store_sqlite._run_migrations(conn)
-        assert conn.execute("PRAGMA user_version").fetchone() == (
-            store_sqlite.STORE_SCHEMA_VERSION,
-        )
-        assert conn.execute(
-            "SELECT sequence, kind, visibility, public_payload_json "
-            "FROM agent_events ORDER BY sequence"
-        ).fetchall() == [
-            (41, "tool_call", "private", "{}"),
-            (42, "tool_call_update", "private", "{}"),
-            (43, "plan", "private", "{}"),
-        ]
-        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-
-    tmp_path.chmod(0o700)
-    db_path.chmod(0o600)
-    assert store_sqlite.list_public_agent_events(db_path, "host-1") == ()
-    assert [
-        stored.event.kind
-        for stored in store_sqlite.list_agent_events(db_path, "host-1")
-    ] == list(kinds)
-
-
-@pytest.mark.parametrize(
-    ("source_version", "historical_ddl"),
-    (
-        (22, _HISTORICAL_V22_AGENT_EVENTS_DDL),
-        (23, _HISTORICAL_V23_AGENT_EVENTS_DDL),
-    ),
-)
-def test_authentic_populated_public_tool_migrations_reach_current_private_schema(
-    tmp_path: Path,
-    source_version: int,
-    historical_ddl: str,
-) -> None:
-    db_path = tmp_path / f"authentic-v{source_version}.db"
-    kinds = ("tool_call", "tool_call_update", "plan")
-    with sqlite3.connect(db_path) as conn:
-        store_sqlite._run_migrations(conn, target_version=source_version - 1)
-        conn.execute("DROP TABLE IF EXISTS agent_events")
-        conn.execute(historical_ddl)
-        for sequence, kind in enumerate(kinds, 51):
-            event = agent_event(
-                kind=kind,
-                source="acp",
-                worker_id="worker-1",
-                source_session_id="private-session",
-                source_sequence=sequence,
-                payload={"content": [{"type": "text", "text": f"private-{kind}"}]},
-                observed_at="2026-07-31T00:00:00+00:00",
-            )
-            event_id = event.event_id
-            if source_version == 22:
-                legacy_identity = {
-                    "schema_version": 1,
-                    "source": event.source,
-                    "session_id": event.source_session_id,
-                    "event_id": event.source_event_id,
-                    "sequence": event.source_sequence,
-                    "kind": event.kind,
-                }
-                event_id = hashlib.sha256(
-                    store_sqlite._canonical_json(legacy_identity).encode("utf-8")
-                ).hexdigest()
-            conn.execute(
-                """
-                INSERT INTO agent_events (
-                    sequence, host_id, event_id, kind, source, worker_id,
-                    visibility, source_session_id, source_turn_id,
-                    source_item_id, source_message_id, source_event_id,
-                    source_sequence, observed_at, payload_fingerprint,
-                    private_payload_json, public_payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, 'public', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    sequence,
-                    "host-1",
-                    event_id,
-                    event.kind,
-                    event.source,
-                    event.worker_id,
-                    event.source_session_id,
-                    event.source_turn_id,
-                    event.source_item_id,
-                    event.source_message_id,
-                    event.source_event_id,
-                    event.source_sequence,
-                    event.observed_at,
-                    event.payload_fingerprint,
-                    store_sqlite._canonical_json(event.payload),
-                    store_sqlite._canonical_json(event.payload),
-                ),
-            )
-        conn.execute(f"PRAGMA user_version = {source_version}")
-        conn.commit()
-
-        store_sqlite._run_migrations(conn)
-
-        assert conn.execute("PRAGMA user_version").fetchone() == (
-            store_sqlite.STORE_SCHEMA_VERSION,
-        )
-        assert conn.execute(
-            "SELECT sequence, kind, visibility, public_payload_json "
-            "FROM agent_events ORDER BY sequence"
-        ).fetchall() == [
-            (51, "tool_call", "private", "{}"),
-            (52, "tool_call_update", "private", "{}"),
-            (53, "plan", "private", "{}"),
-        ]
-        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-
-
-def test_v25_to_v26_retains_legacy_tombstones_as_dedup_only(tmp_path: Path) -> None:
-    db_path = tmp_path / "v25-tombstone.db"
-    legacy_event_id = "a" * 64
-    with sqlite3.connect(db_path) as conn:
-        store_sqlite._run_migrations(conn, target_version=25)
-        assert "observed_at" not in {
-            str(row[1])
-            for row in conn.execute("PRAGMA table_info(agent_event_tombstones)")
-        }
-        conn.execute(
-            """
-            INSERT INTO agent_event_tombstones (
-                host_id, event_id, sequence, replay_fingerprint, retired_at
-            ) VALUES ('host-1', ?, 1, ?, '2026-01-02T00:00:00+00:00')
-            """,
-            (legacy_event_id, "b" * 64),
-        )
-        conn.commit()
-        store_sqlite._run_migrations(conn)
-        assert conn.execute("PRAGMA user_version").fetchone() == (28,)
-        assert conn.execute(
-            "SELECT observed_at FROM agent_event_tombstones WHERE event_id = ?",
-            (legacy_event_id,),
-        ).fetchone() == (None,)
-
-    event = replace(
-        _message_event(sequence=901, visibility="private"),
-        observed_at="2020-01-01T00:00:00+00:00",
-    )
-    store_sqlite.append_agent_event(db_path, "host-1", event)
-    assert store_sqlite.cleanup_agent_event_retention(
-        db_path,
-        "host-1",
-        retention_days=1,
-        now="2021-01-01T00:00:00+00:00",
-    )["tombstoned"] == 1
-    with sqlite3.connect(db_path) as conn:
-        assert conn.execute(
-            "SELECT observed_at FROM agent_event_tombstones WHERE event_id = ?",
-            (event.event_id,),
-        ).fetchone() == ("2020-01-01T00:00:00+00:00",)
-
-
-@pytest.mark.parametrize("source_version", range(store_sqlite.STORE_SCHEMA_VERSION))
-def test_agent_event_schema_migrates_from_every_prior_version(
-    tmp_path: Path,
-    source_version: int,
-) -> None:
-    db_path = tmp_path / f"v{source_version}.db"
-    with sqlite3.connect(db_path) as conn:
-        conn.execute("CREATE TABLE durable_sentinel (value TEXT NOT NULL)")
-        conn.execute("INSERT INTO durable_sentinel VALUES ('preserved')")
-        conn.commit()
-        store_sqlite._run_migrations(conn, target_version=source_version)
-        store_sqlite._run_migrations(conn)
-        assert conn.execute("PRAGMA user_version").fetchone() == (
-            store_sqlite.STORE_SCHEMA_VERSION,
-        )
-        assert conn.execute("SELECT value FROM durable_sentinel").fetchone() == (
-            "preserved",
-        )
-        assert conn.execute(
-            "SELECT COUNT(*) FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'agent_events'"
-        ).fetchone() == (1,)
-        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-
-
-def test_v21_migration_is_idempotent_and_preserves_existing_store(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "store.db"
-    store_sqlite.init_store(db_path)
-    with sqlite3.connect(db_path) as conn:
-        conn.execute("DROP TABLE agent_events")
-        conn.execute("PRAGMA user_version = 21")
-
-    store_sqlite.init_store(db_path)
-    store_sqlite.init_store(db_path)
-    with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone() == (
-            store_sqlite.STORE_SCHEMA_VERSION,
-        )
-        columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(agent_events)")
-        }
-    assert {"sequence", "event_id", "private_payload_json"} <= columns
-
-
-def test_v22_migration_rekeys_legacy_event_identity_without_losing_sequence(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "v22-event.db"
-    event = _message_event(sequence=7)
-    legacy_identity = {
-        "schema_version": 1,
-        "source": event.source,
-        "session_id": event.source_session_id,
-        "event_id": event.source_event_id,
-        "sequence": event.source_sequence,
-        "kind": event.kind,
-    }
-    legacy_event_id = hashlib.sha256(
-        store_sqlite._canonical_json(legacy_identity).encode("utf-8")
-    ).hexdigest()
-    with sqlite3.connect(db_path) as conn:
-        store_sqlite._run_migrations(conn, target_version=22)
-        conn.execute(
-            """
-            INSERT INTO agent_events (
-                sequence, host_id, event_id, kind, source, worker_id,
-                visibility, source_session_id, source_turn_id,
-                source_item_id, source_message_id, source_event_id,
-                source_sequence, observed_at, payload_fingerprint,
-                private_payload_json, public_payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                19,
-                "host-1",
-                legacy_event_id,
-                event.kind,
-                event.source,
-                event.worker_id,
-                event.visibility,
-                event.source_session_id,
-                event.source_turn_id,
-                event.source_item_id,
-                event.source_message_id,
-                event.source_event_id,
-                event.source_sequence,
-                event.observed_at,
-                event.payload_fingerprint,
-                store_sqlite._canonical_json(event.payload),
-                store_sqlite._canonical_json(event.public_payload),
-            ),
-        )
-        conn.commit()
-        store_sqlite._run_migrations(conn)
-        row = conn.execute(
-            "SELECT sequence, event_id FROM agent_events"
-        ).fetchone()
-        assert row == (19, event.event_id)
-        assert conn.execute("PRAGMA user_version").fetchone() == (
-            store_sqlite.STORE_SCHEMA_VERSION,
-        )
-
-    replay = store_sqlite.append_agent_event(db_path, "host-1", event)
-    assert replay.inserted is False
-    assert replay.sequence == 19

@@ -24,9 +24,11 @@ def test_pane_label_is_public_but_cwd_and_target_are_private(tmp_path) -> None:
     assert bindings[0].target_value == "term-private"
 
 
-def test_turn_model_remains_content_not_identity() -> None:
+def test_llm_model_round_trip_and_turn_id_stability() -> None:
     base = {"host_id": "h", "worker_id": "w", "kind": "turn", "source": "acp", "complete": True}
     plain = Turn.from_dict(base)
-    modeled = Turn.from_dict({**base, "model": "claude"})
+    modeled = Turn.from_dict({**base, "model": "claude-fable-5"})
+    assert modeled.model == "claude-fable-5"
+    assert modeled.to_dict()["model"] == "claude-fable-5"
     assert plain.id == modeled.id
     assert plain.fingerprint != modeled.fingerprint

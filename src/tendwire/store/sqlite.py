@@ -31,7 +31,6 @@ from ..config import (
     DEFAULT_PENDING_STALE_GRACE_SECONDS,
     DEFAULT_SUBMISSION_HARD_TTL_SECONDS,
     DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS,
-    DEFAULT_TURN_MODEL,
 )
 from ..local_state import (
     EntryIdentity,
@@ -96,7 +95,6 @@ from ..core.models import (
     utc_timestamp,
 )
 from ..core.turns import (
-    InteractionChoice,
     PendingInteraction,
     PendingObservation,
     PendingObservedChoice,
@@ -143,21 +141,17 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 28
+STORE_SCHEMA_VERSION = 29
 CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
-_LEGACY_TURN_CLAIM_HARD_TTL_SECONDS = 86_400
 TURN_CHANGE_RETENTION_DAYS = 7
 TURN_CHANGE_RETENTION_COUNT = 100_000
 TURN_CHANGE_COMPACTION_BATCH_SIZE = 1_000
-HERDR_TURN_RETENTION_DAYS = 30
-HERDR_TURN_RETENTION_COUNT = 4096
-HERDR_TURN_RETENTION_BATCH_SIZE = 100
 TURN_SUBMISSION_OBSERVATION_ADOPTION_WINDOW_SECONDS = 60.0
 SUBMISSION_LINK_WINDOW_SECONDS = DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS
 SUBMISSION_HARD_TTL_SECONDS = DEFAULT_SUBMISSION_HARD_TTL_SECONDS
 # A send that has not produced an authoritative accepted/uncertain receipt
 # within the backend command timeout is no longer safe for instant linking.
-# Keep this classification local to the shadow linker: receipts and the
+# Keep this classification local to the observation linker: receipts and the
 # submission lifecycle remain authoritative and unchanged.
 SUBMISSION_SEND_ACK_TIMEOUT_SECONDS = 5.0
 TURN_LEDGER_BACKFILL_BATCH_SIZE = 500
@@ -204,7 +198,6 @@ _ATTENTION_SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 _LOGGER = logging.getLogger(__name__)
 _SUBMISSION_LINK_SWEEP_LAST_AT: dict[tuple[str, str, str], float] = {}
 _SUBMISSION_LINK_SWEEP_LOCK = threading.Lock()
-TURN_MODELS = frozenset({"legacy", "dual", "shadow", "observed"})
 DEFAULT_SUBMISSION_LINK_SWEEP_INTERVAL_SECONDS = 2.0
 _SUBMISSION_LINK_BACKOFF: dict[
     tuple[str, str, str, str], datetime | None
@@ -218,14 +211,6 @@ _SUBMISSION_LINK_BACKOFF_MISSING = object()
 # payload missing its version marker), so an unbounded skip would wedge the
 # link until process restart or hard TTL.
 _SUBMISSION_LINK_EMPTY_COMPONENT_RECHECK_SECONDS = 30.0
-
-
-def _submission_linking_enabled(turn_model: str) -> bool:
-    normalized = str(turn_model or "").strip().lower()
-    if normalized not in TURN_MODELS:
-        allowed = ", ".join(sorted(TURN_MODELS))
-        raise ValueError(f"turn_model must be one of: {allowed}")
-    return True
 
 
 def _submission_link_backoff_key(
@@ -354,16 +339,6 @@ def is_valid_turn_submission_state_transition(
 
 
 @dataclass(frozen=True)
-class Migration:
-    """One exact, transaction-external schema transition."""
-
-    from_version: int
-    to_version: int
-    apply: Callable[[sqlite3.Connection], None]
-
-
-
-@dataclass(frozen=True)
 class BackendPendingChoiceClaim:
     status: Literal[
         "claimed",
@@ -421,7 +396,6 @@ class BackendPendingDecisionClaim:
     option_count: int | None = None
     option_refs: tuple[str, ...] = ()
     text: str | None = None
-    route_kind: Literal["legacy", "acp_permission"] = "legacy"
 
 
 @dataclass(frozen=True)
@@ -443,7 +417,6 @@ class BackendPendingDecisionSend:
     option_count: int | None = None
     option_refs: tuple[str, ...] = ()
     text: str | None = None
-    route_kind: Literal["legacy", "acp_permission"] = "legacy"
 
 
 @dataclass(frozen=True)
@@ -509,41 +482,9 @@ class AppendProjectedAgentEventResult:
     event: AppendBoundAgentEventResult
     turn: TurnRefreshApplyResult | None = None
 
-
-@dataclass(frozen=True)
-class HerdrTurnWatermark:
-    """Durable replay position and retained completeness-break evidence."""
-
-    host_id: str
-    pane_id: str
-    turn_epoch: int
-    last_turn: int
-    completeness_break_count: int
-    last_completeness_break_reason: str | None
-    last_completeness_break_at: str | None
-    updated_at: str
-
-
-@dataclass(frozen=True)
-class HerdrTurnRefreshRetry:
-    """Durable local retry state for one Herdr completion refresh."""
-
-    host_id: str
-    pane_id: str
-    turn_epoch: int
-    turn: int
-    status: Literal["pending", "escalated"]
-    refresh_status: str
-    first_seen_at: str
-    last_attempt_at: str
-    next_attempt_at: str | None
-    attempt_count: int
-    escalated_at: str | None
-
-
 @dataclass(frozen=True)
 class _TurnContentMergeResult:
-    """Observation merge outcome and optional shadow-link settlement key."""
+    """Observation merge outcome and optional submission settlement key."""
 
     updated: int
     submission_link: tuple[str, str] | None = None
@@ -621,14 +562,6 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 """
 
-CREATE_LEGACY_SNAPSHOT_INDEXES = (
-    "CREATE INDEX IF NOT EXISTS idx_snapshots_host_id ON snapshots(host_id)",
-    "CREATE INDEX IF NOT EXISTS idx_snapshots_created_at ON snapshots(created_at)",
-    (
-        "CREATE INDEX IF NOT EXISTS idx_snapshots_content_fingerprint "
-        "ON snapshots(content_fingerprint)"
-    ),
-)
 
 CREATE_SNAPSHOT_INDEXES = (
     (
@@ -643,9 +576,6 @@ CREATE_SNAPSHOT_INDEXES = (
 # Leading "~" sorts after every canonical timestamp under SQLite BINARY
 # collation, so raw indexed age comparisons never delete unknown history.
 _SNAPSHOT_CREATED_AT_QUARANTINE = "~invalid-snapshot-created-at"
-_LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE = (
-    "9999-12-31T23:59:59.999999+00:00"
-)
 
 CREATE_STORE_MAINTENANCE_STATE_TABLE = """
 CREATE TABLE IF NOT EXISTS store_maintenance_state (
@@ -675,20 +605,6 @@ INSERT INTO store_maintenance_state (
 ON CONFLICT(scope) DO NOTHING
 """
 
-CREATE_LEGACY_COMMAND_RECEIPTS_TABLE = """
-CREATE TABLE IF NOT EXISTS command_receipts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    host_id TEXT NOT NULL,
-    request_id TEXT NOT NULL,
-    action TEXT NOT NULL,
-    payload_fingerprint TEXT NOT NULL,
-    status TEXT NOT NULL,
-    result_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    completed_at TEXT,
-    uncertain INTEGER NOT NULL DEFAULT 0
-);
-"""
 
 CREATE_COMMAND_RECEIPTS_TABLE = """
 CREATE TABLE IF NOT EXISTS command_receipts (
@@ -713,13 +629,8 @@ CREATE TABLE IF NOT EXISTS command_receipts (
     send_started_at TEXT,
     terminal_at TEXT,
     updated_at TEXT NOT NULL,
-    legacy_collision INTEGER NOT NULL DEFAULT 0 CHECK (legacy_collision IN (0, 1)),
-    legacy_collision_count INTEGER NOT NULL DEFAULT 0 CHECK (
-        legacy_collision_count >= 0
-    ),
     -- Private evidence of the immutable selector this request was spelled with.
-    -- Empty means legacy evidence that cannot prove an alias retry. Declared
-    -- last so a v12 ALTER and a fresh CREATE agree on column order.
+    -- Empty is malformed fail-safe evidence that cannot prove an alias retry.
     selector_proof TEXT NOT NULL DEFAULT '',
     CHECK (
         (
@@ -743,22 +654,10 @@ CREATE TABLE IF NOT EXISTS command_receipts (
     CHECK (
         state != 'rejected'
         OR status NOT IN ('pending', 'accepted', 'request_state_uncertain')
-    ),
-    CHECK (
-        legacy_collision = 0
-        OR (state = 'uncertain' AND legacy_collision_count >= 2)
     )
 );
 """
 
-CREATE_LEGACY_COMMAND_RECEIPT_INDEXES = (
-    "CREATE INDEX IF NOT EXISTS idx_command_receipts_host_request_action "
-    "ON command_receipts(host_id, request_id, action)",
-)
-CREATE_LEGACY_COMMAND_RECEIPT_UNIQUE_INDEX = (
-    "CREATE UNIQUE INDEX IF NOT EXISTS ux_command_receipts_host_request_action "
-    "ON command_receipts(host_id, request_id, action)"
-)
 CREATE_COMMAND_RECEIPT_INDEXES = (
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_command_receipts_host_request "
     "ON command_receipts(host_id, request_id)",
@@ -1374,24 +1273,6 @@ CREATE_ATTENTION_LIFECYCLE_INDEXES = (
     ),
 )
 
-CREATE_LEGACY_COMMANDS_TABLE = """
-CREATE TABLE IF NOT EXISTS commands (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    host_id TEXT NOT NULL,
-    request_id TEXT NOT NULL,
-    action TEXT NOT NULL,
-    payload_fingerprint TEXT NOT NULL,
-    status TEXT NOT NULL,
-    dry_run INTEGER NOT NULL DEFAULT 0,
-    uncertain INTEGER NOT NULL DEFAULT 0,
-    request_json TEXT NOT NULL DEFAULT '{}',
-    result_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL,
-    reserved_at TEXT,
-    completed_at TEXT,
-    updated_at TEXT NOT NULL
-);
-"""
 
 CREATE_COMMANDS_TABLE = """
 CREATE TABLE IF NOT EXISTS commands (
@@ -1413,10 +1294,6 @@ CREATE TABLE IF NOT EXISTS commands (
     send_started_at TEXT,
     terminal_at TEXT,
     updated_at TEXT NOT NULL,
-    legacy_collision INTEGER NOT NULL DEFAULT 0 CHECK (legacy_collision IN (0, 1)),
-    legacy_collision_count INTEGER NOT NULL DEFAULT 0 CHECK (
-        legacy_collision_count >= 0
-    ),
     CHECK (
         (state IN ('reserved', 'send_started') AND terminal_at IS NULL)
         OR (state IN ('accepted', 'rejected', 'uncertain') AND terminal_at IS NOT NULL)
@@ -1430,10 +1307,6 @@ CREATE TABLE IF NOT EXISTS commands (
     CHECK (
         state != 'rejected'
         OR status NOT IN ('pending', 'accepted', 'request_state_uncertain')
-    ),
-    CHECK (
-        legacy_collision = 0
-        OR (state = 'uncertain' AND legacy_collision_count >= 2)
     )
 );
 """
@@ -1488,12 +1361,22 @@ CREATE TABLE IF NOT EXISTS backend_health (
 """
 
 
-CREATE_LEGACY_BACKEND_PENDING_TABLE = """
+CREATE_BACKEND_PENDING_TABLE = """
 CREATE TABLE IF NOT EXISTS backend_pending (
     host_id TEXT NOT NULL,
     worker_id TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     observed_at TEXT NOT NULL,
+    revision_digest TEXT NOT NULL DEFAULT '',
+    choice_routes_json TEXT NOT NULL DEFAULT '{}',
+    binding_private_fingerprint TEXT NOT NULL DEFAULT '',
+    observed_turn_target_value TEXT NOT NULL DEFAULT '',
+    observation_state TEXT NOT NULL DEFAULT 'open',
+    freshness TEXT NOT NULL DEFAULT 'fresh',
+    last_success_at TEXT,
+    last_failure_at TEXT,
+    grace_deadline TEXT,
+    updated_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (host_id, worker_id)
 );
 """
@@ -1517,83 +1400,10 @@ CREATE TABLE IF NOT EXISTS backend_pending_claims (
 );
 """
 
-CREATE_HERDR_TURN_WATERMARKS_TABLE = """
-CREATE TABLE IF NOT EXISTS herdr_turn_watermarks (
-    host_id TEXT NOT NULL,
-    pane_id TEXT NOT NULL,
-    turn_epoch INTEGER NOT NULL CHECK (turn_epoch >= 0),
-    last_turn INTEGER NOT NULL CHECK (last_turn >= 0),
-    completeness_break_count INTEGER NOT NULL DEFAULT 0
-        CHECK (completeness_break_count >= 0),
-    last_completeness_break_reason TEXT,
-    last_completeness_break_at TEXT,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (host_id, pane_id)
-);
-"""
 
-CREATE_HERDR_TURN_COMPLETIONS_TABLE = """
-CREATE TABLE IF NOT EXISTS herdr_turn_completions (
-    host_id TEXT NOT NULL,
-    pane_id TEXT NOT NULL,
-    turn_epoch INTEGER NOT NULL CHECK (turn_epoch >= 0),
-    turn INTEGER NOT NULL CHECK (turn >= 0),
-    outcome TEXT NOT NULL CHECK (outcome IN ('completed', 'aborted')),
-    completed_unix_ms INTEGER NOT NULL CHECK (completed_unix_ms >= 0),
-    message TEXT,
-    message_truncated INTEGER NOT NULL DEFAULT 0
-        CHECK (message_truncated IN (0, 1)),
-    agent_session_path TEXT,
-    worker_id TEXT,
-    refreshed_turn_id TEXT,
-    observed_at TEXT NOT NULL,
-    PRIMARY KEY (host_id, pane_id, turn_epoch, turn)
-);
-"""
 
-CREATE_HERDR_TURN_REFRESH_RETRIES_TABLE = """
-CREATE TABLE IF NOT EXISTS herdr_turn_refresh_retries (
-    host_id TEXT NOT NULL,
-    pane_id TEXT NOT NULL,
-    turn_epoch INTEGER NOT NULL CHECK (turn_epoch >= 0),
-    turn INTEGER NOT NULL CHECK (turn >= 0),
-    status TEXT NOT NULL CHECK (status IN ('pending', 'escalated')),
-    refresh_status TEXT NOT NULL,
-    first_seen_at TEXT NOT NULL,
-    last_attempt_at TEXT NOT NULL,
-    next_attempt_at TEXT,
-    attempt_count INTEGER NOT NULL CHECK (attempt_count >= 1),
-    escalated_at TEXT,
-    PRIMARY KEY (host_id, pane_id, turn_epoch, turn),
-    CHECK (
-        (
-            status = 'pending'
-            AND next_attempt_at IS NOT NULL
-            AND escalated_at IS NULL
-        )
-        OR
-        (
-            status = 'escalated'
-            AND next_attempt_at IS NULL
-            AND escalated_at IS NOT NULL
-        )
-    )
-);
-"""
 
-CREATE_HERDR_TURN_INDEXES = (
-    (
-        "CREATE INDEX IF NOT EXISTS idx_herdr_turn_completions_worker "
-        "ON herdr_turn_completions(host_id, worker_id, turn_epoch, turn)"
-    ),
-)
 
-CREATE_HERDR_TURN_REFRESH_RETRY_INDEXES = (
-    (
-        "CREATE INDEX IF NOT EXISTS idx_herdr_turn_refresh_retries_due "
-        "ON herdr_turn_refresh_retries(host_id, status, next_attempt_at)"
-    ),
-)
 
 CREATE_AGENT_EVENTS_TABLE = """
 CREATE TABLE IF NOT EXISTS agent_events (
@@ -1727,58 +1537,7 @@ CREATE_AGENT_EVENT_INDEXES = (
     ),
 )
 
-CREATE_AGENT_EVENT_TOMBSTONES_TABLE = """
-CREATE TABLE IF NOT EXISTS agent_event_tombstones (
-    host_id TEXT NOT NULL,
-    event_id TEXT NOT NULL,
-    sequence INTEGER NOT NULL CHECK (sequence >= 1),
-    replay_fingerprint TEXT NOT NULL CHECK (length(replay_fingerprint) = 64),
-    observed_at TEXT,
-    retired_at TEXT NOT NULL CHECK (length(retired_at) BETWEEN 20 AND 40),
-    PRIMARY KEY (host_id, event_id),
-    CHECK (length(host_id) BETWEEN 1 AND 2048),
-    CHECK (instr(host_id, char(0)) = 0),
-    CHECK (length(event_id) = 64),
-    CHECK (observed_at IS NULL OR length(observed_at) BETWEEN 20 AND 40)
-);
-"""
 
-# v24/v25 tombstones predate retained replay-authority time.  Migration code
-# must build the historical shape rather than whatever the current target DDL
-# happens to contain.
-CREATE_AGENT_EVENT_TOMBSTONES_V25_TABLE = """
-CREATE TABLE IF NOT EXISTS agent_event_tombstones (
-    host_id TEXT NOT NULL,
-    event_id TEXT NOT NULL,
-    sequence INTEGER NOT NULL CHECK (sequence >= 1),
-    replay_fingerprint TEXT NOT NULL CHECK (length(replay_fingerprint) = 64),
-    retired_at TEXT NOT NULL CHECK (length(retired_at) BETWEEN 20 AND 40),
-    PRIMARY KEY (host_id, event_id),
-    CHECK (length(host_id) BETWEEN 1 AND 2048),
-    CHECK (instr(host_id, char(0)) = 0),
-    CHECK (length(event_id) = 64)
-);
-"""
-
-CREATE_AGENT_EVENT_TOMBSTONE_INDEXES = (
-    (
-        "CREATE INDEX IF NOT EXISTS idx_agent_event_tombstones_host_sequence "
-        "ON agent_event_tombstones(host_id, sequence)"
-    ),
-)
-
-CREATE_PR6_TABLES = (
-    CREATE_EVENTS_TABLE,
-    CREATE_SPACES_TABLE,
-    CREATE_WORKERS_TABLE,
-    CREATE_TURNS_TABLE,
-    CREATE_PENDING_INTERACTIONS_TABLE,
-    CREATE_ATTENTION_ITEMS_TABLE,
-    CREATE_LEGACY_COMMANDS_TABLE,
-    CREATE_CONNECTOR_OUTBOX_TABLE,
-    CREATE_CONNECTOR_DELIVERIES_TABLE,
-    CREATE_BACKEND_HEALTH_TABLE,
-)
 CREATE_CURRENT_PR6_TABLES = (
     CREATE_EVENTS_TABLE,
     CREATE_SPACES_TABLE,
@@ -1812,7 +1571,6 @@ CREATE_PR6_INDEXES = (
         "CREATE INDEX IF NOT EXISTS idx_pending_interactions_host_status "
         "ON pending_interactions(host_id, status)"
     ),
-    CREATE_LEGACY_BACKEND_PENDING_TABLE,
     (
         "CREATE INDEX IF NOT EXISTS idx_attention_items_host_source "
         "ON attention_items(host_id, source)"
@@ -1833,11 +1591,6 @@ CREATE_PR6_INDEXES = (
         "CREATE INDEX IF NOT EXISTS idx_attention_items_host_fingerprint "
         "ON attention_items(host_id, fingerprint)"
     ),
-    (
-        "CREATE UNIQUE INDEX IF NOT EXISTS ux_commands_host_request_action "
-        "ON commands(host_id, request_id, action)"
-    ),
-    "CREATE INDEX IF NOT EXISTS idx_commands_host_status ON commands(host_id, status)",
     (
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_connector_outbox_host_connector_key "
         "ON connector_outbox(host_id, connector, delivery_key)"
@@ -1860,7 +1613,7 @@ CREATE_COMMAND_INDEXES = (
     "ON commands(host_id, state, updated_at, id)",
 )
 CREATE_CURRENT_PR6_INDEXES = (
-    CREATE_PR6_INDEXES[:16] + CREATE_PR6_INDEXES[18:] + CREATE_COMMAND_INDEXES
+    CREATE_PR6_INDEXES + CREATE_COMMAND_INDEXES
 )
 
 
@@ -2962,8 +2715,8 @@ def _connector_reclaim_expired_awaiting_ack_conn(
             if delivery is not None
             else None
         )
-        # A legacy/noncanonical awaiting_ack row without a deadline is already
-        # overdue. Every non-terminal state must be swept rather than wedged.
+        # A malformed awaiting_ack row without a deadline is already overdue.
+        # Every non-terminal state must be swept rather than wedged.
         if not _connector_deadline_due(
             deadline,
             next_attempt_at,
@@ -3575,7 +3328,6 @@ def _final_ready_payload_conn(
     turn_id: str,
     content_revision_value: str,
     allow_unroutable: bool = False,
-    turn_model: str = DEFAULT_TURN_MODEL,
 ) -> dict[str, Any] | None:
     canonical_turn_id = _resolve_canonical_turn_id_conn(
         conn,
@@ -4551,7 +4303,6 @@ def prepare_connector_plan_begin(
     presentation_version: str,
     part_count: int,
     source_ref: str | None = None,
-    turn_model: str = DEFAULT_TURN_MODEL,
     now: str | None = None,
 ) -> dict[str, Any]:
     """Idempotently begin one bounded range-only presentation plan."""
@@ -7432,7 +7183,7 @@ def _connector_update_ref(
                             WHERE id = ? AND status = 'leased'
                             """,
                             (
-                                _migration_private_state(
+                                _connector_group_private_state(
                                     sibling_private,
                                     group=migration_group,
                                     canonical=False,
@@ -8530,9 +8281,7 @@ def _command_receipt_from_row(row: Any) -> dict[str, Any]:
         "send_started_at": row[16],
         "terminal_at": row[17],
         "updated_at": str(row[18]),
-        "legacy_collision": bool(row[19]),
-        "legacy_collision_count": int(row[20]),
-        "selector_proof": str(row[21]),
+        "selector_proof": str(row[19]),
     }
 
 
@@ -8590,50 +8339,8 @@ def _worker_binding_from_row(row: Any) -> WorkerBinding:
     )
 
 
-def _dedupe_command_receipts(conn: sqlite3.Connection) -> None:
-    """Keep the latest legacy receipt per logical key using bounded batches."""
-    while True:
-        delete_ids = [
-            int(row[0])
-            for row in conn.execute(
-                """
-                WITH ranked AS (
-                    SELECT
-                        id,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY host_id, request_id, action
-                            ORDER BY
-                                COALESCE(completed_at, created_at) DESC,
-                                created_at DESC,
-                                id DESC
-                        ) AS receipt_rank
-                    FROM command_receipts
-                )
-                SELECT id
-                FROM ranked
-                WHERE receipt_rank > 1
-                ORDER BY id
-                LIMIT 500
-                """
-            ).fetchall()
-        ]
-        if not delete_ids:
-            return
-        placeholders = ",".join("?" for _ in delete_ids)
-        conn.execute(
-            f"DELETE FROM command_receipts WHERE id IN ({placeholders})",
-            delete_ids,
-        )
 
 
-def _ensure_command_receipt_unique_index(conn: sqlite3.Connection) -> None:
-    for row in conn.execute("PRAGMA index_list(command_receipts)").fetchall():
-        index_name = str(row[1])
-        is_unique = int(row[2]) == 1
-        if index_name == "ux_command_receipts_host_request_action" and not is_unique:
-            conn.execute("DROP INDEX ux_command_receipts_host_request_action")
-            break
-    conn.execute(CREATE_LEGACY_COMMAND_RECEIPT_UNIQUE_INDEX)
 
 
 def _command_request_row(
@@ -8663,8 +8370,6 @@ def _command_request_row(
             send_started_at,
             terminal_at,
             updated_at,
-            legacy_collision,
-            legacy_collision_count,
             selector_proof
         FROM command_receipts
         WHERE host_id = ? AND request_id = ?
@@ -8682,256 +8387,16 @@ def _snapshot_payload(data: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
     return payload_data, fingerprint
 
 
-def _table_columns(conn: sqlite3.Connection, table: str = "snapshots") -> set[str]:
-    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    return {str(row[1]) for row in rows}
 
 
-def _ensure_columns(
-    conn: sqlite3.Connection,
-    table: str,
-    columns: Mapping[str, str],
-) -> None:
-    existing = _table_columns(conn, table)
-    for column, definition in columns.items():
-        if column not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
-def _backfill_content_fingerprints(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        """
-        SELECT id, payload
-        FROM snapshots
-        WHERE content_fingerprint IS NULL OR content_fingerprint = ''
-        """
-    ).fetchall()
-    for row_id, payload in rows:
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            fingerprint = _content_fingerprint({"payload": payload})
-            conn.execute(
-                "UPDATE snapshots SET content_fingerprint = ? WHERE id = ?",
-                (fingerprint, row_id),
-            )
-            continue
-        if not isinstance(data, Mapping):
-            fingerprint = _content_fingerprint({"payload": data})
-            conn.execute(
-                "UPDATE snapshots SET content_fingerprint = ? WHERE id = ?",
-                (fingerprint, row_id),
-            )
-            continue
-        payload_data, fingerprint = _snapshot_payload(
-            Snapshot.from_dict(data).to_dict()
-        )
-        conn.execute(
-            """
-            UPDATE snapshots
-            SET content_fingerprint = ?, payload = ?
-            WHERE id = ?
-            """,
-            (fingerprint, _canonical_json(payload_data), row_id),
-        )
 
 
-def _ensure_command_receipt_columns(conn: sqlite3.Connection) -> None:
-    _ensure_columns(
-        conn,
-        "command_receipts",
-        {
-            "host_id": "TEXT NOT NULL DEFAULT ''",
-            "request_id": "TEXT NOT NULL DEFAULT ''",
-            "action": "TEXT NOT NULL DEFAULT ''",
-            "payload_fingerprint": "TEXT NOT NULL DEFAULT ''",
-            "status": "TEXT NOT NULL DEFAULT ''",
-            "result_json": "TEXT NOT NULL DEFAULT '{}'",
-            "created_at": "TEXT NOT NULL DEFAULT ''",
-            "completed_at": "TEXT",
-            "uncertain": "INTEGER NOT NULL DEFAULT 0",
-        },
-    )
 
 
-def _ensure_worker_binding_columns(conn: sqlite3.Connection) -> None:
-    _ensure_columns(
-        conn,
-        "worker_bindings",
-        {
-            "host_id": "TEXT NOT NULL DEFAULT ''",
-            "worker_id": "TEXT NOT NULL DEFAULT ''",
-            "worker_fingerprint": "TEXT NOT NULL DEFAULT ''",
-            "backend": "TEXT NOT NULL DEFAULT ''",
-            "target_kind": "TEXT NOT NULL DEFAULT ''",
-            "target_value": "TEXT NOT NULL DEFAULT ''",
-            "turn_target_kind": "TEXT",
-            "turn_target_value": "TEXT",
-            "sendable": "INTEGER NOT NULL DEFAULT 0",
-            "reason": "TEXT",
-            "observed_at": "TEXT NOT NULL DEFAULT ''",
-            "expires_at": "TEXT NOT NULL DEFAULT '9999-12-31T23:59:59+00:00'",
-            "private_fingerprint": "TEXT NOT NULL DEFAULT ''",
-        },
-    )
 
 
-def _ensure_pr6_columns(conn: sqlite3.Connection) -> None:
-    _ensure_columns(
-        conn,
-        "events",
-        {
-            "host_id": "TEXT NOT NULL DEFAULT ''",
-            "event_type": "TEXT NOT NULL DEFAULT ''",
-            "aggregate_type": "TEXT NOT NULL DEFAULT ''",
-            "aggregate_id": "TEXT NOT NULL DEFAULT ''",
-            "observed_at": "TEXT NOT NULL DEFAULT ''",
-            "content_fingerprint": "TEXT NOT NULL DEFAULT ''",
-            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
-        },
-    )
-    _ensure_columns(
-        conn,
-        "spaces",
-        {
-            "name": "TEXT NOT NULL DEFAULT ''",
-            "status": "TEXT NOT NULL DEFAULT 'unknown'",
-            "updated_at": "TEXT",
-            "fingerprint": "TEXT NOT NULL DEFAULT ''",
-            "snapshot_content_fingerprint": "TEXT NOT NULL DEFAULT ''",
-            "observed_at": "TEXT NOT NULL DEFAULT ''",
-            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
-        },
-    )
-    _ensure_columns(
-        conn,
-        "workers",
-        {
-            "worker_fingerprint": "TEXT NOT NULL DEFAULT ''",
-            "space_id": "TEXT",
-            "name": "TEXT NOT NULL DEFAULT ''",
-            "status": "TEXT NOT NULL DEFAULT 'unknown'",
-            "last_seen_at": "TEXT",
-            "snapshot_content_fingerprint": "TEXT NOT NULL DEFAULT ''",
-            "observed_at": "TEXT NOT NULL DEFAULT ''",
-            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
-        },
-    )
-    _ensure_columns(
-        conn,
-        "turns",
-        {
-            "worker_id": "TEXT NOT NULL DEFAULT ''",
-            "worker_fingerprint": "TEXT",
-            "space_id": "TEXT",
-            "status": "TEXT NOT NULL DEFAULT 'unknown'",
-            "kind": "TEXT NOT NULL DEFAULT 'unknown'",
-            "updated_at": "TEXT",
-            "fingerprint": "TEXT NOT NULL DEFAULT ''",
-            "snapshot_content_fingerprint": "TEXT NOT NULL DEFAULT ''",
-            "observed_at": "TEXT NOT NULL DEFAULT ''",
-            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
-        },
-    )
-    _ensure_columns(
-        conn,
-        "pending_interactions",
-        {
-            "worker_id": "TEXT NOT NULL DEFAULT ''",
-            "worker_fingerprint": "TEXT",
-            "space_id": "TEXT",
-            "kind": "TEXT NOT NULL DEFAULT 'unknown'",
-            "status": "TEXT NOT NULL DEFAULT 'unknown'",
-            "updated_at": "TEXT",
-            "fingerprint": "TEXT NOT NULL DEFAULT ''",
-            "snapshot_content_fingerprint": "TEXT NOT NULL DEFAULT ''",
-            "observed_at": "TEXT NOT NULL DEFAULT ''",
-            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
-        },
-    )
-    _ensure_columns(
-        conn,
-        "attention_items",
-        {
-            "source": "TEXT NOT NULL DEFAULT ''",
-            "kind": "TEXT NOT NULL DEFAULT 'unknown'",
-            "severity": "TEXT NOT NULL DEFAULT 'info'",
-            "status": "TEXT NOT NULL DEFAULT 'unknown'",
-            "updated_at": "TEXT",
-            "fingerprint": "TEXT NOT NULL DEFAULT ''",
-            "snapshot_content_fingerprint": "TEXT NOT NULL DEFAULT ''",
-            "observed_at": "TEXT NOT NULL DEFAULT ''",
-            "first_seen_at": "TEXT NOT NULL DEFAULT ''",
-            "last_seen_at": "TEXT NOT NULL DEFAULT ''",
-            "last_changed_at": "TEXT NOT NULL DEFAULT ''",
-            "resolved_at": "TEXT",
-            "lifecycle_status": "TEXT NOT NULL DEFAULT 'open'",
-            "resolved_reason": "TEXT",
-            "signal_count": "INTEGER NOT NULL DEFAULT 1",
-            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
-        },
-    )
-    _ensure_columns(
-        conn,
-        "commands",
-        {
-            "host_id": "TEXT NOT NULL DEFAULT ''",
-            "request_id": "TEXT NOT NULL DEFAULT ''",
-            "action": "TEXT NOT NULL DEFAULT ''",
-            "payload_fingerprint": "TEXT NOT NULL DEFAULT ''",
-            "status": "TEXT NOT NULL DEFAULT ''",
-            "dry_run": "INTEGER NOT NULL DEFAULT 0",
-            "uncertain": "INTEGER NOT NULL DEFAULT 0",
-            "request_json": "TEXT NOT NULL DEFAULT '{}'",
-            "result_json": "TEXT NOT NULL DEFAULT '{}'",
-            "created_at": "TEXT NOT NULL DEFAULT ''",
-            "reserved_at": "TEXT",
-            "completed_at": "TEXT",
-            "updated_at": "TEXT NOT NULL DEFAULT ''",
-        },
-    )
-    _ensure_columns(
-        conn,
-        "connector_outbox",
-        {
-            "host_id": "TEXT NOT NULL DEFAULT ''",
-            "connector": "TEXT NOT NULL DEFAULT ''",
-            "delivery_key": "TEXT NOT NULL DEFAULT ''",
-            "status": "TEXT NOT NULL DEFAULT ''",
-            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
-            "private_state_json": "TEXT NOT NULL DEFAULT '{}'",
-            "created_at": "TEXT NOT NULL DEFAULT ''",
-            "updated_at": "TEXT NOT NULL DEFAULT ''",
-            "next_attempt_at": "TEXT",
-        },
-    )
-    _ensure_columns(
-        conn,
-        "connector_deliveries",
-        {
-            "outbox_id": "INTEGER",
-            "host_id": "TEXT NOT NULL DEFAULT ''",
-            "connector": "TEXT NOT NULL DEFAULT ''",
-            "delivery_key": "TEXT NOT NULL DEFAULT ''",
-            "attempt": "INTEGER NOT NULL DEFAULT 0",
-            "status": "TEXT NOT NULL DEFAULT ''",
-            "response_json": "TEXT NOT NULL DEFAULT '{}'",
-            "private_state_json": "TEXT NOT NULL DEFAULT '{}'",
-            "created_at": "TEXT NOT NULL DEFAULT ''",
-            "delivered_at": "TEXT",
-        },
-    )
-    _ensure_columns(
-        conn,
-        "backend_health",
-        {
-            "status": "TEXT NOT NULL DEFAULT 'unknown'",
-            "outcome": "TEXT NOT NULL DEFAULT 'unknown'",
-            "observed_at": "TEXT",
-            "snapshot_content_fingerprint": "TEXT NOT NULL DEFAULT ''",
-            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
-        },
-    )
 
 
 def _append_event_conn(
@@ -9009,30 +8474,6 @@ def _repair_missing_final_ready_anchors_conn(
         )
 
 
-def append_event(
-    db_path: Path,
-    host_id: str,
-    event_type: str,
-    payload: Mapping[str, Any],
-    *,
-    aggregate_type: str = "",
-    aggregate_id: str = "",
-    observed_at: str | None = None,
-    content_fingerprint: str | None = None,
-) -> int:
-    """Append a private store event and return its row id."""
-    with _connect(db_path, prepare=True) as conn:
-        _ensure_schema(conn)
-        return _append_event_conn(
-            conn,
-            host_id=host_id,
-            event_type=event_type,
-            payload=payload,
-            aggregate_type=aggregate_type,
-            aggregate_id=aggregate_id,
-            observed_at=observed_at,
-            content_fingerprint=content_fingerprint,
-        )
 
 
 def _prune_host_projection(
@@ -9239,22 +8680,6 @@ def _strict_utc_timestamp(value: Any) -> str | None:
         return parsed.astimezone(timezone.utc).isoformat()
     except (OverflowError, ValueError):
         return None
-
-
-def _legacy_snapshot_created_at_is_authoritative(
-    created_at: Any,
-    payload: Any,
-) -> bool:
-    """Distinguish a real year-9999 observation from the former sentinel."""
-    canonical_created_at = _strict_utc_timestamp(created_at)
-    canonical_payload_at = _strict_utc_timestamp(
-        _json_object(payload).get("updated_at")
-    )
-    return (
-        canonical_created_at
-        == _LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE
-        and canonical_payload_at == canonical_created_at
-    )
 
 
 def _attention_family_key(host_id: str, item: Mapping[str, Any]) -> str:
@@ -10379,10 +9804,8 @@ def _project_command_request_conn(conn: sqlite3.Connection, row: Any) -> None:
             reserved_at,
             send_started_at,
             terminal_at,
-            updated_at,
-            legacy_collision,
-            legacy_collision_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(host_id, request_id) DO UPDATE SET
             action = excluded.action,
             canonical_version = excluded.canonical_version,
@@ -10396,9 +9819,7 @@ def _project_command_request_conn(conn: sqlite3.Connection, row: Any) -> None:
             reserved_at = excluded.reserved_at,
             send_started_at = excluded.send_started_at,
             terminal_at = excluded.terminal_at,
-            updated_at = excluded.updated_at,
-            legacy_collision = excluded.legacy_collision,
-            legacy_collision_count = excluded.legacy_collision_count
+            updated_at = excluded.updated_at
         """,
         (
             str(row[1]),
@@ -10416,69 +9837,15 @@ def _project_command_request_conn(conn: sqlite3.Connection, row: Any) -> None:
             row[16],
             row[17],
             str(row[18]),
-            int(row[19]),
-            int(row[20]),
         ),
     )
 
 
-def _backfill_command_audit(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        """
-        SELECT
-            host_id,
-            request_id,
-            action,
-            payload_fingerprint,
-            status,
-            result_json,
-            created_at,
-            completed_at,
-            uncertain
-        FROM command_receipts
-        WHERE request_id != ''
-        ORDER BY id
-        """
-    ).fetchall()
-    for row in rows:
-        _upsert_command_audit_from_receipt_row(conn, row)
 
 
-def _backfill_legacy_attention_columns(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        UPDATE attention_items
-        SET
-            first_seen_at = CASE
-                WHEN first_seen_at IS NULL OR first_seen_at = ''
-                THEN COALESCE(NULLIF(observed_at, ''), updated_at, '')
-                ELSE first_seen_at
-            END,
-            last_seen_at = CASE
-                WHEN last_seen_at IS NULL OR last_seen_at = ''
-                THEN COALESCE(NULLIF(observed_at, ''), updated_at, '')
-                ELSE last_seen_at
-            END,
-            last_changed_at = CASE
-                WHEN last_changed_at IS NULL OR last_changed_at = ''
-                THEN COALESCE(NULLIF(observed_at, ''), updated_at, '')
-                ELSE last_changed_at
-            END,
-            lifecycle_status = CASE
-                WHEN lifecycle_status IS NULL OR lifecycle_status = ''
-                THEN 'open'
-                ELSE lifecycle_status
-            END,
-            signal_count = CASE
-                WHEN signal_count IS NULL OR signal_count < 1
-                THEN 1
-                ELSE signal_count
-            END
-        """
-    )
 
 
-def _migration_private_state(
+def _connector_group_private_state(
     raw: Any,
     *,
     group: str,
@@ -10495,673 +9862,6 @@ def _migration_private_state(
     return _canonical_json(state)
 
 
-def _legacy_attention_job_identity(
-    row_host_id: str,
-    payload_json: Any,
-) -> tuple[str, str, str, str, str, str | None] | None:
-    payload = sanitize_public_mapping(_json_object(payload_json), backend_neutral=True)
-    if str(payload.get("host_id") or "") != str(row_host_id):
-        return None
-    event_type = str(payload.get("event_type") or "")
-    if event_type not in {"attention_created", "attention_escalated"}:
-        return None
-    attention = payload.get("attention")
-    if not isinstance(attention, Mapping):
-        return None
-    source = _store_public_text(attention.get("source"), default="")
-    kind = _store_public_label(attention.get("kind"))
-    if not source or kind == "unknown":
-        return None
-    family_key = _attention_family_key(str(row_host_id), attention)
-    stage = (
-        "initial"
-        if event_type == "attention_created"
-        else f"severity:{normalize_severity(attention.get('severity'))}"
-    )
-    return (
-        str(row_host_id),
-        family_key,
-        event_type,
-        stage,
-        _attention_id_from_item(attention),
-        _strict_utc_timestamp(payload.get("transition_at")),
-    )
-
-
-def _migrate_v4_attention_rows_conn(conn: sqlite3.Connection) -> None:
-    conn.execute("DROP TABLE IF EXISTS temp.attention_v5_rows")
-    conn.execute(
-        """
-        CREATE TEMP TABLE attention_v5_rows (
-            host_id TEXT NOT NULL,
-            family_key TEXT NOT NULL,
-            attention_id TEXT NOT NULL,
-            is_open INTEGER NOT NULL,
-            positive_at TEXT,
-            changed_at TEXT,
-            first_seen_at TEXT,
-            severity_rank INTEGER NOT NULL,
-            signal_count INTEGER NOT NULL
-        )
-        """
-    )
-    cursor = conn.execute(
-        """
-        SELECT host_id, attention_id, source, kind, severity, lifecycle_status,
-               updated_at, observed_at, first_seen_at, last_seen_at,
-               last_changed_at, signal_count
-        FROM attention_items
-        ORDER BY host_id, attention_id
-        """
-    )
-    while True:
-        batch = cursor.fetchmany(500)
-        if not batch:
-            break
-        values: list[tuple[Any, ...]] = []
-        for row in batch:
-            host_id = str(row[0])
-            item = {"source": row[2], "kind": row[3]}
-            positive_at = (
-                _strict_utc_timestamp(row[9])
-                or _strict_utc_timestamp(row[7])
-                or _strict_utc_timestamp(row[6])
-            )
-            values.append(
-                (
-                    host_id,
-                    _attention_family_key(host_id, item),
-                    str(row[1]),
-                    int(str(row[5] or "open") == ATTENTION_LIFECYCLE_OPEN),
-                    positive_at,
-                    _strict_utc_timestamp(row[10]),
-                    _strict_utc_timestamp(row[8]),
-                    _attention_severity_rank(row[4]),
-                    max(1, int(row[11] or 1)),
-                )
-            )
-        conn.executemany(
-            """
-            INSERT INTO attention_v5_rows (
-                host_id, family_key, attention_id, is_open, positive_at,
-                changed_at, first_seen_at, severity_rank, signal_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            values,
-        )
-
-    family_cursor = conn.execute(
-        """
-        SELECT host_id, family_key
-        FROM attention_v5_rows
-        GROUP BY host_id, family_key
-        ORDER BY host_id, family_key
-        """
-    )
-    while True:
-        families = family_cursor.fetchmany(500)
-        if not families:
-            break
-        for host_id_raw, family_key_raw in families:
-            host_id = str(host_id_raw)
-            family_key = str(family_key_raw)
-            candidates = conn.execute(
-                """
-                SELECT attention_id, is_open, positive_at, changed_at,
-                       first_seen_at, severity_rank, signal_count
-                FROM attention_v5_rows
-                WHERE host_id = ? AND family_key = ?
-                ORDER BY attention_id
-                """,
-                (host_id, family_key),
-            )
-            winner: tuple[Any, ...] | None = None
-            earliest_first: str | None = None
-            latest_positive: str | None = None
-            latest_progress: str | None = None
-            total_signals = 0
-            max_severity = -1
-            while True:
-                candidate_batch = candidates.fetchmany(500)
-                if not candidate_batch:
-                    break
-                for candidate in candidate_batch:
-                    total_signals += max(1, int(candidate[6] or 1))
-                    max_severity = max(max_severity, int(candidate[5]))
-                    if candidate[4] and (
-                        earliest_first is None or str(candidate[4]) < earliest_first
-                    ):
-                        earliest_first = str(candidate[4])
-                    if candidate[2] and (
-                        latest_positive is None or str(candidate[2]) > latest_positive
-                    ):
-                        latest_positive = str(candidate[2])
-                    progress_at = max(
-                        str(candidate[2] or ""),
-                        str(candidate[3] or ""),
-                    )
-                    if progress_at and (
-                        latest_progress is None or progress_at > latest_progress
-                    ):
-                        latest_progress = progress_at
-                    rank = (
-                        progress_at,
-                        int(candidate[1]),
-                        str(candidate[2] or ""),
-                        str(candidate[3] or ""),
-                        int(candidate[5]),
-                        int(candidate[6]),
-                        "".join(
-                            chr(0x10FFFF - ord(ch)) for ch in str(candidate[0])
-                        ),
-                    )
-                    if winner is None or rank > winner[0]:
-                        winner = (rank, *candidate)
-            if winner is None or latest_positive is None:
-                continue
-            winner_attention_id = str(winner[1])
-            is_open = bool(winner[2])
-            first_seen_at = earliest_first or latest_positive
-            # The lifecycle watermark (last_accepted_at) must be the newest
-            # lifecycle progress — max(latest positive, latest change/resolve) —
-            # not merely the latest positive. A resolved episode whose resolution
-            # (t10) is newer than its last positive (t0) would otherwise seed the
-            # watermark at t0, letting a delayed positive at t5 (< the authoritative
-            # resolution) pass the observation guard and spuriously reopen
-            # generation 2 with a fresh notification. last_positive_at stays the
-            # actual latest positive; the observation key is anchored to the
-            # accepted progress so replaying the authoritative resolution is a no-op.
-            accepted_progress = latest_progress or latest_positive
-            observation_key = stable_fingerprint(
-                {
-                    "domain": "tendwire.attention.observation.v1",
-                    "host_id": host_id,
-                    "authority": "migration",
-                    "observed_at": accepted_progress,
-                    "snapshot_content_fingerprint": family_key,
-                }
-            )
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO attention_lifecycles (
-                    host_id, family_key, generation, lifecycle_status,
-                    current_attention_id, first_seen_at, last_positive_at,
-                    first_missing_at, missing_observation_count, last_accepted_at,
-                    last_observation_key, max_notified_severity_rank
-                ) VALUES (?, ?, 1, ?, ?, ?, ?, NULL, 0, ?, ?, ?)
-                """,
-                (
-                    host_id,
-                    family_key,
-                    (
-                        ATTENTION_LIFECYCLE_OPEN
-                        if is_open
-                        else ATTENTION_LIFECYCLE_RESOLVED
-                    ),
-                    winner_attention_id if is_open else None,
-                    first_seen_at,
-                    latest_positive,
-                    accepted_progress,
-                    observation_key,
-                    max_severity,
-                ),
-            )
-            if is_open:
-                conn.execute(
-                    """
-                    UPDATE attention_items
-                    SET first_seen_at = ?, last_seen_at = ?,
-                        signal_count = ?, lifecycle_status = 'open',
-                        resolved_at = NULL, resolved_reason = NULL
-                    WHERE host_id = ? AND attention_id = ?
-                    """,
-                    (
-                        first_seen_at,
-                        latest_positive,
-                        total_signals,
-                        host_id,
-                        winner_attention_id,
-                    ),
-                )
-                conn.execute(
-                    """
-                    UPDATE attention_items
-                    SET lifecycle_status = 'resolved',
-                        resolved_at = COALESCE(NULLIF(resolved_at, ''), ?),
-                        resolved_reason = ?,
-                        last_changed_at = ?
-                    WHERE host_id = ? AND lifecycle_status = 'open'
-                      AND attention_id != ?
-                      AND attention_id IN (
-                          SELECT attention_id FROM attention_v5_rows
-                          WHERE host_id = ? AND family_key = ? AND is_open = 1
-                      )
-                    """,
-                    (
-                        latest_positive,
-                        ATTENTION_RESOLVED_REASON_SUPERSEDED,
-                        latest_positive,
-                        host_id,
-                        winner_attention_id,
-                        host_id,
-                        family_key,
-                    ),
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE attention_items
-                    SET lifecycle_status = 'resolved',
-                        resolved_at = COALESCE(NULLIF(resolved_at, ''), ?),
-                        resolved_reason = CASE
-                            WHEN attention_id = ? THEN COALESCE(resolved_reason, 'gone')
-                            ELSE ?
-                        END,
-                        last_changed_at = ?
-                    WHERE host_id = ? AND lifecycle_status = 'open'
-                      AND attention_id IN (
-                          SELECT attention_id FROM attention_v5_rows
-                          WHERE host_id = ? AND family_key = ? AND is_open = 1
-                      )
-                    """,
-                    (
-                        latest_positive,
-                        winner_attention_id,
-                        ATTENTION_RESOLVED_REASON_SUPERSEDED,
-                        latest_positive,
-                        host_id,
-                        host_id,
-                        family_key,
-                    ),
-                )
-    conn.execute("DROP TABLE temp.attention_v5_rows")
-
-
-def _migrate_v4_attention_outbox_conn(conn: sqlite3.Connection) -> None:
-    conn.execute("DROP TABLE IF EXISTS temp.attention_v5_jobs")
-    conn.execute(
-        """
-        CREATE TEMP TABLE attention_v5_jobs (
-            outbox_id INTEGER PRIMARY KEY,
-            host_id TEXT NOT NULL,
-            family_key TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            stage TEXT NOT NULL,
-            attention_id TEXT NOT NULL,
-            transition_at TEXT,
-            group_key TEXT NOT NULL
-        )
-        """
-    )
-    cursor = conn.execute(
-        """
-        SELECT id, host_id, payload_json
-        FROM connector_outbox
-        WHERE connector = ?
-        ORDER BY id
-        """,
-        (ATTENTION_OUTBOX_CONNECTOR,),
-    )
-    while True:
-        batch = cursor.fetchmany(500)
-        if not batch:
-            break
-        values: list[tuple[Any, ...]] = []
-        for outbox_id, host_id, payload_json in batch:
-            identity = _legacy_attention_job_identity(str(host_id), payload_json)
-            if identity is None:
-                continue
-            (
-                identity_host,
-                family_key,
-                event_type,
-                stage,
-                attention_id,
-                transition_at,
-            ) = identity
-            group_key = stable_fingerprint(
-                {
-                    "domain": "tendwire.attention.migration-group.v1",
-                    "host_id": identity_host,
-                    "family_key": family_key,
-                    "generation": 1,
-                    "event_type": event_type,
-                    "stage": stage,
-                }
-            )
-            values.append(
-                (
-                    int(outbox_id),
-                    identity_host,
-                    family_key,
-                    event_type,
-                    stage,
-                    attention_id,
-                    transition_at,
-                    group_key,
-                )
-            )
-            if event_type == "attention_escalated":
-                severity = stage.removeprefix("severity:")
-                conn.execute(
-                    """
-                    UPDATE attention_lifecycles
-                    SET max_notified_severity_rank =
-                        MAX(max_notified_severity_rank, ?)
-                    WHERE host_id = ? AND family_key = ?
-                    """,
-                    (
-                        _attention_severity_rank(severity),
-                        identity_host,
-                        family_key,
-                    ),
-                )
-        conn.executemany(
-            """
-            INSERT INTO attention_v5_jobs (
-                outbox_id, host_id, family_key, event_type, stage,
-                attention_id, transition_at, group_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            values,
-        )
-
-    group_cursor = conn.execute(
-        """
-        SELECT host_id, family_key, event_type, stage, group_key
-        FROM attention_v5_jobs
-        GROUP BY host_id, family_key, event_type, stage, group_key
-        ORDER BY group_key
-        """
-    )
-    while True:
-        groups = group_cursor.fetchmany(500)
-        if not groups:
-            break
-        for host_id, family_key, event_type, stage, group_key in groups:
-            candidate_rows = conn.execute(
-                """
-                SELECT o.id, o.status, o.payload_json, o.private_state_json,
-                       j.attention_id, j.transition_at
-                FROM connector_outbox o
-                JOIN attention_v5_jobs j ON j.outbox_id = o.id
-                WHERE j.group_key = ?
-                  AND o.status IN ('queued', 'retry', 'deferred', 'leased')
-                ORDER BY o.id
-                """,
-                (group_key,),
-            ).fetchall()
-            if not candidate_rows:
-                continue
-            lifecycle_row = conn.execute(
-                """
-                SELECT l.lifecycle_status, l.current_attention_id,
-                       l.first_seen_at, l.last_positive_at, l.last_accepted_at,
-                       i.last_changed_at, i.last_seen_at, i.observed_at,
-                       i.updated_at
-                FROM attention_lifecycles l
-                LEFT JOIN attention_items i
-                  ON i.host_id = l.host_id
-                 AND i.attention_id = l.current_attention_id
-                WHERE l.host_id = ? AND l.family_key = ?
-                """,
-                (host_id, family_key),
-            ).fetchone()
-            lifecycle_open = (
-                lifecycle_row is not None
-                and str(lifecycle_row[0]) == ATTENTION_LIFECYCLE_OPEN
-                and lifecycle_row[1] is not None
-            )
-            current_attention_id = (
-                str(lifecycle_row[1]) if lifecycle_open else ""
-            )
-            current_anchor_candidates = (
-                [
-                    canonical
-                    for canonical in (
-                        _strict_utc_timestamp(value)
-                        # Include the lifecycle's persisted last_accepted_at
-                        # (index 4) alongside the attention_items timestamps so
-                        # the current-episode anchor reflects the authoritative
-                        # accepted-progress watermark even when the row's own
-                        # timestamps are skewed (e.g. a delayed positive).
-                        for value in lifecycle_row[4:9]
-                    )
-                    if canonical is not None
-                ]
-                if lifecycle_open
-                else []
-            )
-            current_episode_anchor = (
-                max(current_anchor_candidates)
-                if current_anchor_candidates
-                else ""
-            )
-            terminalized_current_episode = False
-            if lifecycle_open:
-                terminal_rows = conn.execute(
-                    """
-                    SELECT j.attention_id, j.transition_at
-                    FROM connector_outbox o
-                    JOIN attention_v5_jobs j ON j.outbox_id = o.id
-                    WHERE j.group_key = ?
-                      AND o.status IN ('delivered', 'dead_letter')
-                    """,
-                    (group_key,),
-                ).fetchall()
-                terminalized_current_episode = bool(current_episode_anchor) and any(
-                    str(terminal_attention_id) == current_attention_id
-                    and bool(terminal_transition_at)
-                    and str(terminal_transition_at) >= current_episode_anchor
-                    for terminal_attention_id, terminal_transition_at in terminal_rows
-                )
-
-            leased_rows = [
-                row
-                for row in candidate_rows
-                if str(row[1]) == _CONNECTOR_LEASE_STATUS
-                and conn.execute(
-                    """
-                    SELECT 1 FROM connector_deliveries
-                    WHERE outbox_id = ? AND status = 'leased'
-                    LIMIT 1
-                    """,
-                    (int(row[0]),),
-                ).fetchone()
-                is not None
-            ]
-            conn.execute(
-                """
-                UPDATE connector_outbox
-                SET status = ?, next_attempt_at = NULL
-                WHERE id IN (
-                    SELECT j.outbox_id FROM attention_v5_jobs j
-                    WHERE j.group_key = ?
-                ) AND (
-                    status IN ('queued', 'retry', 'deferred')
-                    OR (
-                        status = 'leased'
-                        AND id NOT IN (
-                            SELECT d.outbox_id FROM connector_deliveries d
-                            WHERE d.status = 'leased' AND d.outbox_id IS NOT NULL
-                        )
-                    )
-                )
-                """,
-                (_CONNECTOR_SUPERSEDED_OUTBOX_STATUS, group_key),
-            )
-
-            def active_rank(row: Any) -> tuple[int, str, int, int]:
-                return (
-                    int(str(row[4]) == current_attention_id),
-                    str(row[5] or ""),
-                    int(str(row[1]) == _CONNECTOR_LEASE_STATUS),
-                    -int(row[0]),
-                )
-
-            if not lifecycle_open or terminalized_current_episode:
-                for leased_row in leased_rows:
-                    conn.execute(
-                        """
-                        UPDATE connector_outbox
-                        SET private_state_json = ?
-                        WHERE id = ? AND status = 'leased'
-                        """,
-                        (
-                            _migration_private_state(
-                                leased_row[3],
-                                group=str(group_key),
-                                canonical=False,
-                                terminal_after_lease=True,
-                            ),
-                            int(leased_row[0]),
-                        ),
-                    )
-                continue
-
-            pollable_candidates = [
-                row
-                for row in candidate_rows
-                if str(row[1]) in _CONNECTOR_POLLABLE_STATUSES
-            ]
-            active_candidates = [*pollable_candidates, *leased_rows]
-            if not active_candidates:
-                continue
-            selected = max(active_candidates, key=active_rank)
-            selected_id = int(selected[0])
-            selected_is_lease = (
-                str(selected[1]) == _CONNECTOR_LEASE_STATUS
-                and any(int(row[0]) == selected_id for row in leased_rows)
-            )
-            for leased_row in leased_rows:
-                leased_id = int(leased_row[0])
-                conn.execute(
-                    """
-                    UPDATE connector_outbox
-                    SET private_state_json = ?
-                    WHERE id = ? AND status = 'leased'
-                    """,
-                    (
-                        _migration_private_state(
-                            leased_row[3],
-                            group=str(group_key),
-                            canonical=selected_is_lease and leased_id == selected_id,
-                            terminal_after_lease=(
-                                not selected_is_lease or leased_id != selected_id
-                            ),
-                        ),
-                        leased_id,
-                    ),
-                )
-            if selected_is_lease:
-                continue
-            transition_key = stable_fingerprint(
-                {
-                    "domain": "tendwire.attention.transition.v1",
-                    "host_id": str(host_id),
-                    "family_key": str(family_key),
-                    "generation": 1,
-                    "event_type": str(event_type),
-                    "stage": str(stage),
-                }
-            )
-            canonical_key = f"attention:{event_type}:{transition_key}"
-            payload = sanitize_public_mapping(
-                _json_object(selected[2]), backend_neutral=True
-            )
-            transition_at = str(selected[5] or "")
-            if not transition_at:
-                transition_at = (
-                    str(lifecycle_row[4])
-                    if lifecycle_row is not None
-                    else "1970-01-01T00:00:00+00:00"
-                )
-            conn.execute(
-                """
-                INSERT INTO connector_outbox (
-                    host_id, connector, delivery_key, status, payload_json,
-                    private_state_json, created_at, updated_at, next_attempt_at
-                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, NULL)
-                ON CONFLICT(host_id, connector, delivery_key) DO NOTHING
-                """,
-                (
-                    str(host_id),
-                    ATTENTION_OUTBOX_CONNECTOR,
-                    canonical_key,
-                    _canonical_json(payload),
-                    _migration_private_state(
-                        {},
-                        group=str(group_key),
-                        canonical=True,
-                    ),
-                    transition_at,
-                    transition_at,
-                ),
-            )
-    conn.execute("DROP TABLE temp.attention_v5_jobs")
-
-
-def _migrate_v0_to_v1_conn(conn: sqlite3.Connection) -> None:
-    conn.execute(CREATE_SNAPSHOTS_TABLE)
-    if "content_fingerprint" not in _table_columns(conn):
-        conn.execute(
-            "ALTER TABLE snapshots ADD COLUMN "
-            "content_fingerprint TEXT NOT NULL DEFAULT ''"
-        )
-    _backfill_content_fingerprints(conn)
-    for statement in CREATE_LEGACY_SNAPSHOT_INDEXES:
-        conn.execute(statement)
-
-
-def _migrate_v1_to_v2_conn(conn: sqlite3.Connection) -> None:
-    _migrate_v0_to_v1_conn(conn)
-    conn.execute(CREATE_LEGACY_COMMAND_RECEIPTS_TABLE)
-    _ensure_command_receipt_columns(conn)
-    _dedupe_command_receipts(conn)
-    for statement in CREATE_LEGACY_COMMAND_RECEIPT_INDEXES:
-        conn.execute(statement)
-    _ensure_command_receipt_unique_index(conn)
-    conn.execute(CREATE_WORKER_BINDINGS_TABLE)
-    _ensure_worker_binding_columns(conn)
-    for statement in CREATE_WORKER_BINDING_INDEXES:
-        conn.execute(statement)
-    conn.execute(CREATE_WORKER_BINDING_UNIQUE_INDEX)
-
-
-def _migrate_v2_to_v3_conn(conn: sqlite3.Connection) -> None:
-    _migrate_v1_to_v2_conn(conn)
-    for statement in CREATE_PR6_TABLES:
-        conn.execute(statement)
-    _ensure_pr6_columns(conn)
-    for statement in CREATE_PR6_INDEXES:
-        conn.execute(statement)
-    _backfill_command_audit(conn)
-
-
-def _migrate_v3_to_v4_conn(conn: sqlite3.Connection) -> None:
-    _migrate_v2_to_v3_conn(conn)
-    _backfill_legacy_attention_columns(conn)
-
-
-def _migrate_v4_to_v5_conn(conn: sqlite3.Connection) -> None:
-    conn.execute(CREATE_ATTENTION_LIFECYCLES_TABLE)
-    for statement in CREATE_ATTENTION_LIFECYCLE_INDEXES:
-        conn.execute(statement)
-    _migrate_v4_attention_rows_conn(conn)
-    _migrate_v4_attention_outbox_conn(conn)
-
-
-_LEGACY_TRUNCATION_MARKER = "\n[truncated]"
-
-
-def _legacy_canonical_field(value: Any) -> tuple[str | None, str]:
-    text = sanitize_canonical_turn_text(value)
-    if text is None or text == "":
-        return None, "absent"
-    state = "known_incomplete" if text.endswith(_LEGACY_TRUNCATION_MARKER) else "complete"
-    return text, state
-
-
 def _insert_turn_content_page_boundaries_conn(
     conn: sqlite3.Connection,
     *,
@@ -11174,13 +9874,8 @@ def _insert_turn_content_page_boundaries_conn(
     conn.executemany(
         """
         INSERT OR IGNORE INTO turn_content_page_boundaries (
-            host_id,
-            turn_id,
-            content_revision,
-            field,
-            page_index,
-            start_char,
-            start_byte
+            host_id, turn_id, content_revision, field,
+            page_index, start_char, start_byte
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
@@ -11269,61 +9964,6 @@ def _insert_turn_content_revision_conn(
     )
     return revision
 
-
-def _backfill_legacy_turn_content_conn(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        """
-        SELECT host_id, turn_id, observed_at, payload_json
-        FROM turns
-        ORDER BY host_id, turn_id
-        """
-    ).fetchall()
-    for host_id, turn_id, observed_at, payload_json in rows:
-        try:
-            payload = json.loads(str(payload_json or "{}"))
-        except (TypeError, json.JSONDecodeError):
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
-        user_text, user_state = _legacy_canonical_field(payload.get("user_text"))
-        final_text, final_state = _legacy_canonical_field(
-            payload.get("assistant_final_text")
-        )
-        if user_state != "absent" or final_state != "absent":
-            _insert_turn_content_revision_conn(
-                conn,
-                host_id=str(host_id),
-                turn_id=str(turn_id),
-                user_text=user_text,
-                assistant_final_text=final_text,
-                user_state=user_state,
-                final_state=final_state,
-                created_at=str(observed_at or "1970-01-01T00:00:00+00:00"),
-            )
-        for key in (
-            "user_text",
-            "assistant_final_text",
-            "user_preview",
-            "assistant_final_preview",
-            "content",
-        ):
-            payload.pop(key, None)
-        encoded = _canonical_json(payload)
-        conn.execute(
-            """
-            UPDATE turns
-            SET payload_json = ?, fingerprint = ?
-            WHERE host_id = ? AND turn_id = ?
-            """,
-            (
-                encoded,
-                stable_fingerprint(payload),
-                str(host_id),
-                str(turn_id),
-            ),
-        )
-
-
 def _ensure_payload_turn_content_revision_conn(
     conn: sqlite3.Connection,
     *,
@@ -11371,7 +10011,6 @@ def _ensure_payload_turn_content_revision_conn(
         created_at=str(observed_at or "1970-01-01T00:00:00+00:00"),
     )
     return True
-
 
 def _ensure_absent_turn_content_revision_conn(
     conn: sqlite3.Connection,
@@ -11426,1888 +10065,15 @@ def _ensure_absent_turn_content_revision_conn(
     )
     return bool(cursor.rowcount)
 
-
-def _backfill_missing_turn_content_revisions_conn(
-    conn: sqlite3.Connection,
-) -> int:
-    """Give every stored turn one stable authoritative v2 content descriptor."""
-    repaired = 0
-    cursor = conn.execute(
-        """
-        SELECT turns.host_id, turns.turn_id, turns.observed_at
-        FROM turns
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM turn_content_revisions AS revisions
-            WHERE revisions.host_id = turns.host_id
-              AND revisions.turn_id = turns.turn_id
-              AND revisions.is_current = 1
-        )
-        ORDER BY turns.host_id, turns.turn_id
-        """
-    )
-    while True:
-        rows = cursor.fetchmany(500)
-        if not rows:
-            return repaired
-        for host_id, turn_id, observed_at in rows:
-            if _ensure_absent_turn_content_revision_conn(
-                conn,
-                host_id=str(host_id),
-                turn_id=str(turn_id),
-                observed_at=str(observed_at) if observed_at else None,
-            ):
-                repaired += 1
-
-
-def _rebuild_v6_presentation_plans_conn(conn: sqlite3.Connection) -> None:
-    """Rebuild the two bounded plan tables with generation-aware v7 keys."""
-    conn.execute(
-        """
-        CREATE TABLE turn_presentation_plans_v7 (
-            id INTEGER PRIMARY KEY,
-            host_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            plan_token TEXT NOT NULL,
-            turn_id TEXT NOT NULL,
-            content_revision TEXT NOT NULL,
-            presentation_version TEXT NOT NULL,
-            generation INTEGER NOT NULL DEFAULT 1 CHECK (generation >= 1),
-            part_count INTEGER NOT NULL CHECK (part_count > 0),
-            state TEXT NOT NULL
-                CHECK (state IN (
-                    'preparing',
-                    'waiting_predecessor',
-                    'active',
-                    'completed',
-                    'superseded',
-                    'failed'
-                )),
-            replaces_plan_token TEXT,
-            recovers_plan_token TEXT,
-            created_at TEXT NOT NULL,
-            activated_at TEXT,
-            completed_at TEXT,
-            UNIQUE (host_id, name, plan_token),
-            UNIQUE (
-                host_id,
-                name,
-                turn_id,
-                content_revision,
-                presentation_version,
-                generation
-            ),
-            FOREIGN KEY (host_id, turn_id, content_revision)
-                REFERENCES turn_content_revisions(host_id, turn_id, content_revision)
-                ON DELETE RESTRICT
-        )
-        """
-    )
-    conn.execute(
-        """
-        INSERT INTO turn_presentation_plans_v7 (
-            id, host_id, name, plan_token, turn_id, content_revision,
-            presentation_version, generation, part_count, state,
-            replaces_plan_token, recovers_plan_token, created_at,
-            activated_at, completed_at
-        )
-        SELECT
-            id, host_id, name, plan_token, turn_id, content_revision,
-            presentation_version, 1, part_count, state,
-            replaces_plan_token, NULL, created_at, activated_at, completed_at
-        FROM turn_presentation_plans
-        ORDER BY id
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE turn_presentation_jobs_v7 (
-            id INTEGER PRIMARY KEY,
-            plan_id INTEGER NOT NULL,
-            sequence_index INTEGER NOT NULL CHECK (sequence_index >= 0),
-            operation TEXT NOT NULL CHECK (operation IN ('upsert', 'retire')),
-            part_ordinal INTEGER NOT NULL CHECK (part_ordinal >= 0),
-            spans_json TEXT NOT NULL,
-            outbox_id INTEGER UNIQUE,
-            created_at TEXT NOT NULL,
-            UNIQUE (plan_id, sequence_index),
-            UNIQUE (plan_id, operation, part_ordinal),
-            FOREIGN KEY (plan_id)
-                REFERENCES turn_presentation_plans_v7(id) ON DELETE CASCADE,
-            FOREIGN KEY (outbox_id)
-                REFERENCES connector_outbox(id) ON DELETE RESTRICT
-        )
-        """
-    )
-    conn.execute(
-        """
-        INSERT INTO turn_presentation_jobs_v7 (
-            id, plan_id, sequence_index, operation, part_ordinal,
-            spans_json, outbox_id, created_at
-        )
-        SELECT
-            id, plan_id, sequence_index, operation, part_ordinal,
-            spans_json, outbox_id, created_at
-        FROM turn_presentation_jobs
-        ORDER BY id
-        """
-    )
-    conn.execute("DROP TABLE turn_presentation_jobs")
-    conn.execute("DROP TABLE turn_presentation_plans")
-    conn.execute(
-        "ALTER TABLE turn_presentation_plans_v7 RENAME TO turn_presentation_plans"
-    )
-    conn.execute(
-        "ALTER TABLE turn_presentation_jobs_v7 RENAME TO turn_presentation_jobs"
-    )
-
-
-def _migrate_v6_to_v7_conn(conn: sqlite3.Connection) -> None:
-    """Add explicit failed-plan generations and immutable recovery audit."""
-    conn.execute(CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE)
-    _backfill_missing_turn_content_revisions_conn(conn)
-    _backfill_missing_turn_content_page_boundaries_conn(conn)
-    plan_columns = {
-        str(row[1])
-        for row in conn.execute(
-            "PRAGMA table_info(turn_presentation_plans)"
-        ).fetchall()
-    }
-    if "generation" not in plan_columns:
-        _rebuild_v6_presentation_plans_conn(conn)
-    conn.execute(CREATE_TURN_PRESENTATION_RECOVERIES_TABLE)
-    for statement in CREATE_TURN_PRESENTATION_INDEXES:
-        conn.execute(statement)
-
-
-def _migrate_v5_to_v6_conn(conn: sqlite3.Connection) -> None:
-    conn.execute(CREATE_TURN_CONTENT_REVISIONS_TABLE)
-    conn.execute(CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE)
-    for statement in CREATE_TURN_CONTENT_REVISION_INDEXES:
-        conn.execute(statement)
-    conn.execute(CREATE_TURN_PRESENTATION_PLANS_TABLE)
-    conn.execute(CREATE_TURN_PRESENTATION_JOBS_TABLE)
-    conn.execute(CREATE_TURN_PRESENTATION_RECOVERIES_TABLE)
-    for statement in CREATE_TURN_PRESENTATION_INDEXES:
-        conn.execute(statement)
-    _backfill_legacy_turn_content_conn(conn)
-    _backfill_missing_turn_content_revisions_conn(conn)
-
-
-def _normalize_snapshot_created_at_v8_conn(
-    conn: sqlite3.Connection,
-) -> None:
-    """Canonicalize legacy ordering keys before the v8 age index is built."""
-    last_id = 0
-    while True:
-        rows = conn.execute(
-            """
-            SELECT id, created_at, payload
-            FROM snapshots
-            WHERE id > ?
-            ORDER BY id
-            LIMIT 500
-            """,
-            (last_id,),
-        ).fetchall()
-        if not rows:
-            return
-        updates: list[tuple[str, int]] = []
-        for row_id, raw_created_at, raw_payload in rows:
-            raw_created_at_text = str(raw_created_at)
-            canonical = _strict_utc_timestamp(raw_created_at_text)
-            if (
-                canonical == _LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE
-                and not _legacy_snapshot_created_at_is_authoritative(
-                    raw_created_at,
-                    raw_payload,
-                )
-            ):
-                canonical = None
-            canonical = canonical or _SNAPSHOT_CREATED_AT_QUARANTINE
-            if str(raw_created_at) != canonical:
-                updates.append((canonical, int(row_id)))
-            last_id = int(row_id)
-        if updates:
-            conn.executemany(
-                "UPDATE snapshots SET created_at = ? WHERE id = ?",
-                updates,
-            )
-
-
-def _migrate_v7_to_v8_conn(conn: sqlite3.Connection) -> None:
-    conn.execute(CREATE_STORE_MAINTENANCE_STATE_TABLE)
-    conn.execute(INSERT_STORE_MAINTENANCE_STATE)
-    _normalize_snapshot_created_at_v8_conn(conn)
-    for statement in CREATE_SNAPSHOT_INDEXES:
-        conn.execute(statement)
-    for index_name in (
-        "idx_snapshots_host_id",
-        "idx_snapshots_created_at",
-        "idx_snapshots_content_fingerprint",
-        "idx_snapshots_host_created_id",
-    ):
-        conn.execute(f"DROP INDEX IF EXISTS {index_name}")
-
-
-def _ensure_turn_list_state_conn(conn: sqlite3.Connection) -> str:
-    conn.execute(CREATE_TURN_LIST_STATE_TABLE)
-    row = conn.execute(
-        "SELECT store_epoch FROM turn_list_state WHERE scope = 'turn-list'"
-    ).fetchone()
-    if row is not None and str(row[0]):
-        return str(row[0])
-    epoch = secrets.token_urlsafe(32)
-    conn.execute(
-        """
-        INSERT INTO turn_list_state (scope, store_epoch)
-        VALUES ('turn-list', ?)
-        ON CONFLICT(scope) DO NOTHING
-        """,
-        (epoch,),
-    )
-    row = conn.execute(
-        "SELECT store_epoch FROM turn_list_state WHERE scope = 'turn-list'"
-    ).fetchone()
-    if row is None or not str(row[0]):
-        raise StoreSchemaError("turn_list_state_unavailable")
-    return str(row[0])
-
-
-def _turn_list_store_epoch_conn(conn: sqlite3.Connection) -> str:
-    row = conn.execute(
-        "SELECT store_epoch FROM turn_list_state WHERE scope = 'turn-list'"
-    ).fetchone()
-    if row is None or not str(row[0]):
-        raise StoreSchemaError("turn_list_state_unavailable")
-    return str(row[0])
-
-
-def _ensure_turn_change_state_conn(conn: sqlite3.Connection) -> str:
-    conn.execute(CREATE_TURN_CHANGE_STATE_TABLE)
-    row = conn.execute(
-        "SELECT store_epoch FROM turn_change_state WHERE scope = 'turn-delta'"
-    ).fetchone()
-    if row is not None and str(row[0]):
-        return str(row[0])
-    epoch = secrets.token_urlsafe(32)
-    conn.execute(
-        """
-        INSERT INTO turn_change_state(scope, store_epoch)
-        VALUES ('turn-delta', ?)
-        ON CONFLICT(scope) DO NOTHING
-        """,
-        (epoch,),
-    )
-    row = conn.execute(
-        "SELECT store_epoch FROM turn_change_state WHERE scope = 'turn-delta'"
-    ).fetchone()
-    if row is None or not str(row[0]):
-        raise StoreSchemaError("turn_change_state_unavailable")
-    return str(row[0])
-
-
-def _turn_change_store_epoch_conn(conn: sqlite3.Connection) -> str:
-    row = conn.execute(
-        "SELECT store_epoch FROM turn_change_state WHERE scope = 'turn-delta'"
-    ).fetchone()
-    if row is None or not str(row[0]):
-        raise StoreSchemaError("turn_change_state_unavailable")
-    return str(row[0])
-
-
-def _ensure_turn_list_host_states_conn(conn: sqlite3.Connection) -> None:
-    conn.execute(CREATE_TURN_LIST_HOSTS_TABLE)
-    conn.execute(
-        """
-        INSERT INTO turn_list_hosts (
-            host_id,
-            next_sequence,
-            traversal_generation
-        )
-        SELECT host_id, COALESCE(MAX(list_sequence), 0) + 1, 1
-        FROM turns
-        GROUP BY host_id
-        ON CONFLICT(host_id) DO NOTHING
-        """
-    )
-
-
-def _migrate_v8_to_v9_conn(conn: sqlite3.Connection) -> None:
-    columns = _table_columns(conn, "turns")
-    if "list_sequence" not in columns:
-        conn.execute(
-            "ALTER TABLE turns ADD COLUMN list_sequence "
-            "INTEGER NOT NULL DEFAULT 0"
-        )
-    conn.execute(
-        """
-        WITH ranked AS (
-            SELECT
-                host_id,
-                turn_id,
-                ROW_NUMBER() OVER (
-                    PARTITION BY host_id
-                    ORDER BY COALESCE(updated_at, observed_at, ''), turn_id
-                ) AS assigned_sequence
-            FROM turns
-        )
-        UPDATE turns
-        SET list_sequence = (
-            SELECT assigned_sequence
-            FROM ranked
-            WHERE ranked.host_id = turns.host_id
-              AND ranked.turn_id = turns.turn_id
-        )
-        WHERE list_sequence <= 0
-        """
-    )
-    for statement in CREATE_TURN_LIST_INDEXES:
-        conn.execute(statement)
-    _ensure_turn_list_state_conn(conn)
-    _ensure_turn_list_host_states_conn(conn)
-
-
-def _migrate_v9_to_v10_conn(conn: sqlite3.Connection) -> None:
-    """Add explicit pending freshness, private routing, and two-phase claims."""
-    conn.execute(CREATE_LEGACY_BACKEND_PENDING_TABLE)
-    columns = _table_columns(conn, "backend_pending")
-    additions = (
-        ("revision_digest", "TEXT NOT NULL DEFAULT ''"),
-        ("choice_routes_json", "TEXT NOT NULL DEFAULT '{}'"),
-        ("binding_private_fingerprint", "TEXT NOT NULL DEFAULT ''"),
-        ("observed_turn_target_value", "TEXT NOT NULL DEFAULT ''"),
-        ("observation_state", "TEXT NOT NULL DEFAULT 'open'"),
-        ("freshness", "TEXT NOT NULL DEFAULT 'fresh'"),
-        ("last_success_at", "TEXT"),
-        ("last_failure_at", "TEXT"),
-        ("grace_deadline", "TEXT"),
-        ("updated_at", "TEXT NOT NULL DEFAULT ''"),
-    )
-    for name, declaration in additions:
-        if name not in columns:
-            conn.execute(
-                f"ALTER TABLE backend_pending ADD COLUMN {name} {declaration}"
-            )
-    rows = conn.execute(
-        """
-        SELECT host_id, worker_id, payload_json, observed_at,
-               revision_digest, last_success_at, updated_at
-        FROM backend_pending
-        """
-    ).fetchall()
-    for (
-        host_id,
-        worker_id,
-        payload_json,
-        observed_at,
-        revision_digest,
-        last_success_at,
-        updated_at,
-    ) in rows:
-        timestamp = _strict_utc_timestamp(observed_at) or "1970-01-01T00:00:00+00:00"
-        digest = str(revision_digest or "") or stable_fingerprint(
-            {"legacy_backend_pending": str(payload_json)}
-        )
-        conn.execute(
-            """
-            UPDATE backend_pending
-            SET revision_digest = ?,
-                freshness = 'fresh',
-                last_success_at = ?,
-                updated_at = ?
-            WHERE host_id = ? AND worker_id = ?
-            """,
-            (
-                digest,
-                str(last_success_at or timestamp),
-                str(updated_at or timestamp),
-                str(host_id),
-                str(worker_id),
-            ),
-        )
-    conn.execute(CREATE_BACKEND_PENDING_CLAIMS_TABLE)
-
-
-def _migration_plan_has_exact_coverage_conn(
-    conn: sqlite3.Connection,
-    *,
-    plan_id: int,
-) -> bool:
-    plan = conn.execute(
-        """
-        SELECT
-            host_id, name, turn_id, content_revision,
-            presentation_version, generation, part_count
-        FROM turn_presentation_plans
-        WHERE id = ?
-        """,
-        (int(plan_id),),
-    ).fetchone()
-    if plan is None:
-        return False
-    revision_row, revision_error = _current_presentation_revision_conn(
-        conn,
-        host_id=str(plan[0]),
-        turn_id=str(plan[2]),
-        content_revision_value=str(plan[3]),
-    )
-    if revision_error is not None or revision_row is None:
-        return False
-    staged = conn.execute(
-        """
-        WITH effective AS (
-            SELECT
-                jobs.id,
-                jobs.part_ordinal,
-                jobs.spans_json,
-                ROW_NUMBER() OVER (
-                    PARTITION BY jobs.part_ordinal
-                    ORDER BY lineage.generation DESC, lineage.id DESC, jobs.id DESC
-                ) AS effective_rank
-            FROM turn_presentation_plans AS lineage
-            JOIN turn_presentation_jobs AS jobs
-              ON jobs.plan_id = lineage.id
-            WHERE lineage.host_id = ?
-              AND lineage.name = ?
-              AND lineage.turn_id = ?
-              AND lineage.content_revision = ?
-              AND lineage.presentation_version = ?
-              AND lineage.generation <= ?
-              AND lineage.state IN ('completed', 'superseded')
-              AND jobs.operation = 'upsert'
-        )
-        SELECT id, part_ordinal, spans_json
-        FROM effective
-        WHERE effective_rank = 1
-        ORDER BY part_ordinal
-        """,
-        (
-            str(plan[0]),
-            str(plan[1]),
-            str(plan[2]),
-            str(plan[3]),
-            str(plan[4]),
-            int(plan[5]),
-        ),
-    ).fetchall()
-    if (
-        len(staged) != int(plan[6])
-        or [int(row[1]) for row in staged] != list(range(int(plan[6])))
-    ):
-        return False
-    try:
-        for row in staged:
-            spans = json.loads(str(row[2]))
-            if (
-                not isinstance(spans, list)
-                or _validate_presentation_spans(
-                    spans,
-                    revision_row=revision_row,
-                )
-                is None
-            ):
-                return False
-        return _presentation_exact_coverage(staged, revision_row=revision_row)
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return False
-
-
-def _migration_plan_route_matches_conn(
-    conn: sqlite3.Connection,
-    *,
-    plan_id: int,
-    authoritative: Mapping[str, Any],
-) -> bool:
-    rows = conn.execute(
-        """
-        SELECT jobs.outbox_id, outbox.payload_json
-        FROM turn_presentation_jobs AS jobs
-        LEFT JOIN connector_outbox AS outbox ON outbox.id = jobs.outbox_id
-        WHERE jobs.plan_id = ?
-        ORDER BY jobs.id
-        """,
-        (int(plan_id),),
-    ).fetchall()
-    if not rows:
-        return False
-    expected = {
-        "schema_version": 2,
-        "turn_id": str(authoritative.get("turn_id") or ""),
-        "content_revision": str(authoritative.get("content_revision") or ""),
-        "final_identity": str(authoritative.get("final_identity") or ""),
-        "stable_key": str(authoritative.get("stable_key") or ""),
-        "stable_key_version": 1,
-    }
-    for outbox_id, payload_json in rows:
-        if outbox_id is None:
-            return False
-        payload = _json_object(payload_json)
-        route = payload.get("turn")
-        if not isinstance(route, Mapping):
-            return False
-        actual = {
-            "schema_version": route.get("schema_version"),
-            "turn_id": str(route.get("turn_id") or ""),
-            "content_revision": str(route.get("content_revision") or ""),
-            "final_identity": str(route.get("final_identity") or ""),
-            "stable_key": str(route.get("stable_key") or ""),
-            "stable_key_version": route.get("stable_key_version"),
-        }
-        if actual != expected:
-            return False
-    return True
-
-
-def _migrate_v10_to_v11_conn(conn: sqlite3.Connection) -> None:
-    """Add typed final anchors and conservatively classify legacy finals."""
-    required_legacy_tables = {
-        "connector_outbox",
-        "turn_presentation_plans",
-        "turn_presentation_jobs",
-        "turn_presentation_recoveries",
-        "turn_content_revisions",
-    }
-    present_legacy_tables = {
-        table for table in required_legacy_tables if _table_columns(conn, table)
-    }
-    if not present_legacy_tables:
-        conn.execute(CREATE_SNAPSHOTS_TABLE)
-        conn.execute(CREATE_LEGACY_COMMAND_RECEIPTS_TABLE)
-        conn.execute(CREATE_WORKER_BINDINGS_TABLE)
-        for statement in CREATE_PR6_TABLES:
-            conn.execute(statement)
-        conn.execute(CREATE_ATTENTION_LIFECYCLES_TABLE)
-        conn.execute(CREATE_TURN_CONTENT_REVISIONS_TABLE)
-        conn.execute(CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE)
-        conn.execute(CREATE_TURN_PRESENTATION_PLANS_TABLE)
-        conn.execute(CREATE_TURN_PRESENTATION_JOBS_TABLE)
-        conn.execute(CREATE_TURN_PRESENTATION_RECOVERIES_TABLE)
-        conn.execute(CREATE_STORE_MAINTENANCE_STATE_TABLE)
-        conn.execute(CREATE_STORE_MAINTENANCE_CURSORS_TABLE)
-        conn.execute(CREATE_TURN_LIST_STATE_TABLE)
-        conn.execute(CREATE_TURN_LIST_HOSTS_TABLE)
-        for statements in (
-            CREATE_LEGACY_COMMAND_RECEIPT_INDEXES,
-            CREATE_WORKER_BINDING_INDEXES,
-            CREATE_PR6_INDEXES,
-            CREATE_TURN_LIST_INDEXES,
-            CREATE_ATTENTION_LIFECYCLE_INDEXES,
-            CREATE_TURN_CONTENT_REVISION_INDEXES,
-            CREATE_TURN_PRESENTATION_INDEXES,
-            CREATE_FINAL_DELIVERY_INDEXES,
-            CREATE_SNAPSHOT_INDEXES,
-        ):
-            for statement in statements:
-                conn.execute(statement)
-        conn.execute(CREATE_LEGACY_COMMAND_RECEIPT_UNIQUE_INDEX)
-        conn.execute(CREATE_WORKER_BINDING_UNIQUE_INDEX)
-        conn.execute(INSERT_STORE_MAINTENANCE_STATE)
-        _ensure_turn_list_state_conn(conn)
-        return
-    if present_legacy_tables != required_legacy_tables:
-        raise StoreSchemaError("legacy_final_schema_incomplete")
-    conn.execute(CREATE_STORE_MAINTENANCE_CURSORS_TABLE)
-    _ensure_columns(
-        conn,
-        "connector_outbox",
-        {
-            "delivery_kind": "TEXT NOT NULL DEFAULT 'generic'",
-            "turn_id": "TEXT",
-            "content_revision": "TEXT",
-        },
-    )
-    _ensure_columns(
-        conn,
-        "turn_presentation_plans",
-        {
-            "source_outbox_id": (
-                "INTEGER REFERENCES connector_outbox(id) ON DELETE RESTRICT"
-            ),
-        },
-    )
-    conn.execute(
-        """
-        UPDATE connector_outbox AS outbox
-        SET delivery_kind = 'final_part',
-            turn_id = (
-                SELECT plans.turn_id
-                FROM turn_presentation_jobs AS jobs
-                JOIN turn_presentation_plans AS plans ON plans.id = jobs.plan_id
-                WHERE jobs.outbox_id = outbox.id
-                  AND plans.host_id = outbox.host_id
-                  AND plans.name = outbox.connector
-            ),
-            content_revision = (
-                SELECT plans.content_revision
-                FROM turn_presentation_jobs AS jobs
-                JOIN turn_presentation_plans AS plans ON plans.id = jobs.plan_id
-                WHERE jobs.outbox_id = outbox.id
-                  AND plans.host_id = outbox.host_id
-                  AND plans.name = outbox.connector
-            )
-        WHERE EXISTS (
-            SELECT 1
-            FROM turn_presentation_jobs AS jobs
-            JOIN turn_presentation_plans AS plans ON plans.id = jobs.plan_id
-            WHERE jobs.outbox_id = outbox.id
-              AND plans.host_id = outbox.host_id
-              AND plans.name = outbox.connector
-        )
-        """
-    )
-    dangling_recovery = conn.execute(
-        """
-        SELECT 1
-        FROM turn_presentation_recoveries AS recovery
-        LEFT JOIN turn_presentation_plans AS failed
-          ON failed.id = recovery.failed_plan_id
-        LEFT JOIN turn_presentation_plans AS recovered
-          ON recovered.id = recovery.recovered_plan_id
-        WHERE failed.id IS NULL
-           OR recovered.id IS NULL
-           OR failed.id = recovered.id
-           OR failed.host_id != recovered.host_id
-           OR failed.name != recovered.name
-           OR failed.turn_id != recovered.turn_id
-           OR failed.content_revision != recovered.content_revision
-           OR failed.presentation_version != recovered.presentation_version
-           OR recovered.generation <= failed.generation
-        LIMIT 1
-        """
-    ).fetchone()
-    if dangling_recovery is not None:
-        raise StoreSchemaError("legacy_final_recovery_invalid")
-    recovery_edges = conn.execute(
-        """
-        SELECT failed_plan_id, recovered_plan_id, created_at
-        FROM turn_presentation_recoveries
-        ORDER BY generation DESC, id DESC
-        """
-    ).fetchall()
-    for failed_plan_id, recovered_plan_id, recovered_at in recovery_edges:
-        _finalize_recovered_plan_materialization_conn(
-            conn,
-            failed_plan_id=int(failed_plan_id),
-            recovered_plan_id=int(recovered_plan_id),
-            now=str(recovered_at),
-        )
-    current_finals = conn.execute(
-        """
-        SELECT
-            revisions.host_id,
-            revisions.turn_id,
-            revisions.content_revision,
-            revisions.created_at,
-            turns.payload_json,
-            revisions.user_text,
-            revisions.assistant_final_text
-        FROM turn_content_revisions AS revisions
-        JOIN turns
-          ON turns.host_id = revisions.host_id
-         AND turns.turn_id = revisions.turn_id
-        WHERE revisions.is_current = 1
-          AND revisions.final_state = 'complete'
-        ORDER BY revisions.host_id, revisions.turn_id
-        """
-    ).fetchall()
-    for (
-        host_id,
-        turn_id,
-        revision,
-        revision_created_at,
-        turn_payload_json,
-        revision_user_text,
-        revision_final_text,
-    ) in current_finals:
-        payload = _final_ready_payload_conn(
-            conn,
-            host_id=str(host_id),
-            turn_id=str(turn_id),
-            content_revision_value=str(revision),
-            allow_unroutable=True,
-        )
-        if payload is None:
-            raise StoreSchemaError("legacy_final_descriptor_unavailable")
-        automation_payload = _json_object(turn_payload_json)
-        automation_payload["user_text"] = revision_user_text
-        automation_payload["assistant_final_text"] = revision_final_text
-        internal_automation = is_internal_automation_turn_payload(
-            automation_payload
-        )
-        if internal_automation:
-            conn.execute(
-                """
-                UPDATE connector_outbox
-                SET delivery_kind = 'final_migration_hold',
-                    status = 'dead_letter',
-                    next_attempt_at = NULL,
-                    updated_at = ?
-                WHERE id IN (
-                    SELECT jobs.outbox_id
-                    FROM turn_presentation_jobs AS jobs
-                    JOIN turn_presentation_plans AS plans
-                      ON plans.id = jobs.plan_id
-                    WHERE plans.host_id = ?
-                      AND plans.name = ?
-                      AND plans.turn_id = ?
-                      AND plans.content_revision = ?
-                      AND jobs.outbox_id IS NOT NULL
-                )
-                """,
-                (
-                    str(revision_created_at),
-                    str(host_id),
-                    _TURN_FINAL_NAME,
-                    str(turn_id),
-                    str(revision),
-                ),
-            )
-        routable = (
-            payload.get("schema_version") == 2
-            and not bool(payload["content"]["known_incomplete"])
-            and not internal_automation
-        )
-        unresolved = conn.execute(
-            """
-            SELECT id, state
-            FROM turn_presentation_plans
-            WHERE host_id = ?
-              AND name = ?
-              AND turn_id = ?
-              AND content_revision = ?
-              AND state IN (
-                  'preparing',
-                  'waiting_predecessor',
-                  'active',
-                  'failed'
-              )
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM turn_presentation_recoveries AS recovery
-                  WHERE recovery.failed_plan_id = turn_presentation_plans.id
-              )
-            ORDER BY id DESC
-            """,
-            (
-                str(host_id),
-                _TURN_FINAL_NAME,
-                str(turn_id),
-                str(revision),
-            ),
-        ).fetchall()
-        proven = conn.execute(
-            """
-            SELECT plans.id, plans.completed_at
-            FROM turn_presentation_plans AS plans
-            WHERE plans.host_id = ?
-              AND plans.name = ?
-              AND plans.turn_id = ?
-              AND plans.content_revision = ?
-              AND plans.state = 'completed'
-              AND plans.completed_at IS NOT NULL
-              AND (
-                  SELECT COUNT(DISTINCT jobs.part_ordinal)
-                  FROM turn_presentation_plans AS lineage
-                  JOIN turn_presentation_jobs AS jobs
-                    ON jobs.plan_id = lineage.id
-                  WHERE lineage.host_id = plans.host_id
-                    AND lineage.name = plans.name
-                    AND lineage.turn_id = plans.turn_id
-                    AND lineage.content_revision = plans.content_revision
-                    AND lineage.presentation_version = plans.presentation_version
-                    AND lineage.generation <= plans.generation
-                    AND lineage.state IN ('completed', 'superseded')
-                    AND jobs.operation = 'upsert'
-              ) = plans.part_count
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM turn_presentation_plans AS lineage
-                  JOIN turn_presentation_jobs AS jobs
-                    ON jobs.plan_id = lineage.id
-                  WHERE lineage.host_id = plans.host_id
-                    AND lineage.name = plans.name
-                    AND lineage.turn_id = plans.turn_id
-                    AND lineage.content_revision = plans.content_revision
-                    AND lineage.presentation_version = plans.presentation_version
-                    AND lineage.generation <= plans.generation
-                    AND lineage.state IN ('completed', 'superseded')
-                    AND jobs.operation = 'upsert'
-                    AND jobs.part_ordinal >= plans.part_count
-              )
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM turn_presentation_plans AS lineage
-                  JOIN turn_presentation_jobs AS jobs
-                    ON jobs.plan_id = lineage.id
-                  LEFT JOIN connector_outbox AS outbox
-                    ON outbox.id = jobs.outbox_id
-                  WHERE lineage.host_id = plans.host_id
-                    AND lineage.name = plans.name
-                    AND lineage.turn_id = plans.turn_id
-                    AND lineage.content_revision = plans.content_revision
-                    AND lineage.presentation_version = plans.presentation_version
-                    AND lineage.generation <= plans.generation
-                    AND lineage.state IN ('completed', 'superseded')
-                    AND (
-                        outbox.id IS NULL
-                        OR outbox.host_id != plans.host_id
-                        OR outbox.connector != plans.name
-                        OR outbox.turn_id != plans.turn_id
-                        OR outbox.content_revision != plans.content_revision
-                        OR outbox.delivery_kind != 'final_part'
-                        OR outbox.status != 'delivered'
-                        OR NOT EXISTS (
-                            SELECT 1
-                            FROM connector_deliveries AS delivered_attempt
-                            WHERE delivered_attempt.outbox_id = outbox.id
-                              AND delivered_attempt.host_id = outbox.host_id
-                              AND delivered_attempt.connector = outbox.connector
-                              AND delivered_attempt.delivery_key = outbox.delivery_key
-                              AND delivered_attempt.status = 'delivered'
-                              AND delivered_attempt.delivered_at IS NOT NULL
-                        )
-                    )
-              )
-            ORDER BY plans.id DESC
-            LIMIT 1
-            """,
-            (
-                str(host_id),
-                _TURN_FINAL_NAME,
-                str(turn_id),
-                str(revision),
-            ),
-        ).fetchone()
-        if (
-            proven is not None
-            and not _migration_plan_has_exact_coverage_conn(
-                conn,
-                plan_id=int(proven[0]),
-            )
-        ):
-            proven = None
-        linkable = [
-            int(row[0])
-            for row in unresolved
-            if str(row[1]) in {"waiting_predecessor", "active", "failed"}
-            and _migration_plan_route_matches_conn(
-                conn,
-                plan_id=int(row[0]),
-                authoritative=payload,
-            )
-        ]
-        if not routable:
-            linkable = []
-            delivery_kind = "final_migration_hold"
-            status = "dead_letter"
-            classified_at = str(revision_created_at)
-        elif unresolved:
-            delivery_kind = "final_ready" if linkable else "final_migration_hold"
-            status = "awaiting_ack" if linkable else "dead_letter"
-            classified_at = str(revision_created_at)
-        elif proven is not None:
-            delivery_kind = "final_ready"
-            status = "delivered"
-            classified_at = str(proven[1])
-        else:
-            delivery_kind = "final_migration_hold"
-            status = "dead_letter"
-            classified_at = str(revision_created_at)
-        final_identity = str(payload["final_identity"])
-        delivery_key = f"{_TURN_FINAL_NAME}:revision:{final_identity}"
-        conn.execute(
-            """
-            INSERT INTO connector_outbox (
-                host_id,
-                connector,
-                delivery_key,
-                delivery_kind,
-                turn_id,
-                content_revision,
-                status,
-                payload_json,
-                private_state_json,
-                created_at,
-                updated_at,
-                next_attempt_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, NULL)
-            ON CONFLICT(host_id, connector, delivery_key) DO UPDATE SET
-                delivery_kind = excluded.delivery_kind,
-                turn_id = excluded.turn_id,
-                content_revision = excluded.content_revision,
-                status = excluded.status,
-                payload_json = excluded.payload_json,
-                updated_at = excluded.updated_at,
-                next_attempt_at = NULL
-            """,
-            (
-                str(host_id),
-                _TURN_FINAL_NAME,
-                delivery_key,
-                delivery_kind,
-                str(turn_id),
-                str(revision),
-                status,
-                _canonical_json(payload),
-                str(revision_created_at),
-                classified_at,
-            ),
-        )
-        source_row = conn.execute(
-            """
-            SELECT id
-            FROM connector_outbox
-            WHERE host_id = ? AND connector = ? AND delivery_key = ?
-            """,
-            (str(host_id), _TURN_FINAL_NAME, delivery_key),
-        ).fetchone()
-        if source_row is None:
-            raise StoreSchemaError("legacy_final_anchor_unavailable")
-        source_outbox_id = int(source_row[0])
-        if linkable:
-            placeholders = ",".join("?" for _ in linkable)
-            conn.execute(
-                f"""
-                UPDATE turn_presentation_plans
-                SET source_outbox_id = ?
-                WHERE id IN ({placeholders})
-                """,
-                (source_outbox_id, *linkable),
-            )
-        elif routable and proven is not None:
-            conn.execute(
-                """
-                UPDATE turn_presentation_plans
-                SET source_outbox_id = ?
-                WHERE id = ?
-                """,
-                (source_outbox_id, int(proven[0])),
-            )
-    for statement in CREATE_FINAL_DELIVERY_INDEXES:
-        conn.execute(statement)
-
-
-def _legacy_command_timestamp(
-    values: Iterable[Any],
-    *,
-    latest: bool,
-) -> str:
-    candidates = sorted(str(value) for value in values if str(value or "").strip())
-    if not candidates:
-        return "1970-01-01T00:00:00+00:00"
-    return candidates[-1] if latest else candidates[0]
-
-
-def _legacy_public_worker_id(request_json: Any) -> str:
-    request = _json_object(request_json)
-    target = request.get("target")
-    if not isinstance(target, Mapping):
-        return ""
-    return str(target.get("worker_id") or "")
-
-
-def _migrate_v11_to_v12_conn(conn: sqlite3.Connection) -> None:
-    """Rebuild action-scoped legacy rows into one fail-closed host request."""
-    receipt_columns = _table_columns(conn, "command_receipts")
-    command_columns = _table_columns(conn, "commands")
-    current_receipt_columns = {
-        "canonical_version",
-        "canonical_fingerprint",
-        "canonical_request_json",
-        "public_worker_id",
-        "state",
-        "owner_token_hash",
-        "owner_expires_at",
-        "binding_fingerprint",
-        "reserved_at",
-        "send_started_at",
-        "terminal_at",
-        "updated_at",
-        "legacy_collision",
-        "legacy_collision_count",
-    }
-    current_command_columns = {
-        "canonical_version",
-        "canonical_fingerprint",
-        "public_worker_id",
-        "state",
-        "send_started_at",
-        "terminal_at",
-        "legacy_collision",
-        "legacy_collision_count",
-    }
-    if current_receipt_columns <= receipt_columns:
-        if not current_command_columns <= command_columns:
-            raise StoreSchemaError("legacy_command_request_schema_ambiguous")
-        for statement in CREATE_COMMAND_RECEIPT_INDEXES:
-            conn.execute(statement)
-        for statement in CREATE_COMMAND_INDEXES:
-            conn.execute(statement)
-        return
-    required_receipt_columns = {
-        "id",
-        "host_id",
-        "request_id",
-        "action",
-        "payload_fingerprint",
-        "status",
-        "result_json",
-        "created_at",
-        "completed_at",
-        "uncertain",
-    }
-    required_command_columns = {
-        "id",
-        "host_id",
-        "request_id",
-        "action",
-        "payload_fingerprint",
-        "status",
-        "uncertain",
-        "request_json",
-        "result_json",
-        "created_at",
-        "reserved_at",
-        "completed_at",
-        "updated_at",
-    }
-    if (
-        not required_receipt_columns <= receipt_columns
-        or not required_command_columns <= command_columns
-    ):
-        raise StoreSchemaError("legacy_command_request_schema_ambiguous")
-    conflicting_tables = {
-        str(row[0])
-        for row in conn.execute(
-            """
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table'
-              AND name IN ('command_receipts_v11', 'commands_v11')
-            """
-        ).fetchall()
-    }
-    if conflicting_tables:
-        raise StoreSchemaError("legacy_command_request_schema_ambiguous")
-
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    receipt_rows = conn.execute(
-        """
-        SELECT
-            id, host_id, request_id, action, payload_fingerprint, status,
-            result_json, created_at, completed_at, uncertain
-        FROM command_receipts
-        WHERE TRIM(host_id) <> '' AND TRIM(request_id) <> ''
-        ORDER BY host_id, request_id, id
-        """
-    ).fetchall()
-    for row in receipt_rows:
-        key = (str(row[1]), str(row[2]))
-        grouped.setdefault(key, []).append(
-            {
-                "source": "receipt",
-                "id": int(row[0]),
-                "action": str(row[3]),
-                "fingerprint": str(row[4]),
-                "status": str(row[5]),
-                "result_json": str(row[6]),
-                "created_at": str(row[7]),
-                "terminal_at": row[8],
-                "updated_at": row[8] or row[7],
-                "uncertain": bool(row[9]),
-                "public_worker_id": "",
-            }
-        )
-    command_rows = conn.execute(
-        """
-        SELECT
-            id, host_id, request_id, action, payload_fingerprint, status,
-            result_json, request_json, created_at, completed_at, updated_at,
-            uncertain
-        FROM commands
-        WHERE TRIM(host_id) <> '' AND TRIM(request_id) <> ''
-        ORDER BY host_id, request_id, id
-        """
-    ).fetchall()
-    for row in command_rows:
-        key = (str(row[1]), str(row[2]))
-        grouped.setdefault(key, []).append(
-            {
-                "source": "command",
-                "id": int(row[0]),
-                "action": str(row[3]),
-                "fingerprint": str(row[4]),
-                "status": str(row[5]),
-                "result_json": str(row[6]),
-                "created_at": str(row[8]),
-                "terminal_at": row[9],
-                "updated_at": row[10] or row[9] or row[8],
-                "uncertain": bool(row[11]),
-                "public_worker_id": _legacy_public_worker_id(row[7]),
-            }
-        )
-
-    normalized: list[tuple[Any, ...]] = []
-    for (host_id, request_id), rows in sorted(grouped.items()):
-        rows.sort(key=lambda item: (str(item["source"]), int(item["id"])))
-        pairs = {
-            (str(item["action"]), str(item["fingerprint"]))
-            for item in rows
-        }
-        evidence = {
-            (
-                str(item["status"]),
-                str(item["result_json"]),
-                bool(item["uncertain"]),
-            )
-            for item in rows
-        }
-        public_worker_ids = {
-            str(item["public_worker_id"])
-            for item in rows
-            if str(item["public_worker_id"])
-        }
-        malformed = any(
-            not str(item["action"]).strip()
-            or not str(item["fingerprint"]).strip()
-            for item in rows
-        )
-        collision = (
-            malformed
-            or len(pairs) != 1
-            or len(evidence) != 1
-            or len(public_worker_ids) > 1
-        )
-        created_at = _legacy_command_timestamp(
-            (item["created_at"] for item in rows),
-            latest=False,
-        )
-        terminal_at = _legacy_command_timestamp(
-            (
-                item["terminal_at"] or item["updated_at"] or item["created_at"]
-                for item in rows
-            ),
-            latest=True,
-        )
-        if collision:
-            action = "legacy_collision"
-            fingerprint = "legacy-collision"
-            state = "uncertain"
-            status = "request_state_uncertain"
-            result_json = (
-                '{"ok":false,"status":"request_state_uncertain"}'
-            )
-            collision_count = max(2, len(rows))
-            public_worker_id = ""
-        else:
-            action, fingerprint = next(iter(pairs))
-            first = rows[0]
-            legacy_status = str(first["status"])
-            result_json = str(first["result_json"])
-            uncertain = any(bool(item["uncertain"]) for item in rows)
-            if (
-                uncertain
-                or legacy_status in {"pending", "request_state_uncertain"}
-            ):
-                state = "uncertain"
-                status = "request_state_uncertain"
-            elif legacy_status == "accepted":
-                state = "accepted"
-                status = "accepted"
-            else:
-                state = "rejected"
-                status = legacy_status or "legacy_rejected"
-            collision_count = 0
-            public_worker_id = (
-                next(iter(public_worker_ids)) if public_worker_ids else ""
-            )
-        send_started_at = created_at if state == "accepted" else None
-        normalized.append(
-            (
-                host_id,
-                request_id,
-                action,
-                0,
-                fingerprint,
-                "{}",
-                public_worker_id,
-                state,
-                status,
-                result_json,
-                created_at,
-                created_at,
-                send_started_at,
-                terminal_at,
-                terminal_at,
-                int(collision),
-                collision_count,
-            )
-        )
-
-    conn.execute("ALTER TABLE command_receipts RENAME TO command_receipts_v11")
-    conn.execute("ALTER TABLE commands RENAME TO commands_v11")
-    conn.execute(CREATE_COMMAND_RECEIPTS_TABLE)
-    conn.execute(CREATE_COMMANDS_TABLE)
-    for statement in CREATE_COMMAND_RECEIPT_INDEXES:
-        conn.execute(statement)
-    for statement in CREATE_COMMAND_INDEXES:
-        conn.execute(statement)
-    for record in normalized:
-        conn.execute(
-            """
-            INSERT INTO command_receipts (
-                host_id, request_id, action, canonical_version,
-                canonical_fingerprint, canonical_request_json, public_worker_id,
-                state, status, result_json, owner_token_hash, owner_expires_at,
-                binding_fingerprint, created_at, reserved_at, send_started_at,
-                terminal_at, updated_at, legacy_collision,
-                legacy_collision_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            record,
-        )
-        row = _command_request_row(conn, str(record[0]), str(record[1]))
-        if row is None:
-            raise StoreSchemaError("legacy_command_request_migration_failed")
-        _project_command_request_conn(conn, row)
-    conn.execute("DROP TABLE command_receipts_v11")
-    conn.execute("DROP TABLE commands_v11")
-    for statement in CREATE_COMMAND_RECEIPT_INDEXES:
-        conn.execute(statement)
-    for statement in CREATE_COMMAND_INDEXES:
-        conn.execute(statement)
-
-
-def _migrate_v12_to_v13_conn(conn: sqlite3.Connection) -> None:
-    """Add private selector-proof evidence without inventing it for old rows.
-
-    A v12 receipt records the worker a request resolved to, never how the caller
-    spelled that target, so no existing row's selector can be reconstructed. Any
-    guess here would let a changed target replay an unrelated accepted result.
-    Every legacy row therefore keeps an empty proof, which the submission path
-    reads as "cannot prove an alias retry" and fails closed on.
-    """
-    columns = _table_columns(conn, "command_receipts")
-    if not columns:
-        raise StoreSchemaError("legacy_command_request_schema_ambiguous")
-    if "selector_proof" not in columns:
-        conn.execute(
-            "ALTER TABLE command_receipts "
-            "ADD COLUMN selector_proof TEXT NOT NULL DEFAULT ''"
-        )
-    for statement in CREATE_COMMAND_RECEIPT_INDEXES:
-        conn.execute(statement)
-
-
-def _migrate_v13_to_v14_conn(conn: sqlite3.Connection) -> None:
-    """Repair legacy nonpositive turn-list coordinates and reject recurrence."""
-    columns = _table_columns(conn, "turns")
-    if not columns:
-        return
-    if "list_sequence" not in columns:
-        raise StoreSchemaError("legacy_turn_list_schema_ambiguous")
-    affected_hosts = [
-        str(row[0])
-        for row in conn.execute(
-            """
-            SELECT DISTINCT host_id
-            FROM turns
-            WHERE list_sequence <= 0
-            ORDER BY host_id
-            """
-        ).fetchall()
-    ]
-    for host_id in affected_hosts:
-        _ensure_turn_list_host_state_conn(conn, host_id)
-        state = conn.execute(
-            """
-            SELECT next_sequence
-            FROM turn_list_hosts
-            WHERE host_id = ?
-            """,
-            (host_id,),
-        ).fetchone()
-        if state is None:
-            raise StoreSchemaError("turn_list_host_state_unavailable")
-        high_row = conn.execute(
-            """
-            SELECT COALESCE(MAX(list_sequence), 0)
-            FROM turns
-            WHERE host_id = ? AND list_sequence > 0
-            """,
-            (host_id,),
-        ).fetchone()
-        next_sequence = max(int(state[0]), int(high_row[0]) + 1)
-        invalid_rows = conn.execute(
-            """
-            SELECT turn_id
-            FROM turns
-            WHERE host_id = ? AND list_sequence <= 0
-            ORDER BY COALESCE(updated_at, observed_at, ''), turn_id
-            """,
-            (host_id,),
-        ).fetchall()
-        for row in invalid_rows:
-            conn.execute(
-                """
-                UPDATE turns
-                SET list_sequence = ?
-                WHERE host_id = ? AND turn_id = ? AND list_sequence <= 0
-                """,
-                (next_sequence, host_id, str(row[0])),
-            )
-            next_sequence += 1
-        conn.execute(
-            """
-            UPDATE turn_list_hosts
-            SET next_sequence = ?,
-                traversal_generation = traversal_generation + 1
-            WHERE host_id = ?
-            """,
-            (next_sequence, host_id),
-        )
-    for statement in CREATE_TURN_LIST_SEQUENCE_TRIGGERS:
-        conn.execute(statement)
-
-
-def _migrate_v14_to_v15_conn(conn: sqlite3.Connection) -> None:
-    """Tombstone duplicate and stale command claims without rekeying turns."""
-    if not _table_columns(conn, "turns"):
-        return
-    now = utc_timestamp()
-    now_dt = datetime.fromisoformat(now)
-    rows = conn.execute(
-        """
-        SELECT turns.host_id, turns.turn_id, turns.worker_id,
-               turns.payload_json, turns.observed_at,
-               revisions.user_text, revisions.assistant_final_text,
-               revisions.user_state, revisions.final_state
-        FROM turns
-        LEFT JOIN turn_content_revisions AS revisions
-          ON revisions.host_id = turns.host_id
-         AND revisions.turn_id = turns.turn_id
-         AND revisions.is_current = 1
-        """
-    ).fetchall()
-    decoded = []
-    for row in rows:
-        payload = _json_object(row[3])
-        current = (
-            {
-                "user_text": row[5],
-                "assistant_final_text": row[6],
-                "user_state": str(row[7]),
-                "final_state": str(row[8]),
-            }
-            if row[7] is not None
-            else None
-        )
-        decoded.append(
-            (
-                str(row[0]),
-                str(row[1]),
-                str(row[2]),
-                payload,
-                current,
-                str(row[4] or ""),
-            )
-        )
-    claims = [
-        row
-        for row in decoded
-        if str(row[3].get("source") or "") == "command"
-        and not str(row[3].get("source_turn_id") or "").strip()
-        and not _turn_is_tombstoned(row[3])
-        and row[3].get("complete") is not True
-    ]
-    done = [
-        row
-        for row in decoded
-        if str(row[3].get("source_turn_id") or "").strip()
-        and not _turn_is_tombstoned(row[3])
-        and (
-            row[3].get("complete") is True
-            or row[4] is not None
-            and str(row[4].get("final_state") or "") == "complete"
-        )
-    ]
-    affected_hosts: set[str] = set()
-    used_done = {
-        str(row[3].get("superseded_by_turn_id") or "")
-        for row in decoded
-        if _turn_is_tombstoned(row[3])
-        and str(row[3].get("superseded_by_turn_id") or "").strip()
-    }
-    for claim in claims:
-        claim_view = _turn_with_current_content(claim[3], claim[4])
-        matches = [
-            observed
-            for observed in done
-            if observed[0] == claim[0]
-            and observed[2] == claim[2]
-            and observed[1] not in used_done
-            and _turn_content_matches_origin(
-                _turn_with_current_content(observed[3], observed[4]),
-                claim_view,
-            )
-        ]
-        if len(matches) != 1:
-            continue
-        matching_claims = [
-            candidate
-            for candidate in claims
-            if candidate[0] == claim[0]
-            and candidate[2] == claim[2]
-            and _turn_content_matches_origin(
-                _turn_with_current_content(matches[0][3], matches[0][4]),
-                _turn_with_current_content(candidate[3], candidate[4]),
-            )
-        ]
-        if len(matching_claims) != 1:
-            continue
-        if _migrate_tombstone_command_turn_conn(
-            conn,
-            claim[0],
-            claim[1],
-            superseded_by_turn_id=matches[0][1],
-            superseded_at=now,
-        ):
-            affected_hosts.add(claim[0])
-            used_done.add(matches[0][1])
-
-    configured_hard_ttl = _LEGACY_TURN_CLAIM_HARD_TTL_SECONDS
-    for claim in claims:
-        stored = conn.execute(
-            "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
-            (claim[0], claim[1]),
-        ).fetchone()
-        if stored is None or _turn_is_tombstoned(_json_object(stored[0])):
-            continue
-        claim_dt = _turn_row_time(claim[3], claim[5])
-        if claim_dt is None or (now_dt - claim_dt).total_seconds() < configured_hard_ttl:
-            continue
-        if _migrate_tombstone_command_turn_conn(
-            conn,
-            claim[0],
-            claim[1],
-            superseded_by_turn_id=None,
-            superseded_at=now,
-        ):
-            affected_hosts.add(claim[0])
-    for host_id in sorted(affected_hosts):
-        _increment_turn_list_generation_conn(conn, host_id)
-
-
-def _legacy_outbox_ordering_key(
-    *,
-    outbox_id: int,
-    outbox_payload: Mapping[str, Any],
-    worker_id: Any,
-    turn_payload: Mapping[str, Any],
-) -> str:
-    nested_turn = outbox_payload.get("turn")
-    route = dict(nested_turn) if isinstance(nested_turn, Mapping) else outbox_payload
-    route_meta = _json_object(route.get("meta"))
-    route_stable_key = route.get("stable_key") or route_meta.get("stable_key")
-    route_stable_key_version = (
-        route.get("stable_key_version")
-        if route.get("stable_key") is not None
-        else route_meta.get("stable_key_version")
-    )
-    if (
-        _valid_final_stable_key(route_stable_key)
-        and type(route_stable_key_version) is int
-        and route_stable_key_version == 1
-    ):
-        return str(route_stable_key)
-    meta = _json_object(turn_payload.get("meta"))
-    stable_key = meta.get("stable_key")
-    if (
-        _valid_final_stable_key(stable_key)
-        and type(meta.get("stable_key_version")) is int
-        and meta.get("stable_key_version") == 1
-    ):
-        return str(stable_key)
-    return str(worker_id or route.get("worker_id") or f"orphan:{outbox_id}")
-
-
-def _migrate_v15_to_v16_conn(
-    conn: sqlite3.Connection,
-    *,
-    connector_ack_ttl_seconds: int = CONNECTOR_ACK_TTL_SECONDS,
-) -> None:
-    """Partition final FIFO order and bound legacy awaiting-ack plans."""
-    columns = _table_columns(conn, "connector_outbox")
-    if not columns:
-        conn.execute(CREATE_CONNECTOR_OUTBOX_TABLE)
-    elif "ordering_key" not in columns:
-        conn.execute(
-            "ALTER TABLE connector_outbox "
-            "ADD COLUMN ordering_key TEXT NOT NULL DEFAULT ''"
-        )
-    if _table_columns(conn, "turns"):
-        rows = conn.execute(
-            """
-            SELECT outbox.id, outbox.payload_json, turns.worker_id, turns.payload_json
-            FROM connector_outbox AS outbox
-            LEFT JOIN turns
-              ON turns.host_id = outbox.host_id
-             AND turns.turn_id = outbox.turn_id
-            WHERE outbox.ordering_key = ''
-            ORDER BY outbox.id
-            """
-        ).fetchall()
-    else:
-        rows = [
-            (row[0], row[1], None, None)
-            for row in conn.execute(
-                """
-                SELECT id, payload_json
-                FROM connector_outbox
-                WHERE ordering_key = ''
-                ORDER BY id
-                """
-            ).fetchall()
-        ]
-    for outbox_id, outbox_payload, worker_id, turn_payload in rows:
-        conn.execute(
-            "UPDATE connector_outbox SET ordering_key = ? WHERE id = ?",
-            (
-                _legacy_outbox_ordering_key(
-                    outbox_id=int(outbox_id),
-                    outbox_payload=_json_object(outbox_payload),
-                    worker_id=worker_id,
-                    turn_payload=_json_object(turn_payload),
-                ),
-                int(outbox_id),
-            ),
-        )
-    deadline = _connector_add_seconds(
-        utc_timestamp(),
-        max(1, int(connector_ack_ttl_seconds)),
-    )
-    awaiting_rows = conn.execute(
-        "SELECT id, private_state_json FROM connector_outbox WHERE status = 'awaiting_ack'"
-    ).fetchall()
-    for outbox_id, private_state_json in awaiting_rows:
-        state = _json_object(private_state_json)
-        state["ack_deadline_at"] = deadline
-        conn.execute(
-            """
-            UPDATE connector_outbox
-            SET private_state_json = ?, next_attempt_at = ?
-            WHERE id = ?
-            """,
-            (_canonical_json(state), deadline, int(outbox_id)),
-        )
-        delivery_rows = (
-            conn.execute(
-                """
-                SELECT id, private_state_json
-                FROM connector_deliveries
-                WHERE outbox_id = ? AND status = 'awaiting_ack'
-                """,
-                (int(outbox_id),),
-            ).fetchall()
-            if _table_columns(conn, "connector_deliveries")
-            else []
-        )
-        for delivery_id, delivery_private in delivery_rows:
-            delivery_state = _json_object(delivery_private)
-            delivery_state["ack_deadline_at"] = deadline
-            conn.execute(
-                "UPDATE connector_deliveries SET private_state_json = ? WHERE id = ?",
-                (_canonical_json(delivery_state), int(delivery_id)),
-            )
-    conn.execute(CREATE_CONNECTOR_ORDERING_INDEX)
-
-
-def _migrate_v16_to_v17_conn(conn: sqlite3.Connection) -> None:
-    """Give unresolved legacy outbox rows independent FIFO partitions."""
-    if _table_columns(conn, "turns"):
-        rows = conn.execute(
-            """
-            SELECT outbox.id, outbox.payload_json,
-                   turns.worker_id, turns.payload_json
-            FROM connector_outbox AS outbox
-            LEFT JOIN turns
-              ON turns.host_id = outbox.host_id
-             AND turns.turn_id = outbox.turn_id
-            WHERE outbox.ordering_key = ''
-            ORDER BY outbox.id
-            """
-        ).fetchall()
-    else:
-        rows = [
-            (row[0], row[1], None, None)
-            for row in conn.execute(
-                """
-                SELECT id, payload_json
-                FROM connector_outbox
-                WHERE ordering_key = ''
-                ORDER BY id
-                """
-            ).fetchall()
-        ]
-    for outbox_id, outbox_payload, worker_id, turn_payload in rows:
-        conn.execute(
-            "UPDATE connector_outbox SET ordering_key = ? WHERE id = ?",
-            (
-                _legacy_outbox_ordering_key(
-                    outbox_id=int(outbox_id),
-                    outbox_payload=_json_object(outbox_payload),
-                    worker_id=worker_id,
-                    turn_payload=_json_object(turn_payload),
-                ),
-                int(outbox_id),
-            ),
-        )
-
-
-def _create_available_turn_change_triggers_conn(conn: sqlite3.Connection) -> None:
-    """Install capture triggers whose legacy source tables are present."""
-    has_turns = bool(_table_columns(conn, "turns"))
-    has_revisions = bool(_table_columns(conn, "turn_content_revisions"))
-    for index, statement in enumerate(CREATE_TURN_CHANGE_TRIGGERS):
-        if index < 3 and not has_turns:
-            continue
-        if index in {3, 4} and not (has_turns and has_revisions):
-            continue
-        conn.execute(statement)
-
-
-def _migrate_v17_to_v18_conn(conn: sqlite3.Connection) -> None:
-    """Install the empty, trigger-backed public turn change journal."""
-    conn.execute(CREATE_TURN_CHANGE_JOURNAL_TABLE)
-    conn.execute(CREATE_TURN_CHANGE_FLOOR_TABLE)
-    conn.execute(CREATE_TURN_CHANGE_STATE_TABLE)
-    for statement in CREATE_TURN_CHANGE_INDEXES:
-        conn.execute(statement)
-    _ensure_turn_change_state_conn(conn)
-    _create_available_turn_change_triggers_conn(conn)
-
-
-def _migrate_v18_to_v19_conn(conn: sqlite3.Connection) -> None:
-    """Install empty Phase 2 submission and supersession ledgers."""
-    conn.execute(CREATE_TURN_SUBMISSIONS_TABLE)
-    conn.execute(CREATE_TURN_SUPERSESSIONS_TABLE)
-    for statement in CREATE_TURN_SUBMISSION_INDEXES:
-        conn.execute(statement)
-    for statement in CREATE_TURN_SUPERSESSION_INDEXES:
-        conn.execute(statement)
-
-
-def _backfill_submission_state(receipt_state: Any, receipt_status: Any) -> str | None:
-    """Map a historical send receipt to the shadow-ledger state it earned."""
-    state = str(receipt_state or "").strip().lower()
-    status = str(receipt_status or "").strip().lower()
-    if state == "purged" or status == "purged":
-        return None
-    if state in {"rejected", "cancelled", "canceled"} or status in {
-        "rejected",
-        "cancelled",
-        "canceled",
-    }:
-        return "cancelled"
-    if state == "send_started":
-        return "send_started"
-    if state == "accepted":
-        return "submitted"
-    if state == "uncertain":
-        return "uncertain"
-    # A reservation has not crossed the send boundary, so Stage 2 would not
-    # have created a submission row for it. Unknown legacy states fail closed.
-    return None
-
-
-def _receipt_instruction_text(canonical_request_json: Any) -> str | None:
-    """Recover only a validated canonical send-instruction payload."""
-    try:
-        payload = json.loads(str(canonical_request_json))
-    except (TypeError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, Mapping) or payload.get("action") != "send_instruction":
-        return None
-    instruction = payload.get("instruction")
-    if not isinstance(instruction, Mapping):
-        return None
-    text = instruction.get("text")
-    if not isinstance(text, str) or validate_instruction_text(text) is not None:
-        return None
-    return text
-
-
-def _backfill_turn_submissions_conn(conn: sqlite3.Connection) -> None:
-    """Backfill historical send receipts without changing live dual-write rows."""
-    required_columns = {
-        "id",
-        "host_id",
-        "request_id",
-        "action",
-        "canonical_request_json",
-        "public_worker_id",
-        "state",
-        "status",
-        "created_at",
-        "reserved_at",
-        "send_started_at",
-        "terminal_at",
-        "updated_at",
-    }
-    if not required_columns <= _table_columns(conn, "command_receipts"):
-        return
-    hosts = [
-        str(row[0])
-        for row in conn.execute(
-            """
-            SELECT DISTINCT host_id
-            FROM command_receipts
-            WHERE action = 'send_instruction' AND TRIM(host_id) <> ''
-            ORDER BY host_id
-            """
-        ).fetchall()
-    ]
-    for host_id in hosts:
-        after_id = 0
-        while True:
-            rows = conn.execute(
-                """
-                SELECT id, request_id, canonical_request_json,
-                       public_worker_id, state, status, created_at,
-                       reserved_at, send_started_at, terminal_at, updated_at
-                FROM command_receipts
-                WHERE host_id = ? AND action = 'send_instruction' AND id > ?
-                ORDER BY id
-                LIMIT ?
-                """,
-                (host_id, after_id, TURN_LEDGER_BACKFILL_BATCH_SIZE),
-            ).fetchall()
-            if not rows:
-                break
-            after_id = int(rows[-1][0])
-            for row in rows:
-                request_id = str(row[1] or "").strip()
-                public_worker_id = str(row[3] or "").strip()
-                ledger_state = _backfill_submission_state(row[4], row[5])
-                instruction_text = _receipt_instruction_text(row[2])
-                if (
-                    not request_id
-                    or not public_worker_id
-                    or ledger_state is None
-                    or instruction_text is None
-                ):
-                    continue
-
-                anchor = _strict_utc_timestamp(row[8] or row[7] or row[6])
-                updated_at = _strict_utc_timestamp(row[10])
-                if anchor is None or updated_at is None:
-                    continue
-                anchor_time = datetime.fromisoformat(anchor)
-                link_not_before = (
-                    anchor_time
-                    - timedelta(seconds=SUBMISSION_LINK_WINDOW_SECONDS)
-                ).isoformat(timespec="seconds")
-                link_expires_at = (
-                    anchor_time
-                    + timedelta(seconds=SUBMISSION_LINK_WINDOW_SECONDS)
-                ).isoformat(timespec="seconds")
-                hard_expires_at = (
-                    anchor_time
-                    + timedelta(seconds=SUBMISSION_HARD_TTL_SECONDS)
-                ).isoformat(timespec="seconds")
-                terminal_at = (
-                    _strict_utc_timestamp(row[9])
-                    if ledger_state in {"submitted", "uncertain", "cancelled"}
-                    else None
-                )
-                if (
-                    ledger_state in {"submitted", "uncertain", "cancelled"}
-                    and terminal_at is None
-                ):
-                    continue
-                send_started_at = (
-                    _strict_utc_timestamp(row[8]) if row[8] is not None else None
-                )
-                conn.execute(
-                    """
-                    INSERT INTO turn_submissions (
-                        host_id, submission_id, request_id, owner_key,
-                        owner_key_version, instruction_fingerprint, state,
-                        linked_turn_id, link_not_before, link_expires_at,
-                        hard_expires_at, linked_at, terminal_at, submitted_at,
-                        send_started_at, updated_at
-                    ) VALUES (
-                        ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, NULL, ?, ?, ?, ?
-                    )
-                    ON CONFLICT DO NOTHING
-                    """,
-                    (
-                        host_id,
-                        turn_submission_id(host_id, request_id),
-                        request_id,
-                        f"legacy-worker:{public_worker_id}",
-                        instruction_fingerprint(instruction_text),
-                        ledger_state,
-                        link_not_before,
-                        link_expires_at,
-                        hard_expires_at,
-                        terminal_at,
-                        terminal_at if ledger_state == "submitted" else None,
-                        send_started_at,
-                        updated_at,
-                    ),
-                )
-
-
-def _linked_canonical_turn_id_conn(
-    conn: sqlite3.Connection,
-    host_id: str,
-    replacement_turn_id: Any,
-) -> str | None:
-    """Follow only explicit tombstone links to a source-observed identity."""
-    current = str(replacement_turn_id or "").strip()
-    seen: set[str] = set()
-    while current and current not in seen:
-        seen.add(current)
-        row = conn.execute(
-            """
-            SELECT payload_json
-            FROM turns
-            WHERE host_id = ? AND turn_id = ?
-            """,
-            (str(host_id), current),
-        ).fetchone()
-        if row is None:
-            return None
-        payload = _json_object(row[0])
-        if _turn_is_tombstoned(payload):
-            current = str(payload.get("superseded_by_turn_id") or "").strip()
-            continue
-        if not str(payload.get("source_turn_id") or "").strip():
-            return None
-        # Phase 1 freezes an adopted command row's published turn_id instead
-        # of re-keying it after source_turn_id is learned. The row we just
-        # resolved is therefore the only canonical identity we can prove.
-        return current
-    return None
-
-
 def _resolve_canonical_turn_id_conn(
     conn: sqlite3.Connection,
     host_id: str,
     turn_id: Any,
 ) -> str | None:
-    """Resolve a public legacy turn alias without guessing through bad rows."""
+    """Resolve a superseded public turn alias without guessing through cycles."""
     current = str(turn_id or "").strip()
     if not current:
         return None
-    if not {
-        "host_id",
-        "superseded_turn_id",
-        "canonical_turn_id",
-    } <= _table_columns(conn, "turn_supersessions"):
-        return current
     seen: set[str] = set()
     while current and current not in seen:
         seen.add(current)
@@ -13325,555 +10091,140 @@ def _resolve_canonical_turn_id_conn(
     return None
 
 
-def _backfill_turn_supersessions_conn(conn: sqlite3.Connection) -> None:
-    """Alias only legacy command turns with deterministic Phase 1 linkage."""
-    if not {"host_id", "turn_id", "payload_json", "observed_at", "list_sequence"} <= (
-        _table_columns(conn, "turns")
-    ):
-        return
-    hosts = [
-        str(row[0])
-        for row in conn.execute(
-            """
-            SELECT DISTINCT host_id
-            FROM turns
-            WHERE json_extract(payload_json, '$.source') = 'command'
-            ORDER BY host_id
-            """
-        ).fetchall()
-    ]
-    for host_id in hosts:
-        after_sequence = 0
-        while True:
-            rows = conn.execute(
-                """
-                SELECT turn_id, payload_json, observed_at, list_sequence
-                FROM turns
-                WHERE host_id = ?
-                  AND list_sequence > ?
-                  AND json_extract(payload_json, '$.source') = 'command'
-                ORDER BY list_sequence
-                LIMIT ?
-                """,
-                (host_id, after_sequence, TURN_LEDGER_BACKFILL_BATCH_SIZE),
-            ).fetchall()
-            if not rows:
-                break
-            after_sequence = int(rows[-1][3])
-            for turn_id, payload_json, observed_at, _sequence in rows:
-                legacy_turn_id = str(turn_id)
-                payload = _json_object(payload_json)
-                # A live adopted command turn was never superseded. Its row ID
-                # is deliberately frozen by Phase 1, so recomputing a Turn ID
-                # from its updated payload could only invent a dangling alias.
-                if not _turn_is_tombstoned(payload):
-                    continue
-                canonical_turn_id = _linked_canonical_turn_id_conn(
-                    conn,
-                    host_id,
-                    payload.get("superseded_by_turn_id"),
-                )
-                if not canonical_turn_id or canonical_turn_id == legacy_turn_id:
-                    continue
-                created_at = _strict_utc_timestamp(
-                    payload.get("superseded_at")
-                    or payload.get("updated_at")
-                    or observed_at
-                )
-                if created_at is None:
-                    continue
-                conn.execute(
-                    """
-                    INSERT INTO turn_supersessions (
-                        host_id, superseded_turn_id, canonical_turn_id,
-                        reason, created_at
-                    ) VALUES (?, ?, ?, 'phase1_migration', ?)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    (
-                        host_id,
-                        legacy_turn_id,
-                        canonical_turn_id,
-                        created_at,
-                    ),
-                )
 
-
-def _migrate_v19_to_v20_conn(conn: sqlite3.Connection) -> None:
-    """Backfill Phase 1 history into the non-authoritative Phase 2 ledgers."""
-    # The pre-Phase-2 production lineage also used user_version 19, but did
-    # not contain either ledger table. Repair that valid legacy shape before
-    # backfilling instead of assuming every v19 store passed through this
-    # branch's v18 -> v19 migration.
-    conn.execute(CREATE_TURN_SUBMISSIONS_TABLE)
-    conn.execute(CREATE_TURN_SUPERSESSIONS_TABLE)
-    for statement in CREATE_TURN_SUBMISSION_INDEXES:
-        conn.execute(statement)
-    for statement in CREATE_TURN_SUPERSESSION_INDEXES:
-        conn.execute(statement)
-    _backfill_turn_submissions_conn(conn)
-    _backfill_turn_supersessions_conn(conn)
-
-
-def _migrate_v20_to_v21_conn(conn: sqlite3.Connection) -> None:
-    """Add durable Herdr turn replay watermarks and completion provenance."""
-    conn.execute(CREATE_HERDR_TURN_WATERMARKS_TABLE)
-    conn.execute(CREATE_HERDR_TURN_COMPLETIONS_TABLE)
-    for statement in CREATE_HERDR_TURN_INDEXES:
-        conn.execute(statement)
-
-
-def _migrate_v21_to_v22_conn(conn: sqlite3.Connection) -> None:
-    """Add the append-only structured agent-event journal."""
-    conn.execute(CREATE_AGENT_EVENTS_TABLE)
-    for statement in CREATE_AGENT_EVENT_INDEXES:
-        conn.execute(statement)
-
-
-def _migrate_v22_to_v23_conn(conn: sqlite3.Connection) -> None:
-    """Harden event identity and rebuild v22 rows under the canonical contract."""
-    columns = [
-        "sequence",
-        "host_id",
-        "event_id",
-        "kind",
-        "source",
-        "worker_id",
-        "visibility",
-        "source_session_id",
-        "source_turn_id",
-        "source_item_id",
-        "source_message_id",
-        "source_event_id",
-        "source_sequence",
-        "observed_at",
-        "payload_fingerprint",
-        "private_payload_json",
-        "public_payload_json",
-    ]
-    rows = conn.execute(
-        "SELECT " + ", ".join(columns) + " FROM agent_events ORDER BY sequence"
-    ).fetchall()
-    conn.execute("ALTER TABLE agent_events RENAME TO agent_events_v22")
-    conn.execute(CREATE_AGENT_EVENTS_TABLE)
-    try:
-        for row in rows:
-            try:
-                private_payload = _json_object(row[15])
-                public_payload = _json_object(row[16])
-                if _canonical_json(private_payload) != row[15]:
-                    raise StoreSchemaError("invalid_v22_agent_event_payload")
-                if _canonical_json(public_payload) != row[16]:
-                    raise StoreSchemaError("invalid_v22_agent_event_projection")
-                host_id = normalize_agent_event_identifier(
-                    row[1], "host_id", required=True
-                )
-                # v22 allowed tool/plan rows to be public.  The current
-                # constructor and table correctly reject that historical
-                # shape, so normalize it while it is still in the private
-                # migration transaction instead of rebuilding through the
-                # latest DDL and failing before v24 -> v25 can privatise it.
-                legacy_sensitive = str(row[3]) in {
-                    "thought",
-                    "tool_call",
-                    "tool_call_update",
-                    "plan",
-                    "extension",
-                }
-                canonical = agent_event(
-                    kind=row[3],
-                    source=row[4],
-                    worker_id=row[5],
-                    visibility="private" if legacy_sensitive else row[6],
-                    source_session_id=row[7],
-                    source_turn_id=row[8],
-                    source_item_id=row[9],
-                    source_message_id=row[10],
-                    source_event_id=row[11],
-                    source_sequence=row[12],
-                    observed_at=row[13],
-                    payload=private_payload,
-                )
-                legacy_identity = {
-                    "schema_version": 1,
-                    "source": canonical.source,
-                    "session_id": canonical.source_session_id,
-                    "event_id": canonical.source_event_id,
-                    "sequence": canonical.source_sequence,
-                    "kind": canonical.kind,
-                }
-                legacy_event_id = hashlib.sha256(
-                    _canonical_json(legacy_identity).encode("utf-8")
-                ).hexdigest()
-                if str(row[2]) != legacy_event_id:
-                    raise StoreSchemaError("invalid_v22_agent_event_identity")
-                if str(row[14]) != canonical.payload_fingerprint:
-                    raise StoreSchemaError("invalid_v22_agent_event_fingerprint")
-                if not legacy_sensitive and public_payload != canonical.public_payload:
-                    raise StoreSchemaError("invalid_v22_agent_event_projection")
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise StoreSchemaError("invalid_v22_agent_event_row") from exc
-            conn.execute(
-                """
-                INSERT INTO agent_events (
-                    sequence, host_id, event_id, kind, source, worker_id,
-                    visibility, source_session_id, source_turn_id,
-                    source_item_id, source_message_id, source_event_id,
-                    source_sequence, observed_at, payload_fingerprint,
-                    private_payload_json, public_payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    int(row[0]),
-                    host_id,
-                    canonical.event_id,
-                    canonical.kind,
-                    canonical.source,
-                    canonical.worker_id,
-                    canonical.visibility,
-                    canonical.source_session_id,
-                    canonical.source_turn_id,
-                    canonical.source_item_id,
-                    canonical.source_message_id,
-                    canonical.source_event_id,
-                    canonical.source_sequence,
-                    canonical.observed_at,
-                    canonical.payload_fingerprint,
-                    _canonical_json(canonical.payload),
-                    _canonical_json(canonical.public_payload),
-                ),
-            )
-    except sqlite3.IntegrityError as exc:
-        raise StoreSchemaError("conflicting_v22_agent_event_identity") from exc
-    conn.execute("DROP TABLE agent_events_v22")
-    for statement in CREATE_AGENT_EVENT_INDEXES:
-        conn.execute(statement)
-
-
-def _migrate_v23_to_v24_conn(conn: sqlite3.Connection) -> None:
-    """Raise private event bounds and add replay-preserving retention tombstones."""
-    conn.execute("ALTER TABLE agent_events RENAME TO agent_events_v23")
-    conn.execute(CREATE_AGENT_EVENTS_TABLE)
-    conn.execute(
-        """
-        INSERT INTO agent_events (
-            sequence, host_id, event_id, kind, source, worker_id, visibility,
-            source_session_id, source_turn_id, source_item_id,
-            source_message_id, source_event_id, source_sequence, observed_at,
-            payload_fingerprint, private_payload_json, public_payload_json
-        )
-        SELECT
-            sequence, host_id, event_id, kind, source, worker_id,
-            CASE
-                WHEN kind IN ('thought', 'tool_call', 'tool_call_update', 'plan', 'extension')
-                THEN 'private'
-                ELSE visibility
-            END,
-            source_session_id, source_turn_id, source_item_id,
-            source_message_id, source_event_id, source_sequence, observed_at,
-            payload_fingerprint, private_payload_json,
-            CASE
-                WHEN kind IN ('thought', 'tool_call', 'tool_call_update', 'plan', 'extension')
-                THEN '{}'
-                ELSE public_payload_json
-            END
-        FROM agent_events_v23
-        ORDER BY sequence
-        """
+def _create_current_schema_objects_conn(conn: sqlite3.Connection) -> None:
+    table_statements = (
+        CREATE_SNAPSHOTS_TABLE,
+        CREATE_COMMAND_RECEIPTS_TABLE,
+        CREATE_WORKER_BINDINGS_TABLE,
+        *CREATE_CURRENT_PR6_TABLES,
+        CREATE_BACKEND_PENDING_TABLE,
+        CREATE_BACKEND_PENDING_CLAIMS_TABLE,
+        CREATE_ATTENTION_LIFECYCLES_TABLE,
+        CREATE_TURN_CONTENT_REVISIONS_TABLE,
+        CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE,
+        CREATE_TURN_PRESENTATION_PLANS_TABLE,
+        CREATE_TURN_PRESENTATION_JOBS_TABLE,
+        CREATE_TURN_PRESENTATION_RECOVERIES_TABLE,
+        CREATE_STORE_MAINTENANCE_STATE_TABLE,
+        CREATE_STORE_MAINTENANCE_CURSORS_TABLE,
+        CREATE_TURN_LIST_STATE_TABLE,
+        CREATE_TURN_LIST_HOSTS_TABLE,
+        CREATE_TURN_CHANGE_JOURNAL_TABLE,
+        CREATE_TURN_CHANGE_FLOOR_TABLE,
+        CREATE_TURN_CHANGE_STATE_TABLE,
+        CREATE_TURN_SUBMISSIONS_TABLE,
+        CREATE_TURN_SUPERSESSIONS_TABLE,
+        CREATE_AGENT_EVENTS_TABLE,
     )
-    conn.execute("DROP TABLE agent_events_v23")
-    for statement in CREATE_AGENT_EVENT_INDEXES:
-        conn.execute(statement)
-    conn.execute(CREATE_AGENT_EVENT_TOMBSTONES_V25_TABLE)
-    for statement in CREATE_AGENT_EVENT_TOMBSTONE_INDEXES:
-        conn.execute(statement)
-
-
-def _migrate_v24_to_v25_conn(conn: sqlite3.Connection) -> None:
-    """Make thought, tool, plan, and extension journal rows private-only."""
-    conn.execute("ALTER TABLE agent_events RENAME TO agent_events_v24")
-    conn.execute(CREATE_AGENT_EVENTS_TABLE)
-    conn.execute(
-        """
-        INSERT INTO agent_events (
-            sequence, host_id, event_id, kind, source, worker_id, visibility,
-            source_session_id, source_turn_id, source_item_id,
-            source_message_id, source_event_id, source_sequence, observed_at,
-            payload_fingerprint, private_payload_json, public_payload_json
-        )
-        SELECT
-            sequence, host_id, event_id, kind, source, worker_id,
-            CASE
-                WHEN kind IN ('thought', 'tool_call', 'tool_call_update', 'plan', 'extension')
-                THEN 'private'
-                ELSE visibility
-            END,
-            source_session_id, source_turn_id, source_item_id,
-            source_message_id, source_event_id, source_sequence, observed_at,
-            payload_fingerprint, private_payload_json,
-            CASE
-                WHEN kind IN ('thought', 'tool_call', 'tool_call_update', 'plan', 'extension')
-                THEN '{}'
-                ELSE public_payload_json
-            END
-        FROM agent_events_v24
-        ORDER BY sequence
-        """
+    index_statements = (
+        *CREATE_COMMAND_RECEIPT_INDEXES,
+        *CREATE_WORKER_BINDING_INDEXES,
+        CREATE_WORKER_BINDING_UNIQUE_INDEX,
+        *CREATE_CURRENT_PR6_INDEXES,
+        *CREATE_TURN_LIST_INDEXES,
+        *CREATE_TURN_LIST_SEQUENCE_TRIGGERS,
+        *CREATE_TURN_CHANGE_INDEXES,
+        *CREATE_TURN_CHANGE_TRIGGERS,
+        *CREATE_TURN_SUBMISSION_INDEXES,
+        *CREATE_TURN_SUPERSESSION_INDEXES,
+        *CREATE_AGENT_EVENT_INDEXES,
+        *CREATE_ATTENTION_LIFECYCLE_INDEXES,
+        *CREATE_TURN_CONTENT_REVISION_INDEXES,
+        *CREATE_TURN_PRESENTATION_INDEXES,
+        *CREATE_FINAL_DELIVERY_INDEXES,
+        CREATE_CONNECTOR_ORDERING_INDEX,
+        *CREATE_SNAPSHOT_INDEXES,
     )
-    conn.execute("DROP TABLE agent_events_v24")
-    for statement in CREATE_AGENT_EVENT_INDEXES:
+    for statement in (*table_statements, *index_statements):
         conn.execute(statement)
-
-
-def _migrate_v25_to_v26_conn(conn: sqlite3.Connection) -> None:
-    """Retain original event authority time for safe tombstone repair."""
-    if "observed_at" in _table_columns(conn, "agent_event_tombstones"):
-        return
+    conn.execute(INSERT_STORE_MAINTENANCE_STATE)
     conn.execute(
-        """
-        ALTER TABLE agent_event_tombstones
-        ADD COLUMN observed_at TEXT
-        CHECK (observed_at IS NULL OR length(observed_at) BETWEEN 20 AND 40)
-        """
+        "INSERT INTO turn_list_state(scope, store_epoch) VALUES (?, ?)",
+        ("turn-list", secrets.token_urlsafe(32)),
     )
-
-
-def _migrate_v26_to_v27_conn(conn: sqlite3.Connection) -> None:
-    """Persist private pending-decision transport provenance."""
-    pending_columns = _table_columns(conn, "backend_pending")
-    required_pending_columns = {
-        "revision_digest",
-        "choice_routes_json",
-        "binding_private_fingerprint",
-        "observed_turn_target_value",
-        "observation_state",
-        "freshness",
-        "updated_at",
-    }
-    if not required_pending_columns.issubset(pending_columns):
-        # Some old fixture databases intentionally contain only the v11
-        # command tables. Reconstruct this unrelated family defensively.
-        _migrate_v9_to_v10_conn(conn)
-        pending_columns = _table_columns(conn, "backend_pending")
-    if not _table_columns(conn, "backend_pending_claims"):
-        conn.execute(CREATE_BACKEND_PENDING_CLAIMS_TABLE)
-    if "route_kind" not in pending_columns:
-        conn.execute(
-            "ALTER TABLE backend_pending ADD COLUMN route_kind "
-            "TEXT NOT NULL DEFAULT 'legacy' "
-            "CHECK (route_kind IN ('legacy', 'acp_permission'))"
-        )
-    if "route_kind" not in _table_columns(conn, "backend_pending_claims"):
-        conn.execute(
-            "ALTER TABLE backend_pending_claims ADD COLUMN route_kind "
-            "TEXT NOT NULL DEFAULT 'legacy' "
-            "CHECK (route_kind IN ('legacy', 'acp_permission'))"
-        )
-
-
-def _migrate_v27_to_v28_conn(conn: sqlite3.Connection) -> None:
-    """Persist bounded Herdr completion-refresh retries and escalation."""
-    conn.execute(CREATE_HERDR_TURN_REFRESH_RETRIES_TABLE)
-    for statement in CREATE_HERDR_TURN_REFRESH_RETRY_INDEXES:
-        conn.execute(statement)
-
-
-MIGRATIONS: tuple[Migration, ...] = (
-    Migration(0, 1, _migrate_v0_to_v1_conn),
-    Migration(1, 2, _migrate_v1_to_v2_conn),
-    Migration(2, 3, _migrate_v2_to_v3_conn),
-    Migration(3, 4, _migrate_v3_to_v4_conn),
-    Migration(4, 5, _migrate_v4_to_v5_conn),
-    Migration(5, 6, _migrate_v5_to_v6_conn),
-    Migration(6, 7, _migrate_v6_to_v7_conn),
-    Migration(7, 8, _migrate_v7_to_v8_conn),
-    Migration(8, 9, _migrate_v8_to_v9_conn),
-    Migration(9, 10, _migrate_v9_to_v10_conn),
-    Migration(10, 11, _migrate_v10_to_v11_conn),
-    Migration(11, 12, _migrate_v11_to_v12_conn),
-    Migration(12, 13, _migrate_v12_to_v13_conn),
-    Migration(13, 14, _migrate_v13_to_v14_conn),
-    Migration(14, 15, _migrate_v14_to_v15_conn),
-    Migration(15, 16, _migrate_v15_to_v16_conn),
-    Migration(16, 17, _migrate_v16_to_v17_conn),
-    Migration(17, 18, _migrate_v17_to_v18_conn),
-    Migration(18, 19, _migrate_v18_to_v19_conn),
-    Migration(19, 20, _migrate_v19_to_v20_conn),
-    Migration(20, 21, _migrate_v20_to_v21_conn),
-    Migration(21, 22, _migrate_v21_to_v22_conn),
-    Migration(22, 23, _migrate_v22_to_v23_conn),
-    Migration(23, 24, _migrate_v23_to_v24_conn),
-    Migration(24, 25, _migrate_v24_to_v25_conn),
-    Migration(25, 26, _migrate_v25_to_v26_conn),
-    Migration(26, 27, _migrate_v26_to_v27_conn),
-    Migration(27, 28, _migrate_v27_to_v28_conn),
-)
-
-
-def _validate_migration_registry(
-    migrations: tuple[Migration, ...] | None = None,
-    *,
-    target_version: int = STORE_SCHEMA_VERSION,
-) -> None:
-    registry = MIGRATIONS if migrations is None else migrations
-    expected = 0
-    for migration in registry:
-        if (
-            migration.from_version != expected
-            or migration.to_version != expected + 1
-        ):
-            raise RuntimeError("invalid migration registry")
-        expected = migration.to_version
-    if expected != STORE_SCHEMA_VERSION:
-        raise RuntimeError("invalid migration registry target")
-    if not 0 <= int(target_version) <= STORE_SCHEMA_VERSION:
-        raise RuntimeError("unsupported migration target")
+    conn.execute(
+        "INSERT INTO turn_change_state(scope, store_epoch) VALUES (?, ?)",
+        ("turn-delta", secrets.token_urlsafe(32)),
+    )
+    conn.execute(f"PRAGMA user_version = {STORE_SCHEMA_VERSION}")
 
 
 def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
     """Create an empty database directly at the current schema."""
     if conn.in_transaction:
-        raise StoreSchemaError("schema_migration_in_transaction")
+        raise StoreSchemaError("schema_rebuild_in_transaction")
     conn.execute("BEGIN IMMEDIATE")
     try:
-        conn.execute(CREATE_SNAPSHOTS_TABLE)
-        conn.execute(CREATE_COMMAND_RECEIPTS_TABLE)
-        conn.execute(CREATE_WORKER_BINDINGS_TABLE)
-        for statement in CREATE_CURRENT_PR6_TABLES:
-            conn.execute(statement)
-        conn.execute(CREATE_LEGACY_BACKEND_PENDING_TABLE)
-        _migrate_v9_to_v10_conn(conn)
-        _migrate_v26_to_v27_conn(conn)
-        conn.execute(CREATE_ATTENTION_LIFECYCLES_TABLE)
-        conn.execute(CREATE_TURN_CONTENT_REVISIONS_TABLE)
-        conn.execute(CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE)
-        conn.execute(CREATE_TURN_PRESENTATION_PLANS_TABLE)
-        conn.execute(CREATE_TURN_PRESENTATION_JOBS_TABLE)
-        conn.execute(CREATE_TURN_PRESENTATION_RECOVERIES_TABLE)
-        conn.execute(CREATE_STORE_MAINTENANCE_STATE_TABLE)
-        conn.execute(CREATE_STORE_MAINTENANCE_CURSORS_TABLE)
-        conn.execute(CREATE_TURN_LIST_STATE_TABLE)
-        conn.execute(CREATE_TURN_LIST_HOSTS_TABLE)
-        conn.execute(CREATE_TURN_CHANGE_JOURNAL_TABLE)
-        conn.execute(CREATE_TURN_CHANGE_FLOOR_TABLE)
-        conn.execute(CREATE_TURN_CHANGE_STATE_TABLE)
-        conn.execute(CREATE_TURN_SUBMISSIONS_TABLE)
-        conn.execute(CREATE_TURN_SUPERSESSIONS_TABLE)
-        conn.execute(CREATE_HERDR_TURN_WATERMARKS_TABLE)
-        conn.execute(CREATE_HERDR_TURN_COMPLETIONS_TABLE)
-        conn.execute(CREATE_HERDR_TURN_REFRESH_RETRIES_TABLE)
-        conn.execute(CREATE_AGENT_EVENTS_TABLE)
-        conn.execute(CREATE_AGENT_EVENT_TOMBSTONES_TABLE)
-        for statement in CREATE_COMMAND_RECEIPT_INDEXES:
-            conn.execute(statement)
-        for statement in CREATE_WORKER_BINDING_INDEXES:
-            conn.execute(statement)
-        conn.execute(CREATE_WORKER_BINDING_UNIQUE_INDEX)
-        for statement in CREATE_CURRENT_PR6_INDEXES:
-            conn.execute(statement)
-        for statement in CREATE_TURN_LIST_INDEXES:
-            conn.execute(statement)
-        for statement in CREATE_TURN_LIST_SEQUENCE_TRIGGERS:
-            conn.execute(statement)
-        for statement in CREATE_TURN_CHANGE_INDEXES:
-            conn.execute(statement)
-        for statement in CREATE_TURN_CHANGE_TRIGGERS:
-            conn.execute(statement)
-        for statement in CREATE_TURN_SUBMISSION_INDEXES:
-            conn.execute(statement)
-        for statement in CREATE_TURN_SUPERSESSION_INDEXES:
-            conn.execute(statement)
-        for statement in CREATE_HERDR_TURN_INDEXES:
-            conn.execute(statement)
-        for statement in CREATE_HERDR_TURN_REFRESH_RETRY_INDEXES:
-            conn.execute(statement)
-        for statement in CREATE_AGENT_EVENT_INDEXES:
-            conn.execute(statement)
-        for statement in CREATE_AGENT_EVENT_TOMBSTONE_INDEXES:
-            conn.execute(statement)
-        for statement in CREATE_ATTENTION_LIFECYCLE_INDEXES:
-            conn.execute(statement)
-        for statement in CREATE_TURN_CONTENT_REVISION_INDEXES:
-            conn.execute(statement)
-        for statement in CREATE_TURN_PRESENTATION_INDEXES:
-            conn.execute(statement)
-        for statement in CREATE_FINAL_DELIVERY_INDEXES:
-            conn.execute(statement)
-        conn.execute(CREATE_CONNECTOR_ORDERING_INDEX)
-        for statement in CREATE_SNAPSHOT_INDEXES:
-            conn.execute(statement)
-        conn.execute(INSERT_STORE_MAINTENANCE_STATE)
-        _ensure_turn_list_state_conn(conn)
-        _ensure_turn_change_state_conn(conn)
-        conn.execute(f"PRAGMA user_version = {STORE_SCHEMA_VERSION}")
+        _create_current_schema_objects_conn(conn)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
 
 
-def _database_has_application_objects(conn: sqlite3.Connection) -> bool:
-    return (
-        conn.execute(
-            """
-            SELECT 1
-            FROM sqlite_master
-            WHERE name NOT LIKE 'sqlite_%'
-              AND type IN ('table', 'index', 'view', 'trigger')
-            LIMIT 1
-            """
-        ).fetchone()
-        is not None
-    )
+def _application_schema_objects(
+    conn: sqlite3.Connection,
+) -> tuple[tuple[str, str], ...]:
+    rows = conn.execute(
+        """
+        SELECT type, name
+        FROM sqlite_master
+        WHERE name NOT LIKE 'sqlite_%'
+          AND type IN ('view', 'trigger', 'index', 'table')
+        ORDER BY CASE type
+            WHEN 'view' THEN 0
+            WHEN 'trigger' THEN 1
+            WHEN 'index' THEN 2
+            ELSE 3
+        END, name
+        """
+    ).fetchall()
+    return tuple((str(row[0]), str(row[1])) for row in rows)
 
 
-def _run_migrations(
+def _quote_sqlite_identifier(value: str) -> str:
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def _rebuild_current_schema_conn(
     conn: sqlite3.Connection,
     *,
-    target_version: int = STORE_SCHEMA_VERSION,
-    connector_ack_ttl_seconds: int = CONNECTOR_ACK_TTL_SECONDS,
+    previous_version: int,
 ) -> None:
-    """Run exact ordered transitions with one transaction per version."""
     if conn.in_transaction:
-        raise StoreSchemaError("schema_migration_in_transaction")
-    _validate_migration_registry(target_version=target_version)
-    current = int(conn.execute("PRAGMA user_version").fetchone()[0])
-    while current < int(target_version):
-        migration = MIGRATIONS[current]
-        if migration.from_version != current:
-            raise RuntimeError("invalid migration registry dispatch")
+        raise StoreSchemaError("schema_rebuild_in_transaction")
+    objects = _application_schema_objects(conn)
+    _LOGGER.warning(
+        "store schema mismatch; discarding and recreating database "
+        "previous_version=%d target_version=%d discarded_objects=%s",
+        int(previous_version),
+        STORE_SCHEMA_VERSION,
+        ",".join(f"{kind}:{name}" for kind, name in objects) or "none",
+    )
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            if migration.apply is _migrate_v15_to_v16_conn:
-                _migrate_v15_to_v16_conn(
-                    conn,
-                    connector_ack_ttl_seconds=max(
-                        1, int(connector_ack_ttl_seconds)
-                    ),
+            for kind, name in objects:
+                conn.execute(
+                    f"DROP {kind.upper()} IF EXISTS "
+                    f"{_quote_sqlite_identifier(name)}"
                 )
-            else:
-                migration.apply(conn)
-            conn.execute(f"PRAGMA user_version = {migration.to_version}")
+            _create_current_schema_objects_conn(conn)
             conn.commit()
         except Exception:
             conn.rollback()
             raise
-        current = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if current != migration.to_version:
-            raise StoreSchemaError("schema_version_not_advanced")
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
-def ensure_schema(
-    conn: sqlite3.Connection,
-    *,
-    connector_ack_ttl_seconds: int = CONNECTOR_ACK_TTL_SECONDS,
-) -> None:
-    """Gate the current schema cheaply, or initialize/migrate older stores."""
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Open v29 unchanged or explicitly replace any other schema."""
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if version == STORE_SCHEMA_VERSION:
         return
-    if version > STORE_SCHEMA_VERSION:
-        raise StoreSchemaError("schema_too_new")
     if not isinstance(conn, _ClosingConnection):
         raise local_state_error(LocalStateErrorCode.OPERATION_FAILED)
     schema_authority = _schema_connection_authority(conn)
@@ -13886,37 +10237,44 @@ def ensure_schema(
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         if version == STORE_SCHEMA_VERSION:
             return
-        if version > STORE_SCHEMA_VERSION:
-            raise StoreSchemaError("schema_too_new")
         with private_file_creation_umask():
             _configure_persistent_database_conn(conn)
-            if version == 0 and not _database_has_application_objects(conn):
+            objects = _application_schema_objects(conn)
+            if version == 0 and not objects:
                 _create_current_schema_conn(conn)
                 return
-            _run_migrations(
-                conn,
-                connector_ack_ttl_seconds=max(
-                    1, int(connector_ack_ttl_seconds)
-                ),
+            _rebuild_current_schema_conn(
+                conn, previous_version=version
             )
 
 
 _ensure_schema = ensure_schema
 
 
+def _turn_list_store_epoch_conn(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        "SELECT store_epoch FROM turn_list_state WHERE scope = 'turn-list'"
+    ).fetchone()
+    if row is None or not str(row[0]):
+        raise StoreSchemaError("turn_list_state_unavailable")
+    return str(row[0])
+
+
+def _turn_change_store_epoch_conn(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        "SELECT store_epoch FROM turn_change_state WHERE scope = 'turn-delta'"
+    ).fetchone()
+    if row is None or not str(row[0]):
+        raise StoreSchemaError("turn_change_state_unavailable")
+    return str(row[0])
+
+
 def init_store(
     db_path: Path,
-    *,
-    connector_ack_ttl_seconds: int = CONNECTOR_ACK_TTL_SECONDS,
 ) -> None:
-    """Initialize or migrate the sqlite store to the current schema."""
+    """Initialize the sqlite store at the current schema."""
     with _connect(db_path, prepare=True) as conn:
-        ensure_schema(
-            conn,
-            connector_ack_ttl_seconds=max(
-                1, int(connector_ack_ttl_seconds)
-            ),
-        )
+        ensure_schema(conn)
 
 
 def _agent_event_from_row(row: tuple[Any, ...]) -> StoredAgentEvent:
@@ -14000,60 +10358,8 @@ def _agent_event_conflicts(existing: StoredAgentEvent, incoming: AgentEvent) -> 
     )
 
 
-def _agent_event_replay_contract_fingerprint(
-    *,
-    event_id: str,
-    kind: str,
-    source: str,
-    worker_id: str,
-    visibility: str,
-    source_session_id: str | None,
-    source_turn_id: str | None,
-    source_item_id: str | None,
-    source_message_id: str | None,
-    source_event_id: str | None,
-    source_sequence: int | None,
-    payload_fingerprint: str,
-    public_payload_json: str,
-) -> str:
-    """Fingerprint compact replay metadata without reading private payload text."""
-    contract = {
-        "event_id": event_id,
-        "kind": kind,
-        "source": source,
-        "worker_id": worker_id,
-        "visibility": visibility,
-        "source_session_id": source_session_id,
-        "source_turn_id": source_turn_id,
-        "source_item_id": source_item_id,
-        "source_message_id": source_message_id,
-        "source_event_id": source_event_id,
-        "source_sequence": source_sequence,
-        "payload_fingerprint": payload_fingerprint,
-        "public_payload_fingerprint": hashlib.sha256(
-            public_payload_json.encode("utf-8")
-        ).hexdigest(),
-    }
-    return hashlib.sha256(_canonical_json(contract).encode("utf-8")).hexdigest()
 
 
-def _agent_event_replay_fingerprint(event: AgentEvent) -> str:
-    """Fingerprint the replay contract while excluding source observation time."""
-    return _agent_event_replay_contract_fingerprint(
-        event_id=event.event_id,
-        kind=event.kind,
-        source=event.source,
-        worker_id=event.worker_id,
-        visibility=event.visibility,
-        source_session_id=event.source_session_id,
-        source_turn_id=event.source_turn_id,
-        source_item_id=event.source_item_id,
-        source_message_id=event.source_message_id,
-        source_event_id=event.source_event_id,
-        source_sequence=event.source_sequence,
-        payload_fingerprint=event.payload_fingerprint,
-        public_payload_json=_canonical_json(event.public_payload),
-    )
 
 
 def _canonical_agent_event_for_append(event: AgentEvent) -> AgentEvent:
@@ -14083,22 +10389,6 @@ def _append_agent_event_conn(
     host_id: str,
     event: AgentEvent,
 ) -> AppendAgentEventResult:
-    tombstone = conn.execute(
-        """
-        SELECT sequence, replay_fingerprint
-        FROM agent_event_tombstones
-        WHERE host_id = ? AND event_id = ?
-        """,
-        (host_id, event.event_id),
-    ).fetchone()
-    if tombstone is not None:
-        if str(tombstone[1]) != _agent_event_replay_fingerprint(event):
-            raise AgentEventIdentityConflict(event.event_id)
-        return AppendAgentEventResult(
-            sequence=int(tombstone[0]),
-            event_id=event.event_id,
-            inserted=False,
-        )
     private_json = _canonical_json(event.payload)
     public_json = _canonical_json(event.public_payload)
     cursor = conn.execute(
@@ -14148,80 +10438,8 @@ def _append_agent_event_conn(
     )
 
 
-def append_agent_event(
-    db_path: Path | str,
-    host_id: str,
-    event: AgentEvent,
-) -> AppendAgentEventResult:
-    """Append one structured event, or return its existing replay sequence.
-
-    Reusing a deterministic event identity with different content is rejected
-    instead of silently mutating the journal or accepting source corruption.
-    """
-    normalized_host = normalize_agent_event_identifier(
-        host_id, "host_id", required=True
-    )
-    _canonical_agent_event_for_append(event)
-    with _connect(db_path, prepare=True) as conn:
-        _ensure_schema(conn)
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            result = _append_agent_event_conn(conn, normalized_host or "", event)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-    return result
 
 
-def append_agent_event_for_binding(
-    db_path: Path | str,
-    host_id: str,
-    event: AgentEvent,
-    *,
-    expected_binding: WorkerBinding,
-) -> AppendBoundAgentEventResult:
-    """Append only while the expected active worker binding remains current.
-
-    The binding check and insert share one ``BEGIN IMMEDIATE`` transaction, so
-    a concurrent inventory refresh cannot invalidate the binding between the
-    check and journal mutation.
-    """
-    normalized_host = normalize_agent_event_identifier(
-        host_id, "host_id", required=True
-    )
-    _canonical_agent_event_for_append(event)
-    if not isinstance(expected_binding, WorkerBinding):
-        raise ValueError("expected_binding must be a WorkerBinding")
-    with _connect(db_path, prepare=True) as conn:
-        _ensure_schema(conn)
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            if not _agent_event_binding_matches_conn(
-                conn,
-                normalized_host or "",
-                event.worker_id,
-                expected_binding,
-            ):
-                conn.rollback()
-                return AppendBoundAgentEventResult(
-                    status="binding_changed",
-                    event_id=event.event_id,
-                )
-            result = _append_agent_event_conn(
-                conn,
-                normalized_host or "",
-                event,
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-    return AppendBoundAgentEventResult(
-        status="inserted" if result.inserted else "replayed",
-        event_id=result.event_id,
-        sequence=result.sequence,
-    )
 
 
 def record_agent_event(
@@ -14230,7 +10448,23 @@ def record_agent_event(
     **event_fields: Any,
 ) -> AppendAgentEventResult:
     """Validate, normalize, and durably append one source event."""
-    return append_agent_event(db_path, host_id, agent_event(**event_fields))
+    normalized_host = normalize_agent_event_identifier(
+        host_id, "host_id", required=True
+    )
+    event = agent_event(**event_fields)
+    _canonical_agent_event_for_append(event)
+    with _connect(db_path, prepare=True) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = _append_agent_event_conn(
+                conn, normalized_host or "", event
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return result
 
 
 def list_agent_events(
@@ -14297,519 +10531,6 @@ def list_agent_events(
     return tuple(_agent_event_from_row(row) for row in rows)
 
 
-def list_public_agent_events(
-    db_path: Path | str,
-    host_id: str,
-    *,
-    worker_id: str | None = None,
-    source: str | None = None,
-    session_id: str | None = None,
-    turn_id: str | None = None,
-    after_sequence: int = 0,
-    limit: int = AGENT_EVENT_QUERY_DEFAULT_LIMIT,
-) -> tuple[dict[str, Any], ...]:
-    """List connector-safe projections without private source identifiers."""
-    return tuple(
-        stored.public_dict()
-        for stored in list_agent_events(
-            db_path,
-            host_id,
-            worker_id=worker_id,
-            source=source,
-            session_id=session_id,
-            turn_id=turn_id,
-            visibility="public",
-            after_sequence=after_sequence,
-            limit=limit,
-        )
-    )
-
-
-def _herdr_turn_counter(value: Any, field: str) -> int:
-    if (
-        not isinstance(value, int)
-        or isinstance(value, bool)
-        or not 0 <= value <= _SQLITE_MAX_INTEGER
-    ):
-        raise ValueError(f"{field} must be a nonnegative SQLite integer")
-    return int(value)
-
-
-def _herdr_turn_watermark_from_row(row: tuple[Any, ...]) -> HerdrTurnWatermark:
-    return HerdrTurnWatermark(
-        host_id=str(row[0]),
-        pane_id=str(row[1]),
-        turn_epoch=int(row[2]),
-        last_turn=int(row[3]),
-        completeness_break_count=int(row[4]),
-        last_completeness_break_reason=(
-            str(row[5]) if row[5] is not None else None
-        ),
-        last_completeness_break_at=(
-            str(row[6]) if row[6] is not None else None
-        ),
-        updated_at=str(row[7]),
-    )
-
-
-def get_herdr_turn_watermark(
-    db_path: Path | str,
-    host_id: str,
-    pane_id: str,
-) -> HerdrTurnWatermark | None:
-    """Return one pane's durable Herdr replay watermark."""
-    if not _sqlite_store_exists(db_path):
-        return None
-    with _connect(db_path) as conn:
-        _ensure_schema(conn)
-        row = conn.execute(
-            """
-            SELECT
-                host_id, pane_id, turn_epoch, last_turn,
-                completeness_break_count, last_completeness_break_reason,
-                last_completeness_break_at, updated_at
-            FROM herdr_turn_watermarks
-            WHERE host_id = ? AND pane_id = ?
-            """,
-            (str(host_id), str(pane_id)),
-        ).fetchone()
-    return _herdr_turn_watermark_from_row(row) if row is not None else None
-
-
-def set_herdr_turn_watermark(
-    db_path: Path | str,
-    host_id: str,
-    pane_id: str,
-    *,
-    turn_epoch: int,
-    last_turn: int,
-    observed_at: str | None = None,
-) -> HerdrTurnWatermark:
-    """Create or re-baseline a watermark while retaining prior break evidence."""
-    epoch = _herdr_turn_counter(turn_epoch, "turn_epoch")
-    turn = _herdr_turn_counter(last_turn, "last_turn")
-    current = observed_at or utc_timestamp()
-    with _connect(db_path) as conn:
-        _ensure_schema(conn)
-        conn.execute(
-            """
-            INSERT INTO herdr_turn_watermarks (
-                host_id, pane_id, turn_epoch, last_turn, updated_at
-            ) VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(host_id, pane_id) DO UPDATE SET
-                turn_epoch = excluded.turn_epoch,
-                last_turn = excluded.last_turn,
-                updated_at = excluded.updated_at
-            """,
-            (str(host_id), str(pane_id), epoch, turn, current),
-        )
-    watermark = get_herdr_turn_watermark(db_path, host_id, pane_id)
-    if watermark is None:
-        raise StoreSchemaError("herdr_turn_watermark_unavailable")
-    return watermark
-
-
-def record_herdr_turn_completeness_break(
-    db_path: Path | str,
-    host_id: str,
-    pane_id: str,
-    *,
-    turn_epoch: int,
-    newest_turn: int,
-    reason: str,
-    observed_at: str | None = None,
-) -> HerdrTurnWatermark:
-    """Persist an explicit replay gap and atomically re-baseline the pane."""
-    epoch = _herdr_turn_counter(turn_epoch, "turn_epoch")
-    newest = _herdr_turn_counter(newest_turn, "newest_turn")
-    break_reason = str(reason).strip()
-    if not break_reason:
-        raise ValueError("reason must not be empty")
-    current = observed_at or utc_timestamp()
-    with _connect(db_path) as conn:
-        _ensure_schema(conn)
-        conn.execute(
-            """
-            INSERT INTO herdr_turn_watermarks (
-                host_id, pane_id, turn_epoch, last_turn,
-                completeness_break_count, last_completeness_break_reason,
-                last_completeness_break_at, updated_at
-            ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
-            ON CONFLICT(host_id, pane_id) DO UPDATE SET
-                turn_epoch = excluded.turn_epoch,
-                last_turn = excluded.last_turn,
-                completeness_break_count =
-                    herdr_turn_watermarks.completeness_break_count + 1,
-                last_completeness_break_reason =
-                    excluded.last_completeness_break_reason,
-                last_completeness_break_at =
-                    excluded.last_completeness_break_at,
-                updated_at = excluded.updated_at
-            """,
-            (
-                str(host_id),
-                str(pane_id),
-                epoch,
-                newest,
-                break_reason,
-                current,
-                current,
-            ),
-        )
-    watermark = get_herdr_turn_watermark(db_path, host_id, pane_id)
-    if watermark is None:
-        raise StoreSchemaError("herdr_turn_watermark_unavailable")
-    return watermark
-
-
-def latest_turn_id_for_worker(
-    db_path: Path | str,
-    host_id: str,
-    worker_id: str,
-) -> str | None:
-    """Return the newest live semantic turn row for provenance linking."""
-    if not _sqlite_store_exists(db_path):
-        return None
-    with _connect(db_path) as conn:
-        _ensure_schema(conn)
-        row = conn.execute(
-            """
-            SELECT turn_id
-            FROM turns
-            WHERE host_id = ?
-              AND worker_id = ?
-              AND COALESCE(json_extract(payload_json, '$.superseded_at'), '') = ''
-            ORDER BY observed_at DESC, list_sequence DESC
-            LIMIT 1
-            """,
-            (str(host_id), str(worker_id)),
-        ).fetchone()
-    return str(row[0]) if row is not None else None
-
-
-def _herdr_turn_refresh_retry_from_row(
-    row: tuple[Any, ...],
-) -> HerdrTurnRefreshRetry:
-    return HerdrTurnRefreshRetry(
-        host_id=str(row[0]),
-        pane_id=str(row[1]),
-        turn_epoch=int(row[2]),
-        turn=int(row[3]),
-        status=str(row[4]),  # type: ignore[arg-type]
-        refresh_status=str(row[5]),
-        first_seen_at=str(row[6]),
-        last_attempt_at=str(row[7]),
-        next_attempt_at=str(row[8]) if row[8] is not None else None,
-        attempt_count=int(row[9]),
-        escalated_at=str(row[10]) if row[10] is not None else None,
-    )
-
-
-def get_herdr_turn_refresh_retry(
-    db_path: Path | str,
-    host_id: str,
-    pane_id: str,
-    *,
-    turn_epoch: int,
-    turn: int,
-) -> HerdrTurnRefreshRetry | None:
-    """Return durable completion-refresh retry state, if any."""
-    epoch = _herdr_turn_counter(turn_epoch, "turn_epoch")
-    turn_number = _herdr_turn_counter(turn, "turn")
-    if not _sqlite_store_exists(db_path):
-        return None
-    with _connect(db_path) as conn:
-        _ensure_schema(conn)
-        row = conn.execute(
-            """
-            SELECT
-                host_id, pane_id, turn_epoch, turn, status, refresh_status,
-                first_seen_at, last_attempt_at, next_attempt_at,
-                attempt_count, escalated_at
-            FROM herdr_turn_refresh_retries
-            WHERE host_id = ? AND pane_id = ? AND turn_epoch = ? AND turn = ?
-            """,
-            (str(host_id), str(pane_id), epoch, turn_number),
-        ).fetchone()
-    return _herdr_turn_refresh_retry_from_row(row) if row is not None else None
-
-
-def herdr_turn_refresh_retry_due(
-    db_path: Path | str,
-    host_id: str,
-    pane_id: str,
-    *,
-    turn_epoch: int,
-    turn: int,
-    now: str | None = None,
-) -> bool:
-    """Return whether an absent/pending retry may run under the local clock.
-
-    A backwards local-clock jump makes the retry immediately due. Combined
-    with the durable attempt ceiling this cannot leave a pane wedged waiting
-    for a wall clock to catch up.
-    """
-    retry = get_herdr_turn_refresh_retry(
-        db_path,
-        host_id,
-        pane_id,
-        turn_epoch=turn_epoch,
-        turn=turn,
-    )
-    if retry is None:
-        return True
-    if retry.status == "escalated" or retry.next_attempt_at is None:
-        return False
-    current = _connector_datetime(now or utc_timestamp())
-    last_attempt = _connector_datetime(retry.last_attempt_at)
-    next_attempt = _connector_datetime(retry.next_attempt_at)
-    return current < last_attempt or current >= next_attempt
-
-
-def record_herdr_turn_refresh_retry(
-    db_path: Path | str,
-    host_id: str,
-    pane_id: str,
-    *,
-    turn_epoch: int,
-    turn: int,
-    refresh_status: str,
-    now: str | None = None,
-    base_delay_seconds: int = 1,
-    max_delay_seconds: int = 30,
-    max_retry_age_seconds: int = 300,
-    max_attempts: int = 8,
-) -> HerdrTurnRefreshRetry:
-    """Record one failed refresh attempt with bounded durable backoff."""
-    epoch = _herdr_turn_counter(turn_epoch, "turn_epoch")
-    turn_number = _herdr_turn_counter(turn, "turn")
-    normalized_status = str(refresh_status).strip()
-    if not normalized_status or len(normalized_status) > 128:
-        raise ValueError("refresh_status must contain at most 128 characters")
-    bounds = (base_delay_seconds, max_delay_seconds, max_retry_age_seconds)
-    if any(
-        isinstance(value, bool) or not isinstance(value, int) or value < 0
-        for value in bounds
-    ):
-        raise ValueError("retry delays and age must be nonnegative integers")
-    if max_delay_seconds < base_delay_seconds:
-        raise ValueError("max_delay_seconds must be at least base_delay_seconds")
-    if (
-        isinstance(max_attempts, bool)
-        or not isinstance(max_attempts, int)
-        or max_attempts < 1
-    ):
-        raise ValueError("max_attempts must be a positive integer")
-    current_dt = _connector_datetime(now or utc_timestamp())
-    current = current_dt.isoformat()
-    with _connect(db_path) as conn:
-        _ensure_schema(conn)
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = conn.execute(
-                """
-                SELECT
-                    host_id, pane_id, turn_epoch, turn, status,
-                    refresh_status, first_seen_at, last_attempt_at,
-                    next_attempt_at, attempt_count, escalated_at
-                FROM herdr_turn_refresh_retries
-                WHERE host_id = ? AND pane_id = ? AND turn_epoch = ? AND turn = ?
-                """,
-                (str(host_id), str(pane_id), epoch, turn_number),
-            ).fetchone()
-            if row is not None and str(row[4]) == "escalated":
-                conn.commit()
-                return _herdr_turn_refresh_retry_from_row(row)
-            first_seen = str(row[6]) if row is not None else current
-            attempt_count = (int(row[9]) if row is not None else 0) + 1
-            age_seconds = max(
-                0.0,
-                (current_dt - _connector_datetime(first_seen)).total_seconds(),
-            )
-            escalated = (
-                attempt_count >= max_attempts
-                or age_seconds >= max_retry_age_seconds
-            )
-            # Anchor backoff at the later of the current and last local sample.
-            # The due predicate explicitly detects rollback, while this avoids
-            # persisting decreasing attempt timestamps.
-            attempt_dt = current_dt
-            if row is not None:
-                attempt_dt = max(attempt_dt, _connector_datetime(str(row[7])))
-            delay = min(
-                max_delay_seconds,
-                base_delay_seconds * (2 ** min(attempt_count - 1, 30)),
-            )
-            next_attempt = (
-                None
-                if escalated
-                else (attempt_dt + timedelta(seconds=delay)).isoformat()
-            )
-            escalated_at = attempt_dt.isoformat() if escalated else None
-            conn.execute(
-                """
-                INSERT INTO herdr_turn_refresh_retries (
-                    host_id, pane_id, turn_epoch, turn, status,
-                    refresh_status, first_seen_at, last_attempt_at,
-                    next_attempt_at, attempt_count, escalated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(host_id, pane_id, turn_epoch, turn) DO UPDATE SET
-                    status = excluded.status,
-                    refresh_status = excluded.refresh_status,
-                    last_attempt_at = excluded.last_attempt_at,
-                    next_attempt_at = excluded.next_attempt_at,
-                    attempt_count = excluded.attempt_count,
-                    escalated_at = excluded.escalated_at
-                """,
-                (
-                    str(host_id),
-                    str(pane_id),
-                    epoch,
-                    turn_number,
-                    "escalated" if escalated else "pending",
-                    normalized_status,
-                    first_seen,
-                    attempt_dt.isoformat(),
-                    next_attempt,
-                    attempt_count,
-                    escalated_at,
-                ),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-    retry = get_herdr_turn_refresh_retry(
-        db_path,
-        host_id,
-        pane_id,
-        turn_epoch=epoch,
-        turn=turn_number,
-    )
-    if retry is None:
-        raise StoreSchemaError("herdr_turn_refresh_retry_unavailable")
-    return retry
-
-
-def record_herdr_turn_completion(
-    db_path: Path | str,
-    host_id: str,
-    pane_id: str,
-    *,
-    turn_epoch: int,
-    turn: int,
-    outcome: str,
-    completed_unix_ms: int,
-    message: str | None,
-    message_truncated: bool,
-    agent_session_path: str | None,
-    worker_id: str | None,
-    refreshed_turn_id: str | None,
-    observed_at: str | None = None,
-    preserve_refresh_retry: bool = False,
-) -> HerdrTurnWatermark:
-    """Store completion provenance and advance its replay watermark atomically."""
-    epoch = _herdr_turn_counter(turn_epoch, "turn_epoch")
-    turn_number = _herdr_turn_counter(turn, "turn")
-    completed_ms = _herdr_turn_counter(completed_unix_ms, "completed_unix_ms")
-    normalized_outcome = str(outcome)
-    if normalized_outcome not in {"completed", "aborted"}:
-        raise ValueError("outcome must be completed or aborted")
-    if message is not None and not isinstance(message, str):
-        raise ValueError("message must be text or None")
-    if isinstance(message, str) and len(message.encode("utf-8")) > 8 * 1024:
-        raise ValueError("message must not exceed 8 KiB")
-    if not isinstance(message_truncated, bool):
-        raise ValueError("message_truncated must be a boolean")
-    if agent_session_path is not None and not isinstance(
-        agent_session_path,
-        str,
-    ):
-        raise ValueError("agent_session_path must be text or None")
-    if not isinstance(preserve_refresh_retry, bool):
-        raise ValueError("preserve_refresh_retry must be a boolean")
-    current = observed_at or utc_timestamp()
-    with _connect(db_path) as conn:
-        _ensure_schema(conn)
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            existing = conn.execute(
-                """
-                SELECT turn_epoch, last_turn
-                FROM herdr_turn_watermarks
-                WHERE host_id = ? AND pane_id = ?
-                """,
-                (str(host_id), str(pane_id)),
-            ).fetchone()
-            if existing is not None and int(existing[0]) != epoch:
-                raise StoreSchemaError("herdr_turn_epoch_changed")
-            conn.execute(
-                """
-                INSERT INTO herdr_turn_completions (
-                    host_id, pane_id, turn_epoch, turn, outcome,
-                    completed_unix_ms, message, message_truncated,
-                    agent_session_path, worker_id, refreshed_turn_id, observed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(host_id, pane_id, turn_epoch, turn) DO UPDATE SET
-                    outcome = excluded.outcome,
-                    completed_unix_ms = excluded.completed_unix_ms,
-                    message = excluded.message,
-                    message_truncated = excluded.message_truncated,
-                    agent_session_path = excluded.agent_session_path,
-                    worker_id = COALESCE(
-                        excluded.worker_id, herdr_turn_completions.worker_id
-                    ),
-                    refreshed_turn_id = COALESCE(
-                        excluded.refreshed_turn_id,
-                        herdr_turn_completions.refreshed_turn_id
-                    ),
-                    observed_at = excluded.observed_at
-                """,
-                (
-                    str(host_id),
-                    str(pane_id),
-                    epoch,
-                    turn_number,
-                    normalized_outcome,
-                    completed_ms,
-                    message,
-                    int(message_truncated),
-                    agent_session_path,
-                    str(worker_id) if worker_id else None,
-                    str(refreshed_turn_id) if refreshed_turn_id else None,
-                    current,
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO herdr_turn_watermarks (
-                    host_id, pane_id, turn_epoch, last_turn, updated_at
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(host_id, pane_id) DO UPDATE SET
-                    last_turn = MAX(
-                        herdr_turn_watermarks.last_turn, excluded.last_turn
-                    ),
-                    updated_at = excluded.updated_at
-                """,
-                (str(host_id), str(pane_id), epoch, turn_number, current),
-            )
-            if not preserve_refresh_retry:
-                conn.execute(
-                    """
-                    DELETE FROM herdr_turn_refresh_retries
-                    WHERE host_id = ? AND pane_id = ?
-                      AND turn_epoch = ? AND turn = ? AND status = 'pending'
-                    """,
-                    (str(host_id), str(pane_id), epoch, turn_number),
-                )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-    watermark = get_herdr_turn_watermark(db_path, host_id, pane_id)
-    if watermark is None:
-        raise StoreSchemaError("herdr_turn_watermark_unavailable")
-    return watermark
 
 
 def _normalized_command_request_policy(
@@ -17458,7 +13179,6 @@ def maybe_run_automatic_store_maintenance(
     policy: SnapshotRetentionPolicy,
     agent_event_host_id: str | None = None,
     agent_event_retention_days: int | None = None,
-    turn_model: str = DEFAULT_TURN_MODEL,
     acknowledged_final_retention_days: int = ACKNOWLEDGED_FINAL_RETENTION_DAYS,
     acknowledged_final_retention_count: int = ACKNOWLEDGED_FINAL_RETENTION_COUNT,
     command_retry_horizon_seconds: int = COMMAND_RETRY_HORIZON_SECONDS,
@@ -17527,9 +13247,7 @@ def maybe_run_automatic_store_maintenance(
         "batch_size": policy.batch_size,
         "examined": 0,
         "deleted": 0,
-        "tombstoned": 0,
         "remaining_candidates": False,
-        "replay_identity_retained": True,
     }
     empty_command_requests = _command_request_maintenance_summary(
         None,
@@ -17538,16 +13256,6 @@ def maybe_run_automatic_store_maintenance(
         retention_count=command_receipt_retention_count,
         batch_size=policy.batch_size,
     )
-    empty_herdr_turns = {
-        "examined": 0,
-        "deleted": 0,
-        "deleted_completions": 0,
-        "deleted_watermarks": 0,
-        "remaining_candidates": False,
-        "retention_days": policy.retention_days,
-        "retention_count": policy.retention_count,
-        "batch_size": policy.batch_size,
-    }
     if not _sqlite_store_exists(db_path):
         return dict(sanitize_public_value({
             "schema_version": 1,
@@ -17574,7 +13282,6 @@ def maybe_run_automatic_store_maintenance(
                 ),
             },
             "command_requests": empty_command_requests,
-            "herdr_turns": empty_herdr_turns,
             "batch_size": policy.batch_size,
         }))
     cutoff_at = _utc_cutoff(retention_days=policy.retention_days, now=current_at)
@@ -17634,15 +13341,13 @@ def maybe_run_automatic_store_maintenance(
                         ),
                     },
                     "command_requests": empty_command_requests,
-                    "herdr_turns": empty_herdr_turns,
                     "batch_size": policy.batch_size,
                 }))
-            if _submission_linking_enabled(turn_model):
-                _settle_due_submission_links_conn(
-                    conn,
-                    db_path=db_path,
-                    now=current_at,
-                )
+            _settle_due_submission_links_conn(
+                conn,
+                db_path=db_path,
+                now=current_at,
+            )
             _expire_turn_submissions_conn(
                 conn,
                 current=current_at,
@@ -17656,7 +13361,6 @@ def maybe_run_automatic_store_maintenance(
                         cutoff_at=agent_event_cutoff_at,
                         batch_size=policy.batch_size,
                         dry_run=False,
-                        retired_at=current_at,
                     )
                 )
             candidates, _ = _snapshot_retention_candidates_conn(
@@ -17780,25 +13484,10 @@ def maybe_run_automatic_store_maintenance(
         retention_count=command_receipt_retention_count,
         batch_size=policy.batch_size,
     )
-    herdr_turns = cleanup_herdr_turn_retention(
-        db_path,
-        retention_days=policy.retention_days,
-        retention_count=policy.retention_count,
-        batch_size=policy.batch_size,
-        now=current_at,
-    )
     return dict(sanitize_public_value({
         "schema_version": 1,
-        "ok": bool(command_requests["ok"]) and bool(herdr_turns["ok"]),
-        "status": (
-            "ok"
-            if command_requests["ok"] and herdr_turns["ok"]
-            else (
-                command_requests["status"]
-                if not command_requests["ok"]
-                else herdr_turns["status"]
-            )
-        ),
+        "ok": bool(command_requests["ok"]),
+        "status": "ok" if command_requests["ok"] else command_requests["status"],
         "due": True,
         "last_completed_at": current_at,
         "next_due_at": _connector_add_seconds(current_at, cadence_seconds),
@@ -17820,7 +13509,6 @@ def maybe_run_automatic_store_maintenance(
             ),
         },
         "command_requests": command_requests,
-        "herdr_turns": herdr_turns,
         "batch_size": policy.batch_size,
     }))
 
@@ -17915,44 +13603,9 @@ def cleanup_event_retention(
 
 
 _AGENT_EVENT_RETENTION_SELECT = """
-SELECT
-    sequence, host_id, event_id, kind, source, worker_id, visibility,
-    source_session_id, source_turn_id, source_item_id, source_message_id,
-    source_event_id, source_sequence, payload_fingerprint, public_payload_json,
-    observed_at
+SELECT sequence
 FROM agent_events
 """
-
-
-def _agent_event_retention_candidate(
-    row: tuple[Any, ...],
-) -> tuple[str, str, int, str, str]:
-    """Reduce one bounded metadata row to its durable tombstone fields."""
-    public_payload_json = str(row[14])
-    public_payload = _json_object(public_payload_json)
-    if _canonical_json(public_payload) != public_payload_json:
-        raise StoreSchemaError("invalid_agent_event_projection")
-    return (
-        str(row[1]),
-        str(row[2]),
-        int(row[0]),
-        _agent_event_replay_contract_fingerprint(
-            event_id=str(row[2]),
-            kind=str(row[3]),
-            source=str(row[4]),
-            worker_id=str(row[5]),
-            visibility=str(row[6]),
-            source_session_id=str(row[7]) if row[7] is not None else None,
-            source_turn_id=str(row[8]) if row[8] is not None else None,
-            source_item_id=str(row[9]) if row[9] is not None else None,
-            source_message_id=str(row[10]) if row[10] is not None else None,
-            source_event_id=str(row[11]) if row[11] is not None else None,
-            source_sequence=int(row[12]) if row[12] is not None else None,
-            payload_fingerprint=str(row[13]),
-            public_payload_json=public_payload_json,
-        ),
-        str(row[15]),
-    )
 
 
 def _cleanup_agent_event_retention_conn(
@@ -17962,56 +13615,18 @@ def _cleanup_agent_event_retention_conn(
     cutoff_at: str,
     batch_size: int,
     dry_run: bool,
-    retired_at: str,
 ) -> dict[str, Any]:
-    """Retire one batch using streamed metadata, never private payload values."""
-    cursor = conn.execute(
+    """Delete one bounded batch of expired journal rows."""
+    rows = conn.execute(
         _AGENT_EVENT_RETENTION_SELECT
         + " WHERE host_id = ? AND observed_at < ?"
         + " ORDER BY observed_at, sequence LIMIT ?",
         (str(host_id), cutoff_at, int(batch_size) + 1),
-    )
-    candidates: list[tuple[str, str, int, str, str]] = []
-    remaining = False
-    for row in cursor:
-        if len(candidates) >= batch_size:
-            remaining = True
-            break
-        if dry_run:
-            candidates.append(
-                (str(row[1]), str(row[2]), int(row[0]), "", str(row[15]))
-            )
-        else:
-            candidates.append(_agent_event_retention_candidate(row))
-
+    ).fetchall()
+    sequences = [int(row[0]) for row in rows[:batch_size]]
+    remaining = len(rows) > len(sequences)
     deleted = 0
-    if candidates and not dry_run:
-        conn.executemany(
-            """
-            INSERT INTO agent_event_tombstones (
-                host_id, event_id, sequence, replay_fingerprint,
-                observed_at, retired_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                (
-                    candidate_host,
-                    event_id,
-                    sequence,
-                    fingerprint,
-                    observed_at,
-                    retired_at,
-                )
-                for (
-                    candidate_host,
-                    event_id,
-                    sequence,
-                    fingerprint,
-                    observed_at,
-                ) in candidates
-            ),
-        )
-        sequences = [candidate[2] for candidate in candidates]
+    if sequences and not dry_run:
         placeholders = ",".join("?" for _ in sequences)
         deleted = int(
             conn.execute(
@@ -18021,13 +13636,11 @@ def _cleanup_agent_event_retention_conn(
             ).rowcount
             or 0
         )
-        if deleted != len(candidates):
+        if deleted != len(sequences):
             raise StoreSchemaError("agent_event_retention_delete_mismatch")
-    retired = len(candidates) if dry_run else deleted
     return {
-        "examined": len(candidates),
-        "deleted": retired,
-        "tombstoned": retired,
+        "examined": len(sequences),
+        "deleted": len(sequences) if dry_run else deleted,
         "remaining_candidates": remaining,
     }
 
@@ -18041,7 +13654,7 @@ def cleanup_agent_event_retention(
     dry_run: bool = False,
     batch_size: int = 100,
 ) -> dict[str, Any]:
-    """Retire event payloads while retaining compact replay identities."""
+    """Delete a bounded batch of expired structured agent events."""
     days = max(1, int(retention_days))
     bounded_batch = max(1, min(int(batch_size), 1_000))
     cutoff_at = _utc_cutoff(retention_days=days, now=now)
@@ -18060,7 +13673,6 @@ def cleanup_agent_event_retention(
             "status": "store_unavailable",
             "examined": 0,
             "deleted": 0,
-            "tombstoned": 0,
             "remaining_candidates": False,
         }))
     with _connect(db_path, isolation_level=None) as conn:
@@ -18077,7 +13689,6 @@ def cleanup_agent_event_retention(
                 cutoff_at=cutoff_at,
                 batch_size=bounded_batch,
                 dry_run=bool(dry_run),
-                retired_at=utc_timestamp(),
             )
             if dry_run:
                 conn.rollback()
@@ -19410,189 +15021,6 @@ def compact_turn_change_journal(
     }
 
 
-def cleanup_herdr_turn_retention(
-    db_path: Path | str,
-    *,
-    host_id: str | None = None,
-    retention_days: int = HERDR_TURN_RETENTION_DAYS,
-    retention_count: int = HERDR_TURN_RETENTION_COUNT,
-    batch_size: int = HERDR_TURN_RETENTION_BATCH_SIZE,
-    now: str | None = None,
-    dry_run: bool = False,
-) -> dict[str, Any]:
-    """Bound completion provenance and remove old watermarks for dead panes."""
-    days = max(1, min(int(retention_days), _MAX_RETENTION_DAYS))
-    count = max(1, min(int(retention_count), _SQLITE_MAX_INTEGER))
-    bounded_batch = max(1, min(int(batch_size), 1_000))
-    current_at = _connector_now(now)
-    cutoff_at = _utc_cutoff(retention_days=days, now=current_at)
-    base = {
-        "schema_version": 1,
-        "ok": False,
-        "status": "store_unavailable",
-        "scope": "host" if host_id is not None else "database",
-        "host_id": str(host_id) if host_id is not None else None,
-        "dry_run": bool(dry_run),
-        "retention_days": days,
-        "retention_count": count,
-        "cutoff_at": cutoff_at,
-        "batch_size": bounded_batch,
-    }
-    if not _sqlite_store_exists(db_path):
-        return dict(sanitize_public_value({
-            **base,
-            "examined": 0,
-            "deleted": 0,
-            "deleted_completions": 0,
-            "deleted_watermarks": 0,
-            "remaining_candidates": False,
-        }))
-    host_clause = "AND host_id = :host_id" if host_id is not None else ""
-    watermark_host_clause = (
-        "AND watermarks.host_id = :host_id" if host_id is not None else ""
-    )
-    params: dict[str, Any] = {
-        "host_id": str(host_id) if host_id is not None else "",
-        "cutoff_at": cutoff_at,
-        "current_at": current_at,
-        "retention_count": count,
-        "limit": bounded_batch + 1,
-    }
-    with _connect(db_path, isolation_level=None) as conn:
-        _ensure_schema(conn)
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            completion_pool = [
-                int(row[0])
-                for row in conn.execute(
-                    f"""
-                    WITH ranked AS (
-                        SELECT
-                            rowid AS completion_rowid,
-                            observed_at,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY host_id
-                                ORDER BY observed_at DESC, rowid DESC
-                            ) AS retention_rank
-                        FROM herdr_turn_completions
-                        WHERE 1 = 1 {host_clause}
-                    )
-                    SELECT completion_rowid
-                    FROM ranked
-                    WHERE observed_at < :cutoff_at
-                      AND retention_rank > :retention_count
-                    ORDER BY observed_at, completion_rowid
-                    LIMIT :limit
-                    """,
-                    params,
-                ).fetchall()
-            ]
-            completion_ids = completion_pool[:bounded_batch]
-            completion_retry_keys = []
-            if completion_ids:
-                placeholders = ",".join("?" for _ in completion_ids)
-                completion_retry_keys = conn.execute(
-                    f"""
-                    SELECT host_id, pane_id, turn_epoch, turn
-                    FROM herdr_turn_completions
-                    WHERE rowid IN ({placeholders})
-                    """,
-                    completion_ids,
-                ).fetchall()
-            remaining_budget = bounded_batch - len(completion_ids)
-            watermark_params = {
-                **params,
-                # Query one extra row even when completions consume the whole
-                # batch so remaining_candidates still advertises dead panes.
-                "limit": remaining_budget + 1,
-            }
-            watermark_pool = [
-                (str(row[0]), str(row[1]))
-                for row in conn.execute(
-                    f"""
-                    SELECT watermarks.host_id, watermarks.pane_id
-                    FROM herdr_turn_watermarks AS watermarks
-                    WHERE watermarks.updated_at < :cutoff_at
-                      {watermark_host_clause}
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM worker_bindings AS bindings
-                          WHERE bindings.host_id = watermarks.host_id
-                            AND bindings.backend = 'herdr'
-                            AND bindings.expires_at > :current_at
-                            AND (
-                                (
-                                    bindings.target_kind = 'pane_id'
-                                    AND bindings.target_value = watermarks.pane_id
-                                )
-                                OR (
-                                    bindings.turn_target_kind = 'pane_id'
-                                    AND bindings.turn_target_value = watermarks.pane_id
-                                )
-                            )
-                      )
-                    ORDER BY watermarks.updated_at, watermarks.host_id,
-                             watermarks.pane_id
-                    LIMIT :limit
-                    """,
-                    watermark_params,
-                ).fetchall()
-            ]
-            watermark_keys = watermark_pool[:remaining_budget]
-            if not dry_run:
-                if completion_ids:
-                    placeholders = ",".join("?" for _ in completion_ids)
-                    conn.execute(
-                        f"""
-                        DELETE FROM herdr_turn_completions
-                        WHERE rowid IN ({placeholders})
-                        """,
-                        completion_ids,
-                    )
-                    conn.executemany(
-                        """
-                        DELETE FROM herdr_turn_refresh_retries
-                        WHERE host_id = ? AND pane_id = ?
-                          AND turn_epoch = ? AND turn = ?
-                        """,
-                        completion_retry_keys,
-                    )
-                if watermark_keys:
-                    conn.executemany(
-                        """
-                        DELETE FROM herdr_turn_watermarks
-                        WHERE host_id = ? AND pane_id = ?
-                        """,
-                        watermark_keys,
-                    )
-                    conn.executemany(
-                        """
-                        DELETE FROM herdr_turn_refresh_retries
-                        WHERE host_id = ? AND pane_id = ?
-                        """,
-                        watermark_keys,
-                    )
-                conn.commit()
-            else:
-                conn.rollback()
-        except Exception:
-            conn.rollback()
-            raise
-    examined = len(completion_ids) + len(watermark_keys)
-    remaining = (
-        len(completion_pool) > len(completion_ids)
-        or len(watermark_pool) > len(watermark_keys)
-    )
-    return dict(sanitize_public_value({
-        **base,
-        "ok": True,
-        "status": "ok",
-        "examined": examined,
-        "deleted": examined,
-        "deleted_completions": len(completion_ids),
-        "deleted_watermarks": len(watermark_keys),
-        "remaining_candidates": remaining,
-    }))
 
 
 def run_store_maintenance(
@@ -19616,9 +15044,6 @@ def run_store_maintenance(
     turn_change_retention_days: int = TURN_CHANGE_RETENTION_DAYS,
     turn_change_retention_count: int = TURN_CHANGE_RETENTION_COUNT,
     turn_change_batch_size: int = TURN_CHANGE_COMPACTION_BATCH_SIZE,
-    herdr_turn_retention_days: int = HERDR_TURN_RETENTION_DAYS,
-    herdr_turn_retention_count: int = HERDR_TURN_RETENTION_COUNT,
-    herdr_turn_batch_size: int = HERDR_TURN_RETENTION_BATCH_SIZE,
 ) -> dict[str, Any]:
     """Run one bounded batch for every online store-maintenance class."""
     retention = cleanup_event_retention(
@@ -19696,15 +15121,6 @@ def run_store_maintenance(
         now=now,
         dry_run=dry_run,
     )
-    herdr_turns = cleanup_herdr_turn_retention(
-        db_path,
-        host_id=host_id,
-        retention_days=herdr_turn_retention_days,
-        retention_count=herdr_turn_retention_count,
-        batch_size=herdr_turn_batch_size,
-        now=now,
-        dry_run=dry_run,
-    )
     ok = (
         bool(retention.get("ok"))
         and bool(agent_events.get("ok"))
@@ -19714,7 +15130,6 @@ def run_store_maintenance(
         and bool(turn_content.get("ok"))
         and bool(command_requests.get("ok"))
         and bool(turn_changes.get("ok"))
-        and bool(herdr_turns.get("ok"))
     )
     return sanitize_public_value({
         "schema_version": 1,
@@ -19742,11 +15157,9 @@ def run_store_maintenance(
             ),
             "examined": int(agent_events.get("examined") or 0),
             "deleted": int(agent_events.get("deleted") or 0),
-            "tombstoned": int(agent_events.get("tombstoned") or 0),
             "remaining_candidates": bool(
                 agent_events.get("remaining_candidates")
             ),
-            "replay_identity_retained": True,
         },
         "snapshots": {
             "scope": "database",
@@ -19815,30 +15228,6 @@ def run_store_maintenance(
             "examined": int(turn_changes.get("examined") or 0),
             "deleted": int(turn_changes.get("deleted") or 0),
             "remaining_candidates": bool(turn_changes.get("remaining_candidates")),
-        },
-        "herdr_turns": {
-            "dry_run": bool(herdr_turns.get("dry_run")),
-            "retention_days": int(
-                herdr_turns.get("retention_days") or herdr_turn_retention_days
-            ),
-            "retention_count": int(
-                herdr_turns.get("retention_count") or herdr_turn_retention_count
-            ),
-            "cutoff_at": herdr_turns.get("cutoff_at"),
-            "batch_size": int(
-                herdr_turns.get("batch_size") or herdr_turn_batch_size
-            ),
-            "examined": int(herdr_turns.get("examined") or 0),
-            "deleted": int(herdr_turns.get("deleted") or 0),
-            "deleted_completions": int(
-                herdr_turns.get("deleted_completions") or 0
-            ),
-            "deleted_watermarks": int(
-                herdr_turns.get("deleted_watermarks") or 0
-            ),
-            "remaining_candidates": bool(
-                herdr_turns.get("remaining_candidates")
-            ),
         },
         "turn_content": {
             "dry_run": bool(turn_content.get("dry_run")),
@@ -19920,8 +15309,8 @@ def _turn_continuity_identity(payload: Mapping[str, Any]) -> tuple[str, str, int
     return None
 
 
-def _turn_submission_owner_identity(worker: Any) -> tuple[str, int]:
-    """Extract the Phase-1 continuity owner, with a legacy worker fallback."""
+def _turn_submission_owner_identity(worker: Any) -> tuple[str, int] | None:
+    """Extract the stable continuity owner required for submission linking."""
     meta = getattr(worker, "meta", None)
     if meta is None and isinstance(worker, Mapping):
         meta = worker.get("meta")
@@ -19931,34 +15320,7 @@ def _turn_submission_owner_identity(worker: Any) -> tuple[str, int]:
     if identity is not None:
         _kind, owner_key, owner_key_version = identity
         return owner_key, owner_key_version
-
-    # Old snapshots and direct API callers can predate stable worker keys. The
-    # shadow ledger must never change their submission behavior, so isolate
-    # those rows by the existing public worker ID until Stage 4 migration.
-    worker_id = str(getattr(worker, "id", "") or "").strip()
-    if not worker_id and isinstance(worker, Mapping):
-        worker_id = str(worker.get("id") or worker.get("worker_id") or "").strip()
-    if not worker_id:
-        raise StoreSchemaError("turn_submission_owner_missing")
-    return f"legacy-worker:{worker_id}", 0
-
-
-def _turn_link_candidate_owner_identity(worker: Any) -> tuple[str, int]:
-    """Normalize prod turns that persisted a stable key without its version."""
-    meta = getattr(worker, "meta", None)
-    if meta is None and isinstance(worker, Mapping):
-        meta = worker.get("meta")
-    if isinstance(meta, Mapping):
-        stable_key = meta.get("stable_key")
-        if (
-            _valid_final_stable_key(stable_key)
-            and meta.get("stable_key_version") is None
-        ):
-            # The authenticated owner hash is the continuity identity. Some
-            # production observations omitted its v1 metadata marker, so
-            # normalize only that missing marker for candidate matching.
-            return str(stable_key), 1
-    return _turn_submission_owner_identity(worker)
+    return None
 
 
 def _turn_submission_policy(
@@ -19989,12 +15351,15 @@ def _insert_turn_submission_conn(
     link_window_seconds: int,
     hard_ttl_seconds: int,
 ) -> str:
-    """Insert the send-started shadow ledger row in the caller transaction."""
+    """Insert the send-started submission row in the caller transaction."""
     link_window, hard_ttl = _turn_submission_policy(
         link_window_seconds,
         hard_ttl_seconds,
     )
-    owner_key, owner_key_version = _turn_submission_owner_identity(worker)
+    owner_identity = _turn_submission_owner_identity(worker)
+    if owner_identity is None:
+        raise StoreSchemaError("turn_submission_stable_owner_missing")
+    owner_key, owner_key_version = owner_identity
     submission_id = turn_submission_id(host_id, request_id)
     current_time = datetime.fromisoformat(current)
     link_not_before = (current_time - timedelta(seconds=link_window)).isoformat(
@@ -20061,7 +15426,7 @@ def _terminalize_turn_submission_conn(
     terminal_state: str,
     current: str,
 ) -> bool:
-    """Advance an existing shadow row with its command receipt transaction."""
+    """Advance a submission row with its command receipt transaction."""
     next_state = {
         "accepted": "submitted",
         "rejected": "cancelled",
@@ -20198,18 +15563,18 @@ def _submission_link_candidate_turns_conn(
     ) in rows:
         if not isinstance(source_turn_id, str) or not source_turn_id.strip():
             continue
-        try:
-            candidate_owner, owner_version = _turn_link_candidate_owner_identity(
-                {
-                    "id": str(worker_id),
-                    "meta": {
-                        "stable_key": stable_key,
-                        "stable_key_version": stable_key_version,
-                    },
-                }
-            )
-        except StoreSchemaError:
+        owner_identity = _turn_submission_owner_identity(
+            {
+                "id": str(worker_id),
+                "meta": {
+                    "stable_key": stable_key,
+                    "stable_key_version": stable_key_version,
+                },
+            }
+        )
+        if owner_identity is None:
             continue
+        candidate_owner, owner_version = owner_identity
         if owner_version != 1 or candidate_owner != str(owner_key):
             continue
         if user_text is None:
@@ -20229,7 +15594,7 @@ def _submission_link_candidate_turns_conn(
     return candidates
 
 
-def settle_submission_links_conn(
+def _settle_submission_links_conn(
     conn: sqlite3.Connection,
     host_id: str,
     owner_key: str,
@@ -20586,7 +15951,7 @@ def _settle_due_submission_links_conn(
         if not _submission_link_component_is_due(key, current_dt):
             continue
         next_eligible: list[datetime | None] = []
-        component_changed = settle_submission_links_conn(
+        component_changed = _settle_submission_links_conn(
             conn,
             str(candidate_host),
             str(owner_key),
@@ -21362,66 +16727,6 @@ def _apply_backend_pending_observation_conn(
     return changed
 
 
-def _merge_backend_pending_conn(
-    conn: sqlite3.Connection,
-    host_id: str,
-    worker_id: str,
-    pending: Mapping[str, Any] | None,
-    *,
-    observed_at: str,
-) -> bool:
-    """Compatibility entrypoint routed through the explicit transition helper."""
-    if pending is None:
-        observation = PendingObservation("read_succeeded_no_prompt")
-    else:
-        clean = sanitize_public_mapping(pending)
-        raw_choices = clean.get("choices", []) if isinstance(clean, Mapping) else []
-        normalized_choices = [
-            InteractionChoice.from_dict(choice)
-            for choice in raw_choices
-            if isinstance(choice, Mapping)
-        ]
-        choices = tuple(
-            PendingObservedChoice(
-                choice_id=choice.choice_id,
-                label=choice.label,
-                picker_ordinal=ordinal,
-            )
-            for ordinal, choice in enumerate(normalized_choices, 1)
-        )
-        question = str(clean.get("question") or clean.get("kind") or "Pending action")
-        decision: dict[str, Any] | None = None
-        clean_meta = clean.get("meta")
-        if isinstance(clean_meta, Mapping) and "decision" in clean_meta:
-            decision = _normalize_pending_decision_meta(clean_meta["decision"])
-        observation = PendingObservation(
-            "open_prompt",
-            question=question,
-            pending_kind=str(clean.get("kind") or "question"),
-            choices=choices,
-            revision_digest=stable_fingerprint({"legacy_pending_revision": clean}),
-            decision_kind=(decision or {}).get("kind"),
-            decision_options=tuple(
-                str(option["label"])
-                for option in (decision or {}).get("options", [])
-            ),
-            decision_multi_select=bool(
-                (decision or {}).get("multi_select", False)
-            ),
-            decision_question_count=int(
-                (decision or {}).get("question_count", 0)
-            ),
-        )
-    return _apply_backend_pending_observation_conn(
-        conn,
-        host_id,
-        worker_id,
-        observation,
-        observed_at=observed_at,
-        stale_grace_seconds=DEFAULT_PENDING_STALE_GRACE_SECONDS,
-    )
-
-
 def apply_backend_pending_observation(
     db_path: Path | str,
     host_id: str,
@@ -21433,13 +16738,10 @@ def apply_backend_pending_observation(
     binding_private_fingerprint: str | None = None,
     observed_turn_target_value: str | None = None,
     binding_authoritative: bool = False,
-    route_kind: Literal["legacy", "acp_permission"] = "legacy",
 ) -> bool:
     """Apply one explicit observation in a short writer transaction."""
     if not _sqlite_store_exists(db_path):
         return False
-    if route_kind not in {"legacy", "acp_permission"}:
-        raise ValueError("invalid backend pending route kind")
     current_time, _ = _pending_observed_time(observed_at)
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
@@ -21460,19 +16762,6 @@ def apply_backend_pending_observation(
                 ),
                 binding_authoritative=bool(binding_authoritative),
             )
-            conn.execute(
-                "UPDATE backend_pending SET route_kind = ? "
-                "WHERE host_id = ? AND worker_id = ? "
-                "AND binding_private_fingerprint = ? "
-                "AND observed_turn_target_value = ?",
-                (
-                    route_kind,
-                    str(host_id),
-                    str(worker_id),
-                    str(binding_private_fingerprint or ""),
-                    str(observed_turn_target_value or ""),
-                ),
-            )
             conn.commit()
             return changed
         except Exception:
@@ -21480,52 +16769,8 @@ def apply_backend_pending_observation(
             raise
 
 
-def merge_backend_pending(
-    db_path: Path | str,
-    host_id: str,
-    worker_id: str,
-    pending: Mapping[str, Any] | None,
-) -> bool:
-    """Presence-sync one worker's backend-provided pending prompt."""
-    if not _sqlite_store_exists(db_path):
-        return False
-    with _connect(db_path, isolation_level=None) as conn:
-        _ensure_schema(conn)
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            changed = _merge_backend_pending_conn(
-                conn,
-                host_id,
-                worker_id,
-                pending,
-                observed_at=utc_timestamp(),
-            )
-            conn.commit()
-            return changed
-        except Exception:
-            conn.rollback()
-            raise
 
 
-def list_backend_pending(db_path: Path | str, host_id: str) -> dict[str, dict[str, Any]]:
-    """worker_id -> normalized pending dict for every live backend-provided prompt."""
-    out: dict[str, dict[str, Any]] = {}
-    if not _sqlite_store_exists(db_path):
-        return out
-    with _connect(db_path) as conn:
-        _ensure_schema(conn)
-        for worker_id, payload_json in conn.execute(
-            "SELECT worker_id, payload_json FROM backend_pending "
-            "WHERE host_id = ? AND observation_state = 'open'",
-            (host_id,),
-        ).fetchall():
-            try:
-                payload = json.loads(payload_json)
-            except (TypeError, ValueError):
-                continue
-            if isinstance(payload, Mapping):
-                out[str(worker_id)] = sanitize_public_mapping(payload)
-    return sanitize_public_mapping(out)
 
 
 def _backend_pending_health_from_rows(
@@ -22170,8 +17415,7 @@ def claim_backend_pending_decision(
                 """
                 SELECT payload_json, choice_routes_json, revision_digest,
                        freshness, binding_private_fingerprint,
-                       observed_turn_target_value, observation_state,
-                       route_kind
+                       observed_turn_target_value, observation_state
                 FROM backend_pending
                 WHERE host_id = ? AND worker_id = ?
                 """,
@@ -22205,11 +17449,7 @@ def claim_backend_pending_decision(
                 return BackendPendingDecisionClaim("decision_not_pending")
             if context is None:
                 conn.rollback()
-                return BackendPendingDecisionClaim(
-                    "acp_authority_unavailable"
-                    if str(row[7]) == "acp_permission"
-                    else "decision_not_pending"
-                )
+                return BackendPendingDecisionClaim("acp_authority_unavailable")
             if int(decision["question_count"]) > 1:
                 conn.rollback()
                 return BackendPendingDecisionClaim("unsupported_decision")
@@ -22257,7 +17497,6 @@ def claim_backend_pending_decision(
                 "option_count": option_count,
                 "option_refs": option_refs,
                 "text": text,
-                "route_kind": str(row[7]),
             }
             if not claim:
                 conn.rollback()
@@ -22269,14 +17508,13 @@ def claim_backend_pending_decision(
                     host_id, worker_id, claim_token, revision_digest, choice_id,
                     picker_ordinal, worker_fingerprint,
                     binding_private_fingerprint, turn_target_value, state,
-                    claimed_at, send_started_at, route_kind
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, NULL, ?)
+                    claimed_at, send_started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, NULL)
                 """,
                 (
                     str(host_id), str(worker_id), token, str(row[2]),
                     _encode_decision_claim_selection(option_refs, text),
                     picker_ordinal, context[2], context[1], context[3], current_time,
-                    str(row[7]),
                 ),
             )
             conn.commit()
@@ -22308,7 +17546,7 @@ def start_backend_pending_decision_send(
                 """
                 SELECT worker_id, revision_digest, choice_id,
                        worker_fingerprint, binding_private_fingerprint,
-                       turn_target_value, state, claimed_at, route_kind
+                       turn_target_value, state, claimed_at
                 FROM backend_pending_claims
                 WHERE host_id = ? AND claim_token = ?
                 """,
@@ -22336,7 +17574,7 @@ def start_backend_pending_decision_send(
                 """
                 SELECT payload_json, choice_routes_json, revision_digest,
                        freshness, binding_private_fingerprint,
-                       observed_turn_target_value, route_kind
+                       observed_turn_target_value
                 FROM backend_pending
                 WHERE host_id = ? AND worker_id = ?
                   AND observation_state = 'open'
@@ -22360,7 +17598,6 @@ def start_backend_pending_decision_send(
                 str(current[2]) != str(row[1])
                 or str(current[4]) != str(row[4])
                 or str(current[5]) != str(row[5])
-                or str(current[6]) != str(row[8])
                 or decision is None
                 or validated_selection is None
             ):
@@ -22377,7 +17614,6 @@ def start_backend_pending_decision_send(
                 "option_count": len(decision["options"]),
                 "option_refs": option_refs,
                 "text": text,
-                "route_kind": str(row[8]),
             }
             if str(row[6]) == "send_started":
                 conn.rollback()
@@ -22671,78 +17907,6 @@ def backend_pending_choice_terminal_effect(
     return effect
 
 
-def prune_backend_pending(
-    db_path: Path | str,
-    host_id: str,
-    live_binding_private_fingerprints: Iterable[str],
-    *,
-    deadline_monotonic: float | None = None,
-    cancelled: Callable[[], bool] | None = None,
-    observed_at: str | None = None,
-) -> int:
-    """Delete state whose exact authoritative pane binding disappeared."""
-    if not _sqlite_store_exists(db_path):
-        return 0
-    live = {
-        str(private_fingerprint)
-        for private_fingerprint in live_binding_private_fingerprints
-        if str(private_fingerprint)
-    }
-    current_time, _ = _pending_observed_time(observed_at)
-    with _connect(db_path, isolation_level=None) as conn:
-        _ensure_schema(conn)
-        if not _begin_turn_refresh_transaction(
-            conn,
-            deadline_monotonic=deadline_monotonic,
-            cancelled=cancelled,
-        ):
-            return 0
-        try:
-            if _turn_refresh_is_cancelled(
-                deadline_monotonic=deadline_monotonic,
-                cancelled=cancelled,
-            ):
-                conn.rollback()
-                return 0
-            stored = [
-                (str(row[0]), str(row[1]), str(row[2]))
-                for row in conn.execute(
-                    """
-                    SELECT worker_id, binding_private_fingerprint,
-                           observed_turn_target_value
-                    FROM backend_pending
-                    WHERE host_id = ?
-                    """,
-                    (str(host_id),),
-                ).fetchall()
-            ]
-            stale = [
-                (worker_id, private_fingerprint, turn_target_value)
-                for worker_id, private_fingerprint, turn_target_value in stored
-                if private_fingerprint not in live
-            ]
-            for worker_id, private_fingerprint, turn_target_value in stale:
-                _apply_backend_pending_observation_conn(
-                    conn,
-                    str(host_id),
-                    worker_id,
-                    PendingObservation("worker_authoritatively_absent"),
-                    observed_at=current_time,
-                    stale_grace_seconds=DEFAULT_PENDING_STALE_GRACE_SECONDS,
-                    binding_private_fingerprint=private_fingerprint,
-                    observed_turn_target_value=turn_target_value,
-                )
-            if _turn_refresh_is_cancelled(
-                deadline_monotonic=deadline_monotonic,
-                cancelled=cancelled,
-            ):
-                conn.rollback()
-                return 0
-            conn.commit()
-            return len(stale)
-        except Exception:
-            conn.rollback()
-            raise
 
 
 def _decode_turn_content_rows(
@@ -22986,7 +18150,6 @@ def _raw_owned_source_turn_candidates(
     raw_value: Any,
     *,
     owner_key: str,
-    source: str,
     kind: str,
 ) -> tuple[str, ...]:
     """Derive exact-source lookup tokens without invoking the public sanitizer.
@@ -23017,15 +18180,7 @@ def _raw_owned_source_turn_candidates(
             },
         }
     )
-    legacy_token = "turnsrc-" + stable_fingerprint(
-        {
-            "seed": raw,
-            "public": {"source": str(source), "kind": str(kind)},
-        }
-    )
-    if owner_token == legacy_token:
-        return (owner_token,)
-    return owner_token, legacy_token
+    return (owner_token,)
 
 
 def _canonical_reobservation_text_matches(
@@ -23052,7 +18207,6 @@ def _unchanged_owned_turn_reobservation_conn(
     content: Mapping[str, Any],
     *,
     observed_at: str,
-    turn_model: str,
 ) -> _TurnContentMergeResult | None:
     """Return a no-op merge result without decoding or sanitizing turn payloads.
 
@@ -23112,7 +18266,6 @@ def _unchanged_owned_turn_reobservation_conn(
         source_candidates = _raw_owned_source_turn_candidates(
             content.get("source_turn_id"),
             owner_key=owner_key,
-            source=str(payload.get("source") or "snapshot"),
             kind=str(payload.get("kind") or "unknown"),
         )
         if str(payload.get("source_turn_id") or "") in source_candidates:
@@ -23571,22 +18724,13 @@ def _merge_observed_turn_content_conn(
             revision_repaired = False
         changed = metadata_changed or revision_changed or revision_repaired
 
-    owner_key, owner_key_version = _turn_submission_owner_identity(
-        current_worker_payload
-    )
+    owner_identity = _turn_submission_owner_identity(current_worker_payload)
     submission_link = (
-        (owner_key, instruction_fingerprint(incoming_user))
-        if owner_key_version == 1
+        (owner_identity[0], instruction_fingerprint(incoming_user))
+        if owner_identity is not None and owner_identity[1] == 1
         else None
     )
-    candidate_owner_key, candidate_owner_key_version = (
-        _turn_link_candidate_owner_identity(current_worker_payload)
-    )
-    submission_link_rearm = (
-        (candidate_owner_key, instruction_fingerprint(incoming_user))
-        if candidate_owner_key_version == 1
-        else None
-    )
+    submission_link_rearm = submission_link
     current_revision = conn.execute(
         """
         SELECT content_revision
@@ -23618,7 +18762,6 @@ def _merge_turn_content_conn(
     content: Mapping[str, Any],
     *,
     observed_at: str,
-    turn_model: str,
 ) -> _TurnContentMergeResult:
     if not any(key in content for key in _TURN_CONTENT_FIELDS):
         return _TurnContentMergeResult(0)
@@ -23640,7 +18783,6 @@ def _merge_turn_content_conn(
         current_worker_payload,
         content,
         observed_at=observed_at,
-        turn_model=turn_model,
     )
     if unchanged is not None:
         return unchanged
@@ -23778,21 +18920,11 @@ def _agent_event_authority_observed_at_conn(
     host_id: str,
     event_id: str,
 ) -> str | None:
-    """Return the immutable event time, including retained replay metadata.
-
-    Tombstones written before schema v26 have no retained authority time.
-    They remain valid deduplication evidence but cannot authorize a repair.
-    """
+    """Return the immutable authority time for a retained event."""
     row = conn.execute(
         "SELECT observed_at FROM agent_events WHERE host_id = ? AND event_id = ?",
         (str(host_id), str(event_id)),
     ).fetchone()
-    if row is None:
-        row = conn.execute(
-            "SELECT observed_at FROM agent_event_tombstones "
-            "WHERE host_id = ? AND event_id = ?",
-            (str(host_id), str(event_id)),
-        ).fetchone()
     if row is None or row[0] is None:
         return None
     observed_at = _strict_utc_timestamp(row[0])
@@ -23870,8 +19002,6 @@ def append_agent_event_and_apply_turn_for_binding(
     *,
     expected_binding: WorkerBinding,
     content: Mapping[str, Any] | None = None,
-    observed_at: str | None = None,
-    turn_model: str = DEFAULT_TURN_MODEL,
     _fault_inject: Callable[[str], None] | None = None,
 ) -> AppendProjectedAgentEventResult:
     """Atomically journal an agent event and apply its text-only turn projection.
@@ -23892,15 +19022,8 @@ def append_agent_event_and_apply_turn_for_binding(
             raise ValueError("content must be a mapping or None")
         if not str(content.get("source_turn_id") or "").strip():
             raise ValueError("projected agent content requires source_turn_id")
-    normalized_turn_model = str(turn_model or "").strip().lower()
-    if normalized_turn_model not in TURN_MODELS:
-        allowed = ", ".join(sorted(TURN_MODELS))
-        raise ValueError(f"turn_model must be one of: {allowed}")
     if _fault_inject is not None and not callable(_fault_inject):
         raise TypeError("_fault_inject must be callable or None")
-    # Validate the compatibility argument, but never grant it replay authority.
-    if observed_at is not None:
-        _pending_observed_time(observed_at)
     rearm_key: tuple[str, str] | None = None
 
     def fault(boundary: str) -> None:
@@ -23967,7 +19090,6 @@ def append_agent_event_and_apply_turn_for_binding(
                     event.worker_id,
                     content,
                     observed_at=authority_time,
-                    turn_model=normalized_turn_model,
                 )
                 rearm_key = (
                     merge_result.submission_link_rearm
@@ -23975,7 +19097,7 @@ def append_agent_event_and_apply_turn_for_binding(
                 )
                 if merge_result.submission_link is not None:
                     owner_key, fingerprint = merge_result.submission_link
-                    settle_submission_links_conn(
+                    _settle_submission_links_conn(
                         conn,
                         normalized_host or "",
                         owner_key,
@@ -24012,28 +19134,17 @@ def apply_turn_refresh(
     worker_id: str,
     content: Mapping[str, Any],
     *,
-    backend_pending: Mapping[str, Any] | None | object = _UNSET,
     backend_pending_observation: PendingObservation | object = _UNSET,
     expected_binding: WorkerBinding | None = None,
     deadline_monotonic: float | None = None,
     cancelled: Callable[[], bool] | None = None,
     observed_at: str | None = None,
     pending_stale_grace_seconds: float = DEFAULT_PENDING_STALE_GRACE_SECONDS,
-    turn_model: str = DEFAULT_TURN_MODEL,
 ) -> TurnRefreshApplyResult:
     """Atomically apply one binding's turn observation and optional pending state."""
     if not _sqlite_store_exists(db_path):
         return TurnRefreshApplyResult(0, False)
-    normalized_turn_model = str(turn_model or "").strip().lower()
-    if normalized_turn_model not in TURN_MODELS:
-        allowed = ", ".join(sorted(TURN_MODELS))
-        raise ValueError(f"turn_model must be one of: {allowed}")
     current_time, _ = _pending_observed_time(observed_at)
-    if (
-        backend_pending is not _UNSET
-        and backend_pending_observation is not _UNSET
-    ):
-        raise ValueError("provide only one backend pending observation")
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
         # Transaction acquisition must precede every merge-base read. Use
@@ -24066,7 +19177,6 @@ def apply_turn_refresh(
                 str(worker_id),
                 content,
                 observed_at=current_time,
-                turn_model=normalized_turn_model,
             )
             updated = merge_result.updated
             rearm_key = (
@@ -24085,7 +19195,7 @@ def apply_turn_refresh(
                 owner_key, fingerprint = merge_result.submission_link
                 conn.execute("SAVEPOINT settle_submission_links")
                 try:
-                    settle_submission_links_conn(
+                    _settle_submission_links_conn(
                         conn,
                         str(host_id),
                         owner_key,
@@ -24134,14 +19244,6 @@ def apply_turn_refresh(
                     # pane binding for the same stable worker.
                     binding_authoritative=expected_binding is not None,
                 )
-            elif backend_pending is not _UNSET:
-                pending_changed = _merge_backend_pending_conn(
-                    conn,
-                    str(host_id),
-                    str(worker_id),
-                    backend_pending,
-                    observed_at=current_time,
-                )
             else:
                 pending_changed = False
             if _turn_refresh_is_cancelled(
@@ -24157,24 +19259,6 @@ def apply_turn_refresh(
             raise
 
 
-def merge_turn_content(
-    db_path: Path | str,
-    host_id: str,
-    worker_id: str,
-    content: Mapping[str, Any],
-    *,
-    observed_at: str | None = None,
-    turn_model: str = DEFAULT_TURN_MODEL,
-) -> int:
-    """Compatibility wrapper for the transactional authoritative turn merge."""
-    return apply_turn_refresh(
-        db_path,
-        host_id,
-        worker_id,
-        content,
-        observed_at=observed_at,
-        turn_model=turn_model,
-    ).updated
 
 
 def _update_turn_row(
@@ -24297,16 +19381,6 @@ def _turn_delta_projection(
             final_byte_length=int(final_byte_length), final_page_count=int(final_page_count),
             final_inline=final_inline, final_preview=final_preview,
         ))
-    else:
-        legacy_user, legacy_user_state = _legacy_canonical_field(serialized.get("user_text"))
-        legacy_final, legacy_final_state = _legacy_canonical_field(
-            serialized.get("assistant_final_text")
-        )
-        if legacy_user_state != "absent" or legacy_final_state != "absent":
-            item.update(project_turn_content(
-                str(turn_id), legacy_user, legacy_final,
-                user_state=legacy_user_state, final_state=legacy_final_state,
-            ))
     if submission_id is not None and submission_state == "linked":
         item["submission_id"] = str(submission_id)
         item["submission_state"] = "linked"
@@ -24409,7 +19483,6 @@ def _turn_delta_payload_from_store(
     batch_sequence_ceiling: int = TURN_DELTA_MAX_BATCH_SEQUENCES,
     bootstrap_max_rows: int = TURN_DELTA_BOOTSTRAP_MAX_ROWS,
     bootstrap_max_pages: int = TURN_DELTA_BOOTSTRAP_MAX_PAGES,
-    turn_model: str = DEFAULT_TURN_MODEL,
 ) -> dict[str, Any]:
     """Return one atomic, frozen, byte-bounded public turn-delta page."""
     started = time.perf_counter()
@@ -24456,28 +19529,27 @@ def _turn_delta_payload_from_store(
             ),
         }
 
-    if _submission_linking_enabled(turn_model):
-        sweep_key, sweep_due = _reserve_lazy_submission_link_sweep(
-            db_path,
-            host,
-            purpose="submission_links",
-            current_clock=clock,
-            refresh_interval_seconds=DEFAULT_SUBMISSION_LINK_SWEEP_INTERVAL_SECONDS,
-        )
-        if sweep_due:
-            try:
-                sweep_submission_links(
-                    Path(db_path),
-                    host_id=host,
-                    now=datetime.fromtimestamp(clock, tz=timezone.utc).isoformat(),
-                )
-            except Exception:
-                _release_failed_submission_link_sweep(
-                    sweep_key,
-                    current_clock=clock,
-                )
-                # Delta remains available if opportunistic linkage is contended.
-                pass
+    sweep_key, sweep_due = _reserve_lazy_submission_link_sweep(
+        db_path,
+        host,
+        purpose="submission_links",
+        current_clock=clock,
+        refresh_interval_seconds=DEFAULT_SUBMISSION_LINK_SWEEP_INTERVAL_SECONDS,
+    )
+    if sweep_due:
+        try:
+            _sweep_submission_links(
+                Path(db_path),
+                host_id=host,
+                now=datetime.fromtimestamp(clock, tz=timezone.utc).isoformat(),
+            )
+        except Exception:
+            _release_failed_submission_link_sweep(
+                sweep_key,
+                current_clock=clock,
+            )
+            # Delta remains available if opportunistic linkage is contended.
+            pass
 
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
@@ -24761,7 +19833,6 @@ def turn_delta_payload_from_store(
     batch_sequence_ceiling: int = TURN_DELTA_MAX_BATCH_SEQUENCES,
     bootstrap_max_rows: int = TURN_DELTA_BOOTSTRAP_MAX_ROWS,
     bootstrap_max_pages: int = TURN_DELTA_BOOTSTRAP_MAX_PAGES,
-    turn_model: str = DEFAULT_TURN_MODEL,
 ) -> dict[str, Any]:
     """Fail closed to the documented public outcome for unavailable stores."""
     try:
@@ -24776,7 +19847,6 @@ def turn_delta_payload_from_store(
             batch_sequence_ceiling=batch_sequence_ceiling,
             bootstrap_max_rows=bootstrap_max_rows,
             bootstrap_max_pages=bootstrap_max_pages,
-            turn_model=turn_model,
         )
     except (sqlite3.Error, StoreSchemaError, LocalStateError, OSError):
         return {
@@ -24800,7 +19870,6 @@ def turns_payload_from_store(
     now: float | int | None = None,
     work_counters: TurnContentWorkCounters | None = None,
     turn_refresh_interval_seconds: float = 2.0,
-    turn_model: str = DEFAULT_TURN_MODEL,
 ) -> dict[str, Any]:
     """Return one insertion-stable, byte-bounded turn-list page."""
     requested_schema = int(schema_version)
@@ -24833,31 +19902,30 @@ def turns_payload_from_store(
         }
     current_clock = time.time() if now is None else float(now)
     refresh_interval = float(turn_refresh_interval_seconds)
-    if _submission_linking_enabled(turn_model):
-        submission_sweep_key, submission_sweep_due = _reserve_lazy_submission_link_sweep(
-            db_path,
-            str(host_id),
-            purpose="submission_links",
-            current_clock=current_clock,
-            refresh_interval_seconds=refresh_interval,
-        )
-        if submission_sweep_due:
-            try:
-                sweep_submission_links(
-                    Path(db_path),
-                    host_id=str(host_id),
-                    now=datetime.fromtimestamp(
-                        current_clock,
-                        tz=timezone.utc,
-                    ).isoformat(),
-                )
-            except Exception:
-                _release_failed_submission_link_sweep(
-                    submission_sweep_key,
-                    current_clock=current_clock,
-                )
-                # Listing remains available if opportunistic maintenance is contended.
-                pass
+    submission_sweep_key, submission_sweep_due = _reserve_lazy_submission_link_sweep(
+        db_path,
+        str(host_id),
+        purpose="submission_links",
+        current_clock=current_clock,
+        refresh_interval_seconds=refresh_interval,
+    )
+    if submission_sweep_due:
+        try:
+            _sweep_submission_links(
+                Path(db_path),
+                host_id=str(host_id),
+                now=datetime.fromtimestamp(
+                    current_clock,
+                    tz=timezone.utc,
+                ).isoformat(),
+            )
+        except Exception:
+            _release_failed_submission_link_sweep(
+                submission_sweep_key,
+                current_clock=current_clock,
+            )
+            # Listing remains available if opportunistic maintenance is contended.
+            pass
     try:
         decoded_cursor = (
             decode_turn_list_cursor(
@@ -25172,34 +20240,6 @@ def turns_payload_from_store(
                 for descriptor in fields.values()
             )
             item.update(projection)
-        else:
-            legacy_user, legacy_user_state = _legacy_canonical_field(
-                serialized.get("user_text")
-            )
-            legacy_final, legacy_final_state = _legacy_canonical_field(
-                serialized.get("assistant_final_text")
-            )
-            if requested_schema == TURN_LIST_SCHEMA_VERSION and (
-                legacy_user_state != "absent" or legacy_final_state != "absent"
-            ):
-                item.update(
-                    project_turn_content(
-                        str(turn_id),
-                        legacy_user,
-                        legacy_final,
-                        user_state=legacy_user_state,
-                        final_state=legacy_final_state,
-                    )
-                )
-            elif requested_schema == 1:
-                incompatible_v1 = incompatible_v1 or (
-                    legacy_user_state == "known_incomplete"
-                    or legacy_final_state == "known_incomplete"
-                )
-                if legacy_user_state == "complete":
-                    item["user_text"] = legacy_user
-                if legacy_final_state == "complete":
-                    item["assistant_final_text"] = legacy_final
         if requested_schema == 1:
             item["schema_version"] = 1
             item.pop("content", None)
@@ -25441,7 +20481,7 @@ def _ensure_turn_content_page_boundaries_conn(
 def _backfill_missing_turn_content_page_boundaries_conn(
     conn: sqlite3.Connection,
 ) -> int:
-    """Stream complete legacy fields once and persist exact non-content boundaries."""
+    """Repair missing page boundaries for complete current revisions."""
     repaired_fields = 0
     cursor = conn.execute(
         """
@@ -25559,7 +20599,6 @@ def get_turn_content(
     field: str,
     cursor: str | None = None,
     schema_version: int = 1,
-    turn_model: str = DEFAULT_TURN_MODEL,
     work_counters: TurnContentWorkCounters | None = None,
 ) -> dict[str, Any]:
     """Read one bounded page directly from the canonical SQLite value."""
@@ -25960,15 +20999,7 @@ def _snapshot_projection_refresh_required(
         _snapshot_projection_freshness(payload_data)
     ):
         return True
-    retained_created_at = str(latest[2])
-    retained_at = _strict_utc_timestamp(retained_created_at)
-    return retained_at is None or (
-        retained_at == _LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE
-        and not _legacy_snapshot_created_at_is_authoritative(
-            retained_created_at,
-            latest[3],
-        )
-    )
+    return _strict_utc_timestamp(latest[2]) is None
 
 
 def save_snapshot(
@@ -25980,13 +21011,8 @@ def save_snapshot(
     binding_backend: str | None = None,
     binding_observation_authoritative: bool = False,
     binding_workers_present: bool = True,
-    turn_model: str = DEFAULT_TURN_MODEL,
 ) -> bool:
     """Persist a canonical snapshot; return whether it became the host projection."""
-    normalized_turn_model = str(turn_model or "").strip().lower()
-    if normalized_turn_model not in TURN_MODELS:
-        allowed = ", ".join(sorted(TURN_MODELS))
-        raise ValueError(f"turn_model must be one of: {allowed}")
     context = observation or SnapshotObservationContext()
     binding_list = (
         None
@@ -26085,17 +21111,7 @@ def save_snapshot(
                 if latest is not None
                 else None
             )
-            retained_is_unknown = (
-                latest is None
-                or retained_at is None
-                or (
-                    retained_at == _LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE
-                    and not _legacy_snapshot_created_at_is_authoritative(
-                        retained_created_at,
-                        latest[3],
-                    )
-                )
-            )
+            retained_is_unknown = latest is None or retained_at is None
             refresh_current = retained_is_unknown
             exact_replay = False
             if retained_at is not None and not retained_is_unknown:
@@ -26352,23 +21368,6 @@ def _attention_item_from_row(row: Any) -> dict[str, Any]:
     )
 
 
-def list_attention_items(
-    db_path: Path,
-    host_id: str,
-    *,
-    include_resolved: bool = False,
-) -> list[dict[str, Any]]:
-    """Return public-safe persisted attention items for a host."""
-    if not _sqlite_store_exists(db_path):
-        return []
-    with _connect(db_path) as conn:
-        _ensure_schema(conn)
-        rows = _attention_rows_conn(
-            conn,
-            host_id,
-            include_resolved=include_resolved,
-        )
-    return sanitize_public_value([_attention_item_from_row(row) for row in rows])
 
 
 def attention_payload_from_store(
@@ -26467,16 +21466,6 @@ def attention_payload_from_store(
     return sanitize_public_value(payload)
 
 
-def list_hosts(db_path: Path) -> list[str]:
-    """Return distinct host_ids seen in the store."""
-    if not _sqlite_store_exists(db_path):
-        return []
-    with _connect(db_path) as conn:
-        _ensure_schema(conn)
-        rows = conn.execute(
-            "SELECT DISTINCT host_id FROM snapshots ORDER BY host_id"
-        ).fetchall()
-    return sanitize_public_value([row[0] for row in rows])
 
 
 def upsert_worker_bindings(db_path: Path, bindings: Iterable[WorkerBinding]) -> int:
@@ -26545,56 +21534,6 @@ def list_worker_bindings(
     return [_worker_binding_from_row(row) for row in rows]
 
 
-def resolve_worker_binding(
-    db_path: Path,
-    host_id: str,
-    worker_id: str,
-    *,
-    worker_fingerprint: str | None = None,
-    backend: str | None = None,
-    now: str | None = None,
-) -> WorkerBinding | None:
-    """Resolve a single current, sendable private binding for a public worker."""
-    if not _sqlite_store_exists(db_path):
-        return None
-    current_time = now or utc_timestamp()
-    clauses = ["host_id = ?", "worker_id = ?", "sendable = 1", "expires_at > ?"]
-    params: list[Any] = [str(host_id), str(worker_id), current_time]
-    if worker_fingerprint:
-        clauses.append("worker_fingerprint = ?")
-        params.append(str(worker_fingerprint))
-    if backend is not None:
-        clauses.append("backend = ?")
-        params.append(str(backend))
-    where = " AND ".join(clauses)
-    with _connect(db_path) as conn:
-        _ensure_schema(conn)
-        rows = conn.execute(
-            f"""
-            SELECT
-                host_id,
-                worker_id,
-                worker_fingerprint,
-                backend,
-                target_kind,
-                target_value,
-                turn_target_kind,
-                turn_target_value,
-                sendable,
-                reason,
-                observed_at,
-                expires_at,
-                private_fingerprint
-            FROM worker_bindings
-            WHERE {where}
-            ORDER BY observed_at DESC, id DESC
-            LIMIT 2
-            """,
-            params,
-        ).fetchall()
-    if len(rows) != 1:
-        return None
-    return _worker_binding_from_row(rows[0])
 
 
 def expire_worker_bindings(
@@ -26731,15 +21670,9 @@ def _canonical_request_matches(
     canonical_fingerprint: str,
     canonical_request_json: str,
     public_worker_id: str,
-    legacy_raw_payload_fingerprint: str | None,
 ) -> bool:
     if str(row[3]) != str(action):
         return False
-    if int(row[4]) == 0:
-        return (
-            legacy_raw_payload_fingerprint is not None
-            and str(row[5]) == str(legacy_raw_payload_fingerprint)
-        )
     return (
         int(row[4]) == int(canonical_version)
         and str(row[5]) == str(canonical_fingerprint)
@@ -26774,7 +21707,6 @@ def reserve_command_request(
     public_worker_id: str,
     pending_result_json: str,
     selector_proof: str = "",
-    legacy_raw_payload_fingerprint: str | None = None,
     owner_lease_seconds: float = COMMAND_RECEIPT_OWNER_LEASE_SECONDS,
     now: str | None = None,
 ) -> dict[str, Any]:
@@ -26819,9 +21751,6 @@ def reserve_command_request(
         conn.execute("BEGIN IMMEDIATE")
         row = _command_request_row(conn, values["host_id"], values["request_id"])
         if row is not None:
-            if bool(row[19]):
-                conn.commit()
-                return _command_request_response("terminal", row)
             if not _canonical_request_matches(
                 row,
                 action=values["action"],
@@ -26829,7 +21758,6 @@ def reserve_command_request(
                 canonical_fingerprint=values["canonical_fingerprint"],
                 canonical_request_json=str(canonical_request_json),
                 public_worker_id=str(public_worker_id),
-                legacy_raw_payload_fingerprint=legacy_raw_payload_fingerprint,
             ):
                 conn.commit()
                 return _command_request_response("request_id_conflict", row)
@@ -26883,11 +21811,10 @@ def reserve_command_request(
                     public_worker_id, state, status, result_json,
                     owner_token_hash, owner_expires_at, binding_fingerprint,
                     created_at, reserved_at, send_started_at, terminal_at,
-                    updated_at, legacy_collision, legacy_collision_count,
-                    selector_proof
+                    updated_at, selector_proof
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, 'reserved', 'pending', ?, ?, ?, NULL,
-                    ?, ?, NULL, NULL, ?, 0, 0, ?
+                    ?, ?, NULL, NULL, ?, ?
                 )
                 """,
                 (
@@ -26980,7 +21907,6 @@ def reserve_terminal_command_replay(
     status: str,
     result_json: str,
     selector_proof: str = "",
-    legacy_raw_payload_fingerprint: str | None = None,
     event_payload: Mapping[str, Any] | None = None,
     now: str | None = None,
 ) -> dict[str, Any]:
@@ -27027,9 +21953,6 @@ def reserve_terminal_command_replay(
         conn.execute("BEGIN IMMEDIATE")
         row = _command_request_row(conn, values["host_id"], values["request_id"])
         if row is not None:
-            if bool(row[19]):
-                conn.commit()
-                return _command_request_response("terminal", row)
             if not _canonical_request_matches(
                 row,
                 action=values["action"],
@@ -27037,7 +21960,6 @@ def reserve_terminal_command_replay(
                 canonical_fingerprint=values["canonical_fingerprint"],
                 canonical_request_json=str(canonical_request_json),
                 public_worker_id=str(public_worker_id),
-                legacy_raw_payload_fingerprint=legacy_raw_payload_fingerprint,
             ):
                 conn.commit()
                 return _command_request_response("request_id_conflict", row)
@@ -27055,11 +21977,10 @@ def reserve_terminal_command_replay(
                 public_worker_id, state, status, result_json,
                 owner_token_hash, owner_expires_at, binding_fingerprint,
                 created_at, reserved_at, send_started_at, terminal_at,
-                updated_at, legacy_collision, legacy_collision_count,
-                selector_proof
+                updated_at, selector_proof
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', NULL, NULL,
-                ?, ?, NULL, ?, ?, 0, 0, ?
+                ?, ?, NULL, ?, ?, ?
             )
             """,
             (
@@ -27100,37 +22021,9 @@ def reserve_terminal_command_replay(
         conn.close()
 
 
-def sweep_expired_turn_submissions(
-    db_path: Path,
-    *,
-    host_id: str | None = None,
-    now: str | None = None,
-) -> int:
-    """Expire unlinked shadow submissions past their precomputed hard TTL.
-
-    This Stage-2 store hook is intentionally caller-driven until a later
-    lifecycle stage wires submission maintenance into the daemon scheduler.
-    """
-    if not _sqlite_store_exists(db_path):
-        return 0
-    current = _command_request_now(now)
-    with _connect(db_path, isolation_level=None) as conn:
-        _ensure_schema(conn)
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            expired = _expire_turn_submissions_conn(
-                conn,
-                current=current,
-                host_id=None if host_id is None else str(host_id),
-            )
-            conn.commit()
-            return expired
-        except Exception:
-            conn.rollback()
-            raise
 
 
-def sweep_submission_links(
+def _sweep_submission_links(
     db_path: Path,
     *,
     host_id: str | None = None,
@@ -27189,7 +22082,7 @@ def settle_submission_link_for_request(
                 conn.commit()
                 return None
             owner_key, fingerprint = map(str, component)
-            changed = settle_submission_links_conn(
+            changed = _settle_submission_links_conn(
                 conn,
                 str(host_id),
                 owner_key,
@@ -27269,50 +22162,6 @@ def linked_turn_for_submission(
         return payload
 
 
-def cancel_turn_submission(
-    db_path: Path,
-    *,
-    host_id: str,
-    request_id: str,
-    now: str | None = None,
-) -> bool:
-    """Apply the shadow-ledger side of an authoritative request cancellation.
-
-    This Stage-2 store hook is intentionally caller-driven until a later stage
-    introduces an authoritative production cancellation workflow.
-    """
-    if not _sqlite_store_exists(db_path):
-        return False
-    current = _command_request_now(now)
-    source_states = _turn_submission_transition_sources("cancelled")
-    if not source_states:
-        return False
-    state_placeholders = ", ".join("?" for _ in source_states)
-    with _connect(db_path, isolation_level=None) as conn:
-        _ensure_schema(conn)
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            updated = conn.execute(
-                f"""
-                UPDATE turn_submissions
-                SET state = 'cancelled', terminal_at = ?, updated_at = ?
-                WHERE host_id = ? AND request_id = ?
-                  AND linked_turn_id IS NULL
-                  AND state IN ({state_placeholders})
-                """,
-                (
-                    current,
-                    current,
-                    str(host_id),
-                    str(request_id),
-                    *source_states,
-                ),
-            )
-            conn.commit()
-            return int(updated.rowcount or 0) == 1
-        except Exception:
-            conn.rollback()
-            raise
 
 
 def mark_command_send_started(
@@ -28096,7 +22945,7 @@ def cleanup_command_request_retention(
                         public_worker_id, state, status, result_json,
                         owner_token_hash, owner_expires_at, binding_fingerprint,
                         created_at, reserved_at, send_started_at, terminal_at,
-                        updated_at, legacy_collision, legacy_collision_count
+                        updated_at, selector_proof
                     FROM command_receipts
                     WHERE id = ?
                     """,

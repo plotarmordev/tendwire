@@ -148,7 +148,6 @@ class AcpPermissionBroker:
                     binding_private_fingerprint=binding.private_fingerprint,
                     observed_turn_target_value=binding.turn_target_value,
                     binding_authoritative=True,
-                    route_kind="acp_permission",
                 )
             if not changed:
                 raise AcpPermissionBrokerError("permission overlay was not published")
@@ -256,7 +255,6 @@ class AcpPermissionBroker:
                 PendingObservation("read_succeeded_no_prompt"),
                 binding_private_fingerprint=offer.binding.private_fingerprint,
                 observed_turn_target_value=offer.binding.turn_target_value,
-                route_kind="acp_permission",
             )
         except Exception:
             pass

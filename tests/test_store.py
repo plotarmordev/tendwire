@@ -6,6 +6,7 @@ import fcntl
 import gc
 import hashlib
 import json
+import logging
 import multiprocessing
 import os
 import sqlite3
@@ -41,7 +42,6 @@ from tendwire.store.sqlite import (
     CompactionOptions,
     ack_connector_delivery,
     backend_pending_choice_terminal_effect,
-    append_event,
     attention_payload_from_store,
     cleanup_event_retention,
     compact_store,
@@ -55,22 +55,23 @@ from tendwire.store.sqlite import (
     get_command_request,
     init_store,
     latest_snapshot,
-    list_attention_items,
-    list_hosts,
     list_worker_bindings,
     reclaim_expired_connector_leases,
     poll_connector_outbox,
     mark_command_send_started,
     reserve_command_request,
     reserve_terminal_command_replay,
-    resolve_worker_binding,
     run_store_maintenance,
     save_snapshot,
     store_status,
     tail_event_metadata,
-    merge_turn_content,
     turns_payload_from_store,
     upsert_worker_bindings,
+)
+from .store_helpers import (
+    read_test_attention_items,
+    apply_test_backend_pending,
+    apply_test_turn_refresh,
 )
 
 
@@ -256,8 +257,6 @@ def _invoke_creation_capable_store_path(name: str, db_path: Path) -> None:
     )
     if name == "init_store":
         init_store(db_path)
-    elif name == "append_event":
-        append_event(db_path, "host-a", "store.test", {"safe": True})
     elif name == "save_snapshot":
         save_snapshot(db_path, snapshot)
     elif name == "upsert_worker_bindings":
@@ -341,7 +340,7 @@ def test_creation_boundary_rejects_live_sidecar_change_after_wal_activation(
     assert validated_live_family is True
 
 
-def test_store_startup_repairs_broad_modes_idempotently_and_preserves_data(
+def test_store_startup_repairs_broad_modes_before_explicit_schema_discard(
     tmp_path: Path,
 ) -> None:
     state_dir = tmp_path / "broad-state"
@@ -358,20 +357,24 @@ def test_store_startup_repairs_broad_modes_idempotently_and_preserves_data(
     init_store(db_path)
     first_modes = (_mode(state_dir), _mode(db_path))
     with closing(sqlite3.connect(str(db_path))) as conn, conn:
-        first_value = conn.execute("SELECT value FROM preserved").fetchone()[0]
+        first_preserved = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'preserved'"
+        ).fetchone()
         first_version = _user_version(conn)
     conn.close()
 
     init_store(db_path)
     with sqlite3.connect(str(db_path)) as conn:
-        second_value = conn.execute("SELECT value FROM preserved").fetchone()[0]
+        second_preserved = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'preserved'"
+        ).fetchone()
         second_version = _user_version(conn)
     conn.close()
 
     assert first_modes == (0o700, 0o600)
     assert (_mode(state_dir), _mode(db_path)) == first_modes
     assert db_path.stat().st_ino == inode
-    assert (first_value, second_value) == ("kept", "kept")
+    assert (first_preserved, second_preserved) == (None, None)
     assert (first_version, second_version) == (
         store_sqlite.STORE_SCHEMA_VERSION,
         store_sqlite.STORE_SCHEMA_VERSION,
@@ -592,7 +595,6 @@ def test_store_reads_do_not_invoke_local_state_mutation_for_absent_sidecars(
     "entrypoint",
     [
         "init_store",
-        "append_event",
         "save_snapshot",
         "upsert_worker_bindings",
         "expire_worker_bindings",
@@ -1279,234 +1281,6 @@ def test_connect_expected_main_identity_fails_before_open_and_restores_resources
     assert {process.pid for process in multiprocessing.active_children()} == before_children
 
 
-def test_store_initializes_v8_schema_with_companion_attention_lifecycle(tmp_path: Path) -> None:
-    db_path = tmp_path / "tendwire.db"
-
-    init_store(db_path)
-
-    with sqlite3.connect(str(db_path)) as conn:
-        assert _PR6_TABLES <= _table_names(conn)
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
-        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION
-        assert {"host_id", "created_at", "payload", "content_fingerprint"} <= columns
-        snapshot_indexes = {
-            str(row[1])
-            for row in conn.execute("PRAGMA index_list(snapshots)").fetchall()
-        }
-        assert {
-            "idx_snapshots_host_newest",
-            "idx_snapshots_created_host_id",
-        } <= snapshot_indexes
-        assert {
-            "idx_snapshots_host_id",
-            "idx_snapshots_created_at",
-            "idx_snapshots_content_fingerprint",
-            "idx_snapshots_host_created_id",
-        }.isdisjoint(snapshot_indexes)
-        binding_columns = {row[1] for row in conn.execute("PRAGMA table_info(worker_bindings)")}
-        assert {
-            "host_id",
-            "worker_id",
-            "worker_fingerprint",
-            "backend",
-            "target_kind",
-            "target_value",
-            "turn_target_kind",
-            "turn_target_value",
-            "sendable",
-            "reason",
-            "observed_at",
-            "expires_at",
-            "private_fingerprint",
-        } <= binding_columns
-        binding_indexed = _indexed_columns(conn, "worker_bindings")
-        assert {
-            "worker_id",
-            "worker_fingerprint",
-            "private_fingerprint",
-            "target_kind",
-            "target_value",
-            "expires_at",
-        } <= binding_indexed
-        command_columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(commands)")
-        }
-        assert {
-            "host_id",
-            "request_id",
-            "action",
-            "canonical_version",
-            "canonical_fingerprint",
-            "public_worker_id",
-            "state",
-            "status",
-            "request_json",
-            "result_json",
-            "reserved_at",
-            "send_started_at",
-            "terminal_at",
-            "updated_at",
-            "legacy_collision",
-            "legacy_collision_count",
-        } == command_columns - {"id", "created_at"}
-        receipt_columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(command_receipts)")
-        }
-        assert {
-            "canonical_version",
-            "canonical_fingerprint",
-            "canonical_request_json",
-            "public_worker_id",
-            "state",
-            "owner_token_hash",
-            "owner_expires_at",
-            "binding_fingerprint",
-            "reserved_at",
-            "send_started_at",
-            "terminal_at",
-            "updated_at",
-        } <= receipt_columns
-        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        attention_columns = {row[1] for row in conn.execute("PRAGMA table_info(attention_items)")}
-        assert {
-            "attention_id",
-            "fingerprint",
-            "first_seen_at",
-            "last_seen_at",
-            "last_changed_at",
-            "resolved_at",
-            "lifecycle_status",
-            "resolved_reason",
-            "signal_count",
-        } <= attention_columns
-        attention_indexed = _indexed_columns(conn, "attention_items")
-        assert {"lifecycle_status", "last_seen_at", "fingerprint"} <= attention_indexed
-        lifecycle_columns = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(attention_lifecycles)")
-        }
-        assert lifecycle_columns == {
-            "host_id",
-            "family_key",
-            "generation",
-            "lifecycle_status",
-            "current_attention_id",
-            "first_seen_at",
-            "last_positive_at",
-            "first_missing_at",
-            "missing_observation_count",
-            "last_accepted_at",
-            "last_observation_key",
-            "max_notified_severity_rank",
-        }
-        assert {"lifecycle_status", "current_attention_id"} <= _indexed_columns(
-            conn, "attention_lifecycles"
-        )
-        assert {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(turn_content_revisions)")
-        } == {
-            "host_id",
-            "turn_id",
-            "content_revision",
-            "user_text",
-            "assistant_final_text",
-            "user_state",
-            "final_state",
-            "user_char_length",
-            "user_byte_length",
-            "final_char_length",
-            "final_byte_length",
-            "user_page_count",
-            "final_page_count",
-            "is_current",
-            "created_at",
-            "superseded_at",
-        }
-        revision_indexes = {
-            row[1]
-            for row in conn.execute("PRAGMA index_list(turn_content_revisions)")
-        }
-        assert {"ux_turn_content_current", "idx_turn_content_cleanup"} <= revision_indexes
-        assert {
-            row[1]
-            for row in conn.execute(
-                "PRAGMA table_info(turn_content_page_boundaries)"
-            )
-        } == {
-            "host_id",
-            "turn_id",
-            "content_revision",
-            "field",
-            "page_index",
-            "start_char",
-            "start_byte",
-        }
-        assert {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(turn_presentation_plans)")
-        } == {
-            "id",
-            "host_id",
-            "name",
-            "plan_token",
-            "turn_id",
-            "content_revision",
-            "presentation_version",
-            "generation",
-            "part_count",
-            "state",
-            "replaces_plan_token",
-            "recovers_plan_token",
-            "created_at",
-            "activated_at",
-            "completed_at",
-            "source_outbox_id",
-        }
-        assert {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(turn_presentation_jobs)")
-        } == {
-            "id",
-            "plan_id",
-            "sequence_index",
-            "operation",
-            "part_ordinal",
-            "spans_json",
-            "outbox_id",
-            "created_at",
-        }
-        job_indexes = {
-            row[1]
-            for row in conn.execute("PRAGMA index_list(turn_presentation_jobs)")
-        }
-        assert {
-            "idx_turn_presentation_jobs_plan_sequence",
-            "idx_turn_presentation_jobs_outbox",
-        } <= job_indexes
-        assert {
-            row[1]
-            for row in conn.execute(
-                "PRAGMA table_info(turn_presentation_recoveries)"
-            )
-        } == {
-            "id",
-            "host_id",
-            "name",
-            "request_id",
-            "failed_plan_id",
-            "recovered_plan_id",
-            "failed_plan_token",
-            "recovered_plan_token",
-            "generation",
-            "source_job_count",
-            "delivered_prefix_count",
-            "fresh_job_count",
-            "retained_failed_job_count",
-            "prior_attempt_count",
-            "outcome",
-            "created_at",
-        }
 
 
 def test_store_connections_apply_wal_busy_timeout_and_foreign_keys(tmp_path: Path) -> None:
@@ -1553,29 +1327,23 @@ def test_store_command_receipts_have_unique_logical_key_index(tmp_path: Path) ->
 def test_store_status_tail_and_retention_cleanup_are_host_scoped_and_bounded(tmp_path: Path) -> None:
     db_path = tmp_path / "maintenance.db"
     config = Config(host_id="storehost", db_path=db_path)
-    snapshot = project_from_raw(config, workers=[{"id": "worker-1", "name": "Worker One"}])
-    save_snapshot(db_path, snapshot)
-    append_event(
-        db_path,
-        "storehost",
-        "private.event",
-        {"pane_id": "sentinel-private-pane", "raw_payload": "sentinel-private-raw"},
-        observed_at="2026-01-01T00:00:00+00:00",
+    old_snapshot = project_from_raw(
+        config,
+        workers=[{"id": "worker-1", "name": "Worker One"}],
+        timestamp=datetime.fromisoformat("2026-01-01T00:00:00+00:00"),
     )
-    append_event(
-        db_path,
-        "storehost",
-        "public.event",
-        {"safe": "kept"},
-        observed_at="2026-01-09T00:00:00+00:00",
+    new_snapshot = project_from_raw(
+        config,
+        workers=[{"id": "worker-2", "name": "Worker Two"}],
+        timestamp=datetime.fromisoformat("2026-01-09T00:00:00+00:00"),
     )
-    append_event(
-        db_path,
-        "otherhost",
-        "other.event",
-        {"safe": "kept"},
-        observed_at="2026-01-01T00:00:00+00:00",
+    other_snapshot = project_from_raw(
+        Config(host_id="otherhost", db_path=db_path),
+        workers=[{"id": "worker-3", "name": "Other Worker"}],
+        timestamp=datetime.fromisoformat("2026-01-01T00:00:00+00:00"),
     )
+    for snapshot in (old_snapshot, new_snapshot, other_snapshot):
+        save_snapshot(db_path, snapshot)
     with sqlite3.connect(str(db_path)) as conn:
         conn.execute(
             """
@@ -1629,72 +1397,10 @@ def test_store_status_tail_and_retention_cleanup_are_host_scoped_and_bounded(tmp
     assert cleanup["deleted"] == 1
     assert host_events == before["counts"]["events"] - 1
     assert other_events == 1
-    assert snapshots == 1
+    assert snapshots == 2
     assert outbox_rows == 1
 
 
-def test_store_operational_metadata_buckets_unsafe_labels(tmp_path: Path) -> None:
-    db_path = tmp_path / "unsafe-metadata.db"
-    init_store(db_path)
-    append_event(
-        db_path,
-        "storehost",
-        "telegram.delivery",
-        {"safe": "kept"},
-        aggregate_type="raw_payload",
-        observed_at="2026-01-01T00:00:00+00:00",
-    )
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute(
-            """
-            INSERT INTO connector_outbox (
-                host_id, connector, delivery_key, status, payload_json,
-                private_state_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "storehost",
-                "attention",
-                "job-unsafe",
-                "telegram_delivery",
-                '{"safe":"kept"}',
-                "{}",
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:00+00:00",
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO connector_outbox (
-                host_id, connector, delivery_key, status, payload_json,
-                private_state_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "storehost",
-                "attention",
-                "job-queued",
-                "queued",
-                '{"safe":"kept"}',
-                "{}",
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:00+00:00",
-            ),
-        )
-
-    status = store_status(db_path, "storehost")
-    tail = tail_event_metadata(db_path, "storehost", limit=10)
-    encoded = json.dumps({"status": status, "tail": tail}, sort_keys=True).lower()
-
-    assert status["outbox"]["pending"] == 1
-    assert status["outbox"]["by_status"]["queued"] == 1
-    assert status["outbox"]["by_status"]["unknown"] == 1
-    assert "telegram_delivery" not in status["outbox"]["by_status"]
-    assert tail["events"][0]["event_type"] == "unknown"
-    assert tail["events"][0]["aggregate_type"] == "unknown"
-    assert "telegram" not in encoded
-    assert "raw_payload" not in encoded
-    assert "delivery" not in encoded
 
 
 def test_attention_payload_from_store_buckets_unsafe_row_text(tmp_path: Path) -> None:
@@ -1840,19 +1546,6 @@ def test_store_public_json_boundaries_share_recursive_sanitizer(
     )
 
     _save_observation(db_path, snapshot, "positive", snapshot.updated_at)
-    append_event(
-        db_path,
-        "public-host",
-        "private.adapter",
-        {
-            "note": unsafe_value,
-            "pane_id": "private-pane",
-            "markdown": safe_markdown,
-        },
-        aggregate_type="worker",
-        aggregate_id="worker-public",
-        observed_at="2026-01-01T00:01:00+00:00",
-    )
     binding = WorkerBinding(
         host_id="public-host",
         worker_id="worker-public",
@@ -1903,7 +1596,7 @@ def test_store_public_json_boundaries_share_recursive_sanitizer(
         now="2026-01-01T00:01:02+00:00",
     )
 
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         "public-host",
         "worker-public",
@@ -1915,7 +1608,7 @@ def test_store_public_json_boundaries_share_recursive_sanitizer(
         },
         observed_at="2026-01-01T00:02:00+00:00",
     ) == 1
-    assert store_sqlite.merge_backend_pending(
+    assert apply_test_backend_pending(
         db_path,
         "public-host",
         "worker-public",
@@ -1982,8 +1675,10 @@ def test_store_public_json_boundaries_share_recursive_sanitizer(
     turns = turns_payload_from_store(db_path, "public-host", snapshot=restored)
     attention = attention_payload_from_store(db_path, "public-host")
     assert attention is not None
-    attention_items = list_attention_items(db_path, "public-host")
-    backend_pending = store_sqlite.list_backend_pending(db_path, "public-host")
+    attention_items = read_test_attention_items(db_path, "public-host")
+    backend_pending = store_sqlite.pending_payload_from_store(
+        db_path, "public-host"
+    )
     tail = tail_event_metadata(db_path, "public-host", limit=20)
     public_readers = {
         "snapshot": restored.to_dict(),
@@ -2035,18 +1730,6 @@ def test_store_public_json_boundaries_share_recursive_sanitizer(
             assert values, f"{table}.{column} should be populated"
             assert all(unsafe_value not in value for value in values)
 
-        event_payload = json.loads(
-            conn.execute(
-                """
-                SELECT payload_json
-                FROM events
-                WHERE host_id = ? AND event_type = ?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                ("public-host", "private.adapter"),
-            ).fetchone()[0]
-        )
         outbox_private = json.loads(
             conn.execute(
                 """
@@ -2060,8 +1743,6 @@ def test_store_public_json_boundaries_share_recursive_sanitizer(
             ).fetchone()[0]
         )
 
-    assert event_payload["note"] == unsafe_value
-    assert event_payload["pane_id"] == "private-pane"
     assert outbox_private["note"] == unsafe_value
     assert "lease_token" in outbox_private
     private_bindings = list_worker_bindings(
@@ -2150,287 +1831,10 @@ def test_store_maintenance_dry_run_and_exhausted_outbox_status(tmp_path: Path) -
     assert json.loads(private_state) == {}
 
 
-def test_store_maintenance_bounds_herdr_completions_and_drops_dead_watermarks(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "herdr-turn-maintenance.db"
-    init_store(db_path)
-    host_id = "herdr-retention-host"
-    dead_pane = "workspace:pDead"
-    active_pane = "workspace:pLive"
-    store_sqlite.set_herdr_turn_watermark(
-        db_path,
-        host_id,
-        dead_pane,
-        turn_epoch=7,
-        last_turn=0,
-        observed_at="2026-01-01T00:00:00+00:00",
-    )
-    for turn in range(1, 4):
-        store_sqlite.record_herdr_turn_completion(
-            db_path,
-            host_id,
-            dead_pane,
-            turn_epoch=7,
-            turn=turn,
-            outcome="completed",
-            completed_unix_ms=turn,
-            message=None,
-            message_truncated=False,
-            agent_session_path=None,
-            worker_id="dead-worker",
-            refreshed_turn_id=None,
-            observed_at=f"2026-01-0{turn}T00:00:00+00:00",
-        )
-    store_sqlite.set_herdr_turn_watermark(
-        db_path,
-        host_id,
-        active_pane,
-        turn_epoch=7,
-        last_turn=9,
-        observed_at="2026-01-01T00:00:00+00:00",
-    )
-    store_sqlite.record_herdr_turn_completion(
-        db_path,
-        host_id,
-        active_pane,
-        turn_epoch=7,
-        turn=9,
-        outcome="completed",
-        completed_unix_ms=9,
-        message=None,
-        message_truncated=False,
-        agent_session_path=None,
-        worker_id="dead-worker",
-        refreshed_turn_id=None,
-        observed_at="2026-01-09T00:00:00+00:00",
-    )
-    upsert_worker_bindings(
-        db_path,
-        [
-            WorkerBinding(
-                host_id=host_id,
-                # The same logical worker moved from dead_pane to active_pane.
-                # Only a current pane target keeps a watermark alive.
-                worker_id="dead-worker",
-                worker_fingerprint="live-fingerprint",
-                backend="herdr",
-                target_kind="terminal_id",
-                target_value="live-terminal",
-                turn_target_kind="pane_id",
-                turn_target_value=active_pane,
-                sendable=True,
-                observed_at="2026-01-01T00:00:00+00:00",
-                expires_at="9999-12-31T23:59:59+00:00",
-                private_fingerprint="live-private-fingerprint",
-            )
-        ],
-    )
-
-    result = run_store_maintenance(
-        db_path,
-        host_id,
-        retention_days=30,
-        max_outbox_attempts=3,
-        now="2026-03-15T00:00:00+00:00",
-        herdr_turn_retention_days=30,
-        herdr_turn_retention_count=1,
-        herdr_turn_batch_size=4,
-    )
-
-    assert result["ok"] is True
-    assert result["herdr_turns"]["deleted_completions"] == 3
-    assert result["herdr_turns"]["deleted_watermarks"] == 1
-    with closing(sqlite3.connect(str(db_path))) as conn, conn:
-        assert conn.execute(
-            """
-            SELECT turn
-            FROM herdr_turn_completions
-            WHERE host_id = ? AND pane_id = ?
-            ORDER BY turn
-            """,
-            (host_id, dead_pane),
-        ).fetchall() == []
-        assert conn.execute(
-            """
-            SELECT pane_id, turn
-            FROM herdr_turn_completions
-            WHERE host_id = ?
-            ORDER BY pane_id, turn
-            """,
-            (host_id,),
-        ).fetchall() == [(active_pane, 9)]
-        assert conn.execute(
-            """
-            SELECT pane_id
-            FROM herdr_turn_watermarks
-            WHERE host_id = ?
-            ORDER BY pane_id
-            """,
-            (host_id,),
-        ).fetchall() == [(active_pane,)]
 
 
-def test_herdr_turn_maintenance_reports_watermark_deferred_by_full_batch(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "herdr-turn-deferred-watermark.db"
-    init_store(db_path)
-    host_id = "herdr-recent-retention-host"
-    active_pane = "workspace:pLive"
-    dead_pane = "workspace:pDead"
-    store_sqlite.set_herdr_turn_watermark(
-        db_path,
-        host_id,
-        dead_pane,
-        turn_epoch=7,
-        last_turn=0,
-        observed_at="2026-01-01T00:00:00+00:00",
-    )
-    store_sqlite.set_herdr_turn_watermark(
-        db_path,
-        host_id,
-        active_pane,
-        turn_epoch=7,
-        last_turn=0,
-        observed_at="2026-01-01T00:00:00+00:00",
-    )
-    for turn in range(1, 4):
-        store_sqlite.record_herdr_turn_completion(
-            db_path,
-            host_id,
-            active_pane,
-            turn_epoch=7,
-            turn=turn,
-            outcome="completed",
-            completed_unix_ms=turn,
-            message=None,
-            message_truncated=False,
-            agent_session_path=None,
-            worker_id="live-worker",
-            refreshed_turn_id=None,
-            observed_at=f"2026-01-0{turn}T00:00:00+00:00",
-        )
-    upsert_worker_bindings(
-        db_path,
-        [
-            WorkerBinding(
-                host_id=host_id,
-                worker_id="live-worker",
-                worker_fingerprint="live-fingerprint",
-                backend="herdr",
-                target_kind="terminal_id",
-                target_value="live-terminal",
-                turn_target_kind="pane_id",
-                turn_target_value=active_pane,
-                sendable=True,
-                observed_at="2026-01-01T00:00:00+00:00",
-                expires_at="9999-12-31T23:59:59+00:00",
-                private_fingerprint="live-private-fingerprint",
-            )
-        ],
-    )
-
-    first = store_sqlite.cleanup_herdr_turn_retention(
-        db_path,
-        host_id=host_id,
-        retention_days=30,
-        retention_count=1,
-        batch_size=2,
-        now="2026-03-15T00:00:00+00:00",
-    )
-
-    assert first["deleted_completions"] == 2
-    assert first["deleted_watermarks"] == 0
-    assert first["remaining_candidates"] is True
-
-    second = store_sqlite.cleanup_herdr_turn_retention(
-        db_path,
-        host_id=host_id,
-        retention_days=30,
-        retention_count=1,
-        batch_size=2,
-        now="2026-03-15T00:00:00+00:00",
-    )
-
-    assert second["deleted_completions"] == 0
-    assert second["deleted_watermarks"] == 1
-    assert second["remaining_candidates"] is False
-    with closing(sqlite3.connect(str(db_path))) as conn, conn:
-        assert conn.execute(
-            """
-            SELECT turn
-            FROM herdr_turn_completions
-            WHERE host_id = ? AND pane_id = ?
-            ORDER BY turn
-            """,
-            (host_id, active_pane),
-        ).fetchall() == [(3,)]
-        assert conn.execute(
-            """
-            SELECT pane_id
-            FROM herdr_turn_watermarks
-            WHERE host_id = ?
-            ORDER BY pane_id
-            """,
-            (host_id,),
-        ).fetchall() == [(active_pane,)]
 
 
-def test_herdr_turn_maintenance_low_count_preserves_fresh_rows(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "herdr-turn-fresh-count-floor.db"
-    init_store(db_path)
-    host_id = "herdr-fresh-retention-host"
-    pane_id = "workspace:pFresh"
-    store_sqlite.set_herdr_turn_watermark(
-        db_path,
-        host_id,
-        pane_id,
-        turn_epoch=7,
-        last_turn=0,
-        observed_at="2026-03-14T00:00:00+00:00",
-    )
-    for turn in range(1, 4):
-        store_sqlite.record_herdr_turn_completion(
-            db_path,
-            host_id,
-            pane_id,
-            turn_epoch=7,
-            turn=turn,
-            outcome="completed",
-            completed_unix_ms=turn,
-            message=None,
-            message_truncated=False,
-            agent_session_path=None,
-            worker_id="fresh-worker",
-            refreshed_turn_id=None,
-            observed_at=f"2026-03-14T00:00:0{turn}+00:00",
-        )
-
-    result = store_sqlite.cleanup_herdr_turn_retention(
-        db_path,
-        host_id=host_id,
-        retention_days=30,
-        retention_count=1,
-        batch_size=100,
-        now="2026-03-15T00:00:00+00:00",
-    )
-
-    assert result["deleted_completions"] == 0
-    assert result["deleted_watermarks"] == 0
-    assert result["remaining_candidates"] is False
-    with closing(sqlite3.connect(str(db_path))) as conn, conn:
-        assert conn.execute(
-            """
-            SELECT turn
-            FROM herdr_turn_completions
-            WHERE host_id = ? AND pane_id = ?
-            ORDER BY turn
-            """,
-            (host_id, pane_id),
-        ).fetchall() == [(1,), (2,), (3,)]
 
 
 def test_exhaust_connector_retries_reclaims_expired_leases_before_dead_letter(tmp_path: Path) -> None:
@@ -2523,161 +1927,8 @@ def test_exhaust_connector_retries_reclaims_expired_leases_before_dead_letter(tm
     assert (attempt_count, max_attempt) == (2, 2)
 
 
-def test_store_migrates_v1_schema_and_persists_content_fingerprint(tmp_path: Path) -> None:
-    db_path = tmp_path / "legacy.db"
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.executescript(
-            """
-            CREATE TABLE snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                host_id TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                payload TEXT NOT NULL
-            );
-            PRAGMA user_version = 1;
-            """
-        )
-
-    init_store(db_path)
-    config = Config(host_id="storehost", db_path=db_path)
-    snapshot = project_from_raw(
-        config,
-        workers=[{"id": "worker-1", "name": "Agent One", "status": "blocked"}],
-    )
-    save_snapshot(db_path, snapshot)
-
-    with sqlite3.connect(str(db_path)) as conn:
-        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION
-        row = conn.execute(
-            "SELECT host_id, content_fingerprint, payload FROM snapshots ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-
-    assert row[0] == "storehost"
-    assert row[1] == snapshot.content_fingerprint
-    assert json.loads(row[2]) == json.loads(snapshot.to_json())
-    restored = latest_snapshot(db_path)
-    assert restored is not None
-    assert restored.host_id == "storehost"
-    assert restored.content_fingerprint == snapshot.content_fingerprint
 
 
-def test_store_migrates_partial_v3_db_with_legacy_data_idempotently(tmp_path: Path) -> None:
-    db_path = tmp_path / "partial-v3.db"
-    snapshot = project_empty(Config(host_id="legacy-host", db_path=db_path))
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.executescript(
-            """
-            CREATE TABLE snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                host_id TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                content_fingerprint TEXT NOT NULL DEFAULT '',
-                payload TEXT NOT NULL
-            );
-            CREATE TABLE command_receipts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                host_id TEXT NOT NULL,
-                request_id TEXT NOT NULL,
-                action TEXT NOT NULL,
-                payload_fingerprint TEXT NOT NULL,
-                status TEXT NOT NULL,
-                result_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                completed_at TEXT,
-                uncertain INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE worker_bindings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                host_id TEXT NOT NULL,
-                worker_id TEXT NOT NULL,
-                worker_fingerprint TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                target_kind TEXT NOT NULL,
-                target_value TEXT NOT NULL,
-                turn_target_kind TEXT,
-                turn_target_value TEXT,
-                sendable INTEGER NOT NULL DEFAULT 0,
-                reason TEXT,
-                observed_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                private_fingerprint TEXT NOT NULL
-            );
-            PRAGMA user_version = 3;
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO snapshots (host_id, created_at, content_fingerprint, payload)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                snapshot.host_id,
-                snapshot.updated_at,
-                snapshot.content_fingerprint,
-                snapshot.to_json(),
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO command_receipts (
-                host_id, request_id, action, payload_fingerprint, status,
-                result_json, created_at, completed_at, uncertain
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "legacy-host",
-                "legacy-req",
-                "send_instruction",
-                "legacy-fp",
-                STATUS_ACCEPTED,
-                '{"status":"accepted"}',
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:01+00:00",
-                0,
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO worker_bindings (
-                host_id, worker_id, worker_fingerprint, backend, target_kind,
-                target_value, sendable, reason, observed_at, expires_at,
-                private_fingerprint
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "legacy-host",
-                "worker-legacy",
-                "worker-fp",
-                "herdr",
-                "agent_id",
-                "agent-private",
-                1,
-                None,
-                "2026-01-01T00:00:00+00:00",
-                "9999-12-31T23:59:59+00:00",
-                "legacy-private",
-            ),
-        )
-
-    init_store(db_path)
-    init_store(db_path)
-
-    with sqlite3.connect(str(db_path)) as conn:
-        assert _PR6_TABLES <= _table_names(conn)
-        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION
-        assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 1
-        assert conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0] == 1
-        assert conn.execute("SELECT COUNT(*) FROM worker_bindings").fetchone()[0] == 1
-        command = conn.execute(
-            """
-            SELECT status, canonical_fingerprint, result_json
-            FROM commands
-            WHERE host_id = 'legacy-host'
-              AND request_id = 'legacy-req'
-            """
-        ).fetchone()
-
-    assert command == (STATUS_ACCEPTED, "legacy-fp", '{"status":"accepted"}')
 
 
 def _snapshot_with_worker_status(
@@ -2775,7 +2026,9 @@ def test_store_default_context_is_non_authoritative_and_snapshot_fallback_remain
     save_snapshot(db_path, snapshot)
 
     assert _lifecycle_rows(db_path) == []
-    assert list_attention_items(db_path, "attention-host") == []
+    assert read_test_attention_items(db_path, "attention-host")[0]["id"] == (
+        snapshot.attention[0].id
+    )
     payload = attention_payload_from_store(db_path, "attention-host")
     assert payload is not None
     assert payload["attention"][0]["id"] == snapshot.attention[0].id
@@ -2845,8 +2098,8 @@ def test_store_resolution_requires_distinct_misses_and_120_seconds(tmp_path: Pat
 
     lifecycle = _lifecycle_rows(db_path)[0]
     assert lifecycle[3:5] == ("resolved", None)
-    assert list_attention_items(db_path, "attention-host") == []
-    audit = list_attention_items(
+    assert read_test_attention_items(db_path, "attention-host") == []
+    audit = read_test_attention_items(
         db_path, "attention-host", include_resolved=True
     )
     assert audit[0]["resolved_reason"] == "gone"
@@ -2894,7 +2147,7 @@ def test_store_none_authority_is_lifecycle_byte_equivalent(
     )
     _save_observation(db_path, present, "complete", present.updated_at)
     before_lifecycle = _lifecycle_rows(db_path)
-    before_attention = list_attention_items(
+    before_attention = read_test_attention_items(
         db_path, "attention-host", include_resolved=True
     )
     before_outbox = _connector_outbox_rows(db_path)
@@ -2908,7 +2161,7 @@ def test_store_none_authority_is_lifecycle_byte_equivalent(
     _save_observation(db_path, degraded, "none", degraded.updated_at)
 
     assert _lifecycle_rows(db_path) == before_lifecycle
-    assert list_attention_items(
+    assert read_test_attention_items(
         db_path, "attention-host", include_resolved=True
     ) == before_attention
     assert _connector_outbox_rows(db_path) == before_outbox
@@ -2991,10 +2244,10 @@ def test_store_escalation_downgrade_one_generation_one_current_pointer(
         _save_observation(db_path, snapshot, "positive", at)
 
     assert _lifecycle_rows(db_path)[0][2:4] == (1, "open")
-    current = list_attention_items(db_path, "attention-host")
+    current = read_test_attention_items(db_path, "attention-host")
     assert len(current) == 1
     assert current[0]["status"] == "blocked"
-    audit = list_attention_items(
+    audit = read_test_attention_items(
         db_path, "attention-host", include_resolved=True
     )
     assert len(audit) == 2
@@ -3149,7 +2402,7 @@ def test_store_same_family_variant_selection_is_order_independent(tmp_path: Path
         data["attention"] = list(reversed(variants)) if reverse else variants
         snapshot = store_sqlite.Snapshot.from_dict(data)
         _save_observation(db_path, snapshot, "complete", snapshot.updated_at)
-        current = list_attention_items(db_path, "attention-host")
+        current = read_test_attention_items(db_path, "attention-host")
         assert len(current) == 1
         selected_ids.append(current[0]["id"])
     assert selected_ids == ["critical-variant", "critical-variant"]
@@ -3168,7 +2421,7 @@ def test_store_invalid_or_naive_lifecycle_time_is_noop(
     _save_observation(db_path, first, "complete", first.updated_at)
     before = (
         _lifecycle_rows(db_path),
-        list_attention_items(db_path, "attention-host", include_resolved=True),
+        read_test_attention_items(db_path, "attention-host", include_resolved=True),
         _connector_outbox_rows(db_path),
     )
     failed = _snapshot_with_worker_status(
@@ -3177,7 +2430,7 @@ def test_store_invalid_or_naive_lifecycle_time_is_noop(
     _save_observation(db_path, failed, "positive", observed_at)
     after = (
         _lifecycle_rows(db_path),
-        list_attention_items(db_path, "attention-host", include_resolved=True),
+        read_test_attention_items(db_path, "attention-host", include_resolved=True),
         _connector_outbox_rows(db_path),
     )
     assert after == before
@@ -3195,7 +2448,7 @@ def test_store_strict_order_preserves_subsecond_observations(tmp_path: Path) -> 
         )
         _save_observation(db_path, snapshot, "positive", at)
     lifecycle = _lifecycle_rows(db_path)[0]
-    current = list_attention_items(db_path, "attention-host")[0]
+    current = read_test_attention_items(db_path, "attention-host")[0]
     assert lifecycle[9] == "2026-01-01T00:00:00.000002+00:00"
     assert current["signal_count"] == 2
     assert current["last_seen_at"] == lifecycle[9]
@@ -3221,1176 +2474,14 @@ def test_store_deterministic_30_minute_flap_has_one_episode_and_initial(
     lifecycle = _lifecycle_rows(db_path)[0]
     assert lifecycle[2:4] == (1, "open")
     assert lifecycle[7:9] == (None, 0)
-    assert len(list_attention_items(db_path, "attention-host")) == 1
+    assert len(read_test_attention_items(db_path, "attention-host")) == 1
     assert len(_connector_outbox_rows(db_path)) == 1
 
 
-def _reset_store_to_v4(db_path: Path) -> None:
-    init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute("DROP TABLE attention_lifecycles")
-        conn.execute("PRAGMA user_version = 4")
-
-
-def _insert_legacy_attention(
-    conn: sqlite3.Connection,
-    *,
-    attention_id: str,
-    source: str,
-    severity: str,
-    status: str,
-    lifecycle_status: str,
-    at: str,
-    first_seen_at: str | None = None,
-    signal_count: int = 1,
-    last_seen_at: str | None = None,
-    last_changed_at: str | None = None,
-) -> None:
-    payload = {
-        "id": attention_id,
-        "source": source,
-        "kind": "worker_status",
-        "severity": severity,
-        "status": status,
-        "fingerprint": f"fp-{attention_id}",
-    }
-    # last_seen_at drives the migration's positive_at; last_changed_at drives its
-    # change/resolve progress. Allowing them to differ from `at` is what lets a
-    # test build a resolved episode whose resolution is newer than its last
-    # positive (the ordering the collapsed default hides).
-    seen_at = last_seen_at or at
-    changed_at = last_changed_at or at
-    resolved_at = (changed_at if lifecycle_status != "open" else None)
-    conn.execute(
-        """
-        INSERT INTO attention_items (
-            host_id, attention_id, source, kind, severity, status, updated_at,
-            fingerprint, snapshot_content_fingerprint, observed_at,
-            first_seen_at, last_seen_at, last_changed_at, resolved_at,
-            lifecycle_status, resolved_reason, signal_count, payload_json
-        ) VALUES (
-            'legacy-host', ?, ?, 'worker_status', ?, ?, ?, ?, 'snapshot-fp', ?,
-            ?, ?, ?, ?, ?, ?, ?, ?
-        )
-        """,
-        (
-            attention_id,
-            source,
-            severity,
-            status,
-            at,
-            f"fp-{attention_id}",
-            at,
-            first_seen_at or at,
-            seen_at,
-            changed_at,
-            resolved_at,
-            lifecycle_status,
-            "gone" if lifecycle_status != "open" else None,
-            signal_count,
-            json.dumps(payload, sort_keys=True),
-        ),
-    )
-
-
-def test_store_v4_collision_migration_is_deterministic_and_preserves_audit(
-    tmp_path: Path,
-) -> None:
-    winners: list[tuple[Any, ...]] = []
-    for reverse in (False, True):
-        db_path = tmp_path / f"collision-{reverse}.db"
-        _reset_store_to_v4(db_path)
-        candidates = [
-            {
-                "attention_id": "attn-blocked",
-                "severity": "warning",
-                "status": "blocked",
-                "lifecycle_status": "open",
-                "at": "2026-01-01T00:01:00+00:00",
-                "first_seen_at": "2026-01-01T00:00:00+00:00",
-                "signal_count": 3,
-            },
-            {
-                "attention_id": "attn-failed",
-                "severity": "critical",
-                "status": "failed",
-                "lifecycle_status": "open",
-                "at": "2026-01-01T00:02:00+00:00",
-                "first_seen_at": "2026-01-01T00:01:00+00:00",
-                "signal_count": 4,
-            },
-            {
-                "attention_id": "attn-resolved",
-                "severity": "critical",
-                "status": "failed",
-                "lifecycle_status": "resolved",
-                "at": "2026-01-01T00:03:00+00:00",
-                "signal_count": 2,
-            },
-        ]
-        with sqlite3.connect(str(db_path)) as conn:
-            for candidate in (
-                reversed(candidates) if reverse else candidates
-            ):
-                _insert_legacy_attention(
-                    conn,
-                    source="worker:legacy",
-                    **candidate,
-                )
-        init_store(db_path)
-        init_store(db_path)
-        with sqlite3.connect(str(db_path)) as conn:
-            lifecycle = conn.execute(
-                """
-                SELECT generation, lifecycle_status, current_attention_id,
-                       first_seen_at, last_positive_at,
-                       max_notified_severity_rank
-                FROM attention_lifecycles
-                """
-            ).fetchone()
-            public_rows = conn.execute(
-                """
-                SELECT attention_id, lifecycle_status, resolved_reason,
-                       signal_count
-                FROM attention_items ORDER BY attention_id
-                """
-            ).fetchall()
-            assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION
-        winners.append((lifecycle, public_rows))
-
-    assert winners[0] == winners[1]
-    lifecycle, public_rows = winners[0]
-    assert lifecycle == (
-        1,
-        "resolved",
-        None,
-        "2026-01-01T00:00:00+00:00",
-        "2026-01-01T00:03:00+00:00",
-        2,
-    )
-    assert public_rows == [
-        ("attn-blocked", "resolved", "superseded", 3),
-        ("attn-failed", "resolved", "superseded", 4),
-        ("attn-resolved", "resolved", "gone", 2),
-    ]
-
-
-_MIG_T0 = "2026-01-01T00:00:00+00:00"
-_MIG_T5 = "2026-01-01T00:05:00+00:00"
-_MIG_T10 = "2026-01-01T00:10:00+00:00"
-_MIG_T11 = "2026-01-01T00:11:00+00:00"
-
-
-def _migrate_resolved_skewed_episode(db_path: Path) -> None:
-    """Legacy resolved episode whose resolution (t10) is newer than its last
-    positive (t0), migrated to v5."""
-    _reset_store_to_v4(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        _insert_legacy_attention(
-            conn,
-            attention_id="attn-legacy",
-            source="worker:legacy",
-            severity="warning",
-            status="blocked",
-            lifecycle_status="resolved",
-            at=_MIG_T0,
-            first_seen_at=_MIG_T0,
-            last_seen_at=_MIG_T0,
-            last_changed_at=_MIG_T10,
-            signal_count=2,
-        )
-    init_store(db_path)
-
-
-def _migrated_lifecycle_row(db_path: Path) -> tuple[Any, ...]:
-    with sqlite3.connect(str(db_path)) as conn:
-        return conn.execute(
-            """
-            SELECT generation, lifecycle_status, current_attention_id,
-                   last_positive_at, last_accepted_at
-            FROM attention_lifecycles
-            """
-        ).fetchone()
-
-
-def _attention_outbox_job_count(db_path: Path) -> int:
-    with sqlite3.connect(str(db_path)) as conn:
-        return int(
-            conn.execute(
-                "SELECT COUNT(*) FROM connector_outbox WHERE connector = 'attention'"
-            ).fetchone()[0]
-        )
-
-
-def _legacy_worker_snapshot(status: str, timestamp: str):
-    from datetime import datetime
-
-    config = Config(host_id="legacy-host", db_path=Path("unused"))
-    return project_from_raw(
-        config,
-        workers=[{"id": "legacy", "name": "Legacy Worker", "status": status}],
-        backend_health=[
-            {
-                "name": "herdr",
-                "status": "healthy",
-                "outcome": "healthy_non_empty",
-                "observed_at": timestamp,
-                "counts": {"workers": 1},
-            }
-        ],
-        timestamp=datetime.fromisoformat(timestamp),
-    )
-
-
-def test_migration_resolved_episode_seeds_accepted_watermark_from_resolution(
-    tmp_path: Path,
-) -> None:
-    """The migrated watermark is the resolution progress (t10), not the last
-    positive (t0), and a delayed positive at t5 cannot reopen the lifecycle."""
-    db_path = tmp_path / "skewed-resolved.db"
-    _migrate_resolved_skewed_episode(db_path)
-
-    assert _migrated_lifecycle_row(db_path) == (
-        1,
-        "resolved",
-        None,
-        _MIG_T0,   # last_positive_at = actual latest positive
-        _MIG_T10,  # last_accepted_at = newest lifecycle progress (resolution)
-    )
-    assert _attention_outbox_job_count(db_path) == 0
-
-    # A delayed positive observation timestamped t5 (< the authoritative t10
-    # resolution) must be ignored: no reopen, no generation 2, no job.
-    save_snapshot(
-        db_path,
-        _legacy_worker_snapshot("blocked", _MIG_T5),
-        observation=SnapshotObservationContext(authority="positive", observed_at=_MIG_T5),
-    )
-    assert _migrated_lifecycle_row(db_path) == (1, "resolved", None, _MIG_T0, _MIG_T10)
-    assert _attention_outbox_job_count(db_path) == 0
-
-
-def test_migration_resolved_episode_genuine_later_positive_opens_one_generation(
-    tmp_path: Path,
-) -> None:
-    """A genuine positive after the resolution watermark opens generation 2 and
-    enqueues exactly one notification."""
-    db_path = tmp_path / "genuine-reopen.db"
-    _migrate_resolved_skewed_episode(db_path)
-    assert _attention_outbox_job_count(db_path) == 0
-
-    save_snapshot(
-        db_path,
-        _legacy_worker_snapshot("blocked", _MIG_T11),
-        observation=SnapshotObservationContext(authority="positive", observed_at=_MIG_T11),
-    )
-    generation, status, current, _positive, accepted = _migrated_lifecycle_row(db_path)
-    assert (generation, status) == (2, "open")
-    assert current is not None
-    assert accepted == _MIG_T11
-    assert _attention_outbox_job_count(db_path) == 1
-
-
-def test_migration_resolved_episode_delayed_complete_miss_is_inert(
-    tmp_path: Path,
-) -> None:
-    """A delayed 'complete' (missing) observation before the resolution watermark
-    cannot mutate the migrated resolved lifecycle."""
-    db_path = tmp_path / "delayed-complete.db"
-    _migrate_resolved_skewed_episode(db_path)
-
-    save_snapshot(
-        db_path,
-        _legacy_worker_snapshot("idle", _MIG_T5),
-        observation=SnapshotObservationContext(authority="complete", observed_at=_MIG_T5),
-    )
-    assert _migrated_lifecycle_row(db_path) == (1, "resolved", None, _MIG_T0, _MIG_T10)
-    assert _attention_outbox_job_count(db_path) == 0
-
-
-def _legacy_attention_job_payload(
-    *,
-    event_type: str = "attention_created",
-    severity: str = "warning",
-    attention_id: str = "attn-legacy",
-    transition_at: str = "2026-01-01T00:00:00+00:00",
-) -> str:
-    return json.dumps(
-        {
-            "schema_version": 1,
-            "event_type": event_type,
-            "host_id": "legacy-host",
-            "attention": {
-                "id": attention_id,
-                "source": "worker:legacy",
-                "kind": "worker_status",
-                "severity": severity,
-                "status": "blocked",
-                "fingerprint": "fp-attn-legacy",
-            },
-            "transition_at": transition_at,
-        },
-        sort_keys=True,
-    )
-
-
-def test_store_v4_migration_consolidates_duplicate_jobs_and_preserves_terminal_audit(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "migration-jobs.db"
-    _reset_store_to_v4(db_path)
-    created_payload = _legacy_attention_job_payload()
-    escalation_payload = _legacy_attention_job_payload(
-        event_type="attention_escalated", severity="critical"
-    )
-    with sqlite3.connect(str(db_path)) as conn:
-        _insert_legacy_attention(
-            conn,
-            attention_id="attn-legacy",
-            source="worker:legacy",
-            severity="warning",
-            status="blocked",
-            lifecycle_status="open",
-            at="2026-01-01T00:00:00+00:00",
-        )
-        outbox_ids: dict[str, int] = {}
-        for index, status in enumerate(
-            ("queued", "retry", "deferred", "delivered", "dead_letter")
-        ):
-            cursor = conn.execute(
-                """
-                INSERT INTO connector_outbox (
-                    host_id, connector, delivery_key, status, payload_json,
-                    private_state_json, created_at, updated_at, next_attempt_at
-                ) VALUES ('legacy-host', 'attention', ?, ?, ?, '{}', ?, ?, NULL)
-                """,
-                (
-                    f"legacy-created-{index}",
-                    status,
-                    created_payload,
-                    "2026-01-01T00:00:00+00:00",
-                    "2026-01-01T00:00:00+00:00",
-                ),
-            )
-            outbox_ids[status] = int(cursor.lastrowid)
-        conn.execute(
-            """
-            INSERT INTO connector_deliveries (
-                outbox_id, host_id, connector, delivery_key, attempt, status,
-                response_json, private_state_json, created_at, delivered_at
-            ) VALUES (?, 'legacy-host', 'attention', 'legacy-created-3', 1,
-                      'delivered', '{}', '{}', ?, ?)
-            """,
-            (
-                outbox_ids["delivered"],
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:01+00:00",
-            ),
-        )
-        leased_cursor = conn.execute(
-            """
-            INSERT INTO connector_outbox (
-                host_id, connector, delivery_key, status, payload_json,
-                private_state_json, created_at, updated_at, next_attempt_at
-            ) VALUES ('legacy-host', 'attention', 'legacy-created-leased',
-                      'leased', ?, '{}', ?, ?, NULL)
-            """,
-            (
-                created_payload,
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:00+00:00",
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO connector_deliveries (
-                outbox_id, host_id, connector, delivery_key, attempt, status,
-                response_json, private_state_json, created_at, delivered_at
-            ) VALUES (?, 'legacy-host', 'attention', 'legacy-created-leased', 1,
-                      'leased', '{}', '{}', ?, NULL)
-            """,
-            (
-                int(leased_cursor.lastrowid),
-                "2026-01-01T00:00:00+00:00",
-            ),
-        )
-        for index in range(8):
-            conn.execute(
-                """
-                INSERT INTO connector_outbox (
-                    host_id, connector, delivery_key, status, payload_json,
-                    private_state_json, created_at, updated_at, next_attempt_at
-                ) VALUES ('legacy-host', 'attention', ?, 'queued', ?, '{}', ?, ?, NULL)
-                """,
-                (
-                    f"legacy-escalation-{index}",
-                    escalation_payload,
-                    "2026-01-01T00:01:00+00:00",
-                    "2026-01-01T00:01:00+00:00",
-                ),
-            )
-
-    init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        created_statuses = conn.execute(
-            """
-            SELECT status, private_state_json FROM connector_outbox
-            WHERE delivery_key LIKE 'legacy-created-%'
-            ORDER BY id
-            """
-        ).fetchall()
-        escalation_statuses = conn.execute(
-            """
-            SELECT status, delivery_key FROM connector_outbox
-            WHERE json_extract(payload_json, '$.event_type') = 'attention_escalated'
-            ORDER BY id
-            """
-        ).fetchall()
-        delivered_count = conn.execute(
-            "SELECT COUNT(*) FROM connector_deliveries WHERE status = 'delivered'"
-        ).fetchone()[0]
-    assert created_statuses == [
-        ("superseded", "{}"),
-        ("superseded", "{}"),
-        ("superseded", "{}"),
-        ("delivered", "{}"),
-        ("dead_letter", "{}"),
-        (
-            "leased",
-            next(
-                private
-                for status, private in created_statuses
-                if status == "leased"
-            ),
-        ),
-    ]
-    leased_state = json.loads(created_statuses[-1][1])
-    assert leased_state["migration_canonical"] is False
-    assert leased_state["terminal_after_lease"] is True
-    assert sum(status == "queued" for status, _ in escalation_statuses) == 1
-    assert sum(status == "superseded" for status, _ in escalation_statuses) == 8
-    assert delivered_count == 1
-
-
-def test_store_v4_delivered_old_does_not_suppress_active_current_recurrence(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "migration-delivered-old.db"
-    _reset_store_to_v4(db_path)
-    old_payload = _legacy_attention_job_payload(
-        attention_id="attn-current",
-        transition_at="2026-01-01T00:00:00+00:00",
-    )
-    current_payload = _legacy_attention_job_payload(
-        attention_id="attn-current",
-        transition_at="2026-01-01T00:10:00+00:00",
-    )
-    with sqlite3.connect(str(db_path)) as conn:
-        _insert_legacy_attention(
-            conn,
-            attention_id="attn-current",
-            source="worker:legacy",
-            severity="warning",
-            status="blocked",
-            lifecycle_status="open",
-            at="2026-01-01T00:10:00+00:00",
-            first_seen_at="2026-01-01T00:00:00+00:00",
-        )
-        delivered_ids: list[int] = []
-        for key in ("old-delivered-audit", "old-delivered-outbox-only"):
-            cursor = conn.execute(
-                """
-                INSERT INTO connector_outbox (
-                    host_id, connector, delivery_key, status, payload_json,
-                    private_state_json, created_at, updated_at, next_attempt_at
-                ) VALUES ('legacy-host', 'attention', ?, 'delivered', ?, '{}',
-                          ?, ?, NULL)
-                """,
-                (
-                    key,
-                    old_payload,
-                    "2026-01-01T00:00:00+00:00",
-                    "2026-01-01T00:00:00+00:00",
-                ),
-            )
-            delivered_ids.append(int(cursor.lastrowid))
-        conn.execute(
-            """
-            INSERT INTO connector_deliveries (
-                outbox_id, host_id, connector, delivery_key, attempt, status,
-                response_json, private_state_json, created_at, delivered_at
-            ) VALUES (?, 'legacy-host', 'attention', 'old-delivered-audit', 1,
-                      'delivered', '{}', '{}', ?, ?)
-            """,
-            (
-                delivered_ids[0],
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:01+00:00",
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO connector_outbox (
-                host_id, connector, delivery_key, status, payload_json,
-                private_state_json, created_at, updated_at, next_attempt_at
-            ) VALUES ('legacy-host', 'attention', 'current-recurrence',
-                      'queued', ?, '{}', ?, ?, NULL)
-            """,
-            (
-                current_payload,
-                "2026-01-01T00:10:00+00:00",
-                "2026-01-01T00:10:00+00:00",
-            ),
-        )
-    init_store(db_path)
-
-    with sqlite3.connect(str(db_path)) as conn:
-        rows = conn.execute(
-            """
-            SELECT delivery_key, status, payload_json
-            FROM connector_outbox ORDER BY id
-            """
-        ).fetchall()
-    assert [row[1] for row in rows] == [
-        "delivered",
-        "delivered",
-        "superseded",
-        "queued",
-    ]
-    assert json.loads(rows[-1][2])["attention"]["id"] == "attn-current"
-    assert rows[-1][0].startswith("attention:attention_created:")
-
-
-@pytest.mark.parametrize("with_delivery_audit", [False, True])
-def test_store_v4_delivered_current_episode_suppresses_duplicate(
-    tmp_path: Path,
-    with_delivery_audit: bool,
-) -> None:
-    db_path = tmp_path / f"migration-delivered-current-{with_delivery_audit}.db"
-    _reset_store_to_v4(db_path)
-    payload = _legacy_attention_job_payload(
-        attention_id="attn-current",
-        transition_at="2026-01-01T00:10:00+00:00",
-    )
-    with sqlite3.connect(str(db_path)) as conn:
-        _insert_legacy_attention(
-            conn,
-            attention_id="attn-current",
-            source="worker:legacy",
-            severity="warning",
-            status="blocked",
-            lifecycle_status="open",
-            at="2026-01-01T00:10:00+00:00",
-        )
-        delivered_cursor = conn.execute(
-            """
-            INSERT INTO connector_outbox (
-                host_id, connector, delivery_key, status, payload_json,
-                private_state_json, created_at, updated_at, next_attempt_at
-            ) VALUES ('legacy-host', 'attention', 'current-delivered',
-                      'delivered', ?, '{}', ?, ?, NULL)
-            """,
-            (
-                payload,
-                "2026-01-01T00:10:00+00:00",
-                "2026-01-01T00:10:00+00:00",
-            ),
-        )
-        if with_delivery_audit:
-            conn.execute(
-                """
-                INSERT INTO connector_deliveries (
-                    outbox_id, host_id, connector, delivery_key, attempt,
-                    status, response_json, private_state_json, created_at,
-                    delivered_at
-                ) VALUES (?, 'legacy-host', 'attention', 'current-delivered',
-                          1, 'delivered', '{}', '{}', ?, ?)
-                """,
-                (
-                    int(delivered_cursor.lastrowid),
-                    "2026-01-01T00:10:00+00:00",
-                    "2026-01-01T00:10:01+00:00",
-                ),
-            )
-        conn.execute(
-            """
-            INSERT INTO connector_outbox (
-                host_id, connector, delivery_key, status, payload_json,
-                private_state_json, created_at, updated_at, next_attempt_at
-            ) VALUES ('legacy-host', 'attention', 'current-duplicate',
-                      'queued', ?, '{}', ?, ?, NULL)
-            """,
-            (
-                payload,
-                "2026-01-01T00:10:00+00:00",
-                "2026-01-01T00:10:00+00:00",
-            ),
-        )
-    init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        statuses = conn.execute(
-            "SELECT status FROM connector_outbox ORDER BY id"
-        ).fetchall()
-    assert statuses == [("delivered",), ("superseded",)]
-
-
-@pytest.mark.parametrize(
-    ("dead_at", "expected_statuses"),
-    [
-        (
-            "2026-01-01T00:00:00+00:00",
-            [("dead_letter",), ("superseded",), ("queued",)],
-        ),
-        (
-            "2026-01-01T00:10:00+00:00",
-            [("dead_letter",), ("superseded",)],
-        ),
-    ],
-)
-def test_store_v4_dead_letter_suppresses_only_proven_current_episode(
-    tmp_path: Path,
-    dead_at: str,
-    expected_statuses: list[tuple[str]],
-) -> None:
-    db_path = tmp_path / f"migration-dead-{dead_at[14:19].replace(':', '-')}.db"
-    _reset_store_to_v4(db_path)
-    dead_payload = _legacy_attention_job_payload(
-        attention_id="attn-current",
-        transition_at=dead_at,
-    )
-    current_payload = _legacy_attention_job_payload(
-        attention_id="attn-current",
-        transition_at="2026-01-01T00:10:00+00:00",
-    )
-    with sqlite3.connect(str(db_path)) as conn:
-        _insert_legacy_attention(
-            conn,
-            attention_id="attn-current",
-            source="worker:legacy",
-            severity="warning",
-            status="blocked",
-            lifecycle_status="open",
-            at="2026-01-01T00:10:00+00:00",
-            first_seen_at="2026-01-01T00:00:00+00:00",
-        )
-        for key, status, payload in (
-            ("current-dead", "dead_letter", dead_payload),
-            ("current-active", "queued", current_payload),
-        ):
-            conn.execute(
-                """
-                INSERT INTO connector_outbox (
-                    host_id, connector, delivery_key, status, payload_json,
-                    private_state_json, created_at, updated_at, next_attempt_at
-                ) VALUES ('legacy-host', 'attention', ?, ?, ?, '{}', ?, ?, NULL)
-                """,
-                (
-                    key,
-                    status,
-                    payload,
-                    "2026-01-01T00:10:00+00:00",
-                    "2026-01-01T00:10:00+00:00",
-                ),
-            )
-    init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        statuses = conn.execute(
-            "SELECT status FROM connector_outbox ORDER BY id"
-        ).fetchall()
-    assert statuses == expected_statuses
-
-
-def test_store_v4_resolved_lifecycle_terminalizes_all_active_jobs(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "migration-resolved-active.db"
-    _reset_store_to_v4(db_path)
-    payload = _legacy_attention_job_payload(
-        attention_id="attn-resolved",
-        transition_at="2026-01-01T00:10:00+00:00",
-    )
-    with sqlite3.connect(str(db_path)) as conn:
-        _insert_legacy_attention(
-            conn,
-            attention_id="attn-resolved",
-            source="worker:legacy",
-            severity="warning",
-            status="blocked",
-            lifecycle_status="resolved",
-            at="2026-01-01T00:10:00+00:00",
-        )
-        conn.execute(
-            """
-            INSERT INTO connector_outbox (
-                host_id, connector, delivery_key, status, payload_json,
-                private_state_json, created_at, updated_at, next_attempt_at
-            ) VALUES ('legacy-host', 'attention', 'resolved-active', 'queued',
-                      ?, '{}', ?, ?, NULL)
-            """,
-            (
-                payload,
-                "2026-01-01T00:10:00+00:00",
-                "2026-01-01T00:10:00+00:00",
-            ),
-        )
-    init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        lifecycle_status = conn.execute(
-            "SELECT lifecycle_status FROM attention_lifecycles"
-        ).fetchone()[0]
-        outbox_status = conn.execute(
-            "SELECT status FROM connector_outbox"
-        ).fetchone()[0]
-    assert (lifecycle_status, outbox_status) == ("resolved", "superseded")
 
 
 
 
-@pytest.mark.parametrize("terminal_action", ["fail", "defer", "expiry"])
-def test_store_v4_current_pollable_outranks_stale_live_lease(
-    tmp_path: Path,
-    terminal_action: str,
-) -> None:
-    db_path = tmp_path / f"migration-stale-lease-{terminal_action}.db"
-    init_store(db_path)
-    old_payload = _legacy_attention_job_payload(
-        attention_id="attn-old",
-        transition_at="2026-01-01T00:00:00+00:00",
-    )
-    current_payload = _legacy_attention_job_payload(
-        attention_id="attn-current",
-        transition_at="2026-01-01T00:10:00+00:00",
-    )
-    with sqlite3.connect(str(db_path)) as conn:
-        _insert_legacy_attention(
-            conn,
-            attention_id="attn-current",
-            source="worker:legacy",
-            severity="warning",
-            status="blocked",
-            lifecycle_status="open",
-            at="2026-01-01T00:10:00+00:00",
-        )
-        conn.execute(
-            """
-            INSERT INTO connector_outbox (
-                host_id, connector, delivery_key, status, payload_json,
-                private_state_json, created_at, updated_at, next_attempt_at
-            ) VALUES ('legacy-host', 'attention', 'old-leased', 'queued',
-                      ?, '{}', ?, ?, NULL)
-            """,
-            (
-                old_payload,
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:00+00:00",
-            ),
-        )
-    old_item = poll_connector_outbox(
-        db_path,
-        "legacy-host",
-        "attention",
-        lease_seconds=30,
-        now="2026-01-01T00:00:00+00:00",
-    )["items"][0]
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute(
-            """
-            INSERT INTO connector_outbox (
-                host_id, connector, delivery_key, status, payload_json,
-                private_state_json, created_at, updated_at, next_attempt_at
-            ) VALUES ('legacy-host', 'attention', 'current-queued', 'queued',
-                      ?, '{}', ?, ?, NULL)
-            """,
-            (
-                current_payload,
-                "2026-01-01T00:10:00+00:00",
-                "2026-01-01T00:10:00+00:00",
-            ),
-        )
-        conn.execute("DROP TABLE attention_lifecycles")
-        conn.execute("PRAGMA user_version = 4")
-    init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        rows = conn.execute(
-            """
-            SELECT delivery_key, status, private_state_json
-            FROM connector_outbox ORDER BY id
-            """
-        ).fetchall()
-    assert [row[1] for row in rows] == ["leased", "superseded", "queued"]
-    stale_state = json.loads(rows[0][2])
-    assert stale_state["migration_canonical"] is False
-    assert stale_state["terminal_after_lease"] is True
-    if terminal_action == "fail":
-        result = fail_connector_delivery(
-            db_path,
-            host_id="legacy-host",
-            name="attention",
-            ref=old_item["ref"],
-            now="2026-01-01T00:00:10+00:00",
-        )
-        assert result["status"] == "superseded"
-    elif terminal_action == "defer":
-        result = defer_connector_delivery(
-            db_path,
-            host_id="legacy-host",
-            name="attention",
-            ref=old_item["ref"],
-            now="2026-01-01T00:00:10+00:00",
-        )
-        assert result["status"] == "superseded"
-    else:
-        result = reclaim_expired_connector_leases(
-            db_path,
-            "legacy-host",
-            "attention",
-            now="2026-01-01T00:00:31+00:00",
-        )
-        assert result["reclaimed"] == 1
-    with sqlite3.connect(str(db_path)) as conn:
-        statuses = conn.execute(
-            "SELECT status, COUNT(*) FROM connector_outbox GROUP BY status"
-        ).fetchall()
-    assert dict(statuses) == {"queued": 1, "superseded": 2}
-
-
-def test_store_v4_generated_flap_damage_migrates_bounded_and_idempotent(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "migration-generated-flap.db"
-    _reset_store_to_v4(db_path)
-    current_payload = _legacy_attention_job_payload(
-        attention_id="attn-current",
-        transition_at="2026-01-01T00:10:00+00:00",
-    )
-    old_payload = _legacy_attention_job_payload(
-        attention_id="attn-old",
-        transition_at="2026-01-01T00:00:00+00:00",
-    )
-    with sqlite3.connect(str(db_path)) as conn:
-        for index in range(509):
-            _insert_legacy_attention(
-                conn,
-                attention_id=f"attn-flap-{index:04d}",
-                source="worker:legacy",
-                severity="warning",
-                status="blocked",
-                lifecycle_status="open",
-                at="2026-01-01T00:00:00+00:00",
-                signal_count=2,
-            )
-        _insert_legacy_attention(
-            conn,
-            attention_id="attn-current",
-            source="worker:legacy",
-            severity="warning",
-            status="blocked",
-            lifecycle_status="open",
-            at="2026-01-01T00:10:00+00:00",
-            signal_count=172,
-        )
-        for index in range(600):
-            status = ("queued", "retry", "deferred")[index % 3]
-            conn.execute(
-                """
-                INSERT INTO connector_outbox (
-                    host_id, connector, delivery_key, status, payload_json,
-                    private_state_json, created_at, updated_at, next_attempt_at
-                ) VALUES ('legacy-host', 'attention', ?, ?, ?, '{}', ?, ?, NULL)
-                """,
-                (
-                    f"flap-active-{index:04d}",
-                    status,
-                    current_payload,
-                    "2026-01-01T00:10:00+00:00",
-                    "2026-01-01T00:10:00+00:00",
-                ),
-            )
-        delivered_cursor = conn.execute(
-            """
-            INSERT INTO connector_outbox (
-                host_id, connector, delivery_key, status, payload_json,
-                private_state_json, created_at, updated_at, next_attempt_at
-            ) VALUES ('legacy-host', 'attention', 'flap-old-delivered',
-                      'delivered', ?, '{}', ?, ?, NULL)
-            """,
-            (
-                old_payload,
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:00+00:00",
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO connector_deliveries (
-                outbox_id, host_id, connector, delivery_key, attempt, status,
-                response_json, private_state_json, created_at, delivered_at
-            ) VALUES (?, 'legacy-host', 'attention', 'flap-old-delivered', 1,
-                      'delivered', '{}', '{}', ?, ?)
-            """,
-            (
-                int(delivered_cursor.lastrowid),
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:01+00:00",
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO connector_outbox (
-                host_id, connector, delivery_key, status, payload_json,
-                private_state_json, created_at, updated_at, next_attempt_at
-            ) VALUES ('legacy-host', 'attention', 'flap-old-dead',
-                      'dead_letter', ?, '{}', ?, ?, NULL)
-            """,
-            (
-                old_payload,
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:00+00:00",
-            ),
-        )
-
-    def migration_evidence() -> tuple[Any, ...]:
-        with sqlite3.connect(str(db_path)) as conn:
-            lifecycle = conn.execute(
-                """
-                SELECT COUNT(*), lifecycle_status, current_attention_id
-                FROM attention_lifecycles
-                """
-            ).fetchone()
-            attention = conn.execute(
-                """
-                SELECT COUNT(*),
-                       MAX(CASE WHEN lifecycle_status = 'open'
-                                THEN signal_count ELSE 0 END)
-                FROM attention_items
-                """
-            ).fetchone()
-            outbox = dict(
-                conn.execute(
-                    "SELECT status, COUNT(*) FROM connector_outbox GROUP BY status"
-                ).fetchall()
-            )
-            delivered_audit = conn.execute(
-                """
-                SELECT COUNT(*) FROM connector_deliveries
-                WHERE status = 'delivered'
-                """
-            ).fetchone()[0]
-            canonical_payload = conn.execute(
-                """
-                SELECT payload_json FROM connector_outbox
-                WHERE status = 'queued'
-                """
-            ).fetchall()
-            return (
-                lifecycle,
-                attention,
-                outbox,
-                delivered_audit,
-                canonical_payload,
-                _user_version(conn),
-            )
-
-    init_store(db_path)
-    first = migration_evidence()
-    init_store(db_path)
-    second = migration_evidence()
-    with sqlite3.connect(str(db_path)) as conn:
-        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
-
-    assert first == second
-    lifecycle, attention, outbox, delivered_audit, canonical_payload, version = first
-    assert lifecycle == (1, "open", "attn-current")
-    assert attention == (510, 1190)
-    assert outbox == {
-        "dead_letter": 1,
-        "delivered": 1,
-        "queued": 1,
-        "superseded": 600,
-    }
-    assert delivered_audit == 1
-    assert len(canonical_payload) == 1
-    assert json.loads(canonical_payload[0][0])["attention"]["id"] == "attn-current"
-    assert version == store_sqlite.STORE_SCHEMA_VERSION
-    assert integrity == "ok"
-
-
-def test_store_v4_migration_retains_single_and_multiple_live_leases_safely(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "migration-leases.db"
-    init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        _insert_legacy_attention(
-            conn,
-            attention_id="attn-legacy",
-            source="worker:legacy",
-            severity="warning",
-            status="blocked",
-            lifecycle_status="open",
-            at="2026-01-01T00:00:00+00:00",
-        )
-        created_payload = _legacy_attention_job_payload()
-        escalation_payload = _legacy_attention_job_payload(
-            event_type="attention_escalated", severity="critical"
-        )
-        for index in range(5):
-            conn.execute(
-                """
-                INSERT INTO connector_outbox (
-                    host_id, connector, delivery_key, status, payload_json,
-                    private_state_json, created_at, updated_at, next_attempt_at
-                ) VALUES ('legacy-host', 'attention', ?, 'queued', ?, '{}', ?, ?, NULL)
-                """,
-                (
-                    f"leased-created-{index}",
-                    created_payload,
-                    "2026-01-01T00:00:00+00:00",
-                    "2026-01-01T00:00:00+00:00",
-                ),
-            )
-        conn.execute(
-            """
-            INSERT INTO connector_outbox (
-                host_id, connector, delivery_key, status, payload_json,
-                private_state_json, created_at, updated_at, next_attempt_at
-            ) VALUES ('legacy-host', 'attention', 'leased-escalation', 'queued',
-                      ?, '{}', ?, ?, NULL)
-            """,
-            (
-                escalation_payload,
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:00+00:00",
-            ),
-        )
-    leased = poll_connector_outbox(
-        db_path,
-        "legacy-host",
-        "attention",
-        limit=6,
-        lease_seconds=600,
-        now="2026-01-01T00:00:00+00:00",
-    )["items"]
-    assert len(leased) == 6
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute("DROP TABLE attention_lifecycles")
-        conn.execute("PRAGMA user_version = 4")
-    init_store(db_path)
-
-    with sqlite3.connect(str(db_path)) as conn:
-        leased_rows = conn.execute(
-            """
-            SELECT id, delivery_key, private_state_json
-            FROM connector_outbox WHERE status = 'leased' ORDER BY id
-            """
-        ).fetchall()
-        pollable = conn.execute(
-            """
-            SELECT COUNT(*) FROM connector_outbox
-            WHERE status IN ('queued', 'retry', 'deferred')
-            """
-        ).fetchone()[0]
-    assert len(leased_rows) == 6
-    assert pollable == 0
-    created_rows = [row for row in leased_rows if "created" in row[1]]
-    created_states = [json.loads(row[2]) for row in created_rows]
-    assert sum(bool(state["migration_canonical"]) for state in created_states) == 1
-    assert sum(bool(state.get("terminal_after_lease")) for state in created_states) == 4
-    escalation_state = json.loads(
-        next(row[2] for row in leased_rows if row[1] == "leased-escalation")
-    )
-    assert escalation_state["migration_canonical"] is True
-    assert "terminal_after_lease" not in escalation_state
-
-    items_by_key = {item["key"]: item for item in leased}
-    canonical_created = next(
-        row for row in created_rows if json.loads(row[2])["migration_canonical"]
-    )
-    duplicate_created = [
-        row
-        for row in created_rows
-        if json.loads(row[2]).get("terminal_after_lease")
-    ]
-    canonical_ack = ack_connector_delivery(
-        db_path,
-        host_id="legacy-host",
-        name="attention",
-        ref=items_by_key[canonical_created[1]]["ref"],
-        now="2026-01-01T00:00:05+00:00",
-    )
-    assert canonical_ack["status"] == "acknowledged"
-    with sqlite3.connect(str(db_path)) as conn:
-        sibling_states = [
-            json.loads(row[0])
-            for row in conn.execute(
-                """
-                SELECT private_state_json FROM connector_outbox
-                WHERE status = 'leased'
-                  AND delivery_key LIKE 'leased-created-%'
-                """
-            ).fetchall()
-        ]
-    assert len(sibling_states) == 4
-    assert all(state["terminal_after_lease"] for state in sibling_states)
-
-    failed = fail_connector_delivery(
-        db_path,
-        host_id="legacy-host",
-        name="attention",
-        ref=items_by_key[duplicate_created[0][1]]["ref"],
-        now="2026-01-01T00:00:10+00:00",
-    )
-    deferred = defer_connector_delivery(
-        db_path,
-        host_id="legacy-host",
-        name="attention",
-        ref=items_by_key[duplicate_created[1][1]]["ref"],
-        now="2026-01-01T00:00:20+00:00",
-    )
-    assert failed["status"] == deferred["status"] == "superseded"
-    with sqlite3.connect(str(db_path)) as conn:
-        expiring = duplicate_created[2]
-        delivery = conn.execute(
-            """
-            SELECT id, private_state_json FROM connector_deliveries
-            WHERE outbox_id = ? AND status = 'leased'
-            """,
-            (expiring[0],),
-        ).fetchone()
-        delivery_state = json.loads(delivery[1])
-        delivery_state["lease_expires_at"] = "2026-01-01T00:00:30+00:00"
-        conn.execute(
-            "UPDATE connector_deliveries SET private_state_json = ? WHERE id = ?",
-            (json.dumps(delivery_state, sort_keys=True), delivery[0]),
-        )
-    reclaimed = reclaim_expired_connector_leases(
-        db_path,
-        "legacy-host",
-        "attention",
-        now="2026-01-01T00:01:00+00:00",
-    )
-    assert reclaimed["reclaimed"] == 1
-    duplicate_ack = ack_connector_delivery(
-        db_path,
-        host_id="legacy-host",
-        name="attention",
-        ref=items_by_key[duplicate_created[3][1]]["ref"],
-        now="2026-01-01T00:01:30+00:00",
-    )
-    assert duplicate_ack["status"] == "acknowledged"
-    single_ack = ack_connector_delivery(
-        db_path,
-        host_id="legacy-host",
-        name="attention",
-        ref=items_by_key["leased-escalation"]["ref"],
-        now="2026-01-01T00:02:00+00:00",
-    )
-    assert single_ack["status"] == canonical_ack["status"] == "acknowledged"
-    with sqlite3.connect(str(db_path)) as conn:
-        statuses = conn.execute(
-            "SELECT status, COUNT(*) FROM connector_outbox GROUP BY status"
-        ).fetchall()
-    assert dict(statuses) == {"delivered": 3, "superseded": 3}
 
 
 def _worker_binding(
@@ -4443,17 +2534,6 @@ def test_store_worker_binding_upsert_list_resolve_and_expire(tmp_path: Path) -> 
     assert len(current) == 1
     assert current[0].target_value == "pane-2"
     assert current[0].worker_id == "worker-1"
-    resolved = resolve_worker_binding(
-        db_path,
-        "host-a",
-        "worker-1",
-        worker_fingerprint="fp-1",
-        backend="herdr",
-        now="2026-01-01T00:30:00+00:00",
-    )
-    assert resolved is not None
-    assert resolved.target_value == "pane-2"
-
     expired_count = expire_worker_bindings(
         db_path,
         "host-a",
@@ -4474,13 +2554,6 @@ def test_store_worker_binding_upsert_list_resolve_and_expire(tmp_path: Path) -> 
     assert len(history) == 1
     assert history[0].sendable is False
     assert history[0].reason == "stale_target"
-    assert resolve_worker_binding(
-        db_path,
-        "host-a",
-        "worker-1",
-        backend="herdr",
-        now="2026-01-01T00:46:00+00:00",
-    ) is None
 
 
 def test_store_worker_bindings_allow_duplicate_targets_and_expire_stale(tmp_path: Path) -> None:
@@ -4507,13 +2580,6 @@ def test_store_worker_bindings_allow_duplicate_targets_and_expire_stale(tmp_path
     assert len(current) == 2
     assert {binding.target_value for binding in current} == {"same-pane"}
     assert {binding.reason for binding in current} == {"duplicate_backend_target"}
-    assert resolve_worker_binding(
-        db_path,
-        "host-a",
-        "worker-a",
-        backend="herdr",
-        now="2026-01-01T00:30:00+00:00",
-    ) is None
 
     expired_count = expire_stale_worker_bindings(
         db_path,
@@ -4552,13 +2618,6 @@ def test_store_upsert_separates_colliding_duplicate_private_fingerprints(tmp_pat
     assert {binding.reason for binding in current} == {"duplicate_backend_target"}
     assert "colliding-private" not in {binding.private_fingerprint for binding in current}
     assert len({binding.private_fingerprint for binding in current}) == 2
-    assert resolve_worker_binding(
-        db_path,
-        "host-a",
-        "worker-a",
-        backend="herdr",
-        now="2026-01-01T00:30:00+00:00",
-    ) is None
 
 
 def test_store_snapshot_payload_does_not_contain_private_worker_bindings(tmp_path: Path) -> None:
@@ -4701,7 +2760,7 @@ def test_store_merges_public_turn_content_without_private_labels(tmp_path: Path)
     init_store(db_path)
     save_snapshot(db_path, snapshot)
 
-    updated = merge_turn_content(
+    updated = apply_test_turn_refresh(
         db_path,
         "turn-host",
         "worker-1",
@@ -4731,7 +2790,7 @@ def test_store_merges_public_turn_content_without_private_labels(tmp_path: Path)
 
 
 
-def test_store_save_latest_host_scope_and_list_hosts(tmp_path: Path) -> None:
+def test_store_save_and_latest_snapshot_are_host_scoped(tmp_path: Path) -> None:
     db_path = tmp_path / "tendwire.db"
     config_a = Config(host_id="host-a", db_path=db_path)
     config_b = Config(host_id="host-b", db_path=db_path)
@@ -4774,7 +2833,6 @@ def test_store_save_latest_host_scope_and_list_hosts(tmp_path: Path) -> None:
     assert restored_b.workers[0].id == "worker-b"
 
     assert latest_snapshot(db_path, "missing-host") is None
-    assert list_hosts(db_path) == ["host-a", "host-b"]
 
 
 def _reserve_test_request(
@@ -4853,7 +2911,7 @@ def test_store_host_wide_request_identity_conflicts_across_actions_and_tombstone
     collision = _reserve_test_request(
         db_path,
         request_id="same-id",
-        action="answer_pending",
+        action="answer_decision",
         fingerprint="answer-fingerprint",
     )
     assert collision["status"] == "request_id_conflict"
@@ -5038,7 +3096,7 @@ def test_backend_pending_choice_terminal_effect_is_atomic_with_acceptance(
     reservation = _reserve_test_request(
         db_path,
         request_id="choice-effect",
-        action="answer_pending",
+        action="answer_decision",
         fingerprint="choice-effect-fingerprint",
     )
     started = mark_command_send_started(
@@ -5112,7 +3170,7 @@ def test_backend_pending_choice_terminal_effect_is_atomic_with_acceptance(
     missing_reservation = _reserve_test_request(
         db_path,
         request_id="missing-choice",
-        action="answer_pending",
+        action="answer_decision",
         fingerprint="missing-choice-fingerprint",
         now="2026-01-01T00:01:00+00:00",
     )
@@ -5529,247 +3587,10 @@ def test_store_command_reservation_allows_one_concurrent_owner(tmp_path: Path) -
         assert conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0] == 1
 
 
-def test_store_v11_host_request_collision_migrates_to_uncertain_tombstone(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "legacy-collision.db"
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.executescript(
-            store_sqlite.CREATE_LEGACY_COMMAND_RECEIPTS_TABLE
-            + store_sqlite.CREATE_LEGACY_COMMANDS_TABLE
-        )
-        for index, (action, fingerprint) in enumerate(
-            (
-                ("send_instruction", "send-fingerprint"),
-                ("answer_pending", "answer-fingerprint"),
-            )
-        ):
-            created = f"2026-01-01T00:00:0{index}+00:00"
-            conn.execute(
-                """
-                INSERT INTO command_receipts (
-                    host_id, request_id, action, payload_fingerprint, status,
-                    result_json, created_at, completed_at, uncertain
-                ) VALUES (?, 'collision', ?, ?, 'accepted', ?, ?, ?, 0)
-                """,
-                (
-                    "host-a",
-                    action,
-                    fingerprint,
-                    '{"ok":true,"private":"must-not-survive"}',
-                    created,
-                    created,
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO commands (
-                    host_id, request_id, action, payload_fingerprint, status,
-                    dry_run, uncertain, request_json, result_json, created_at,
-                    reserved_at, completed_at, updated_at
-                ) VALUES (?, 'collision', ?, ?, 'accepted', 0, 0, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    "host-a",
-                    action,
-                    fingerprint,
-                    '{"target":{"worker_id":"public","worker_fingerprint":"private"}}',
-                    '{"ok":true,"private":"must-not-survive"}',
-                    created,
-                    created,
-                    created,
-                    created,
-                ),
-            )
-        conn.execute("PRAGMA user_version = 11")
-
-    init_store(db_path)
-    receipt = get_command_request(db_path, "host-a", "collision")
-    assert receipt is not None
-    assert receipt["state"] == "uncertain"
-    assert receipt["status"] == "request_state_uncertain"
-    assert receipt["legacy_collision"] is True
-    assert receipt["legacy_collision_count"] == 4
-    assert receipt["canonical_request_json"] == "{}"
-    assert "must-not-survive" not in receipt["result_json"]
-    assert _reserve_test_request(
-        db_path,
-        request_id="collision",
-        fingerprint="new-fingerprint",
-    )["status"] == "terminal"
-    with sqlite3.connect(str(db_path)) as conn:
-        assert conn.execute(
-            "SELECT state, legacy_collision FROM commands"
-        ).fetchone() == ("uncertain", 1)
-        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        conn.execute(store_sqlite.CREATE_EVENTS_TABLE)
-
-    _accept_test_request(
-        db_path,
-        request_id="newer-than-collision",
-        now="2026-02-02T00:00:00+00:00",
-    )
-    cleanup = cleanup_command_request_retention(
-        db_path,
-        retry_horizon_seconds=604_800,
-        retention_seconds=2_592_000,
-        retention_count=1,
-        now="2026-03-05T00:00:00+00:00",
-    )
-    assert cleanup["deleted"] == 1
-    assert get_command_request(db_path, "host-a", "collision") is None
-    assert get_command_request(
-        db_path, "host-a", "newer-than-collision"
-    ) is not None
 
 
 
-def test_store_v11_noncollision_replays_only_exact_legacy_raw_fingerprint(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "legacy-noncollision.db"
-    legacy_fingerprint = "legacy-raw-payload-fingerprint"
-    canonical_json = '{"action":"send_instruction","worker_id":"worker-public"}'
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.executescript(
-            store_sqlite.CREATE_LEGACY_COMMAND_RECEIPTS_TABLE
-            + store_sqlite.CREATE_LEGACY_COMMANDS_TABLE
-        )
-        conn.execute(
-            """
-            INSERT INTO command_receipts (
-                host_id, request_id, action, payload_fingerprint, status,
-                result_json, created_at, completed_at, uncertain
-            ) VALUES (
-                'host-a', 'legacy-exact', 'send_instruction', ?, 'accepted',
-                '{"ok":true,"status":"accepted"}',
-                '2026-01-01T00:00:00+00:00',
-                '2026-01-01T00:00:01+00:00', 0
-            )
-            """,
-            (legacy_fingerprint,),
-        )
-        conn.execute(
-            """
-            INSERT INTO commands (
-                host_id, request_id, action, payload_fingerprint, status,
-                dry_run, uncertain, request_json, result_json, created_at,
-                reserved_at, completed_at, updated_at
-            ) VALUES (
-                'host-a', 'legacy-exact', 'send_instruction', ?, 'accepted',
-                0, 0, '{"target":{"worker_id":"worker-public"}}',
-                '{"ok":true,"status":"accepted"}',
-                '2026-01-01T00:00:00+00:00',
-                '2026-01-01T00:00:00+00:00',
-                '2026-01-01T00:00:01+00:00',
-                '2026-01-01T00:00:01+00:00'
-            )
-            """,
-            (legacy_fingerprint,),
-        )
-        conn.execute("PRAGMA user_version = 11")
 
-    init_store(db_path)
-    canonical_only = reserve_command_request(
-        db_path,
-        host_id="host-a",
-        request_id="legacy-exact",
-        action="send_instruction",
-        canonical_version=1,
-        canonical_fingerprint=legacy_fingerprint,
-        canonical_request_json=canonical_json,
-        public_worker_id="worker-public",
-        pending_result_json='{"ok":false,"status":"pending"}',
-    )
-    assert canonical_only["status"] == "request_id_conflict"
-
-    exact_replay = reserve_command_request(
-        db_path,
-        host_id="host-a",
-        request_id="legacy-exact",
-        action="send_instruction",
-        canonical_version=1,
-        canonical_fingerprint="new-canonical-fingerprint",
-        canonical_request_json=canonical_json,
-        public_worker_id="worker-public",
-        pending_result_json='{"ok":false,"status":"pending"}',
-        legacy_raw_payload_fingerprint=legacy_fingerprint,
-    )
-    assert exact_replay["status"] == "terminal"
-    assert exact_replay["receipt"]["canonical_version"] == 0
-    assert exact_replay["receipt"]["canonical_fingerprint"] == legacy_fingerprint
-    assert exact_replay["receipt"]["result_json"] == (
-        '{"ok":true,"status":"accepted"}'
-    )
-
-    wrong_raw = reserve_command_request(
-        db_path,
-        host_id="host-a",
-        request_id="legacy-exact",
-        action="send_instruction",
-        canonical_version=1,
-        canonical_fingerprint="new-canonical-fingerprint",
-        canonical_request_json=canonical_json,
-        public_worker_id="worker-public",
-        pending_result_json='{"ok":false,"status":"pending"}',
-        legacy_raw_payload_fingerprint="different-legacy-raw-fingerprint",
-    )
-    wrong_action = reserve_command_request(
-        db_path,
-        host_id="host-a",
-        request_id="legacy-exact",
-        action="answer_pending",
-        canonical_version=1,
-        canonical_fingerprint="new-canonical-fingerprint",
-        canonical_request_json=canonical_json,
-        public_worker_id="worker-public",
-        pending_result_json='{"ok":false,"status":"pending"}',
-        legacy_raw_payload_fingerprint=legacy_fingerprint,
-    )
-    assert wrong_raw["status"] == "request_id_conflict"
-    assert wrong_action["status"] == "request_id_conflict"
-
-def test_store_v11_receipt_audit_disagreement_fails_closed(tmp_path: Path) -> None:
-    db_path = tmp_path / "legacy-disagreement.db"
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.executescript(
-            store_sqlite.CREATE_LEGACY_COMMAND_RECEIPTS_TABLE
-            + store_sqlite.CREATE_LEGACY_COMMANDS_TABLE
-        )
-        conn.execute(
-            """
-            INSERT INTO command_receipts (
-                host_id, request_id, action, payload_fingerprint, status,
-                result_json, created_at, completed_at, uncertain
-            ) VALUES (
-                'host-a', 'disagree', 'send_instruction', 'same-fingerprint',
-                'accepted', '{"ok":true}', '2026-01-01T00:00:00+00:00',
-                '2026-01-01T00:00:01+00:00', 0
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO commands (
-                host_id, request_id, action, payload_fingerprint, status,
-                dry_run, uncertain, request_json, result_json, created_at,
-                reserved_at, completed_at, updated_at
-            ) VALUES (
-                'host-a', 'disagree', 'send_instruction', 'same-fingerprint',
-                'backend_failed', 0, 0, '{}', '{"ok":false}',
-                '2026-01-01T00:00:00+00:00',
-                '2026-01-01T00:00:00+00:00',
-                '2026-01-01T00:00:01+00:00',
-                '2026-01-01T00:00:01+00:00'
-            )
-            """
-        )
-        conn.execute("PRAGMA user_version = 11")
-    init_store(db_path)
-    receipt = get_command_request(db_path, "host-a", "disagree")
-    assert receipt is not None
-    assert receipt["state"] == "uncertain"
-    assert receipt["legacy_collision"] is True
 
 
 def test_store_command_retention_obeys_age_count_host_and_batch_floors(
@@ -6328,7 +4149,7 @@ def test_distinct_source_turns_mint_distinct_public_turn_ids(tmp_path: Path) -> 
         [("first question", "first answer"), ("second question", "second answer")],
         start=1,
     ):
-        merge_turn_content(
+        apply_test_turn_refresh(
             db_path,
             "turn-host",
             "worker-1",
@@ -6352,7 +4173,7 @@ def test_distinct_source_turns_mint_distinct_public_turn_ids(tmp_path: Path) -> 
     assert all(not t.get("assistant_final_text") and not t.get("user_text") for t in base_rows)
 
     # Same source turn observed again updates its row, keeping the id stable.
-    merge_turn_content(
+    apply_test_turn_refresh(
         db_path,
         "turn-host",
         "worker-1",
@@ -6421,7 +4242,7 @@ def test_twenty_offline_source_finals_are_retained_as_unique_ready_anchors(
     init_store(db_path)
     save_snapshot(db_path, snapshot)
     for index in range(20):
-        assert merge_turn_content(
+        assert apply_test_turn_refresh(
             db_path,
             "turn-host",
             "worker-1",
@@ -6476,67 +4297,6 @@ def test_twenty_offline_source_finals_are_retained_as_unique_ready_anchors(
 
 
 
-def _reset_store_to_v5_with_legacy_turn(
-    db_path: Path,
-    *,
-    final_text: str,
-) -> tuple[Any, str]:
-    config = Config(host_id="legacy-turn-host", db_path=db_path)
-    snapshot = project_from_raw(
-        config,
-        workers=[
-            {
-                "id": "worker-1",
-                "name": "claude",
-                "status": "active",
-                "space_id": "space-1",
-            }
-        ],
-    )
-    init_store(db_path)
-    save_snapshot(db_path, snapshot)
-    assert merge_turn_content(
-        db_path,
-        "legacy-turn-host",
-        "worker-1",
-        {
-            "source_turn_id": "v5-migration-source",
-            "user_text": "legacy prompt",
-            "assistant_final_text": final_text,
-            "complete": True,
-            "has_open_turn": False,
-        },
-    ) == 1
-    with sqlite3.connect(str(db_path)) as conn:
-        turn_id, payload_json = conn.execute(
-            """
-            SELECT turn_id, payload_json
-            FROM turns
-            WHERE host_id = 'legacy-turn-host'
-            """
-        ).fetchone()
-        payload = json.loads(payload_json)
-        payload["user_text"] = "legacy prompt"
-        payload["assistant_final_text"] = final_text
-        payload["complete"] = True
-        payload["has_open_turn"] = False
-        conn.execute(
-            "UPDATE turns SET payload_json = ? WHERE host_id = ? AND turn_id = ?",
-            (
-                json.dumps(payload, sort_keys=True),
-                "legacy-turn-host",
-                str(turn_id),
-            ),
-        )
-        conn.execute("DROP TABLE turn_presentation_recoveries")
-        conn.execute("DROP TABLE turn_presentation_jobs")
-        conn.execute("DROP TABLE turn_presentation_plans")
-        conn.execute("DROP TABLE turn_content_page_boundaries")
-        conn.execute("DROP TABLE turn_content_revisions")
-        conn.execute("CREATE TABLE preserved_v5 (value TEXT NOT NULL)")
-        conn.execute("INSERT INTO preserved_v5 (value) VALUES ('untouched')")
-        conn.execute("PRAGMA user_version = 5")
-    return snapshot, str(turn_id)
 
 
 def _reconstruct_turn_content(
@@ -6568,326 +4328,9 @@ def _reconstruct_turn_content(
     return "".join(str(page["text"]) for page in pages), pages
 
 
-def test_store_v5_to_v6_migration_is_atomic_idempotent_and_marks_incomplete(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "turn-v5.db"
-    fragment = ("x" * 11_988) + "\n[truncated]"
-    snapshot, turn_id = _reset_store_to_v5_with_legacy_turn(
-        db_path,
-        final_text=fragment,
-    )
-
-    init_store(db_path)
-    first_v2 = turns_payload_from_store(
-        db_path,
-        "legacy-turn-host",
-        snapshot=snapshot,
-        schema_version=2,
-    )
-    init_store(db_path)
-    second_v2 = turns_payload_from_store(
-        db_path,
-        "legacy-turn-host",
-        snapshot=snapshot,
-        schema_version=2,
-    )
-
-    with sqlite3.connect(str(db_path)) as conn:
-        version = _user_version(conn)
-        tables = _table_names(conn)
-        revision_rows = conn.execute(
-            """
-            SELECT
-                content_revision, user_text, assistant_final_text,
-                user_state, final_state, user_page_count, final_page_count,
-                is_current
-            FROM turn_content_revisions
-            WHERE host_id = ? AND turn_id = ?
-            """,
-            ("legacy-turn-host", turn_id),
-        ).fetchall()
-        stored_payload = conn.execute(
-            "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
-            ("legacy-turn-host", turn_id),
-        ).fetchone()[0]
-        preserved = conn.execute("SELECT value FROM preserved_v5").fetchone()[0]
-        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
-        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
-
-    assert version == store_sqlite.STORE_SCHEMA_VERSION
-    assert {
-        "turn_content_revisions",
-        "turn_presentation_plans",
-        "turn_presentation_jobs",
-    } <= tables
-    assert len(revision_rows) == 1
-    revision = revision_rows[0]
-    assert revision[1:] == (
-        "legacy prompt",
-        fragment,
-        "complete",
-        "known_incomplete",
-        1,
-        0,
-        1,
-    )
-    assert json.loads(stored_payload).get("assistant_final_text") is None
-    assert fragment not in stored_payload
-    assert preserved == "untouched"
-    assert integrity == "ok"
-    assert foreign_keys == []
-    assert first_v2 == second_v2
-    turn = next(item for item in first_v2["turns"] if item["id"] == turn_id)
-    assert turn["content"]["known_incomplete"] is True
-    assert turn["content"]["fields"]["assistant_final_text"] == {
-        "availability": "known_incomplete",
-        "inline": False,
-        "char_length": len(fragment),
-        "byte_length": len(fragment.encode("utf-8")),
-        "page_count": 0,
-        "first_cursor": None,
-    }
-    assert "assistant_final_text" not in turn
-    assert turn["assistant_final_preview"] == fragment[:1000]
-    assert turns_payload_from_store(
-        db_path,
-        "legacy-turn-host",
-        schema_version=1,
-    ) == {
-        "schema_version": 1,
-        "ok": False,
-        "status": "upgrade_required",
-        "required_turn_schema_version": 2,
-    }
-    assert store_sqlite.get_turn_content(
-        db_path,
-        "legacy-turn-host",
-        turn_id=turn_id,
-        content_revision=revision[0],
-        field="assistant_final_text",
-    ) == {
-        "schema_version": 1,
-        "ok": False,
-        "status": "content_known_incomplete",
-    }
-
-def test_store_v5_to_v6_migration_rolls_back_all_v6_ddl(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "turn-v5-rollback.db"
-    _reset_store_to_v5_with_legacy_turn(db_path, final_text="legacy answer")
-
-    def fail_backfill(conn: sqlite3.Connection) -> None:
-        raise RuntimeError("controlled v6 migration failure")
-
-    monkeypatch.setattr(
-        store_sqlite,
-        "_backfill_legacy_turn_content_conn",
-        fail_backfill,
-    )
-    with pytest.raises(RuntimeError, match="controlled v6 migration failure"):
-        init_store(db_path)
-
-    with sqlite3.connect(str(db_path)) as conn:
-        assert _user_version(conn) == 5
-        assert "turn_content_revisions" not in _table_names(conn)
-        assert "turn_content_page_boundaries" not in _table_names(conn)
-        assert "turn_presentation_plans" not in _table_names(conn)
-        assert "turn_presentation_jobs" not in _table_names(conn)
-        assert "turn_presentation_recoveries" not in _table_names(conn)
-        assert conn.execute("SELECT value FROM preserved_v5").fetchone()[0] == "untouched"
 
 
-def test_v6_to_v7_repairs_mixed_turns_with_absent_content_descriptors(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "mixed-v6-turn-content.db"
-    host_id = "mixed-v6-host"
-    snapshot = project_from_raw(
-        Config(host_id=host_id, db_path=db_path),
-        workers=[
-            {"id": "worker-complete", "name": "Complete", "status": "active"},
-            {"id": "worker-working", "name": "Working", "status": "active"},
-        ],
-    )
-    init_store(db_path)
-    save_snapshot(db_path, snapshot)
-    assert merge_turn_content(
-        db_path,
-        host_id,
-        "worker-complete",
-        {
-            "source_turn_id": "complete-source",
-            "assistant_final_text": "complete final",
-            "complete": True,
-            "has_open_turn": False,
-        },
-        observed_at="2026-01-01T00:00:00+00:00",
-    ) == 1
-    assert merge_turn_content(
-        db_path,
-        host_id,
-        "worker-working",
-        {
-            "source_turn_id": "working-source",
-            "user_text": "observed working turn",
-            "complete": False,
-            "has_open_turn": True,
-        },
-        observed_at="2026-01-01T00:01:00+00:00",
-    ) == 1
 
-    with sqlite3.connect(str(db_path)) as conn:
-        complete_turn_id = str(
-            conn.execute(
-                """
-                SELECT turn_id
-                FROM turn_content_revisions
-                WHERE host_id = ? AND final_state = 'complete' AND is_current = 1
-                """,
-                (host_id,),
-            ).fetchone()[0]
-        )
-        missing_rows = conn.execute(
-            """
-            SELECT turn_id, payload_json
-            FROM turns
-            WHERE host_id = ? AND turn_id != ?
-            ORDER BY turn_id
-            """,
-            (host_id, complete_turn_id),
-        ).fetchall()
-        assert len(missing_rows) == 1
-        missing_turn_ids = [str(row[0]) for row in missing_rows]
-        for turn_id, payload_json in missing_rows:
-            payload = json.loads(payload_json)
-            payload["assistant_stream_text"] = "working progress"
-            conn.execute(
-                """
-                UPDATE turns
-                SET payload_json = ?
-                WHERE host_id = ? AND turn_id = ?
-                """,
-                (json.dumps(payload, sort_keys=True), host_id, str(turn_id)),
-            )
-        placeholders = ",".join("?" for _ in missing_turn_ids)
-        conn.execute(
-            f"""
-            DELETE FROM turn_content_page_boundaries
-            WHERE host_id = ? AND turn_id IN ({placeholders})
-            """,
-            (host_id, *missing_turn_ids),
-        )
-        conn.execute(
-            f"""
-            DELETE FROM turn_content_revisions
-            WHERE host_id = ? AND turn_id IN ({placeholders})
-            """,
-            (host_id, *missing_turn_ids),
-        )
-        conn.execute("DROP TABLE turn_content_page_boundaries")
-        conn.execute("PRAGMA user_version = 6")
-
-    init_store(db_path)
-    first_v2 = turns_payload_from_store(
-        db_path,
-        host_id,
-        snapshot=snapshot,
-        schema_version=2,
-    )
-    first_v1 = turns_payload_from_store(
-        db_path,
-        host_id,
-        snapshot=snapshot,
-        schema_version=1,
-    )
-    with sqlite3.connect(str(db_path)) as conn:
-        first_rows = conn.execute(
-            """
-            SELECT turn_id, content_revision, user_state, final_state, is_current
-            FROM turn_content_revisions
-            WHERE host_id = ? AND turn_id IN (
-                SELECT turn_id
-                FROM turns
-                WHERE host_id = ? AND turn_id != ?
-            )
-            ORDER BY turn_id, content_revision
-            """,
-            (host_id, host_id, complete_turn_id),
-        ).fetchall()
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
-    init_store(db_path)
-    second_v2 = turns_payload_from_store(
-        db_path,
-        host_id,
-        snapshot=snapshot,
-        schema_version=2,
-    )
-    with sqlite3.connect(str(db_path)) as conn:
-        second_rows = conn.execute(
-            """
-            SELECT turn_id, content_revision, user_state, final_state, is_current
-            FROM turn_content_revisions
-            WHERE host_id = ? AND turn_id IN (
-                SELECT turn_id
-                FROM turns
-                WHERE host_id = ? AND turn_id != ?
-            )
-            ORDER BY turn_id, content_revision
-            """,
-            (host_id, host_id, complete_turn_id),
-        ).fetchall()
-
-    absent_field = {
-        "availability": "absent",
-        "inline": False,
-        "char_length": 0,
-        "byte_length": 0,
-        "page_count": 0,
-        "first_cursor": None,
-    }
-    assert version == store_sqlite.STORE_SCHEMA_VERSION
-    assert first_v2 == second_v2
-    assert first_rows == second_rows
-    assert len(first_rows) == len(missing_turn_ids)
-    assert all(
-        row
-        == (
-            row[0],
-            store_sqlite.content_revision(
-                str(row[0]),
-                None,
-                None,
-                "absent",
-                "absent",
-            ),
-            "absent",
-            "absent",
-            1,
-        )
-        for row in first_rows
-    )
-    assert len(first_v2["turns"]) >= 2
-    for turn in first_v2["turns"]:
-        assert turn["content"]["schema_version"] == 1
-        if turn["id"] not in missing_turn_ids:
-            continue
-        assert turn["assistant_stream_text"] == "working progress"
-        assert turn["content"]["known_incomplete"] is False
-        assert turn["content"]["fields"] == {
-            "user_text": absent_field,
-            "assistant_final_text": absent_field,
-        }
-        assert "user_text" not in turn
-        assert "assistant_final_text" not in turn
-    assert first_v1["schema_version"] == 1
-    assert all("content" not in turn for turn in first_v1["turns"])
-    for turn in first_v1["turns"]:
-        if turn["id"] in missing_turn_ids:
-            assert turn["user_text"] is None
-            assert turn["assistant_final_text"] is None
 
 
 def _exact_utf8_fixture(byte_length: int) -> str:
@@ -6917,7 +4360,7 @@ def test_store_list_is_preview_bounded_and_sequential_pages_are_linear(
     save_snapshot(db_path, snapshot)
     final = _exact_utf8_fixture(target_byte_length)
     assert len(final.encode("utf-8")) == target_byte_length
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         worker_id,
@@ -6989,153 +4432,6 @@ def test_store_list_is_preview_bounded_and_sequential_pages_are_linear(
     )
 
 
-def test_migrated_v6_boundaries_make_first_long_read_page_bounded(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "migrated-v6-page-boundaries.db"
-    host_id = "legacy-boundary-host"
-    worker_id = "worker-boundary"
-    snapshot = project_from_raw(
-        Config(host_id=host_id, db_path=db_path),
-        workers=[{"id": worker_id, "name": "Boundary", "status": "active"}],
-    )
-    init_store(db_path)
-    save_snapshot(db_path, snapshot)
-    final = _exact_utf8_fixture(1024 * 1024)
-    assert merge_turn_content(
-        db_path,
-        host_id,
-        worker_id,
-        {
-            "source_turn_id": "migrated-boundary-source",
-            "assistant_final_text": final,
-            "complete": True,
-            "has_open_turn": False,
-        },
-        observed_at="2026-01-01T00:00:00+00:00",
-    ) == 1
-    listed = turns_payload_from_store(
-        db_path,
-        host_id,
-        snapshot=snapshot,
-        schema_version=2,
-    )
-    turn = listed["turns"][0]
-    revision = turn["content"]["content_revision"]
-    page_count = turn["content"]["fields"]["assistant_final_text"]["page_count"]
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute(
-            """
-            DELETE FROM turn_content_page_boundaries
-            WHERE host_id = ?
-              AND turn_id = ?
-              AND content_revision = ?
-              AND field = 'assistant_final_text'
-            """,
-            (host_id, turn["id"], revision),
-        )
-        conn.execute("PRAGMA user_version = 6")
-
-    init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        migrated_version = conn.execute("PRAGMA user_version").fetchone()[0]
-        migrated_boundaries = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM turn_content_page_boundaries
-            WHERE host_id = ?
-              AND turn_id = ?
-              AND content_revision = ?
-              AND field = 'assistant_final_text'
-            """,
-            (host_id, turn["id"], revision),
-        ).fetchone()[0]
-    first_counters = store_sqlite.TurnContentWorkCounters()
-    first_rebuilt, first_pages = _reconstruct_turn_content(
-        db_path,
-        host_id=host_id,
-        turn_id=turn["id"],
-        revision=revision,
-        field="assistant_final_text",
-        work_counters=first_counters,
-    )
-
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute(
-            """
-            DELETE FROM turn_content_page_boundaries
-            WHERE host_id = ?
-              AND turn_id = ?
-              AND content_revision = ?
-              AND field = 'assistant_final_text'
-            """,
-            (host_id, turn["id"], revision),
-        )
-    init_store(db_path)
-    init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        current_boundaries = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM turn_content_page_boundaries
-            WHERE host_id = ?
-              AND turn_id = ?
-              AND content_revision = ?
-              AND field = 'assistant_final_text'
-            """,
-            (host_id, turn["id"], revision),
-        ).fetchone()[0]
-        incomplete_boundary_fields = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM turn_content_revisions AS revisions
-            WHERE (
-                revisions.user_state = 'complete'
-                AND revisions.user_page_count != (
-                    SELECT COUNT(*)
-                    FROM turn_content_page_boundaries AS boundaries
-                    WHERE boundaries.host_id = revisions.host_id
-                      AND boundaries.turn_id = revisions.turn_id
-                      AND boundaries.content_revision = revisions.content_revision
-                      AND boundaries.field = 'user_text'
-                )
-            ) OR (
-                revisions.final_state = 'complete'
-                AND revisions.final_page_count != (
-                    SELECT COUNT(*)
-                    FROM turn_content_page_boundaries AS boundaries
-                    WHERE boundaries.host_id = revisions.host_id
-                      AND boundaries.turn_id = revisions.turn_id
-                      AND boundaries.content_revision = revisions.content_revision
-                      AND boundaries.field = 'assistant_final_text'
-                )
-            )
-            """
-        ).fetchone()[0]
-    failed_page = store_sqlite.get_turn_content(
-        db_path,
-        host_id,
-        turn_id=turn["id"],
-        content_revision=revision,
-        field="assistant_final_text",
-    )
-
-    assert migrated_version == store_sqlite.STORE_SCHEMA_VERSION
-    assert migrated_boundaries == page_count
-    assert current_boundaries == 0
-    assert incomplete_boundary_fields == 1
-    assert first_rebuilt == final
-    assert len(first_pages) == page_count
-    assert first_counters.page_blob_reads == page_count
-    assert first_counters.page_chars_examined == len(final)
-    assert first_counters.page_bytes_examined <= (
-        len(final.encode("utf-8")) + 3 * (page_count - 1)
-    )
-    assert failed_page == {
-        "schema_version": 1,
-        "ok": False,
-        "status": "content_not_available",
-    }
 
 
 def test_many_long_turn_descriptors_do_one_bounded_list_query(tmp_path: Path) -> None:
@@ -7152,7 +4448,7 @@ def test_many_long_turn_descriptors_do_one_bounded_list_query(tmp_path: Path) ->
     init_store(db_path)
     save_snapshot(db_path, snapshot)
     for index, worker_id in enumerate(worker_ids):
-        assert merge_turn_content(
+        assert apply_test_turn_refresh(
             db_path,
             host_id,
             worker_id,
@@ -7214,7 +4510,7 @@ def test_store_canonical_pages_round_trip_long_content_without_duplicate_copy(
     final = "\n# Heading\n\n```\n" + ("🙂" * 270_000) + "\n```\n"
 
     assert len(final.encode("utf-8")) > 1024 * 1024
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         "long-host",
         "worker-1",
@@ -7361,7 +4657,7 @@ def test_store_canonical_pages_round_trip_long_content_without_duplicate_copy(
     assert final[:1000] not in payload_json
     assert revision_count == 1
 
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         "long-host",
         "worker-1",
@@ -7372,7 +4668,7 @@ def test_store_canonical_pages_round_trip_long_content_without_duplicate_copy(
         },
         observed_at="2026-01-01T00:01:00+00:00",
     ) == 0
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         "long-host",
         "worker-1",
@@ -7404,7 +4700,7 @@ def test_store_merge_distinguishes_whitespace_content_from_empty_or_absent_field
     init_store(db_path)
     save_snapshot(db_path, snapshot)
 
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         worker_id,
@@ -7416,14 +4712,14 @@ def test_store_merge_distinguishes_whitespace_content_from_empty_or_absent_field
         },
         observed_at="2026-01-01T00:00:00+00:00",
     ) == 1
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         worker_id,
         {"source_turn_id": "merge-precedence-source", "user_text": ""},
         observed_at="2026-01-01T00:01:00+00:00",
     ) == 0
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         worker_id,
@@ -7444,7 +4740,7 @@ def test_store_merge_distinguishes_whitespace_content_from_empty_or_absent_field
     assert preserved["assistant_final_text"] == "known final"
 
     whitespace = " \t\r\n "
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         worker_id,
@@ -7463,7 +4759,7 @@ def test_store_merge_distinguishes_whitespace_content_from_empty_or_absent_field
     assert replaced["user_text"] == "known prompt"
     assert replaced["assistant_final_text"] == whitespace
 
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         worker_id,
@@ -7492,7 +4788,7 @@ def test_store_revision_replacement_rolls_back_projection_and_current_flip(
     )
     init_store(db_path)
     save_snapshot(db_path, snapshot)
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         "rollback-host",
         "worker-1",
@@ -7520,7 +4816,7 @@ def test_store_revision_replacement_rolls_back_projection_and_current_flip(
 
     monkeypatch.setattr(store_sqlite, "_insert_turn_content_revision_conn", fail_insert)
     with pytest.raises(RuntimeError, match="controlled revision insert failure"):
-        merge_turn_content(
+        apply_test_turn_refresh(
             db_path,
             "rollback-host",
             "worker-1",
@@ -7573,7 +4869,7 @@ def _seed_superseded_content_revision(
     )
     init_store(db_path)
     save_snapshot(db_path, snapshot)
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         "worker-1",
@@ -7584,7 +4880,7 @@ def _seed_superseded_content_revision(
         },
         observed_at="2026-01-01T00:00:00+00:00",
     ) == 1
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         "worker-1",
@@ -8351,7 +5647,7 @@ def test_acknowledged_revision_count_bounds_one_frequently_revised_turn(
     api = ConnectorOutboxAPI(db_path, host_id)
     revisions: list[str] = []
     for index in range(4):
-        assert merge_turn_content(
+        assert apply_test_turn_refresh(
             db_path,
             host_id,
             "worker-1",
@@ -8557,7 +5853,6 @@ def test_turn_content_maintenance_preserves_live_and_young_final_sources(
                     attempt_at if attempt_status == "delivered" else None,
                 ),
             )
-
     result = run_store_maintenance(
         db_path,
         host_id,
@@ -8798,7 +6093,7 @@ def test_turn_content_maintenance_preserves_all_reference_classes(
                 workers=[{"id": "worker-1", "name": "claude", "status": "active"}],
             ),
         )
-        assert merge_turn_content(
+        assert apply_test_turn_refresh(
             db_path,
             host_id,
             "worker-1",
@@ -9067,7 +6362,7 @@ def test_source_turn_history_pruning_retains_referenced_old_turn(
     init_store(db_path)
     save_snapshot(db_path, snapshot)
     for index in range(6):
-        assert merge_turn_content(
+        assert apply_test_turn_refresh(
             db_path,
             "protected-host",
             "worker-1",
@@ -9148,7 +6443,7 @@ def test_source_turn_history_pruning_retains_referenced_old_turn(
         )
 
     for index in range(6, 10):
-        assert merge_turn_content(
+        assert apply_test_turn_refresh(
             db_path,
             "protected-host",
             "worker-1",
@@ -9218,7 +6513,7 @@ def test_source_turn_history_pruning_retains_referenced_old_turn(
         max_outbox_attempts=99,
         now="2026-01-20T00:00:00+00:00",
     )
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         "protected-host",
         "worker-1",
@@ -9391,7 +6686,7 @@ def test_store_v8_maintenance_schema_singleton_and_ordered_indexes(
     assert created == ("created_at", "host_id", "id")
 
 
-def test_current_v9_schema_gate_and_second_init_have_no_mutation_or_wal_setting(
+def test_current_v29_schema_gate_and_second_init_have_no_mutation_or_wal_setting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9417,20 +6712,6 @@ def test_current_v9_schema_gate_and_second_init_have_no_mutation_or_wal_setting(
         original_pragmas(conn, path)
 
     monkeypatch.setattr(store_sqlite, "_apply_connection_pragmas", traced_pragmas)
-    monkeypatch.setattr(
-        store_sqlite,
-        "MIGRATIONS",
-        tuple(
-            store_sqlite.Migration(
-                migration.from_version,
-                migration.to_version,
-                lambda _conn: (_ for _ in ()).throw(
-                    AssertionError("current schema dispatched a migration")
-                ),
-            )
-            for migration in store_sqlite.MIGRATIONS
-        ),
-    )
     original_flock = fcntl.flock
 
     def reject_parent_ex(fd: int, operation: int) -> None:
@@ -9451,6 +6732,200 @@ def test_current_v9_schema_gate_and_second_init_have_no_mutation_or_wal_setting(
         statement.startswith("PRAGMA USER_VERSION =")
         for statement in normalized
     )
+
+
+def test_base_v28_schema_is_loudly_reset_without_removed_store_objects(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db_path = tmp_path / "base-v28-reset.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE herdr_turn_watermarks (
+                host_id TEXT NOT NULL,
+                pane_id TEXT NOT NULL,
+                last_turn INTEGER NOT NULL
+            );
+            INSERT INTO herdr_turn_watermarks VALUES ('host-a', 'pane-private', 7);
+            CREATE TABLE agent_event_tombstones (
+                host_id TEXT NOT NULL,
+                event_id TEXT NOT NULL
+            );
+            INSERT INTO agent_event_tombstones VALUES ('host-a', 'event-private');
+            CREATE TABLE backend_pending (
+                sentinel TEXT NOT NULL,
+                route_kind TEXT NOT NULL DEFAULT 'legacy'
+            );
+            INSERT INTO backend_pending VALUES ('pending-private', 'legacy');
+            CREATE TABLE command_receipts (
+                sentinel TEXT NOT NULL,
+                legacy_collision INTEGER NOT NULL DEFAULT 0,
+                legacy_collision_count INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO command_receipts VALUES ('receipt-private', 1, 2);
+            PRAGMA user_version = 28;
+            """
+        )
+
+    with caplog.at_level(logging.WARNING, logger=store_sqlite.__name__):
+        init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        assert _user_version(conn) == 29
+        object_names = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+        assert "herdr_turn_watermarks" not in object_names
+        assert "agent_event_tombstones" not in object_names
+        assert "route_kind" not in {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(backend_pending)")
+        }
+        receipt_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(command_receipts)")
+        }
+        assert "legacy_collision" not in receipt_columns
+        assert "legacy_collision_count" not in receipt_columns
+        assert conn.execute("SELECT COUNT(*) FROM backend_pending").fetchone() == (0,)
+        assert conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone() == (0,)
+
+    message = caplog.records[-1].getMessage()
+    assert "previous_version=28" in message
+    assert "target_version=29" in message
+    assert "table:herdr_turn_watermarks" in message
+    assert "table:agent_event_tombstones" in message
+
+
+def _create_discarded_schema(db_path: Path, version: int) -> None:
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE discarded_data (id INTEGER PRIMARY KEY, value TEXT);
+            CREATE INDEX discarded_index ON discarded_data(value);
+            CREATE TABLE discarded_audit (value TEXT);
+            CREATE TRIGGER discarded_trigger
+            AFTER INSERT ON discarded_data
+            BEGIN
+                INSERT INTO discarded_audit(value) VALUES (NEW.value);
+            END;
+            CREATE VIEW discarded_view AS
+            SELECT id, value FROM discarded_data;
+            INSERT INTO discarded_data(value) VALUES ('must be discarded');
+            """
+        )
+        conn.execute(f"PRAGMA user_version = {int(version)}")
+
+
+def _application_objects(db_path: Path) -> tuple[tuple[str, str], ...]:
+    with sqlite3.connect(str(db_path)) as conn:
+        return tuple(
+            (str(row[0]), str(row[1]))
+            for row in conn.execute(
+                """
+                SELECT type, name FROM sqlite_master
+                WHERE name NOT LIKE 'sqlite_%'
+                ORDER BY type, name
+                """
+            ).fetchall()
+        )
+
+
+def test_older_schema_is_loudly_discarded_and_recreated(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db_path = tmp_path / "older.db"
+    _create_discarded_schema(db_path, store_sqlite.STORE_SCHEMA_VERSION - 1)
+
+    with caplog.at_level(logging.WARNING, logger=store_sqlite.__name__):
+        init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION
+        assert conn.execute(
+            "SELECT COUNT(*) FROM snapshots"
+        ).fetchone() == (0,)
+    names = {name for _kind, name in _application_objects(db_path)}
+    assert not any(name.startswith("discarded_") for name in names)
+    message = caplog.records[-1].getMessage()
+    for discarded in (
+        "view:discarded_view",
+        "trigger:discarded_trigger",
+        "index:discarded_index",
+        "table:discarded_data",
+        "table:discarded_audit",
+    ):
+        assert discarded in message
+
+
+def test_newer_schema_is_loudly_discarded_and_recreated(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db_path = tmp_path / "newer.db"
+    _create_discarded_schema(db_path, store_sqlite.STORE_SCHEMA_VERSION + 1)
+
+    with caplog.at_level(logging.WARNING, logger=store_sqlite.__name__):
+        init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION
+    message = caplog.records[-1].getMessage()
+    assert f"previous_version={store_sqlite.STORE_SCHEMA_VERSION + 1}" in message
+    assert f"target_version={store_sqlite.STORE_SCHEMA_VERSION}" in message
+    assert "table:discarded_data" in message
+
+
+def test_v0_with_application_objects_is_loudly_discarded_and_recreated(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db_path = tmp_path / "v0-with-objects.db"
+    _create_discarded_schema(db_path, 0)
+
+    with caplog.at_level(logging.WARNING, logger=store_sqlite.__name__):
+        init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'discarded_data'"
+        ).fetchone() is None
+    assert "previous_version=0" in caplog.records[-1].getMessage()
+
+
+def test_schema_rebuild_failure_rolls_back_every_discarded_object(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "rebuild-rollback.db"
+    _create_discarded_schema(db_path, store_sqlite.STORE_SCHEMA_VERSION - 1)
+    before = _application_objects(db_path)
+
+    def fail_rebuild(_conn: sqlite3.Connection) -> None:
+        raise RuntimeError("injected rebuild failure")
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "_create_current_schema_objects_conn",
+        fail_rebuild,
+    )
+    with store_sqlite._connect(db_path, prepare=True) as conn:
+        assert conn.execute("PRAGMA foreign_keys").fetchone() == (1,)
+        with pytest.raises(RuntimeError, match="injected rebuild failure"):
+            store_sqlite.ensure_schema(conn)
+        assert conn.execute("PRAGMA foreign_keys").fetchone() == (1,)
+        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION - 1
+        assert conn.execute(
+            "SELECT value FROM discarded_data"
+        ).fetchone() == ("must be discarded",)
+        assert conn.execute(
+            "SELECT value FROM discarded_audit"
+        ).fetchone() == ("must be discarded",)
+    assert _application_objects(db_path) == before
 
 @pytest.mark.parametrize("version", (0, 1))
 @pytest.mark.parametrize(
@@ -9564,6 +7039,10 @@ def test_cross_thread_close_keeps_schema_authority_until_connection_closes(
     try:
         store_sqlite.ensure_schema(conn)
         assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'legacy_sentinel'"
+        ).fetchone() is None
+        assert "snapshots" in _table_names(conn)
         assert len(close_errors) == 1
         assert isinstance(close_errors[0], sqlite3.ProgrammingError)
     finally:
@@ -9880,107 +7359,6 @@ def test_noncurrent_schema_downgrade_recovery_retry_fails_closed(
     assert set(os.listdir("/proc/self/fd")) - before_fds == set()
 
 
-def test_noncurrent_schema_downgrade_external_ex_contention_fails_closed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "downgrade-ex-legacy.db"
-    with sqlite3.connect(str(db_path)) as legacy:
-        legacy.execute("CREATE TABLE legacy_sentinel (value TEXT NOT NULL)")
-        legacy.execute("INSERT INTO legacy_sentinel VALUES ('preserved')")
-        legacy.execute("PRAGMA user_version = 1")
-    os.chmod(tmp_path, 0o700)
-    os.chmod(db_path, 0o600)
-    before_threads = {id(thread) for thread in threading.enumerate()}
-    before_children = {process.pid for process in multiprocessing.active_children()}
-    context = multiprocessing.get_context("spawn")
-    acquired = context.Queue()
-    release = context.Event()
-    process = context.Process(
-        target=_cross_process_hold_parent_lock,
-        args=(str(db_path.parent), fcntl.LOCK_EX, acquired, release),
-    )
-    connection: sqlite3.Connection | None = None
-    lock_fd = -1
-    started = False
-    connection_id = -1
-    try:
-        connection = store_sqlite._connect(db_path, prepare=True)
-        authority = store_sqlite._schema_connection_authority(connection)
-        assert authority.parent_fd is not None
-        parent_fd = authority.parent_fd
-        connection_id = id(connection)
-        original_run_migrations = store_sqlite._run_migrations
-        original_flock = fcntl.flock
-        failed_restores = 0
-
-        def start_external_ex_after_migration(*args: Any, **kwargs: Any) -> None:
-            nonlocal started
-            original_run_migrations(*args, **kwargs)
-            process.start()
-            started = True
-
-        def lose_downgrade_to_external_ex(fd: int, operation: int) -> None:
-            nonlocal failed_restores
-            if fd == parent_fd and operation == (fcntl.LOCK_SH | fcntl.LOCK_NB):
-                failed_restores += 1
-                original_flock(fd, fcntl.LOCK_UN)
-                if failed_restores == 1:
-                    assert acquired.get(timeout=5) is None
-                raise BlockingIOError()
-            original_flock(fd, operation)
-
-        monkeypatch.setattr(
-            store_sqlite,
-            "_run_migrations",
-            start_external_ex_after_migration,
-        )
-        monkeypatch.setattr(
-            store_sqlite.fcntl,
-            "flock",
-            lose_downgrade_to_external_ex,
-        )
-        with pytest.raises(LocalStateError) as caught:
-            store_sqlite.ensure_schema(connection)
-        assert caught.value.code is LocalStateErrorCode.OPERATION_FAILED
-        assert failed_restores == store_sqlite._SCHEMA_PARENT_SHARED_LOCK_RECOVERY_ATTEMPTS
-        with pytest.raises(sqlite3.ProgrammingError):
-            connection.execute("SELECT 1")
-        with pytest.raises(OSError):
-            os.fstat(parent_fd)
-        assert connection_id not in store_sqlite._SCHEMA_CONNECTION_AUTHORITIES
-
-        release.set()
-        process.join(timeout=15)
-        if process.is_alive():
-            pytest.fail("external parent EX holder did not terminate")
-        assert process.exitcode == 0
-        process.close()
-        started = False
-
-        lock_fd = os.open(
-            db_path.parent,
-            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0),
-        )
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-    finally:
-        release.set()
-        if started:
-            process.join(timeout=15)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
-            process.close()
-        if connection is not None:
-            connection.close()
-        if lock_fd >= 0:
-            os.close(lock_fd)
-        acquired.close()
-        acquired.join_thread()
-
-    assert {id(thread) for thread in threading.enumerate()} == before_threads
-    assert {process.pid for process in multiprocessing.active_children()} == before_children
 
 
 def test_noncurrent_schema_live_shared_parent_fails_before_persistent_mutation(
@@ -10042,103 +7420,6 @@ def test_noncurrent_schema_live_shared_parent_fails_before_persistent_mutation(
     assert {process.pid for process in multiprocessing.active_children()} == before_children
 
 
-@pytest.mark.parametrize("change", ("unlink", "replace"))
-def test_noncurrent_schema_finalization_rejects_changed_pinned_main_without_creation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    change: str,
-) -> None:
-    db_path = tmp_path / "unlinked-legacy.db"
-    replacement_bytes = b"replacement main must remain untouched"
-    with sqlite3.connect(str(db_path)) as legacy:
-        legacy.execute("CREATE TABLE legacy_sentinel (value TEXT NOT NULL)")
-        legacy.execute("INSERT INTO legacy_sentinel VALUES ('preserved')")
-        legacy.execute("PRAGMA user_version = 1")
-    os.chmod(tmp_path, 0o700)
-    os.chmod(db_path, 0o600)
-
-    selected_identity = entry_identity(os.lstat(db_path))
-    before_fds = set(os.listdir("/proc/self/fd"))
-    before_threads = {id(thread) for thread in threading.enumerate()}
-    before_children = {process.pid for process in multiprocessing.active_children()}
-    original_prepare = store_sqlite.prepare_sqlite_family_at
-    original_migrations = store_sqlite._run_migrations
-    prepare_calls = 0
-    migrated = False
-    fired = False
-    connection: sqlite3.Connection | None = None
-    lock_fd = -1
-
-    def record_migration(*args: Any, **kwargs: Any) -> None:
-        nonlocal migrated
-        original_migrations(*args, **kwargs)
-        migrated = True
-
-    def change_before_final_family_prepare(
-        parent_fd: int,
-        leaf: str,
-        **kwargs: Any,
-    ) -> tuple[PermissionResult, ...]:
-        nonlocal prepare_calls, fired
-        prepare_calls += 1
-        if prepare_calls == 2:
-            assert migrated
-            assert kwargs["_parent_exclusive_lock_held"] is True
-            assert kwargs["_expected_main_identity"] == selected_identity
-            os.unlink(leaf, dir_fd=parent_fd)
-            if change == "replace":
-                replacement_fd = os.open(
-                    leaf,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                    dir_fd=parent_fd,
-                )
-                try:
-                    os.write(replacement_fd, replacement_bytes)
-                    os.fchmod(replacement_fd, 0o600)
-                finally:
-                    os.close(replacement_fd)
-            fired = True
-        return original_prepare(parent_fd, leaf, **kwargs)
-
-    monkeypatch.setattr(store_sqlite, "_run_migrations", record_migration)
-    monkeypatch.setattr(
-        store_sqlite,
-        "prepare_sqlite_family_at",
-        change_before_final_family_prepare,
-    )
-    try:
-        connection = store_sqlite._connect(db_path, prepare=True)
-        with pytest.raises(LocalStateError) as caught:
-            store_sqlite.ensure_schema(connection)
-
-        assert fired
-        assert prepare_calls == 2
-        assert caught.value.code is LocalStateErrorCode.ENTRY_CHANGED
-        if change == "replace":
-            assert db_path.read_bytes() == replacement_bytes
-            assert _mode(db_path) == 0o600
-        else:
-            assert not db_path.exists()
-        lock_fd = os.open(
-            db_path.parent,
-            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0),
-        )
-        with pytest.raises(BlockingIOError):
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    finally:
-        if connection is not None:
-            connection.close()
-        if lock_fd >= 0:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
-
-    if change == "replace":
-        assert db_path.read_bytes() == replacement_bytes
-    assert set(os.listdir("/proc/self/fd")) - before_fds == set()
-    assert {id(thread) for thread in threading.enumerate()} == before_threads
-    assert {process.pid for process in multiprocessing.active_children()} == before_children
 
 
 def test_noncurrent_schema_keeps_sidecars_private_and_restores_shared_parent_lock(
@@ -10163,8 +7444,9 @@ def test_noncurrent_schema_keeps_sidecars_private_and_restores_shared_parent_loc
 
         assert _user_version(connection) == store_sqlite.STORE_SCHEMA_VERSION
         assert connection.execute(
-            "SELECT value FROM legacy_sentinel"
-        ).fetchone() == ("preserved",)
+            "SELECT 1 FROM sqlite_master WHERE name = 'legacy_sentinel'"
+        ).fetchone() is None
+        assert "snapshots" in _table_names(connection)
         for suffix in ("", "-wal", "-shm"):
             assert _mode(Path(f"{db_path}{suffix}")) == 0o600
 
@@ -10190,224 +7472,10 @@ def test_noncurrent_schema_keeps_sidecars_private_and_restores_shared_parent_loc
     assert {process.pid for process in multiprocessing.active_children()} == before_children
 
 
-def test_direct_empty_creation_does_not_replay_migration_registry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "direct-current.db"
-    monkeypatch.setattr(
-        store_sqlite,
-        "MIGRATIONS",
-        tuple(
-            store_sqlite.Migration(
-                migration.from_version,
-                migration.to_version,
-                lambda _conn: (_ for _ in ()).throw(
-                    AssertionError("direct creation replayed history")
-                ),
-            )
-            for migration in store_sqlite.MIGRATIONS
-        ),
-    )
-
-    init_store(db_path)
-
-    with sqlite3.connect(str(db_path)) as conn:
-        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION
-        assert "turn_list_hosts" in _table_names(conn)
-        assert {"store_maintenance_state", "turn_list_state"} <= _table_names(conn)
-        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
-def test_v13_migration_repairs_nonpositive_turn_sequences_and_blocks_recurrence(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "legacy-turn-sequence.db"
-    observed_at = "2026-07-15T00:00:00+00:00"
-    with sqlite3.connect(str(db_path)) as conn:
-        store_sqlite._run_migrations(conn, target_version=13)
-        conn.execute("DROP TABLE turns")
-        conn.execute(
-            store_sqlite.CREATE_TURNS_TABLE.replace(
-                " CHECK (list_sequence > 0)",
-                "",
-            )
-        )
-        for statement in store_sqlite.CREATE_TURN_LIST_INDEXES:
-            conn.execute(statement)
-        for turn_id, sequence in (("turn-valid", 5), ("turn-invalid", 0)):
-            payload = {
-                "id": turn_id,
-                "worker_id": "worker-a",
-                "status": "complete",
-                "kind": "prompt",
-                "source": "snapshot",
-                "updated_at": observed_at,
-            }
-            conn.execute(
-                """
-                INSERT INTO turns (
-                    host_id, turn_id, worker_id, worker_fingerprint, space_id,
-                    status, kind, updated_at, fingerprint,
-                    snapshot_content_fingerprint, observed_at, payload_json,
-                    list_sequence
-                ) VALUES (?, ?, 'worker-a', NULL, NULL, 'complete', 'prompt',
-                          ?, '', '', ?, ?, ?)
-                """,
-                (
-                    "legacy-host",
-                    turn_id,
-                    observed_at,
-                    observed_at,
-                    json.dumps(payload),
-                    sequence,
-                ),
-            )
-        conn.execute(
-            """
-            INSERT INTO turn_list_hosts (
-                host_id, next_sequence, traversal_generation
-            ) VALUES ('legacy-host', 6, 7)
-            """
-        )
-        conn.commit()
-    os.chmod(tmp_path, 0o700)
-    os.chmod(db_path, 0o600)
-
-    init_store(db_path)
-
-    with sqlite3.connect(str(db_path)) as conn:
-        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION == 28
-        assert conn.execute(
-            """
-            SELECT turn_id, list_sequence
-            FROM turns
-            WHERE host_id = 'legacy-host'
-            ORDER BY list_sequence
-            """
-        ).fetchall() == [("turn-valid", 5), ("turn-invalid", 6)]
-        assert conn.execute(
-            """
-            SELECT next_sequence, traversal_generation
-            FROM turn_list_hosts
-            WHERE host_id = 'legacy-host'
-            """
-        ).fetchone() == (7, 8)
-        assert conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM sqlite_master
-            WHERE type = 'trigger'
-              AND name LIKE 'trg_turns_positive_list_sequence_%'
-            """
-        ).fetchone() == (2,)
-        with pytest.raises(sqlite3.IntegrityError, match="invalid turn list sequence"):
-            conn.execute(
-                """
-                UPDATE turns SET list_sequence = 0
-                WHERE host_id = 'legacy-host' AND turn_id = 'turn-valid'
-                """
-            )
-        conn.rollback()
-        with pytest.raises(sqlite3.IntegrityError, match="invalid turn list sequence"):
-            conn.execute(
-                """
-                INSERT INTO turns (
-                    host_id, turn_id, worker_id, status, kind, fingerprint,
-                    snapshot_content_fingerprint, observed_at, payload_json,
-                    list_sequence
-                ) VALUES (
-                    'legacy-host', 'turn-recurrence', 'worker-a', 'complete',
-                    'prompt', '', '', ?, '{}', 0
-                )
-                """,
-                (observed_at,),
-            )
-        conn.rollback()
-
-    first = turns_payload_from_store(
-        db_path,
-        "legacy-host",
-        schema_version=2,
-        limit=1,
-        now=1_800_000_000,
-    )
-    assert first["has_more"] is True
-    assert isinstance(first["next_cursor"], str)
-    second = turns_payload_from_store(
-        db_path,
-        "legacy-host",
-        schema_version=2,
-        limit=1,
-        cursor=first["next_cursor"],
-        now=1_800_000_001,
-    )
-    assert second["has_more"] is False
-    assert [item["id"] for item in first["turns"] + second["turns"]] == [
-        "turn-invalid",
-        "turn-valid",
-    ]
 
 
-@pytest.mark.parametrize("source_version", range(store_sqlite.STORE_SCHEMA_VERSION))
-def test_migration_registry_transition_rolls_back_resumes_and_reruns(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    source_version: int,
-) -> None:
-    db_path = tmp_path / f"registry-{source_version}.db"
-    original_registry = store_sqlite.MIGRATIONS
-    assert tuple(
-        (migration.from_version, migration.to_version)
-        for migration in original_registry
-    ) == tuple(
-        (version, version + 1)
-        for version in range(store_sqlite.STORE_SCHEMA_VERSION)
-    )
-
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("CREATE TABLE durable_sentinel (value TEXT NOT NULL)")
-        conn.execute("INSERT INTO durable_sentinel VALUES ('preserved')")
-        conn.commit()
-        store_sqlite._run_migrations(conn, target_version=source_version)
-        assert _user_version(conn) == source_version
-
-        transition = original_registry[source_version]
-
-        def apply_then_fail(current: sqlite3.Connection) -> None:
-            transition.apply(current)
-            raise RuntimeError("controlled migration interruption")
-
-        interrupted = list(original_registry)
-        interrupted[source_version] = store_sqlite.Migration(
-            transition.from_version,
-            transition.to_version,
-            apply_then_fail,
-        )
-        monkeypatch.setattr(store_sqlite, "MIGRATIONS", tuple(interrupted))
-        with pytest.raises(RuntimeError, match="controlled migration interruption"):
-            store_sqlite._run_migrations(
-                conn,
-                target_version=source_version + 1,
-            )
-        assert _user_version(conn) == source_version
-        assert conn.execute("SELECT value FROM durable_sentinel").fetchone() == (
-            "preserved",
-        )
-
-        monkeypatch.setattr(store_sqlite, "MIGRATIONS", original_registry)
-        store_sqlite._run_migrations(conn, target_version=source_version + 1)
-        assert _user_version(conn) == source_version + 1
-        conn.execute("BEGIN IMMEDIATE")
-        transition.apply(conn)
-        conn.commit()
-        assert conn.execute("SELECT value FROM durable_sentinel").fetchone() == (
-            "preserved",
-        )
-        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_ten_thousand_adjacent_identical_saves_keep_one_row_and_event(
@@ -10648,417 +7716,8 @@ def test_snapshot_created_at_is_canonical_utc_and_invalid_input_fails_before_ope
     assert not invalid_path.parent.exists()
 
 
-def test_v7_timestamp_normalization_is_transactional_idempotent_and_age_safe(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "offset-migration.db"
-    init_store(db_path)
-    raw_rows = [
-        (
-            "2026-07-01T01:00:00+02:00",
-            "valid-old-positive-offset",
-        ),
-        (
-            "2026-06-30T13:00:00-12:00",
-            "adversarial-newer-negative-offset",
-        ),
-        ("malformed-legacy-time", "malformed-quarantine"),
-        (
-            "0001-01-01T00:00:00+14:00",
-            "underflow-quarantine",
-        ),
-        (
-            "9999-12-31T23:59:59-14:00",
-            "overflow-quarantine",
-        ),
-        (
-            store_sqlite._LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE,
-            "legacy-year-9999-quarantine",
-        ),
-        (
-            store_sqlite._LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE,
-            "legacy-sentinel-malformed-payload",
-        ),
-        (
-            store_sqlite._LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE,
-            "legacy-sentinel-different-payload",
-        ),
-        (
-            store_sqlite._LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE,
-            "legacy-sentinel-underflow-payload",
-        ),
-        (
-            store_sqlite._LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE,
-            "legacy-sentinel-overflow-payload",
-        ),
-        (
-            store_sqlite._LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE,
-            "legitimate-year-9999-observation",
-        ),
-        (
-            "2026-07-01T00:30:00+02:00",
-            "old-but-latest",
-        ),
-    ]
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute("DELETE FROM snapshots")
-        conn.executemany(
-            """
-            INSERT INTO snapshots (
-                host_id, created_at, content_fingerprint, payload
-            ) VALUES ('offset-host', ?, ?, '{}')
-            """,
-            raw_rows,
-        )
-        conn.executemany(
-            """
-            UPDATE snapshots
-            SET payload = ?
-            WHERE content_fingerprint = ?
-            """,
-            (
-                (
-                    json.dumps({"updated_at": updated_at}, sort_keys=True),
-                    fingerprint,
-                )
-                for fingerprint, updated_at in (
-                    ("legacy-sentinel-malformed-payload", "not-a-time"),
-                    (
-                        "legacy-sentinel-different-payload",
-                        "2026-01-01T00:00:00+00:00",
-                    ),
-                    (
-                        "legacy-sentinel-underflow-payload",
-                        "0001-01-01T00:00:00+14:00",
-                    ),
-                    (
-                        "legacy-sentinel-overflow-payload",
-                        "9999-12-31T23:59:59-14:00",
-                    ),
-                    (
-                        "legitimate-year-9999-observation",
-                        store_sqlite._LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE,
-                    ),
-                )
-            ),
-        )
-        conn.execute("DROP TABLE store_maintenance_state")
-        conn.execute("DROP INDEX idx_snapshots_host_newest")
-        conn.execute("DROP INDEX idx_snapshots_created_host_id")
-        conn.execute(
-            "CREATE INDEX idx_snapshots_host_id ON snapshots(host_id)"
-        )
-        conn.execute(
-            "CREATE INDEX idx_snapshots_created_at ON snapshots(created_at)"
-        )
-        conn.execute(
-            """
-            CREATE INDEX idx_snapshots_content_fingerprint
-            ON snapshots(content_fingerprint)
-            """
-        )
-        conn.execute("PRAGMA user_version = 7")
-
-    original_registry = store_sqlite.MIGRATIONS
-    transition = original_registry[7]
-
-    def normalize_then_fail(conn: sqlite3.Connection) -> None:
-        transition.apply(conn)
-        raise RuntimeError("controlled timestamp migration interruption")
-
-    interrupted = list(original_registry)
-    interrupted[7] = store_sqlite.Migration(7, 8, normalize_then_fail)
-    monkeypatch.setattr(store_sqlite, "MIGRATIONS", tuple(interrupted))
-    with pytest.raises(
-        RuntimeError,
-        match="controlled timestamp migration interruption",
-    ):
-        init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        assert _user_version(conn) == 7
-        assert conn.execute(
-            """
-            SELECT created_at, content_fingerprint
-            FROM snapshots
-            ORDER BY id
-            """
-        ).fetchall() == raw_rows
-        assert "store_maintenance_state" not in _table_names(conn)
-
-    monkeypatch.setattr(store_sqlite, "MIGRATIONS", original_registry)
-    init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        normalized = conn.execute(
-            """
-            SELECT created_at, content_fingerprint
-            FROM snapshots
-            ORDER BY id
-            """
-        ).fetchall()
-        indexes = {
-            str(row[1])
-            for row in conn.execute("PRAGMA index_list(snapshots)").fetchall()
-        }
-        conn.execute("BEGIN IMMEDIATE")
-        store_sqlite._migrate_v7_to_v8_conn(conn)
-        conn.commit()
-        rerun = conn.execute(
-            """
-            SELECT created_at, content_fingerprint
-            FROM snapshots
-            ORDER BY id
-            """
-        ).fetchall()
-
-    assert normalized == [
-        (
-            "2026-06-30T23:00:00+00:00",
-            "valid-old-positive-offset",
-        ),
-        (
-            "2026-07-01T01:00:00+00:00",
-            "adversarial-newer-negative-offset",
-        ),
-        (
-            store_sqlite._SNAPSHOT_CREATED_AT_QUARANTINE,
-            "malformed-quarantine",
-        ),
-        (
-            store_sqlite._SNAPSHOT_CREATED_AT_QUARANTINE,
-            "underflow-quarantine",
-        ),
-        (
-            store_sqlite._SNAPSHOT_CREATED_AT_QUARANTINE,
-            "overflow-quarantine",
-        ),
-        (
-            store_sqlite._SNAPSHOT_CREATED_AT_QUARANTINE,
-            "legacy-year-9999-quarantine",
-        ),
-        (
-            store_sqlite._SNAPSHOT_CREATED_AT_QUARANTINE,
-            "legacy-sentinel-malformed-payload",
-        ),
-        (
-            store_sqlite._SNAPSHOT_CREATED_AT_QUARANTINE,
-            "legacy-sentinel-different-payload",
-        ),
-        (
-            store_sqlite._SNAPSHOT_CREATED_AT_QUARANTINE,
-            "legacy-sentinel-underflow-payload",
-        ),
-        (
-            store_sqlite._SNAPSHOT_CREATED_AT_QUARANTINE,
-            "legacy-sentinel-overflow-payload",
-        ),
-        (
-            store_sqlite._LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE,
-            "legitimate-year-9999-observation",
-        ),
-        (
-            "2026-06-30T22:30:00+00:00",
-            "old-but-latest",
-        ),
-    ]
-    assert (
-        store_sqlite._strict_utc_timestamp(
-            store_sqlite._SNAPSHOT_CREATED_AT_QUARANTINE
-        )
-        is None
-    )
-    assert (
-        store_sqlite._SNAPSHOT_CREATED_AT_QUARANTINE
-        > store_sqlite._LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE
-    )
-    assert rerun == normalized
-    assert indexes == {
-        "idx_snapshots_host_newest",
-        "idx_snapshots_created_host_id",
-    }
-
-    cleanup = store_sqlite.cleanup_snapshot_retention(
-        db_path,
-        retention_days=1,
-        retention_count=100,
-        batch_size=100,
-        now="2026-07-02T00:00:00Z",
-    )
-    with sqlite3.connect(str(db_path)) as conn:
-        retained = conn.execute(
-            """
-            SELECT content_fingerprint
-            FROM snapshots
-            ORDER BY id
-            """
-        ).fetchall()
-        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
-        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
-
-    assert cleanup["deleted"] == 1
-    assert retained == [
-        ("adversarial-newer-negative-offset",),
-        ("malformed-quarantine",),
-        ("underflow-quarantine",),
-        ("overflow-quarantine",),
-        ("legacy-year-9999-quarantine",),
-        ("legacy-sentinel-malformed-payload",),
-        ("legacy-sentinel-different-payload",),
-        ("legacy-sentinel-underflow-payload",),
-        ("legacy-sentinel-overflow-payload",),
-        ("legitimate-year-9999-observation",),
-        ("old-but-latest",),
-    ]
-    assert integrity == "ok"
-    assert foreign_keys == []
 
 
-def test_legacy_sentinel_mismatched_payload_recovers_then_remains_monotonic(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "quarantine-recovery.db"
-    config = Config(host_id="quarantine-host", db_path=db_path)
-    base_at = "2026-01-01T00:00:00+00:00"
-    fresh_at = "2027-01-01T00:00:00+00:00"
-    stale_at = "2026-06-01T00:00:00+00:00"
-    base = _snapshot_with_worker_status(
-        config,
-        status="blocked",
-        observed_at=base_at,
-    )
-    fresh = _snapshot_with_worker_status(
-        config,
-        status="blocked",
-        observed_at=fresh_at,
-    )
-    stale = _snapshot_with_worker_status(
-        config,
-        status="blocked",
-        observed_at=stale_at,
-    )
-    assert {
-        base.content_fingerprint,
-        fresh.content_fingerprint,
-        stale.content_fingerprint,
-    } == {base.content_fingerprint}
-    _save_observation(db_path, base, "positive", base_at)
-
-    with sqlite3.connect(str(db_path)) as conn:
-        row_id = conn.execute(
-            """
-            SELECT id
-            FROM snapshots
-            WHERE host_id = ?
-            """,
-            ("quarantine-host",),
-        ).fetchone()[0]
-        conn.execute(
-            """
-            UPDATE snapshots
-            SET created_at = ?
-            WHERE id = ?
-            """,
-            (
-                store_sqlite._LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE,
-                row_id,
-            ),
-        )
-        conn.execute(
-            """
-            UPDATE workers
-            SET observed_at = 'malformed-legacy-time'
-            WHERE host_id = ?
-            """,
-            ("quarantine-host",),
-        )
-        conn.execute(
-            """
-            UPDATE backend_health
-            SET observed_at = 'malformed-legacy-time'
-            WHERE host_id = ?
-            """,
-            ("quarantine-host",),
-        )
-        conn.execute("DROP TABLE store_maintenance_state")
-        conn.execute("DROP INDEX idx_snapshots_host_newest")
-        conn.execute("DROP INDEX idx_snapshots_created_host_id")
-        conn.execute("PRAGMA user_version = 7")
-
-    init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        assert conn.execute(
-            "SELECT created_at FROM snapshots WHERE id = ?",
-            (row_id,),
-        ).fetchone() == (store_sqlite._SNAPSHOT_CREATED_AT_QUARANTINE,)
-
-    _save_observation(db_path, fresh, "positive", fresh_at)
-
-    def current_state() -> tuple[Any, ...]:
-        with sqlite3.connect(str(db_path)) as conn:
-            retained = conn.execute(
-                """
-                SELECT id, created_at, payload
-                FROM snapshots
-                WHERE host_id = ?
-                """,
-                ("quarantine-host",),
-            ).fetchone()
-            return (
-                int(retained[0]),
-                str(retained[1]),
-                json.loads(retained[2])["updated_at"],
-                conn.execute(
-                    """
-                    SELECT observed_at
-                    FROM workers
-                    WHERE host_id = ? AND worker_id = 'worker-1'
-                    """,
-                    ("quarantine-host",),
-                ).fetchone()[0],
-                conn.execute(
-                    """
-                    SELECT observed_at
-                    FROM backend_health
-                    WHERE host_id = ? AND backend_name = 'herdr'
-                    """,
-                    ("quarantine-host",),
-                ).fetchone()[0],
-                conn.execute(
-                    """
-                    SELECT last_seen_at, signal_count
-                    FROM attention_items
-                    WHERE host_id = ?
-                    """,
-                    ("quarantine-host",),
-                ).fetchone(),
-                conn.execute(
-                    "SELECT COUNT(*) FROM snapshots WHERE host_id = ?",
-                    ("quarantine-host",),
-                ).fetchone()[0],
-                conn.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM events
-                    WHERE host_id = ? AND event_type = 'snapshot.saved'
-                    """,
-                    ("quarantine-host",),
-                ).fetchone()[0],
-            )
-
-    recovered = current_state()
-    assert recovered == (
-        row_id,
-        fresh_at,
-        fresh_at,
-        fresh_at,
-        fresh_at,
-        (fresh_at, 2),
-        1,
-        1,
-    )
-
-    _save_observation(db_path, stale, "positive", stale_at)
-    assert current_state() == recovered
 
 
 
@@ -12242,7 +8901,7 @@ def test_compact_store_dry_run_reports_low_headroom_without_mutating(
     assert _tree_metadata(tmp_path) == before
 
 
-def test_compact_store_requires_current_v9_without_migrating(
+def test_compact_store_requires_current_schema_without_rebuilding(
     tmp_path: Path,
 ) -> None:
     db_path, _private_payload = _seed_compaction_fixture(tmp_path)
@@ -12567,450 +9226,8 @@ def test_compact_store_cleans_vacuum_output_when_sqlite_raises_after_creation(
     _assert_compaction_logical_evidence(db_path)
 
 
-def test_v7_to_current_conservatively_classifies_legacy_final_and_preserves_state(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "complete-preservation.db"
-    backup_path = tmp_path / "complete-preservation-backup.db"
-    init_store(db_path)
-    old_rows = [
-        (
-            host_id,
-            f"2025-12-{sequence + 1:02d}T00:00:00+00:00",
-            f"old-{host_id}-{sequence}",
-            json.dumps({"old": sequence, "host_id": host_id}, sort_keys=True),
-        )
-        for host_id in ("host-a", "host-b")
-        for sequence in range(3)
-    ]
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.executemany(
-            """
-            INSERT INTO snapshots (
-                host_id, created_at, content_fingerprint, payload
-            ) VALUES (?, ?, ?, ?)
-            """,
-            old_rows,
-        )
-
-    host_a_config = Config(host_id="host-a", db_path=db_path)
-    host_b_config = Config(host_id="host-b", db_path=db_path)
-    host_a_snapshot = project_from_raw(
-        host_a_config,
-        spaces=[{"id": "space-a", "name": "Space A", "status": "active"}],
-        workers=[
-            {
-                "id": "worker-1",
-                "name": "Worker One",
-                "status": "pending",
-                "space_id": "space-a",
-                "summary": "human approval required before continuing",
-            }
-        ],
-        backend_health=[
-            {
-                "name": "herdr",
-                "status": "healthy",
-                "outcome": "healthy_non_empty",
-                "observed_at": "2026-01-31T00:00:00+00:00",
-                "counts": {"workers": 1},
-            }
-        ],
-        timestamp=datetime.fromisoformat("2026-01-31T00:00:00+00:00"),
-    )
-    host_b_snapshot = project_from_raw(
-        host_b_config,
-        spaces=[{"id": "space-b", "name": "Space B", "status": "active"}],
-        workers=[
-            {
-                "id": "worker-b",
-                "name": "Worker B",
-                "status": "active",
-                "space_id": "space-b",
-            }
-        ],
-        backend_health=[
-            {
-                "name": "herdr",
-                "status": "healthy",
-                "outcome": "healthy_non_empty",
-                "observed_at": "2026-01-31T00:01:00+00:00",
-                "counts": {"workers": 1},
-            }
-        ],
-        timestamp=datetime.fromisoformat("2026-01-31T00:01:00+00:00"),
-    )
-    _save_observation(
-        db_path,
-        host_a_snapshot,
-        "positive",
-        "2026-01-31T00:00:00+00:00",
-    )
-    _save_observation(
-        db_path,
-        host_b_snapshot,
-        "positive",
-        "2026-01-31T00:01:00+00:00",
-    )
-    assert merge_turn_content(
-        db_path,
-        "host-a",
-        "worker-1",
-        {
-            "user_text": "Preserve this prompt.",
-            "assistant_final_text": "Preserve this final.",
-            "complete": True,
-            "has_open_turn": False,
-            "source_turn_id": "complete-preservation-turn",
-        },
-        observed_at="2026-01-31T00:02:00+00:00",
-    ) == 1
-    assert upsert_worker_bindings(
-        db_path,
-        [
-            _worker_binding(
-                observed_at="2026-01-31T00:00:00+00:00",
-                expires_at="2027-01-31T00:00:00+00:00",
-            )
-        ],
-    ) == 1
-    reserved = reserve_command_request(
-        db_path,
-        host_id="host-a",
-        request_id="preserved-request",
-        action="send_instruction",
-        canonical_version=1,
-        canonical_fingerprint="preserved-command-fingerprint",
-        canonical_request_json='{"action":"send_instruction"}',
-        public_worker_id="worker-1",
-        pending_result_json='{"status":"pending"}',
-        now="2026-01-31T00:02:01+00:00",
-    )
-    assert reserved["status"] == "reserved"
-    started = mark_command_send_started(
-        db_path,
-        host_id="host-a",
-        request_id="preserved-request",
-        canonical_fingerprint="preserved-command-fingerprint",
-        owner_token=reserved["owner_token"],
-        binding_fingerprint="preserved-private-binding",
-        now="2026-01-31T00:02:02+00:00",
-    )
-    finish_command_request(
-        db_path,
-        host_id="host-a",
-        request_id="preserved-request",
-        canonical_fingerprint="preserved-command-fingerprint",
-        owner_token=started["owner_token"],
-        expected_state="send_started",
-        terminal_state="accepted",
-        status=STATUS_ACCEPTED,
-        result_json='{"status":"accepted","result":"preserved"}',
-        now="2026-01-31T00:02:03+00:00",
-    )
-    assert store_sqlite.merge_backend_pending(
-        db_path,
-        "host-a",
-        "worker-1",
-        {"kind": "approval", "safe": "preserved"},
-    )
-    leased = poll_connector_outbox(
-        db_path,
-        "host-a",
-        "attention",
-        now="2026-01-31T00:03:00+00:00",
-    )
-    assert len(leased["items"]) == 1
-
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO pending_interactions (
-                host_id, pending_id, worker_id, worker_fingerprint, space_id,
-                kind, status, updated_at, fingerprint,
-                snapshot_content_fingerprint, observed_at, payload_json
-            ) VALUES (
-                'host-a', 'durable-pending', 'worker-1', 'worker-fingerprint',
-                'space-a', 'approval', 'pending',
-                '2026-01-31T00:00:00+00:00', 'pending-fingerprint',
-                ?, '2026-01-31T00:00:00+00:00',
-                '{"kind":"approval","safe":"preserved"}'
-            )
-            """,
-            (host_a_snapshot.content_fingerprint,),
-        )
-        conn.execute(
-            "CREATE TABLE unrelated_preservation_sentinel (value TEXT NOT NULL)"
-        )
-        conn.execute(
-            "INSERT INTO unrelated_preservation_sentinel VALUES ('preserved')"
-        )
-        conn.execute("DROP TABLE store_maintenance_state")
-        conn.execute("DROP INDEX idx_snapshots_host_newest")
-        conn.execute("DROP INDEX idx_snapshots_created_host_id")
-        conn.execute(
-            "CREATE INDEX idx_snapshots_host_id ON snapshots(host_id)"
-        )
-        conn.execute(
-            "CREATE INDEX idx_snapshots_created_at ON snapshots(created_at)"
-        )
-        conn.execute(
-            """
-            CREATE INDEX idx_snapshots_content_fingerprint
-            ON snapshots(content_fingerprint)
-            """
-        )
-        conn.execute("PRAGMA user_version = 7")
-
-    preserved_tables = (
-        "commands",
-        "command_receipts",
-        "worker_bindings",
-        "pending_interactions",
-        "backend_pending",
-        "attention_items",
-        "attention_lifecycles",
-        "spaces",
-        "workers",
-        "turns",
-        "turn_content_revisions",
-        "turn_content_page_boundaries",
-        "backend_health",
-        "connector_outbox",
-        "connector_deliveries",
-        "unrelated_preservation_sentinel",
-    )
-
-    def logical_evidence() -> dict[str, Any]:
-        with sqlite3.connect(str(db_path)) as conn:
-            table_rows = {
-                table: tuple(
-                    sorted(
-                        (
-                            tuple(row)
-                            for row in conn.execute(
-                                f"SELECT * FROM {table}"
-                            ).fetchall()
-                        ),
-                        key=repr,
-                    )
-                )
-                for table in preserved_tables
-            }
-            latest = tuple(
-                conn.execute(
-                    """
-                    SELECT snapshot.host_id, snapshot.content_fingerprint,
-                           snapshot.payload
-                    FROM snapshots AS snapshot
-                    WHERE snapshot.id = (
-                        SELECT MAX(newest.id)
-                        FROM snapshots AS newest
-                        WHERE newest.host_id = snapshot.host_id
-                    )
-                    ORDER BY snapshot.host_id
-                    """
-                ).fetchall()
-            )
-            snapshot_count = int(
-                conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
-            )
-            return {
-                "tables": table_rows,
-                "latest": latest,
-                "snapshot_count": snapshot_count,
-                "integrity": conn.execute(
-                    "PRAGMA integrity_check"
-                ).fetchone()[0],
-                "foreign_keys": conn.execute(
-                    "PRAGMA foreign_key_check"
-                ).fetchall(),
-            }
-
-    before_migration = logical_evidence()
-    assert all(before_migration["tables"][table] for table in preserved_tables)
-    assert before_migration["snapshot_count"] == 8
-    assert before_migration["integrity"] == "ok"
-    assert before_migration["foreign_keys"] == []
-
-    init_store(db_path)
-    after_migration = logical_evidence()
-    for table in preserved_tables:
-        if table != "connector_outbox":
-            assert after_migration["tables"][table] == before_migration["tables"][table]
-    assert after_migration["latest"] == before_migration["latest"]
-    assert after_migration["snapshot_count"] == before_migration["snapshot_count"]
-    with sqlite3.connect(str(db_path)) as conn:
-        legacy_final = conn.execute(
-            """
-            SELECT delivery_kind, status, payload_json
-            FROM connector_outbox
-            WHERE host_id = 'host-a' AND connector = 'turn-final'
-            """
-        ).fetchone()
-    assert legacy_final is not None
-    assert legacy_final[:2] == ("final_migration_hold", "dead_letter")
-    assert json.loads(legacy_final[2])["operation"] == "materialize"
-    assert poll_connector_outbox(
-        db_path,
-        "host-a",
-        "turn-final",
-        now="2026-01-31T00:04:00+00:00",
-    )["items"] == []
-    with sqlite3.connect(str(db_path)) as conn:
-        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION
-        assert conn.execute(
-            "SELECT scope FROM store_maintenance_state"
-        ).fetchone() == ("automatic",)
-
-    while True:
-        retention = store_sqlite.cleanup_snapshot_retention(
-            db_path,
-            retention_days=14,
-            retention_count=1,
-            batch_size=2,
-            now="2026-02-01T00:00:00+00:00",
-        )
-        if not retention["remaining_candidates"]:
-            break
-    after_retention = logical_evidence()
-    assert after_retention["tables"] == after_migration["tables"]
-    assert after_retention["latest"] == after_migration["latest"]
-    assert after_retention["snapshot_count"] == 2
-    assert after_retention["integrity"] == "ok"
-    assert after_retention["foreign_keys"] == []
-
-    compacted = compact_store(
-        db_path,
-        options=CompactionOptions(
-            dry_run=False,
-            acknowledge_offline=True,
-            backup_path=backup_path,
-            snapshot_retention_days=14,
-            snapshot_retention_count=1,
-            batch_size=2,
-        ),
-        now="2026-02-01T00:00:00+00:00",
-    )
-    after_compaction = logical_evidence()
-    assert compacted["status"] == "completed"
-    assert compacted["ok"] is True
-    assert after_compaction == after_retention
-    assert backup_path.is_file()
 
 
-def test_store_v8_to_v9_backfills_host_local_sequences_and_paging_indexes(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "turn-v8-to-v9.db"
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute(
-            """
-            CREATE TABLE turns (
-                host_id TEXT NOT NULL,
-                turn_id TEXT NOT NULL,
-                worker_id TEXT NOT NULL,
-                worker_fingerprint TEXT,
-                space_id TEXT,
-                status TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                updated_at TEXT,
-                fingerprint TEXT NOT NULL,
-                snapshot_content_fingerprint TEXT NOT NULL,
-                observed_at TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                PRIMARY KEY (host_id, turn_id)
-            )
-            """
-        )
-        conn.execute("PRAGMA user_version=8")
-        rows = (
-            ("host-a", "turn-c", "worker-a", "2026-01-02T00:00:00+00:00"),
-            ("host-a", "turn-b", "worker-a", "2026-01-01T00:00:00+00:00"),
-            ("host-a", "turn-a", "worker-a", "2026-01-01T00:00:00+00:00"),
-            ("host-b", "turn-z", "worker-z", "2026-01-03T00:00:00+00:00"),
-        )
-        for host_id, turn_id, worker_id, observed_at in rows:
-            conn.execute(
-                """
-                INSERT INTO turns (
-                    host_id, turn_id, worker_id, worker_fingerprint, space_id,
-                    status, kind, updated_at, fingerprint,
-                    snapshot_content_fingerprint, observed_at, payload_json
-                ) VALUES (?, ?, ?, NULL, NULL, 'active', 'task', ?, '', '', ?, '{}')
-                """,
-                (host_id, turn_id, worker_id, observed_at, observed_at),
-            )
-        conn.commit()
-
-    init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        first = conn.execute(
-            """
-            SELECT host_id, turn_id, list_sequence
-            FROM turns
-            ORDER BY host_id, list_sequence
-            """
-        ).fetchall()
-        indexes = {
-            str(row[1]): tuple(
-                str(column[2])
-                for column in conn.execute(
-                    f"PRAGMA index_info({row[1]})"
-                ).fetchall()
-            )
-            for row in conn.execute("PRAGMA index_list(turns)").fetchall()
-        }
-        epoch = conn.execute(
-            "SELECT store_epoch FROM turn_list_state WHERE scope = 'turn-list'"
-        ).fetchone()[0]
-        host_states = conn.execute(
-            """
-            SELECT host_id, next_sequence, traversal_generation
-            FROM turn_list_hosts
-            ORDER BY host_id
-            """
-        ).fetchall()
-        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION
-    init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        second = conn.execute(
-            """
-            SELECT host_id, turn_id, list_sequence
-            FROM turns
-            ORDER BY host_id, list_sequence
-            """
-        ).fetchall()
-        second_epoch = conn.execute(
-            "SELECT store_epoch FROM turn_list_state WHERE scope = 'turn-list'"
-        ).fetchone()[0]
-        second_host_states = conn.execute(
-            """
-            SELECT host_id, next_sequence, traversal_generation
-            FROM turn_list_hosts
-            ORDER BY host_id
-            """
-        ).fetchall()
-
-    assert first == [
-        ("host-a", "turn-a", 1),
-        ("host-a", "turn-b", 2),
-        ("host-a", "turn-c", 3),
-        ("host-b", "turn-z", 1),
-    ]
-    assert second == first
-    assert second_epoch == epoch
-    assert host_states == second_host_states == [
-        ("host-a", 4, 1),
-        ("host-b", 2, 1),
-    ]
-    assert indexes["ux_turns_host_list_sequence"] == ("host_id", "list_sequence")
-    assert indexes["idx_turns_host_worker_list_sequence"] == (
-        "host_id",
-        "worker_id",
-        "list_sequence",
-        "turn_id",
-    )
 
 
 def test_all_api_turn_insertions_allocate_unique_immutable_sequences_concurrently(
@@ -13030,7 +9247,7 @@ def test_all_api_turn_insertions_allocate_unique_immutable_sequences_concurrentl
     def insert_observation(index: int) -> None:
         try:
             barrier.wait(timeout=10)
-            assert merge_turn_content(
+            assert apply_test_turn_refresh(
                 db_path,
                 host_id,
                 "worker-1",
@@ -13097,7 +9314,7 @@ def test_turn_list_pagination_is_insert_stable_and_since_discovers_only_new_rows
     init_store(db_path)
     save_snapshot(db_path, snapshot)
     for index, worker in enumerate(snapshot.workers):
-        assert merge_turn_content(
+        assert apply_test_turn_refresh(
             db_path,
             host_id,
             worker.id,
@@ -13123,7 +9340,7 @@ def test_turn_list_pagination_is_insert_stable_and_since_discovers_only_new_rows
                 (host_id,),
             ).fetchall()
         }
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         snapshot.workers[0].id,
@@ -13180,7 +9397,7 @@ def test_turn_list_tokens_distinguish_invalid_cursor_cursor_expiry_and_since_exp
     init_store(db_path)
     save_snapshot(db_path, snapshot)
     for index, worker in enumerate(snapshot.workers):
-        assert merge_turn_content(
+        assert apply_test_turn_refresh(
             db_path,
             "expiry-host",
             worker.id,
@@ -13273,6 +9490,17 @@ def test_turn_list_pages_remain_below_frame_cap_for_over_one_mib_logical_list(
                     index + 1,
                 ),
             )
+            store_sqlite._insert_turn_content_revision_conn(
+                conn,
+                host_id=host_id,
+                turn_id=str(item["id"]),
+                user_text=None,
+                assistant_final_text=str(item["assistant_final_text"]),
+                user_state="absent",
+                final_state="complete",
+                created_at=str(item["updated_at"]),
+                is_current=True,
+            )
         conn.commit()
 
     ids: list[str] = []
@@ -13319,7 +9547,7 @@ def test_same_source_completion_is_observation_monotonic_and_never_reopens(
     init_store(db_path)
     save_snapshot(db_path, snapshot)
     source = "same-source"
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         worker_id,
@@ -13349,7 +9577,7 @@ def test_same_source_completion_is_observation_monotonic_and_never_reopens(
         "2029-12-31T23:59:59+00:00",
         "2030-01-01T00:00:00+00:00",
     ):
-        assert merge_turn_content(
+        assert apply_test_turn_refresh(
             db_path,
             host_id,
             worker_id,
@@ -13361,7 +9589,7 @@ def test_same_source_completion_is_observation_monotonic_and_never_reopens(
             },
             observed_at=observed_at,
         ) == 0
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         worker_id,
@@ -13399,7 +9627,7 @@ def test_same_source_completion_is_observation_monotonic_and_never_reopens(
     assert revisions[0][1] == 0
     assert revisions[1][1] == 1
 
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         worker_id,
@@ -13443,23 +9671,27 @@ def test_apply_turn_refresh_rolls_back_turn_pending_and_rejects_stale_binding(
         turn_target_value="private-pane",
     )
     upsert_worker_bindings(db_path, [binding])
-    original_pending_apply = store_sqlite._merge_backend_pending_conn
+    original_pending_apply = store_sqlite._apply_backend_pending_observation_conn
 
     def fail_pending(*args: Any, **kwargs: Any) -> bool:
         raise RuntimeError("controlled pending failure")
 
-    monkeypatch.setattr(store_sqlite, "_merge_backend_pending_conn", fail_pending)
+    monkeypatch.setattr(store_sqlite, "_apply_backend_pending_observation_conn", fail_pending)
     with pytest.raises(RuntimeError, match="controlled pending failure"):
         store_sqlite.apply_turn_refresh(
             db_path,
             host_id,
             worker.id,
             {"assistant_final_text": "must roll back", "complete": True},
-            backend_pending={"question": "must roll back"},
+            backend_pending_observation=store_sqlite.PendingObservation(
+                "open_prompt",
+                question="must roll back",
+                revision_digest="must-roll-back",
+            ),
             expected_binding=binding,
             observed_at="2099-01-01T00:00:00+00:00",
         )
-    assert not store_sqlite.list_backend_pending(db_path, host_id)
+    assert not store_sqlite.pending_payload_from_store(db_path, host_id)["pending_interactions"]
     assert all(
         turn.get("assistant_final_text") in (None, "")
         for turn in turns_payload_from_store(db_path, host_id)["turns"]
@@ -13467,7 +9699,7 @@ def test_apply_turn_refresh_rolls_back_turn_pending_and_rejects_stale_binding(
 
     monkeypatch.setattr(
         store_sqlite,
-        "_merge_backend_pending_conn",
+        "_apply_backend_pending_observation_conn",
         original_pending_apply,
     )
     with sqlite3.connect(str(db_path)) as conn:
@@ -13484,12 +9716,16 @@ def test_apply_turn_refresh_rolls_back_turn_pending_and_rejects_stale_binding(
         host_id,
         worker.id,
         {"assistant_final_text": "stale result", "complete": True},
-        backend_pending={"question": "stale pending"},
+        backend_pending_observation=store_sqlite.PendingObservation(
+            "open_prompt",
+            question="stale pending",
+            revision_digest="stale-pending",
+        ),
         expected_binding=binding,
         observed_at="2099-01-01T00:00:01+00:00",
     )
     assert stale == store_sqlite.TurnRefreshApplyResult(0, False, True)
-    assert not store_sqlite.list_backend_pending(db_path, host_id)
+    assert not store_sqlite.pending_payload_from_store(db_path, host_id)["pending_interactions"]
     assert all(
         turn.get("assistant_final_text") in (None, "")
         for turn in turns_payload_from_store(db_path, host_id)["turns"]
@@ -13561,7 +9797,7 @@ def test_merge_begin_immediate_barrier_forces_late_writer_to_read_committed_fina
     )
 
     def write_final() -> None:
-        results["final"] = merge_turn_content(
+        results["final"] = apply_test_turn_refresh(
             db_path,
             host_id,
             worker_id,
@@ -13575,7 +9811,7 @@ def test_merge_begin_immediate_barrier_forces_late_writer_to_read_committed_fina
         )
 
     def write_late_working() -> None:
-        results["working"] = merge_turn_content(
+        results["working"] = apply_test_turn_refresh(
             db_path,
             host_id,
             worker_id,
@@ -13643,7 +9879,11 @@ def test_apply_turn_refresh_deadline_while_writer_locked_never_commits_later(
             host_id,
             worker_id,
             {"assistant_final_text": "must never commit", "complete": True},
-            backend_pending={"question": "must never persist"},
+            backend_pending_observation=store_sqlite.PendingObservation(
+                "open_prompt",
+                question="must never persist",
+                revision_digest="must-never-persist",
+            ),
             deadline_monotonic=started + 0.15,
             observed_at="2099-01-01T00:00:00+00:00",
         )
@@ -13659,7 +9899,7 @@ def test_apply_turn_refresh_deadline_while_writer_locked_never_commits_later(
         blocker.rollback()
         blocker.close()
 
-    assert not store_sqlite.list_backend_pending(db_path, host_id)
+    assert not store_sqlite.pending_payload_from_store(db_path, host_id)["pending_interactions"]
     assert all(
         turn.get("assistant_final_text") in (None, "")
         for turn in turns_payload_from_store(db_path, host_id)["turns"]
@@ -13689,73 +9929,23 @@ def test_apply_turn_refresh_deadline_while_writer_locked_never_commits_later(
         host_id,
         worker_id,
         {"assistant_final_text": "rollback at commit seam", "complete": True},
-        backend_pending={"question": "rollback at commit seam"},
+        backend_pending_observation=store_sqlite.PendingObservation(
+            "open_prompt",
+            question="rollback at commit seam",
+            revision_digest="rollback-at-commit-seam",
+        ),
         cancelled=cancel_apply_before_commit,
         observed_at="2099-01-01T00:00:02+00:00",
     )
     assert precommit_cancelled.cancelled is True
     assert apply_checks == 3
-    assert not store_sqlite.list_backend_pending(db_path, host_id)
+    assert not store_sqlite.pending_payload_from_store(db_path, host_id)["pending_interactions"]
     assert all(
         turn.get("assistant_final_text") in (None, "")
         for turn in turns_payload_from_store(db_path, host_id)["turns"]
     )
 
 
-def test_prune_backend_pending_deadline_while_writer_locked_is_non_mutating(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "pending-prune-deadline.db"
-    init_store(db_path)
-    assert store_sqlite.merge_backend_pending(
-        db_path,
-        "prune-host",
-        "orphan-worker",
-        {"question": "still present"},
-    )
-    blocker = store_sqlite._connect(db_path, isolation_level=None)
-    try:
-        blocker.execute("BEGIN IMMEDIATE")
-        started = time.monotonic()
-        assert store_sqlite.prune_backend_pending(
-            db_path,
-            "prune-host",
-            (),
-            deadline_monotonic=started + 0.15,
-        ) == 0
-        assert time.monotonic() - started < 1.0
-    finally:
-        blocker.rollback()
-        blocker.close()
-
-    assert "orphan-worker" in store_sqlite.list_backend_pending(
-        db_path,
-        "prune-host",
-    )
-    prune_checks = 0
-
-    def cancel_prune_before_commit() -> bool:
-        nonlocal prune_checks
-        prune_checks += 1
-        return prune_checks == 3
-
-    assert store_sqlite.prune_backend_pending(
-        db_path,
-        "prune-host",
-        (),
-        cancelled=cancel_prune_before_commit,
-    ) == 0
-    assert prune_checks == 3
-    assert "orphan-worker" in store_sqlite.list_backend_pending(
-        db_path,
-        "prune-host",
-    )
-    assert store_sqlite.prune_backend_pending(
-        db_path,
-        "prune-host",
-        (),
-    ) == 1
-    assert not store_sqlite.list_backend_pending(db_path, "prune-host")
 
 
 def test_turn_list_filtered_rows_advance_bounded_cursor_without_hiding_public_rows(
@@ -13813,6 +10003,17 @@ def test_turn_list_filtered_rows_advance_bounded_cursor_without_hiding_public_ro
             """,
             (host_id, public_payload),
         )
+        store_sqlite._insert_turn_content_revision_conn(
+            conn,
+            host_id=host_id,
+            turn_id="public-turn",
+            user_text="Public prompt",
+            assistant_final_text="Public answer",
+            user_state="complete",
+            final_state="complete",
+            created_at="1970-01-01T00:00:00+00:00",
+            is_current=True,
+        )
 
     first = turns_payload_from_store(
         db_path,
@@ -13852,7 +10053,7 @@ def test_turn_sequence_high_water_never_reuses_deleted_max_and_since_finds_inser
     init_store(db_path)
     save_snapshot(db_path, snapshot)
     for index, worker in enumerate(snapshot.workers):
-        assert merge_turn_content(
+        assert apply_test_turn_refresh(
             db_path,
             host_id,
             worker.id,
@@ -13883,7 +10084,7 @@ def test_turn_sequence_high_water_never_reuses_deleted_max_and_since_finds_inser
             str(highest_turn),
         )
         conn.commit()
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         snapshot.workers[0].id,
@@ -13950,7 +10151,7 @@ def test_turn_list_interior_deletion_expires_cursor_but_not_since_watermark(
     init_store(db_path)
     save_snapshot(db_path, snapshot)
     for index, worker in enumerate(snapshot.workers):
-        assert merge_turn_content(
+        assert apply_test_turn_refresh(
             db_path,
             host_id,
             worker.id,
@@ -14006,7 +10207,7 @@ def test_turn_list_interior_deletion_expires_cursor_but_not_since_watermark(
     assert insertion_poll["turns"] == []
 
 
-def test_source_reconciliation_isolates_stable_owners_and_legacy_no_owner(
+def test_source_reconciliation_isolates_stable_owners(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "owner-source-isolation.db"
@@ -14017,14 +10218,10 @@ def test_source_reconciliation_isolates_stable_owners_and_legacy_no_owner(
 
     def snapshot_for(
         worker_id: str,
-        stable_key: str | None,
+        stable_key: str,
         observed_at: str,
     ) -> Snapshot:
-        meta = (
-            {"stable_key": stable_key, "stable_key_version": 1}
-            if stable_key is not None
-            else {}
-        )
+        meta = {"stable_key": stable_key, "stable_key_version": 1}
         return Snapshot(
             host_id=host_id,
             updated_at=observed_at,
@@ -14060,28 +10257,10 @@ def test_source_reconciliation_isolates_stable_owners_and_legacy_no_owner(
             "owner two final",
             "2026-07-13T03:01:01+00:00",
         ),
-        (
-            snapshot_for(
-                "shared-worker",
-                None,
-                "2026-07-13T03:02:00+00:00",
-            ),
-            "legacy same-worker final",
-            "2026-07-13T03:02:01+00:00",
-        ),
-        (
-            snapshot_for(
-                "legacy-worker-b",
-                None,
-                "2026-07-13T03:03:00+00:00",
-            ),
-            "legacy changed-worker final",
-            "2026-07-13T03:03:01+00:00",
-        ),
     )
     for snapshot, final_text, observed_at in cases:
         save_snapshot(db_path, snapshot)
-        assert merge_turn_content(
+        assert apply_test_turn_refresh(
             db_path,
             host_id,
             snapshot.workers[0].id,
@@ -14103,65 +10282,14 @@ def test_source_reconciliation_isolates_stable_owners_and_legacy_no_owner(
     assert set(source_turns) == {
         "owner one final",
         "owner two final",
-        "legacy same-worker final",
-        "legacy changed-worker final",
     }
     ids = {str(turn["id"]) for turn in source_turns.values()}
     tokens = {str(turn["source_turn_id"]) for turn in source_turns.values()}
-    assert len(ids) == len(tokens) == 4
+    assert len(ids) == len(tokens) == 2
     assert (
         source_turns["owner one final"]["meta"]["stable_key"],
         source_turns["owner two final"]["meta"]["stable_key"],
     ) == (stable_key_1, stable_key_2)
-    assert source_turns["legacy same-worker final"]["meta"].get("stable_key") is None
-    assert source_turns["legacy changed-worker final"]["meta"].get("stable_key") is None
-    assert (
-        source_turns["legacy same-worker final"]["source_turn_id"]
-        == "turnsrc-fdc56cfa0289296df514b264"
-    )
-    assert source_turns["legacy same-worker final"]["worker_id"] == "shared-worker"
-    assert source_turns["legacy changed-worker final"]["worker_id"] == "legacy-worker-b"
     assert raw_source not in json.dumps(payload, sort_keys=True)
     with sqlite3.connect(str(db_path)) as conn:
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
-
-
-def test_v20_to_v21_adds_herdr_turn_watermark_and_provenance_tables(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "herdr-turn-v20.db"
-    with sqlite3.connect(str(db_path)) as conn:
-        store_sqlite._run_migrations(conn, target_version=20)
-        assert conn.execute("PRAGMA user_version").fetchone() == (20,)
-        assert conn.execute(
-            """
-            SELECT COUNT(*) FROM sqlite_master
-            WHERE type = 'table'
-              AND name IN (
-                  'herdr_turn_watermarks',
-                  'herdr_turn_completions'
-              )
-            """
-        ).fetchone() == (0,)
-    os.chmod(tmp_path, 0o700)
-    os.chmod(db_path, 0o600)
-
-    init_store(db_path)
-
-    with sqlite3.connect(str(db_path)) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone() == (
-            store_sqlite.STORE_SCHEMA_VERSION,
-        ) == (28,)
-        assert {
-            str(row[0])
-            for row in conn.execute(
-                """
-                SELECT name FROM sqlite_master
-                WHERE type = 'table'
-                  AND name IN (
-                      'herdr_turn_watermarks',
-                      'herdr_turn_completions'
-                  )
-                """
-            )
-        } == {"herdr_turn_watermarks", "herdr_turn_completions"}

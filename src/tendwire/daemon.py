@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .config import DEFAULT_TURN_MODEL, Config
+from .config import Config
 from .core.commands import CommandEnvelope
 from .core.models import Snapshot, sanitize_public_mapping, utc_timestamp
 from .daemon_api import (
@@ -449,19 +449,10 @@ def default_socket_path(config: Config) -> Path:
     return Path(config.data_dir) / "tendwire.sock"
 
 
-def _default_init_store(
-    db_path: Path,
-    *,
-    connector_ack_ttl_seconds: int | None = None,
-) -> None:
+def _default_init_store(db_path: Path) -> None:
     from .store.sqlite import init_store
 
-    kwargs = (
-        {"connector_ack_ttl_seconds": connector_ack_ttl_seconds}
-        if connector_ack_ttl_seconds is not None
-        else {}
-    )
-    init_store(db_path, **kwargs)
+    init_store(db_path)
 
 
 def _default_acp_supervisor_factory(config: Config, stop_event: threading.Event) -> Any:
@@ -536,12 +527,7 @@ class TendwireDaemon:
                 socket_group=self.config.socket_group,
             )
             if self.hooks.init_store is _default_init_store:
-                _default_init_store(
-                    Path(self.config.db_path),
-                    connector_ack_ttl_seconds=(
-                        self.config.connector_ack_ttl_seconds
-                    ),
-                )
+                _default_init_store(Path(self.config.db_path))
             else:
                 self.hooks.init_store(Path(self.config.db_path))
             api = TendwireDaemonAPI(
@@ -763,7 +749,6 @@ class TendwireDaemon:
                 policy=policy,
                 agent_event_host_id=self.config.host_id,
                 agent_event_retention_days=self.config.event_retention_days,
-                turn_model=DEFAULT_TURN_MODEL,
                 acknowledged_final_retention_days=(
                     self.config.acknowledged_final_retention_days
                 ),
@@ -1129,7 +1114,6 @@ class TendwireDaemon:
             limit=limit,
             cursor=cursor,
             since=since,
-            turn_model=DEFAULT_TURN_MODEL,
         )
 
     def get_turn_content(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1154,7 +1138,6 @@ class TendwireDaemon:
             field=params.get("field"),
             cursor=params.get("cursor"),
             schema_version=params.get("schema_version", 1),
-            turn_model=DEFAULT_TURN_MODEL,
         )
 
     def get_turn_delta(
@@ -1181,7 +1164,6 @@ class TendwireDaemon:
             watermark=watermark,
             cursor=cursor,
             limit=limit,
-            turn_model=DEFAULT_TURN_MODEL,
         )
 
     def connector_call(self, method: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1206,7 +1188,6 @@ class TendwireDaemon:
             max_lease_seconds=self.config.connector_max_claim_ttl_seconds,
             ack_ttl_seconds=self.config.connector_ack_ttl_seconds,
             max_attempts=self.config.max_outbox_attempts,
-            turn_model=DEFAULT_TURN_MODEL,
         ).dispatch(method, params)
 
     def _connector_periodic_tick(self) -> None:
