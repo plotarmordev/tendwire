@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from contextlib import closing
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
+from datetime import datetime, timedelta, timezone
 import io
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +19,11 @@ from tendwire.connectors import ConnectorOutboxAPI
 from tendwire.config import Config
 from tendwire.core.models import Snapshot
 from tendwire.daemon import TendwireDaemon
-from tendwire.daemon_api import TendwireDaemonAPI
+from tendwire.daemon_api import (
+    DaemonAPIClient,
+    TendwireDaemonAPI,
+    UnixSocketJSONServer,
+)
 from tendwire.store import sqlite as store_sqlite
 from tendwire.store.sqlite import init_store
 
@@ -64,6 +71,64 @@ def _enqueue(db_path: Path, *, host_id: str = "host-a", key: str = "job-1") -> N
         )
 
 
+def _canonical_final_turn(db_path: Path, *, host_id: str) -> tuple[str, str]:
+    init_store(db_path)
+    turn_id = "turn-worker-contract-source-contract"
+    final_text = "abcdefgh"
+    revision = store_sqlite.content_revision(
+        turn_id,
+        None,
+        final_text,
+        "absent",
+        "complete",
+    )
+    created_at = "2026-01-01T00:00:00+00:00"
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
+        conn.execute(
+            """
+            INSERT INTO turns (
+                host_id, turn_id, worker_id, status, kind, updated_at,
+                fingerprint, snapshot_content_fingerprint, observed_at,
+                payload_json, list_sequence
+            ) VALUES (?, ?, ?, 'complete', 'turn', ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                host_id,
+                turn_id,
+                "worker-contract",
+                created_at,
+                "fingerprint-contract",
+                "snapshot-contract",
+                created_at,
+                json.dumps(
+                    {
+                        "source_turn_id": "source-contract",
+                        "complete": True,
+                        "meta": {
+                            "stable_key": "wsk1_" + ("c" * 64),
+                            "stable_key_version": 1,
+                        },
+                    }
+                ),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO turn_content_revisions (
+                host_id, turn_id, content_revision, user_text,
+                assistant_final_text, user_state, final_state,
+                user_char_length, user_byte_length,
+                final_char_length, final_byte_length,
+                user_page_count, final_page_count,
+                is_current, created_at, superseded_at
+            ) VALUES (?, ?, ?, NULL, ?, 'absent', 'complete', 0, 0, 8, 8,
+                      0, 1, 1, ?, NULL)
+            """,
+            (host_id, turn_id, revision, final_text, created_at),
+        )
+    return turn_id, revision
+
+
 def _assert_json_only_and_safe(payload: dict[str, Any]) -> None:
     encoded = json.dumps(payload, sort_keys=True).lower()
     for forbidden in (
@@ -84,6 +149,251 @@ def _assert_json_only_and_safe(payload: dict[str, Any]) -> None:
         "delivery",
     ):
         assert forbidden not in encoded
+
+
+@contextmanager
+def _socket_client(
+    tmp_path: Path,
+    api: TendwireDaemonAPI,
+) -> Iterator[DaemonAPIClient]:
+    socket_path = tmp_path / "s"
+    server = UnixSocketJSONServer(socket_path, api.dispatch)
+    server.start()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield DaemonAPIClient(socket_path, timeout_seconds=2)
+    finally:
+        server.close()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("socket"), "AF_UNIX"),
+    reason="Unix sockets required",
+)
+def test_socket_ack_lost_repoll_preserves_durable_identity_and_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "ack-lost.db"
+    turn_id, revision = _canonical_final_turn(db_path, host_id="daemon-host")
+    current = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        store_sqlite,
+        "utc_timestamp",
+        lambda: current.isoformat(timespec="seconds"),
+    )
+    outbox = ConnectorOutboxAPI(db_path, "daemon-host")
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: Snapshot(host_id="daemon-host"),
+        get_health=lambda: {},
+        submit_command=lambda _params: {},
+        connector_call=outbox.dispatch,
+    )
+
+    provider_sends: list[str] = []
+    provider_message_by_key: dict[str, str] = {}
+    with _socket_client(tmp_path, api) as client:
+        begun = client.request(
+            "connector.prepare",
+            {
+                "schema_version": 1,
+                "action": "begin",
+                "name": "turn-final",
+                "turn_id": turn_id,
+                "content_revision": revision,
+                "presentation_version": "contract-v2",
+                "part_count": 2,
+            },
+        )
+        plan_token = begun["result"]["plan_token"]
+        for ordinal, start in enumerate((0, 4)):
+            staged = client.request(
+                "connector.prepare",
+                {
+                    "schema_version": 1,
+                    "action": "part",
+                    "name": "turn-final",
+                    "plan_token": plan_token,
+                    "ordinal": ordinal,
+                    "spans": [
+                        {
+                            "field": "assistant_final_text",
+                            "start_char": start,
+                            "end_char": start + 4,
+                        }
+                    ],
+                },
+            )
+            assert staged["ok"] is True
+            assert staged["result"]["ok"] is True
+        committed = client.request(
+            "connector.prepare",
+            {
+                "schema_version": 1,
+                "action": "commit",
+                "name": "turn-final",
+                "plan_token": plan_token,
+            },
+        )
+        assert begun["ok"] is True
+        assert begun["result"]["ok"] is True
+        assert committed["ok"] is True
+        assert committed["result"]["ok"] is True
+        assert committed["result"]["job_count"] == 2
+
+        first_outer = client.request(
+            "connector.poll",
+            {"name": "turn-final", "lease_seconds": 5},
+        )
+        first = first_outer["result"]["items"][0]
+
+        # The provider accepted the message and Herdres persisted the binding,
+        # but the connector ACK was lost before Tendwire received it.
+        provider_sends.append("provider-message-17")
+        provider_message_by_key[first["key"]] = provider_sends[-1]
+        current += timedelta(seconds=6)
+
+        reclaimed = client.request("connector.reclaim", {"name": "turn-final"})
+        second_outer = client.request(
+            "connector.poll",
+            {"name": "turn-final", "lease_seconds": 5},
+        )
+        second = second_outer["result"]["items"][0]
+
+        assert first_outer["ok"] is True
+        assert first_outer["result"]["ok"] is True
+        assert reclaimed["ok"] is True
+        assert reclaimed["result"]["reclaimed"] == 1
+        assert second["key"] == first["key"]
+        assert second["payload"] == first["payload"]
+        assert json.dumps(
+            second["payload"], sort_keys=True, separators=(",", ":")
+        ) == json.dumps(first["payload"], sort_keys=True, separators=(",", ":"))
+        assert second["ref"] != first["ref"]
+        assert second["attempt"] == first["attempt"] + 1
+        stale_ack = client.request(
+            "connector.ack",
+            {"name": "turn-final", "ref": first["ref"]},
+        )
+        assert stale_ack["ok"] is True
+        assert stale_ack["result"]["ok"] is False
+        assert stale_ack["result"]["status"] in {
+            "expired_ref",
+            "invalid_ref",
+            "stale_ref",
+        }
+
+        # A thin connector recognizes the durable key, does not resend, and
+        # acknowledges the current attempt rather than the stale first ref.
+        assert provider_message_by_key[second["key"]] == "provider-message-17"
+        acknowledged = client.request(
+            "connector.ack",
+            {
+                "name": "turn-final",
+                "ref": second["ref"],
+                "response": {"status": "deduplicated"},
+            },
+        )
+        assert acknowledged["ok"] is True
+        assert acknowledged["result"]["ok"] is True
+        assert acknowledged["result"]["status"] == "acknowledged"
+        assert provider_sends == ["provider-message-17"]
+        next_item = client.request("connector.poll", {"name": "turn-final"})[
+            "result"
+        ]["items"][0]
+        assert next_item["key"] != second["key"]
+        assert next_item["payload"]["plan_token"] == plan_token
+        assert next_item["payload"]["sequence_index"] == 1
+        assert client.request(
+            "connector.ack",
+            {"name": "turn-final", "ref": next_item["ref"]},
+        )["result"]["ok"] is True
+        assert client.request("connector.poll", {"name": "turn-final"})["result"][
+            "items"
+        ] == []
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("socket"), "AF_UNIX"),
+    reason="Unix sockets required",
+)
+def test_socket_keeps_transport_and_connector_errors_in_separate_envelopes(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "error-envelopes.db"
+    init_store(db_path)
+    outbox = ConnectorOutboxAPI(db_path, "daemon-host")
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: Snapshot(host_id="daemon-host"),
+        get_health=lambda: {},
+        submit_command=lambda _params: {},
+        connector_call=outbox.dispatch,
+    )
+
+    with _socket_client(tmp_path, api) as client:
+        connector_error = client.request(
+            "connector.ack",
+            {"name": "attention", "ref": "not-a-live-ref"},
+        )
+        protocol_error = client.request("turn_final_ack", {})
+
+    assert connector_error["ok"] is True
+    assert connector_error["status"] == "ok"
+    assert connector_error["error"] is None
+    assert connector_error["result"]["ok"] is False
+    assert connector_error["result"]["status"] == "invalid_ref"
+    assert connector_error["result"]["error"]["code"] == "invalid_ref"
+    assert protocol_error["ok"] is False
+    assert protocol_error["status"] == "error"
+    assert protocol_error["result"] is None
+    assert protocol_error["error"]["code"] == "unknown_method"
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("socket"), "AF_UNIX"),
+    reason="Unix sockets required",
+)
+def test_socket_preserves_opaque_connector_tokens_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    expected = {
+        "plan_token": "twplan1.AaZz09_-ExactPlan",
+        "replaces_plan_token": "twplan1.Replaced_AaZz09-",
+        "content_revision": "twrev1.AaZz09_-ExactRevision",
+        "final_identity": "twfinal1.AaZz09_-ExactFinal",
+    }
+    key = f"turn-final:revision:{expected['final_identity']}"
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: Snapshot(host_id="daemon-host"),
+        get_health=lambda: {},
+        submit_command=lambda _params: {},
+        connector_call=lambda _method, _params: {
+            "schema_version": 1,
+            "ok": True,
+            "status": "ok",
+            "host_id": "daemon-host",
+            "name": "turn-final",
+            "items": [
+                {
+                    "ref": "twref1.AaZz09_-ExactRef",
+                    "key": key,
+                    "attempt": 1,
+                    "payload": {**expected, "operation": "upsert"},
+                }
+            ],
+        },
+    )
+
+    with _socket_client(tmp_path, api) as client:
+        response = client.request("connector.poll", {"name": "turn-final"})
+
+    item = response["result"]["items"][0]
+    assert item["key"] == key
+    for token_name, token in expected.items():
+        assert item["payload"][token_name] == token
 
 
 def test_daemon_api_routes_connector_methods_safely(tmp_path: Path) -> None:
