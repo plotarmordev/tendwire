@@ -637,6 +637,144 @@ def test_observed_submission_linker_waits_for_window_close_before_failing_closed
 
 
 
+@pytest.mark.parametrize(
+    (
+        "scenario",
+        "initial_state",
+        "submission_count",
+        "observe_candidate",
+        "terminal_state",
+    ),
+    (
+        ("no-candidate", "submitted", 1, False, "expired"),
+        ("stale-send-started", "send_started", 1, True, "expired"),
+        ("two-by-one", "submitted", 2, True, "ambiguous"),
+    ),
+)
+def test_link_window_close_settles_current_submission_components(
+    tmp_path: Path,
+    scenario: str,
+    initial_state: str,
+    submission_count: int,
+    observe_candidate: bool,
+    terminal_state: str,
+) -> None:
+    db_path = tmp_path / f"window-close-{scenario}.db"
+    owner_key = _seed_link_worker(db_path)
+    for index in range(submission_count):
+        _insert_link_submission(
+            db_path,
+            request_id=f"{scenario}-{index}",
+            owner_key=owner_key,
+            state=initial_state,
+            link_expires_at="2026-02-01T12:01:00+00:00",
+            hard_expires_at="2026-02-02T12:00:00+00:00",
+        )
+    if observe_candidate:
+        observed_at = "2026-02-01T12:00:03+00:00"
+        if initial_state == "send_started":
+            observed_at = (
+                datetime.fromisoformat("2026-02-01T12:00:00+00:00")
+                + timedelta(
+                    seconds=store_sqlite.SUBMISSION_SEND_ACK_TIMEOUT_SECONDS + 1
+                )
+            ).isoformat()
+        _observe_link_turn(
+            db_path,
+            source_turn_id=f"{scenario}-source",
+            observed_at=observed_at,
+        )
+
+    before_close = turn_delta_payload_from_store(
+        db_path,
+        "host-a",
+        now=datetime.fromisoformat(
+            "2026-02-01T12:00:30+00:00"
+        ).timestamp(),
+    )
+    assert before_close["host_id"] == "host-a"
+    assert _submission_rows(db_path) == [
+        (f"{scenario}-{index}", initial_state, None)
+        for index in range(submission_count)
+    ]
+
+    at_close = turn_delta_payload_from_store(
+        db_path,
+        "host-a",
+        now=datetime.fromisoformat(
+            "2026-02-01T12:01:00+00:00"
+        ).timestamp(),
+    )
+    assert at_close["host_id"] == "host-a"
+    assert _submission_rows(db_path) == [
+        (f"{scenario}-{index}", terminal_state, None)
+        for index in range(submission_count)
+    ]
+    with sqlite3.connect(str(db_path)) as conn:
+        stamps = conn.execute(
+            """
+            SELECT terminal_at, hard_expires_at
+            FROM turn_submissions
+            WHERE host_id = 'host-a'
+            ORDER BY request_id
+            """
+        ).fetchall()
+    assert stamps == [
+        ("2026-02-01T12:01:00+00:00", "2026-02-02T12:00:00+00:00")
+    ] * submission_count
+
+
+def test_disconnected_submission_components_settle_independently(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "disconnected-components.db"
+    owner_key = _seed_link_worker(db_path)
+    _insert_link_submission(
+        db_path,
+        request_id="old-disconnected",
+        owner_key=owner_key,
+        link_not_before="2026-02-01T11:00:00+00:00",
+        link_expires_at="2026-02-01T11:01:00+00:00",
+    )
+    _insert_link_submission(
+        db_path,
+        request_id="live-singleton",
+        owner_key=owner_key,
+        link_expires_at="2026-02-01T12:01:00+00:00",
+    )
+    turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="live-singleton-source",
+        observed_at="2026-02-01T12:00:03+00:00",
+    )
+
+    payload = turn_delta_payload_from_store(
+        db_path,
+        "host-a",
+        now=datetime.fromisoformat(
+            "2026-02-01T12:00:05+00:00"
+        ).timestamp(),
+    )
+
+    assert payload["host_id"] == "host-a"
+    assert _submission_rows(db_path) == [
+        ("live-singleton", "linked", turn_id),
+        ("old-disconnected", "expired", None),
+    ]
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT request_id, terminal_at, linked_at
+            FROM turn_submissions
+            WHERE host_id = 'host-a'
+            ORDER BY request_id
+            """
+        ).fetchall() == [
+            ("live-singleton", None, "2026-02-01T12:00:03+00:00"),
+            ("old-disconnected", "2026-02-01T12:00:03+00:00", None),
+        ]
+
+
 def test_manual_same_text_turn_links_single_open_submission(
     tmp_path: Path,
 ) -> None:
@@ -951,6 +1089,124 @@ def test_turn_alias_resolves_public_content_and_final_root(
         ).fetchone() == (canonical_turn_id,)
 
 
+
+
+def test_stable_key_delta_lazy_sweep_rearms_component_backoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "stable-key-delta-rearm.db"
+    owner_key = _seed_link_worker(db_path)
+    _insert_link_submission(
+        db_path,
+        request_id="stable-key-delta-rearm",
+        owner_key=owner_key,
+        link_not_before="2026-07-22T12:01:23+00:00",
+        link_expires_at="2026-07-22T12:03:23+00:00",
+        hard_expires_at="2026-07-23T12:02:23+00:00",
+    )
+    candidate_calls = 0
+    rearmed_keys: list[tuple[str, str]] = []
+    original_candidates = store_sqlite._submission_link_candidate_turns_conn
+    original_rearm = store_sqlite._rearm_submission_link_component
+    original_settle = store_sqlite._settle_submission_links_conn
+    fail_direct_settlement = False
+
+    def record_candidates(*args: object, **kwargs: object):
+        nonlocal candidate_calls
+        candidate_calls += 1
+        return original_candidates(*args, **kwargs)
+
+    def record_rearm(
+        db: Path | str,
+        host: str,
+        owner: str,
+        fingerprint: str,
+    ) -> None:
+        rearmed_keys.append((owner, fingerprint))
+        original_rearm(db, host, owner, fingerprint)
+
+    def fail_one_direct_settlement(*args: object, **kwargs: object) -> int:
+        if fail_direct_settlement:
+            raise RuntimeError("controlled direct settlement failure")
+        return original_settle(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "_submission_link_candidate_turns_conn",
+        record_candidates,
+    )
+    monkeypatch.setattr(
+        store_sqlite,
+        "_rearm_submission_link_component",
+        record_rearm,
+    )
+    monkeypatch.setattr(
+        store_sqlite,
+        "_settle_submission_links_conn",
+        fail_one_direct_settlement,
+    )
+
+    for observed_at in (
+        "2026-07-22T12:02:33+00:00",
+        "2026-07-22T12:02:38+00:00",
+    ):
+        payload = turn_delta_payload_from_store(
+            db_path,
+            "host-a",
+            now=datetime.fromisoformat(observed_at).timestamp(),
+        )
+        assert payload["host_id"] == "host-a"
+    assert candidate_calls == 1
+    assert _submission_rows(db_path) == [
+        ("stable-key-delta-rearm", "submitted", None)
+    ]
+
+    fail_direct_settlement = True
+    observed_turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="stable-key-delta-rearm-source",
+        instruction_text="hello\x01",
+        observed_at="2026-07-22T12:02:40+00:00",
+    )
+    fail_direct_settlement = False
+    assert (owner_key, instruction_fingerprint("hello")) in rearmed_keys
+    assert all(owner == owner_key for owner, _fingerprint in rearmed_keys)
+    assert candidate_calls == 1
+    assert _submission_rows(db_path) == [
+        ("stable-key-delta-rearm", "submitted", None)
+    ]
+
+    linked_page = turn_delta_payload_from_store(
+        db_path,
+        "host-a",
+        now=datetime.fromisoformat(
+            "2026-07-22T12:02:42+00:00"
+        ).timestamp(),
+    )
+    assert linked_page["host_id"] == "host-a"
+    assert candidate_calls == 2
+    assert _submission_rows(db_path) == [
+        ("stable-key-delta-rearm", "linked", observed_turn_id)
+    ]
+    linked_turn = next(
+        change["turn"]
+        for change in linked_page["changes"]
+        if change.get("op") == "upsert"
+        and change.get("turn_id") == observed_turn_id
+    )
+    assert linked_turn["submission_id"] == turn_submission_id(
+        "host-a", "stable-key-delta-rearm"
+    )
+    assert linked_turn["submission_state"] == "linked"
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT linked_at FROM turn_submissions
+            WHERE host_id = 'host-a'
+              AND request_id = 'stable-key-delta-rearm'
+            """
+        ).fetchone() == ("2026-07-22T12:02:42+00:00",)
 
 
 def test_observed_link_rearm_uses_stable_owner_across_worker_renumber(

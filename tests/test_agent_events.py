@@ -743,6 +743,102 @@ def test_automatic_maintenance_retires_agent_events_only_when_due(
         )
 
 
+def test_automatic_agent_retention_failure_does_not_advance_cadence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "automatic-agent-rollback.db"
+    old = replace(
+        _message_event(sequence=1, visibility="private"),
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    record_test_agent_event(db_path, "host-1", old)
+    original_cleanup = store_sqlite._cleanup_agent_event_retention_conn
+
+    def fail_after_cleanup(*args: object, **kwargs: object) -> dict[str, object]:
+        original_cleanup(*args, **kwargs)
+        raise RuntimeError("controlled retention failure")
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "_cleanup_agent_event_retention_conn",
+        fail_after_cleanup,
+    )
+
+    with pytest.raises(RuntimeError, match="controlled retention failure"):
+        store_sqlite.maybe_run_automatic_store_maintenance(
+            db_path,
+            policy=store_sqlite.SnapshotRetentionPolicy(
+                retention_days=30,
+                retention_count=100,
+                batch_size=10,
+            ),
+            agent_event_host_id="host-1",
+            agent_event_retention_days=7,
+            now="2026-02-01T00:00:00+00:00",
+        )
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT last_completed_at FROM store_maintenance_state "
+            "WHERE scope = 'automatic'"
+        ).fetchone() == (None,)
+        assert conn.execute("SELECT COUNT(*) FROM agent_events").fetchone() == (1,)
+
+
+def test_retention_cleanup_serializes_concurrent_append_and_both_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "retention-concurrency.db"
+    old = replace(
+        _message_event(sequence=1, visibility="private"),
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    record_test_agent_event(db_path, "host-1", old)
+    entered = threading.Event()
+    release = threading.Event()
+    original_cleanup = store_sqlite._cleanup_agent_event_retention_conn
+
+    def blocking_cleanup(*args: object, **kwargs: object) -> dict[str, object]:
+        entered.set()
+        assert release.wait(timeout=5)
+        return original_cleanup(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "_cleanup_agent_event_retention_conn",
+        blocking_cleanup,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        cleanup = executor.submit(
+            store_sqlite.cleanup_agent_event_retention,
+            db_path,
+            "host-1",
+            retention_days=7,
+            now="2026-02-01T00:00:00+00:00",
+        )
+        assert entered.wait(timeout=5)
+        append = executor.submit(
+            record_test_agent_event,
+            db_path,
+            "host-1",
+            _message_event(sequence=2, text="new", visibility="private"),
+        )
+        time.sleep(0.05)
+        assert append.done() is False
+        release.set()
+        assert cleanup.result(timeout=5)["deleted"] == 1
+        assert append.result(timeout=5).inserted is True
+
+    assert [
+        item.event.payload["text"]
+        for item in store_sqlite.list_agent_events(db_path, "host-1")
+    ] == ["new"]
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def test_journal_accepts_acp_sized_private_text(tmp_path: Path) -> None:
     event = _message_event(sequence=1, text="x" * (64 * 1024), visibility="private")
     result = record_test_agent_event(tmp_path / "store.db", "host-1", event)
