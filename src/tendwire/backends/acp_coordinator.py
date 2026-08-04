@@ -12,7 +12,8 @@ from __future__ import annotations
 import json
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -20,7 +21,16 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Config
-from ..core.models import Worker, WorkerBinding, utc_timestamp
+from ..core.models import (
+    BackendHealth,
+    Space,
+    Worker,
+    WorkerBinding,
+    normalize_status,
+    separate_duplicate_worker_bindings,
+    utc_timestamp,
+    worker_binding_private_fingerprint,
+)
 from ..core.commands import turn_submission_id
 from ..core.models import stable_fingerprint
 from ..store.sqlite import (
@@ -30,7 +40,15 @@ from ..store.sqlite import (
     list_worker_bindings,
     pending_payload_from_store,
     record_agent_event,
+    save_snapshot,
     upsert_worker_bindings,
+)
+from ..core.projector import project_from_observations
+from ..worker_identity import (
+    STABLE_KEY_VERSION,
+    canonical_herdr_pane_identity,
+    load_or_create_installation_key,
+    stable_worker_key,
 )
 from .acp_client import BoundedAcpConnection
 from .acp_permissions import AcpPermissionBroker
@@ -209,6 +227,7 @@ class AcpSupervisor:
         stop_event: threading.Event,
         *,
         endpoint_client_factory: EndpointClientFactory | None = None,
+        discovery_client_factory: EndpointClientFactory | None = None,
         session_factory: WorkerSessionFactory = AcpWorkerSession,
         connection_factory: ConnectionFactory = BoundedAcpConnection,
         reconcile_interval: float | None = None,
@@ -227,6 +246,9 @@ class AcpSupervisor:
         self._endpoint_client_factory = (
             endpoint_client_factory or _default_endpoint_client_factory
         )
+        self._discovery_client_factory = discovery_client_factory
+        if self._discovery_client_factory is None and endpoint_client_factory is None:
+            self._discovery_client_factory = _default_endpoint_client_factory
         self._session_factory = session_factory
         self._connection_factory = connection_factory
         self._permission_callback = permission_callback
@@ -261,6 +283,8 @@ class AcpSupervisor:
         # Exact ACP ownership survives runtime retirement so an outage remains
         # distinguishable from a worker that Herdr has actually removed.
         self._published_acp_claims: dict[str, str] = {}
+        self._last_discovery_at: str | None = None
+        self._worker_count = 0
 
     def start(self) -> "AcpSupervisor":
         with self._lock:
@@ -451,6 +475,8 @@ class AcpSupervisor:
             "state": state.value,
             "healthy": healthy,
             "failure_type": failure_type,
+            "last_reconcile_at": self._last_discovery_at,
+            "worker_count": self._worker_count,
             **counters,
         }
 
@@ -1113,6 +1139,16 @@ class AcpSupervisor:
                     self._stop_all()
 
     def _reconcile_locked(self, *, strict: bool) -> None:
+        if self._discovery_client_factory is not None:
+            try:
+                self._discover_continuity()
+            except Exception as exc:
+                with self._lock:
+                    self._required_degraded = True
+                    self._failure_type = type(exc).__name__
+                if strict:
+                    raise
+                return
         current, ambiguities = self._continuity_bindings()
         with self._lock:
             failed_claims = tuple(self._console_failed_claims.items())
@@ -1169,6 +1205,67 @@ class AcpSupervisor:
                 self._failure_type = None
         if strict and failures:
             raise AcpCoordinatorError("one or more ACP workers failed to attach")
+
+    def _discover_continuity(self) -> None:
+        """Refresh the one Herdr lifecycle projection consumed by ACP routing."""
+
+        client = self._discovery_client_factory(self.config)
+        try:
+            connect = getattr(client, "connect", None)
+            if callable(connect):
+                connect()
+            workspaces = client.workspace_list(timeout=self.config.herdr_timeout_seconds)
+            panes = client.pane_list(timeout=self.config.herdr_timeout_seconds)
+            agents = client.agent_list(timeout=self.config.herdr_timeout_seconds)
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
+
+        observed_at = utc_timestamp()
+        spaces = _discovered_spaces(workspaces)
+        prior_bindings = list_worker_bindings(
+            Path(self.config.db_path),
+            self.config.host_id,
+            backend="herdr",
+        )
+        workers, bindings = _discovered_workers(
+            self.config,
+            panes,
+            agents,
+            observed_at,
+            prior_bindings=prior_bindings,
+        )
+        health = BackendHealth(
+            name="herdr",
+            status="healthy",
+            outcome="healthy_non_empty" if spaces or workers else "empty_healthy",
+            observed_at=observed_at,
+            counts={"spaces": len(spaces), "workers": len(workers)},
+        )
+        snapshot = project_from_observations(
+            self.config,
+            spaces=spaces,
+            workers=workers,
+            backend_health=[health],
+        )
+        from ..store.sqlite import SnapshotObservationContext
+
+        save_snapshot(
+            Path(self.config.db_path),
+            snapshot,
+            observation=SnapshotObservationContext(
+                authority="complete",
+                observed_at=observed_at,
+            ),
+            worker_bindings=bindings,
+            binding_backend="herdr",
+            binding_observation_authoritative=True,
+            binding_workers_present=bool(workers),
+        )
+        with self._lock:
+            self._last_discovery_at = observed_at
+            self._worker_count = len(workers)
 
     def _reconcile_worker(self, worker_id: str, *, strict: bool) -> None:
         with self._reconcile_lock:
@@ -1680,6 +1777,272 @@ def _same_continuity(left: WorkerBinding, right: WorkerBinding) -> bool:
         right.private_fingerprint,
         right.sendable,
     )
+
+
+def _field(item: Mapping[str, Any], name: str) -> Any:
+    expected = name.replace("_", "").lower()
+    for key, value in item.items():
+        if str(key).replace("_", "").replace("-", "").lower() == expected:
+            return value
+    return None
+
+
+def _text(item: Mapping[str, Any], *names: str) -> str | None:
+    for name in names:
+        value = _field(item, name)
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            text = str(value).strip()
+            if text:
+                return text
+    return None
+
+
+def _items(payload: Any, *names: str) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        values = payload
+    elif isinstance(payload, Mapping):
+        values = []
+        for name in (*names, "data", "payload"):
+            candidate = _field(payload, name)
+            if isinstance(candidate, list):
+                values = candidate
+                break
+            if isinstance(candidate, Mapping):
+                nested = _items(candidate, *names)
+                if nested:
+                    return nested
+    else:
+        return []
+    return [dict(value) for value in values if isinstance(value, Mapping)]
+
+
+def _discovered_spaces(payload: Any) -> list[Space]:
+    spaces: list[Space] = []
+    for item in _items(payload, "workspaces", "spaces", "items", "result"):
+        space_id = _text(item, "workspace_id", "space_id", "id", "name")
+        if space_id is None:
+            continue
+        spaces.append(
+            Space(
+                id=space_id,
+                name=_text(item, "label", "name", "title") or space_id,
+                status=normalize_status(_text(item, "status", "state")),
+                updated_at=_text(item, "updated_at", "observed_at"),
+            )
+        )
+    return spaces
+
+
+def _agent_match(
+    pane: Mapping[str, Any],
+    agents: Sequence[Mapping[str, Any]],
+) -> tuple[Mapping[str, Any] | None, bool]:
+    pane_id = _text(pane, "pane_id")
+    terminal_id = _text(pane, "terminal_id")
+    matches = [
+        agent
+        for agent in agents
+        if (pane_id and _text(agent, "pane_id") == pane_id)
+        or (terminal_id and _text(agent, "terminal_id") == terminal_id)
+    ]
+    return (matches[0], False) if len(matches) == 1 else (None, len(matches) > 1)
+
+
+def _assign_prior_worker_ids(
+    rows: list[dict[str, Any]],
+    prior_bindings: Sequence[WorkerBinding],
+) -> None:
+    private_counts = Counter(str(row["private_fingerprint"]) for row in rows)
+    target_key_counts = Counter(
+        (str(row["target_kind"]), str(row["target_value"])) for row in rows
+    )
+    stored_by_private: dict[str, list[WorkerBinding]] = {}
+    stored_by_target: dict[tuple[str, str], list[WorkerBinding]] = {}
+    for binding in prior_bindings:
+        if (
+            binding.backend != "herdr"
+            or not binding.worker_id
+            or binding.reason in {"duplicate_backend_target", "ambiguous_pane_match"}
+        ):
+            continue
+        stored_by_private.setdefault(binding.private_fingerprint, []).append(binding)
+        stored_by_target.setdefault(
+            (binding.target_kind, binding.target_value), []
+        ).append(binding)
+    for row in rows:
+        prior: WorkerBinding | None = None
+        private_fingerprint = str(row["private_fingerprint"])
+        private_candidates = stored_by_private.get(private_fingerprint, [])
+        if private_counts[private_fingerprint] == 1 and len(private_candidates) == 1:
+            prior = private_candidates[0]
+        target_key = (str(row["target_kind"]), str(row["target_value"]))
+        target_candidates = stored_by_target.get(target_key, [])
+        if prior is None and target_key_counts[target_key] == 1 and len(target_candidates) == 1:
+            prior = target_candidates[0]
+        row["desired_id"] = prior.worker_id if prior is not None else row["base_id"]
+
+
+def _materialize_discovered_workers(
+    config: Config,
+    rows: list[dict[str, Any]],
+    observed_at: str,
+) -> tuple[list[Worker], list[WorkerBinding]]:
+    target_counts = Counter(str(row["target_value"]) for row in rows)
+    id_counts = Counter(str(row["desired_id"]) for row in rows)
+    workers: list[Worker] = []
+    bindings: list[WorkerBinding] = []
+    duplicate_indexes: dict[str, int] = {}
+    for row in sorted(rows, key=lambda value: str(value["private_fingerprint"])):
+        base_id = str(row["desired_id"])
+        worker_id = base_id
+        if id_counts[base_id] > 1:
+            duplicate_indexes[base_id] = duplicate_indexes.get(base_id, 0) + 1
+            worker_id = f"{base_id}-{duplicate_indexes[base_id]}"
+        pane = row["pane"]
+        agent = row["agent"]
+        meta: dict[str, Any] = {}
+        label = _text(pane, "label")
+        if label:
+            meta["label"] = label
+        stable_key = row["stable_key"]
+        if stable_key is not None:
+            meta["stable_key"] = stable_key
+            meta["stable_key_version"] = STABLE_KEY_VERSION
+        reason = row["reason"]
+        sendable = reason is None and target_counts[str(row["target_value"])] == 1
+        if not sendable and reason is None:
+            reason = "duplicate_backend_target"
+        worker = Worker(
+            id=worker_id,
+            name=(
+                _text(agent, "agent", "name")
+                or _text(pane, "agent", "label", "name")
+                or worker_id
+            ),
+            status=normalize_status(
+                _text(agent, "status", "agent_status")
+                or _text(pane, "agent_status", "status")
+            ),
+            space_id=_text(pane, "workspace_id"),
+            meta=meta,
+            last_seen_at=observed_at,
+            backend_target={
+                "kind": row["target_kind"],
+                "value": row["target_value"],
+                "sendable": sendable,
+                "reason": reason,
+            },
+        )
+        workers.append(worker)
+        bindings.append(
+            WorkerBinding(
+                host_id=config.host_id,
+                worker_id=worker.id,
+                worker_fingerprint=worker.fingerprint,
+                backend="herdr",
+                target_kind=str(row["target_kind"]),
+                target_value=str(row["target_value"]),
+                sendable=sendable,
+                reason=reason,
+                observed_at=observed_at,
+                expires_at=None,
+                private_fingerprint=str(row["private_fingerprint"]),
+            )
+        )
+    separated = separate_duplicate_worker_bindings(bindings)
+    final_workers: list[Worker] = []
+    final_bindings: list[WorkerBinding] = []
+    for worker, binding in zip(workers, separated, strict=True):
+        if worker.backend_target != binding.backend_target():
+            worker = replace(worker, backend_target=binding.backend_target())
+            binding = replace(binding, worker_fingerprint=worker.fingerprint)
+        final_workers.append(worker)
+        final_bindings.append(binding)
+    return final_workers, final_bindings
+
+
+def _discovered_workers(
+    config: Config,
+    pane_payload: Any,
+    agent_payload: Any,
+    observed_at: str,
+    *,
+    prior_bindings: Sequence[WorkerBinding] = (),
+) -> tuple[list[Worker], list[WorkerBinding]]:
+    panes = _items(pane_payload, "panes", "items", "result")
+    agents = _items(agent_payload, "agents", "workers", "items", "result")
+    rows: list[dict[str, Any]] = []
+    needs_stable_key = False
+    for pane in panes:
+        agent, ambiguous_agent = _agent_match(pane, agents)
+        if agent is None and not ambiguous_agent and not _text(pane, "agent", "name", "label"):
+            continue
+        workspace_id = _text(pane, "workspace_id")
+        pane_id = _text(pane, "pane_id")
+        identity = canonical_herdr_pane_identity(workspace_id, pane_id)
+        needs_stable_key = needs_stable_key or identity is not None
+        target_kind = ""
+        target_value = ""
+        for kind, value in (
+            ("agent_id", _text(agent or {}, "agent_id")),
+            ("terminal_id", _text(pane, "terminal_id")),
+            ("pane_id", pane_id),
+        ):
+            if value:
+                target_kind, target_value = kind, value
+                break
+        if not target_value:
+            continue
+        base_id = (
+            _text(agent or {}, "agent", "name")
+            or _text(pane, "agent", "name", "label")
+            or "worker"
+        )
+        private_fingerprint = worker_binding_private_fingerprint(
+            host_id=config.host_id,
+            backend="herdr",
+            identity_material={
+                "workspace_id": workspace_id,
+                "pane_id": pane_id,
+                "terminal_id": _text(pane, "terminal_id"),
+                "agent_id": _text(agent or {}, "agent_id"),
+            },
+        )
+        rows.append(
+            {
+                "agent": agent or {},
+                "base_id": base_id,
+                "identity": identity,
+                "pane": pane,
+                "private_fingerprint": private_fingerprint,
+                "target_kind": target_kind,
+                "target_value": target_value,
+                "reason": (
+                    "ambiguous_pane_match"
+                    if ambiguous_agent
+                    else ("invalid_pane_identity" if identity is None else None)
+                ),
+            }
+        )
+
+    installation_key = (
+        load_or_create_installation_key(config.data_dir) if needs_stable_key else None
+    )
+    for row in rows:
+        identity = row["identity"]
+        if installation_key is not None and identity is not None:
+            workspace_id, pane_id = identity
+            row["stable_key"] = stable_worker_key(
+                installation_key,
+                backend="herdr",
+                host_id=config.host_id,
+                workspace_id=workspace_id,
+                pane_id=pane_id,
+            )
+        else:
+            row["stable_key"] = None
+    _assign_prior_worker_ids(rows, prior_bindings)
+    return _materialize_discovered_workers(config, rows, observed_at)
 
 
 def _nonempty_text(value: Any, field: str) -> str:

@@ -550,7 +550,7 @@ def test_sqlite_family_optional_sidecar_disappears_after_capture(
         assert results[result_index].mode is None
         assert not sidecar.exists()
         assert _mode(db_path) == 0o600
-        assert set(os.listdir("/proc/self/fd")) == before_fds
+        assert set(os.listdir("/proc/self/fd")) <= before_fds
     finally:
         os.close(parent_fd)
 

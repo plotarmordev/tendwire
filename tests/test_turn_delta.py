@@ -976,7 +976,7 @@ def test_turn_delta_rpc_advertises_feature_and_cannot_invoke_delivery(tmp_path: 
     assert delivery_calls == []
 
 
-def test_turn_delta_cli_bootstrap_and_incremental_read(tmp_path: Path, capsys) -> None:
+def test_turn_delta_cli_requires_daemon_and_does_not_read_store(tmp_path: Path, capsys) -> None:
     db_path = tmp_path / "cli.db"
     socket_path = tmp_path / "missing.sock"
     init_store(db_path)
@@ -994,15 +994,11 @@ def test_turn_delta_cli_bootstrap_and_incremental_read(tmp_path: Path, capsys) -
         "--db-path",
         str(db_path),
     ]
-    assert main(base_args) == 0
-    bootstrap = json.loads(capsys.readouterr().out)
-    assert bootstrap["changes"][0]["turn"]["summary"] == "first CLI projection"
-    checkpoint = str(bootstrap["checkpoint"])
-
-    _mutate_turn(db_path, "cli-turn", summary="second CLI projection")
-    assert main([*base_args, "--watermark", checkpoint]) == 0
-    changed = json.loads(capsys.readouterr().out)
-    assert changed["changes"][0]["turn"]["summary"] == "second CLI projection"
+    assert main(base_args) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["status"] == "daemon_unavailable"
+    assert "changes" not in payload
 
 
 def test_turn_change_retention_config_defaults_env_and_bounds(

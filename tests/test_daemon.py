@@ -22,7 +22,6 @@ from typing import Any
 import pytest
 
 from tendwire import __version__
-from tendwire.backends.herdr_socket import HerdrSocketTimeoutError
 from tendwire.cli import main
 from tendwire.config import Config
 from tendwire.core.commands import (
@@ -112,7 +111,27 @@ def _required_acp_supervisor_for_daemon_unit_tests(
     """Keep non-ACP daemon tests focused on their own boundary."""
 
     class Supervisor:
+        def __init__(self, config: Config) -> None:
+            self.config = config
+
         def start(self) -> None:
+            assert self.config.db_path is not None
+            init_store(self.config.db_path)
+            if latest_snapshot(self.config.db_path, self.config.host_id) is None:
+                save_snapshot(
+                    self.config.db_path,
+                    Snapshot(
+                        host_id=self.config.host_id,
+                        updated_at="2026-08-04T00:00:00+00:00",
+                        backend_health=[
+                            BackendHealth(
+                                name="herdr",
+                                status="healthy",
+                                outcome="empty_healthy",
+                            )
+                        ],
+                    ),
+                )
             return None
 
         def stop(self, *, timeout: float) -> None:
@@ -141,9 +160,9 @@ def _required_acp_supervisor_for_daemon_unit_tests(
             object.__setattr__(
                 hooks,
                 "acp_supervisor_factory",
-                lambda _config, _stop: Supervisor(),
+                lambda config, _stop: Supervisor(config),
             )
-            self._acp_supervisor = Supervisor()
+            self._acp_supervisor = Supervisor(self.config)
 
     monkeypatch.setattr(TendwireDaemon, "__init__", init_with_required_acp)
 
@@ -661,7 +680,9 @@ def test_malformed_durable_snapshot_is_fixed_unavailable_for_daemon_and_cli(
     }
 
     assert cli_code == 1
-    assert daemon_payload == cli_payload == expected
+    assert daemon_payload == expected
+    assert cli_payload["ok"] is False
+    assert cli_payload["status"] == "daemon_unavailable"
     assert "sentinel-private" not in json.dumps(
         {"daemon": daemon_payload, "cli": cli_payload},
         sort_keys=True,
@@ -1319,127 +1340,13 @@ def test_attention_recurrence_after_two_complete_misses_re_notifies(tmp_path: Pa
     assert generation == 2
 
 
-def test_socket_daemon_synthesized_fallback_has_no_lifecycle_authority(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "socket-fallback.db"
-    config = Config(host_id="socket-fallback-host", db_path=db_path, herdr_backend="socket")
-    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    save_snapshot(
-        db_path,
-        project_from_raw(
-            config,
-            workers=_blocked_worker("blocked"),
-            backend_health=_HEALTHY_BACKEND,
-            timestamp=base,
-        ),
-        observation=_complete_observation(base),
-    )
-
-    class _HealthyState:
-        def to_backend_health(self) -> BackendHealth:
-            return BackendHealth(
-                name="herdr",
-                status="healthy",
-                outcome="empty_healthy",
-                observed_at=(base + timedelta(seconds=300)).isoformat(),
-            )
-
-    class _Backend:
-        health = _HealthyState()
-
-        def start(self, *, wait_for_reconcile: bool) -> None:
-            assert wait_for_reconcile is True
-
-        def stop(self) -> None:
-            pass
-
-    backend = _Backend()
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(event_backend_factory=lambda _config, _stop_event: backend),
-    )
-    monkeypatch.setattr("tendwire.store.sqlite.latest_snapshot", lambda _path, _host_id: None)
-
-    fallback = daemon._start_socket_event_backend()
-
-    assert fallback.attention == []
-    assert len(attention_payload_from_store(db_path, config.host_id)["attention"]) == 1
-    assert _attention_outbox_count(db_path, config.host_id) == 1
-    with sqlite3.connect(str(db_path)) as conn:
-        missing_count = conn.execute(
-            "SELECT missing_observation_count FROM attention_lifecycles WHERE host_id = ?",
-            (config.host_id,),
-        ).fetchone()[0]
-    assert missing_count == 0
-
-
-@pytest.mark.parametrize(
-    "observed_at",
-    ["not-a-timestamp", "2026-01-01T00:00:00"],
-)
-def test_socket_daemon_fallback_drops_unordered_health_timestamp(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    observed_at: str,
-) -> None:
-    config = Config(
-        host_id="socket-fallback-invalid-time",
-        db_path=tmp_path / "socket-fallback-invalid-time.db",
-        herdr_backend="socket",
-    )
-    captured: list[SnapshotObservationContext] = []
-
-    class _HealthState:
-        def to_backend_health(self) -> BackendHealth:
-            return BackendHealth(
-                name="herdr",
-                status="healthy",
-                outcome="empty_healthy",
-                observed_at=observed_at,
-            )
-
-    class _Backend:
-        health = _HealthState()
-
-        def start(self, *, wait_for_reconcile: bool) -> None:
-            assert wait_for_reconcile is True
-
-    def _capture_save(
-        _db_path: Path,
-        _snapshot: Snapshot,
-        *,
-        turn_model: str,
-        observation: SnapshotObservationContext,
-    ) -> None:
-        assert turn_model == "observed"
-        captured.append(observation)
-
-    backend = _Backend()
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(event_backend_factory=lambda _config, _stop_event: backend),
-    )
-    monkeypatch.setattr("tendwire.store.sqlite.latest_snapshot", lambda _path, _host_id: None)
-    monkeypatch.setattr("tendwire.store.sqlite.save_snapshot", _capture_save)
-
-    daemon._start_socket_event_backend()
-
-    assert len(captured) == 1
-    assert captured[0].authority == "none"
-    assert captured[0].observed_at is None
-
-
 def test_daemon_health_exposes_public_operational_status_without_private_values(tmp_path: Path) -> None:
     db_path = tmp_path / "health.db"
     config = Config(
         host_id="health-host",
         db_path=db_path,
-        event_debounce_seconds=0.2,
         reconcile_interval_seconds=0,
         event_retention_days=3,
-        output_excerpt_chars=80,
         max_workers=8,
         max_outbox_attempts=4,
         connector_claim_ttl_seconds=33,
@@ -1547,10 +1454,8 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
         "backlog": False,
     }
     assert health["limits"] == {
-        "event_debounce_seconds": 0.2,
         "reconcile_interval_seconds": 0,
         "event_retention_days": 3,
-        "output_excerpt_chars": 80,
         "max_workers": 8,
         "max_outbox_attempts": 4,
         "outbox_claim_ttl_seconds": 33,
@@ -2150,22 +2055,6 @@ def test_sigterm_handler_only_requests_stop_before_ordered_teardown(
     ]
 
 
-@_UNIX_SOCKET_TEST
-def test_service_group_sigterm_exits_closes_socket_and_reaps_child() -> None:
-    root = Path(__file__).resolve().parents[1]
-    result = subprocess.run(
-        ["bash", str(root / "scripts/tendwired_lifecycle_smoke.sh")],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=15,
-        env={**os.environ, "PYTHON": sys.executable},
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == "tendwired lifecycle smoke: ok\n"
-
-
 def _socket_mode(path: Path) -> int:
     return stat.S_IMODE(os.lstat(path).st_mode)
 
@@ -2287,10 +2176,10 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         tuple[Path, Any, str | None, int | None, int, int, int, int, int, int]
     ] = []
 
-    def observe(_config: Config) -> Snapshot:
+    def initialize(path: Path) -> None:
+        init_store(path)
         snapshot = _public_snapshot()
         save_snapshot(db_path, snapshot)
-        return snapshot
 
     def maintenance(
         path: Path,
@@ -2349,7 +2238,7 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
     )
     daemon = TendwireDaemon(
         config,
-        hooks=DaemonHooks(init_store=init_store, observe_initial_snapshot=observe),
+        hooks=DaemonHooks(init_store=initialize),
     )
     try:
         daemon.start()
@@ -2423,10 +2312,10 @@ def test_cli_snapshot_persists_when_automatic_maintenance_fails(
     config = Config(host_id="daemon-host", data_dir=data_dir, db_path=db_path)
     calls = 0
 
-    def observe(_config: Config) -> Snapshot:
+    def initialize(path: Path) -> None:
+        init_store(path)
         snapshot = _public_snapshot()
         save_snapshot(db_path, snapshot)
-        return snapshot
 
     def maintenance_failure(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         nonlocal calls
@@ -2439,7 +2328,7 @@ def test_cli_snapshot_persists_when_automatic_maintenance_fails(
     )
     daemon = TendwireDaemon(
         config,
-        hooks=DaemonHooks(init_store=init_store, observe_initial_snapshot=observe),
+        hooks=DaemonHooks(init_store=initialize),
     )
     try:
         daemon.start()
@@ -2493,10 +2382,7 @@ def test_daemon_default_socket_parent_and_endpoint_are_private_under_umask_zero(
     )
     daemon = TendwireDaemon(
         config,
-        hooks=DaemonHooks(
-            init_store=lambda _path: None,
-            observe_initial_snapshot=lambda _config: _public_snapshot(),
-        ),
+        hooks=DaemonHooks(init_store=lambda _path: None),
     )
 
     try:
@@ -2524,7 +2410,7 @@ def test_daemon_startup_repairs_all_existing_state_before_empty_observation(
     data_dir.mkdir()
     os.chmod(data_dir, 0o755)
     db_path = data_dir / "daemon.db"
-    db_path.write_bytes(b"existing-database")
+    init_store(db_path)
     os.chmod(db_path, 0o644)
     config = Config(host_id="daemon-host", data_dir=data_dir, db_path=db_path)
     identity_paths = (
@@ -2535,29 +2421,16 @@ def test_daemon_startup_repairs_all_existing_state_before_empty_observation(
     for path in identity_paths:
         path.write_bytes(b"existing-identity")
         os.chmod(path, 0o644)
-    observations: list[Snapshot] = []
-
     def initialize_store(path: Path) -> None:
         assert path == db_path
         assert _socket_mode(data_dir) == 0o700
         assert _socket_mode(db_path) == 0o600
         assert all(_socket_mode(identity_path) == 0o600 for identity_path in identity_paths)
 
-    def observe(_config: Config) -> Snapshot:
-        snapshot = Snapshot(
-            host_id="daemon-host",
-            updated_at="2026-01-01T00:00:00+00:00",
-        )
-        observations.append(snapshot)
-        return snapshot
-
     for _attempt in range(2):
         daemon = TendwireDaemon(
             config,
-            hooks=DaemonHooks(
-                init_store=initialize_store,
-                observe_initial_snapshot=observe,
-            ),
+            hooks=DaemonHooks(init_store=initialize_store),
         )
         try:
             daemon.start()
@@ -2572,7 +2445,6 @@ def test_daemon_startup_repairs_all_existing_state_before_empty_observation(
         finally:
             daemon.stop()
 
-    assert len(observations) == 2
     assert not os.path.lexists(data_dir / "tendwire.sock")
 
 
@@ -2598,16 +2470,9 @@ def test_daemon_rejects_identity_defect_before_socket_or_hook_work(
         hook_calls.append("init_store")
         raise AssertionError("store hook must not run")
 
-    def observe(_config: Config) -> Snapshot:
-        hook_calls.append("observe")
-        raise AssertionError("observation hook must not run")
-
     daemon = TendwireDaemon(
         Config(host_id="daemon-host", data_dir=data_dir, db_path=db_path),
-        hooks=DaemonHooks(
-            init_store=initialize_store,
-            observe_initial_snapshot=observe,
-        ),
+        hooks=DaemonHooks(init_store=initialize_store),
     )
 
     with pytest.raises(LocalStateError) as caught:
@@ -2698,10 +2563,7 @@ def test_daemon_group_socket_and_client_use_exact_shared_mode(
     )
     daemon = TendwireDaemon(
         config,
-        hooks=DaemonHooks(
-            init_store=lambda _path: None,
-            observe_initial_snapshot=lambda _config: _public_snapshot(),
-        ),
+        hooks=DaemonHooks(init_store=lambda _path: None),
     )
     thread: threading.Thread | None = None
 
@@ -2976,10 +2838,7 @@ def test_daemon_rejects_group_sharing_on_implicit_private_parent_before_mutation
             db_path=tmp_path / "daemon.db",
             socket_group=group_name,
         ),
-        hooks=DaemonHooks(
-            init_store=lambda _path: None,
-            observe_initial_snapshot=lambda _config: _public_snapshot(),
-        ),
+        hooks=DaemonHooks(init_store=lambda _path: None),
     )
 
     with pytest.raises(DaemonUnavailable) as caught:
@@ -3382,10 +3241,6 @@ def test_daemon_active_socket_fails_before_store_or_backend_work(tmp_path: Path)
     def forbidden_store(_path: Path) -> None:
         calls.append("init_store")
 
-    def forbidden_observe(_config: Config) -> Snapshot:
-        calls.append("observe")
-        raise AssertionError("live-socket guard must precede backend work")
-
     daemon = TendwireDaemon(
         Config(
             host_id="fail-fast-host",
@@ -3393,10 +3248,7 @@ def test_daemon_active_socket_fails_before_store_or_backend_work(tmp_path: Path)
             db_path=tmp_path / "fail-fast.db",
             socket_path=socket_path,
         ),
-        hooks=DaemonHooks(
-            init_store=forbidden_store,
-            observe_initial_snapshot=forbidden_observe,
-        ),
+        hooks=DaemonHooks(init_store=forbidden_store),
     )
     try:
         with pytest.raises(DaemonUnavailable) as caught:
@@ -3655,40 +3507,26 @@ def test_unix_socket_server_close_preserves_substituted_socket(tmp_path: Path) -
 
 
 @_UNIX_SOCKET_TEST
-@pytest.mark.parametrize("failure_stage", ["init_store", "observe"])
-def test_daemon_startup_failure_never_publishes_socket(
-    tmp_path: Path,
-    failure_stage: str,
-) -> None:
-    socket_path = tmp_path / f"{failure_stage}.sock"
+def test_daemon_store_startup_failure_never_publishes_socket(tmp_path: Path) -> None:
+    socket_path = tmp_path / "init-store.sock"
 
     def assert_unpublished() -> None:
         assert not os.path.lexists(socket_path)
 
     def initialize_store(path: Path) -> None:
         assert_unpublished()
-        if failure_stage == "init_store":
-            raise RuntimeError("sentinel startup failure")
-        init_store(path)
-
-    def observe(_config: Config) -> Snapshot:
-        assert_unpublished()
-        if failure_stage == "observe":
-            raise RuntimeError("sentinel startup failure")
-        return _public_snapshot()
+        del path
+        raise RuntimeError("sentinel startup failure")
 
     config = Config(
         host_id="daemon-host",
         data_dir=tmp_path,
-        db_path=tmp_path / f"{failure_stage}.db",
+        db_path=tmp_path / "init-store.db",
         socket_path=socket_path,
     )
     daemon = TendwireDaemon(
         config,
-        hooks=DaemonHooks(
-            init_store=initialize_store,
-            observe_initial_snapshot=observe,
-        ),
+        hooks=DaemonHooks(init_store=initialize_store),
     )
 
     try:
@@ -3705,159 +3543,13 @@ def test_daemon_startup_failure_never_publishes_socket(
 
 
 @_UNIX_SOCKET_TEST
-def test_daemon_backend_start_failure_stops_backend_without_publishing_socket(
-    tmp_path: Path,
-) -> None:
-    socket_path = tmp_path / "backend-failure.sock"
-
-    def assert_unpublished() -> None:
-        assert not os.path.lexists(socket_path)
-
-    class FailingEventBackend:
-        def __init__(self) -> None:
-            self.started = False
-            self.stopped = False
-
-        def start(self, *, wait_for_reconcile: bool) -> None:
-            assert wait_for_reconcile is True
-            assert_unpublished()
-            self.started = True
-            raise RuntimeError("sentinel backend startup failure")
-
-        def stop(self) -> None:
-            self.stopped = True
-
-    backend = FailingEventBackend()
-
-    def initialize_store(path: Path) -> None:
-        assert_unpublished()
-        init_store(path)
-
-    def event_backend_factory(_config: Config, _stop_event: threading.Event) -> Any:
-        assert_unpublished()
-        return backend
-
-    config = Config(
-        host_id="daemon-host",
-        data_dir=tmp_path,
-        db_path=tmp_path / "backend-failure.db",
-        socket_path=socket_path,
-        herdr_backend="socket",
-    )
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(
-            init_store=initialize_store,
-            event_backend_factory=event_backend_factory,
-        ),
-    )
-
-    try:
-        with pytest.raises(RuntimeError, match="sentinel backend startup failure") as caught:
-            daemon.start()
-
-        assert backend.started is True
-        assert backend.stopped is True
-        _assert_private_daemon_failure(caught.value, socket_path)
-        assert daemon.server is None
-        assert not os.path.lexists(socket_path)
-    finally:
-        daemon.stop()
-
-
-@_UNIX_SOCKET_TEST
-def test_daemon_backend_timeout_never_reaches_acp_startup(tmp_path: Path) -> None:
-    calls: list[str] = []
-
-    class TimedOutEventBackend:
-        def start(self, *, wait_for_reconcile: bool) -> None:
-            assert wait_for_reconcile is True
-            calls.append("backend_start")
-            raise HerdrSocketTimeoutError("initial Herdr reconciliation timed out")
-
-        def stop(self) -> None:
-            calls.append("backend_stop")
-
-    def forbidden_acp_factory(_config: Config, _stop_event: threading.Event) -> Any:
-        calls.append("acp_factory")
-        raise AssertionError("ACP startup must not follow a Herdr readiness timeout")
-
-    config = Config(
-        host_id="daemon-host",
-        data_dir=tmp_path,
-        db_path=tmp_path / "backend-timeout.db",
-        socket_path=tmp_path / "backend-timeout.sock",
-        herdr_backend="socket",
-    )
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(
-            event_backend_factory=lambda _config, _stop_event: TimedOutEventBackend(),
-            acp_supervisor_factory=forbidden_acp_factory,
-        ),
-    )
-
-    try:
-        with pytest.raises(
-            HerdrSocketTimeoutError,
-            match="initial Herdr reconciliation timed out",
-        ):
-            daemon.start()
-
-        assert calls == ["backend_start", "backend_stop"]
-        assert daemon.server is None
-        assert not os.path.lexists(config.socket_path)
-    finally:
-        daemon.stop()
-
-
-@_UNIX_SOCKET_TEST
-def test_daemon_default_backend_keeps_startup_and_rpc_timeouts_distinct(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: list[tuple[float, float]] = []
-
-    def time_out_start(self: Any, *, wait_for_reconcile: bool) -> None:
-        assert wait_for_reconcile is True
-        captured.append(
-            (
-                self.config.herdr_timeout_seconds,
-                self.config.herdr_initial_reconcile_timeout_seconds,
-            )
-        )
-        raise HerdrSocketTimeoutError("initial Herdr reconciliation timed out")
-
-    monkeypatch.setattr(
-        "tendwire.backends.herdr_events.HerdrEventBackend.start",
-        time_out_start,
-    )
-    config = Config(
-        host_id="daemon-distinct-timeouts",
-        data_dir=tmp_path,
-        db_path=tmp_path / "daemon-distinct-timeouts.db",
-        socket_path=tmp_path / "daemon-distinct-timeouts.sock",
-        herdr_backend="socket",
-        herdr_timeout_seconds=0.25,
-        herdr_initial_reconcile_timeout_seconds=17,
-    )
-    daemon = TendwireDaemon(config)
-
-    try:
-        with pytest.raises(HerdrSocketTimeoutError):
-            daemon.start()
-        assert captured == [(0.25, 17.0)]
-    finally:
-        daemon.stop()
-
-
-@_UNIX_SOCKET_TEST
-def test_daemon_starts_observes_persists_serves_and_removes_socket(tmp_path: Path) -> None:
+def test_daemon_starts_persists_serves_and_removes_socket(tmp_path: Path) -> None:
     db_path = tmp_path / "daemon.db"
     socket_path = tmp_path / "daemon.sock"
     config = Config(host_id="daemon-host", data_dir=tmp_path, db_path=db_path, socket_path=socket_path)
 
-    def observe(config: Config) -> Snapshot:
+    def initialize(path: Path) -> None:
+        init_store(path)
         snapshot = project_from_raw(
             config,
             workers=[{"id": "worker-1", "name": "Worker One", "status": "active"}],
@@ -3872,11 +3564,10 @@ def test_daemon_starts_observes_persists_serves_and_removes_socket(tmp_path: Pat
             ],
         )
         save_snapshot(db_path, snapshot)
-        return snapshot
 
     daemon = TendwireDaemon(
         config,
-        hooks=DaemonHooks(observe_initial_snapshot=observe),
+        hooks=DaemonHooks(init_store=initialize),
     )
     daemon.start()
     thread = threading.Thread(target=daemon.serve_forever)
@@ -4336,7 +4027,6 @@ def test_daemon_command_submit_rejects_blank_request_id_before_mutation(
         host_id="cmd-host",
         data_dir=tmp_path,
         db_path=db_path,
-        herdr_backend="socket",
     )
     init_store(db_path)
     calls: list[str] = []
@@ -4368,7 +4058,7 @@ def test_daemon_command_submit_rejects_blank_request_id_before_mutation(
         assert conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
 
-def test_cli_snapshot_falls_back_when_configured_socket_is_absent(
+def test_cli_snapshot_requires_daemon_when_configured_socket_is_absent(
     tmp_path: Path,
     capsys,
     monkeypatch,
@@ -4378,11 +4068,6 @@ def test_cli_snapshot_falls_back_when_configured_socket_is_absent(
     data_dir.mkdir(mode=0o700)
     monkeypatch.setenv("TENDWIRE_DATA_DIR", os.fspath(data_dir))
     monkeypatch.delenv("TENDWIRE_DB_PATH", raising=False)
-
-    def fake_state(config: Config) -> tuple[list[Any], list[Worker]]:
-        return [], [Worker(id="fallback-worker", name="Fallback", status="active")]
-
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", fake_state)
 
     code = main(
         [
@@ -4397,9 +4082,11 @@ def test_cli_snapshot_falls_back_when_configured_socket_is_absent(
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
 
-    assert code == 0
+    assert code == 1
     assert captured.err == ""
-    assert payload["workers"][0]["id"] == "fallback-worker"
+    assert payload["ok"] is False
+    assert payload["status"] == "daemon_unavailable"
+    assert not (data_dir / "tendwire.db").exists()
 
 
 def test_cli_command_falls_back_when_configured_socket_is_stale(
@@ -5118,15 +4805,7 @@ def test_isolated_daemon_survives_deterministic_real_wal_retirement_without_reso
     baseline_threads = {id(thread) for thread in threading.enumerate()}
     baseline_children = direct_child_processes()
     main_identity = (db_path.stat().st_dev, db_path.stat().st_ino)
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(
-            observe_initial_snapshot=lambda _config: latest_snapshot(
-                db_path,
-                config.host_id,
-            ),
-        ),
-    )
+    daemon = TendwireDaemon(config)
     server_thread: threading.Thread | None = None
     writer_thread = threading.Thread(target=churn_wal)
     writer_started = False

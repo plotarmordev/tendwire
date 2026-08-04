@@ -17,7 +17,6 @@ from tendwire.config import (
     DEFAULT_COMMAND_RECEIPT_RETENTION_COUNT,
     DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS,
     DEFAULT_COMMAND_RETRY_HORIZON_SECONDS,
-    DEFAULT_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS,
     DEFAULT_SUBMISSION_HARD_TTL_SECONDS,
     DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS,
     DEFAULT_TURN_MODEL,
@@ -29,46 +28,6 @@ from tendwire.config import (
     Config,
     load_config,
 )
-
-
-def test_initial_reconcile_timeout_is_distinct_and_configurable(monkeypatch) -> None:
-    monkeypatch.delenv(
-        "TENDWIRE_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS",
-        raising=False,
-    )
-    defaults = load_config(herdr_timeout_seconds="2.5")
-    assert defaults.herdr_timeout_seconds == 2.5
-    assert (
-        defaults.herdr_initial_reconcile_timeout_seconds
-        == DEFAULT_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS
-        == 120.0
-    )
-
-    monkeypatch.setenv("TENDWIRE_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS", "45")
-    environment = load_config(herdr_timeout_seconds="1.5")
-    explicit = load_config(
-        herdr_timeout_seconds="0.75",
-        herdr_initial_reconcile_timeout_seconds="90",
-    )
-
-    assert environment.herdr_timeout_seconds == 1.5
-    assert environment.herdr_initial_reconcile_timeout_seconds == 45.0
-    assert explicit.herdr_timeout_seconds == 0.75
-    assert explicit.herdr_initial_reconcile_timeout_seconds == 90.0
-
-
-@pytest.mark.parametrize("value", ["", "invalid", "0", "-1", "inf", "nan"])
-def test_initial_reconcile_timeout_rejects_invalid_environment(
-    monkeypatch,
-    value: str,
-) -> None:
-    monkeypatch.setenv("TENDWIRE_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS", value)
-
-    with pytest.raises(
-        ValueError,
-        match="herdr_initial_reconcile_timeout_seconds must be a finite positive number",
-    ):
-        load_config()
 
 
 def test_acp_defaults_are_required_runtime_settings_with_thoughts_disabled(
@@ -216,10 +175,8 @@ def test_submission_hard_ttl_must_cover_link_window() -> None:
 
 def test_pr16_runtime_knobs_have_documented_defaults(monkeypatch) -> None:
     for name in (
-        "TENDWIRE_EVENT_DEBOUNCE_SECONDS",
         "TENDWIRE_RECONCILE_INTERVAL_SECONDS",
         "TENDWIRE_EVENT_RETENTION_DAYS",
-        "TENDWIRE_OUTPUT_EXCERPT_CHARS",
         "TENDWIRE_MAX_WORKERS",
         "TENDWIRE_MAX_OUTBOX_ATTEMPTS",
         "TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS",
@@ -233,10 +190,8 @@ def test_pr16_runtime_knobs_have_documented_defaults(monkeypatch) -> None:
 
     config = load_config()
 
-    assert config.event_debounce_seconds == 0.05
-    assert config.reconcile_interval_seconds == 300.0
+    assert config.reconcile_interval_seconds == 15.0
     assert config.event_retention_days == 7
-    assert config.output_excerpt_chars == 200
     assert config.max_workers == 512
     assert config.max_outbox_attempts == 10
     assert config.connector_claim_ttl_seconds == 60
@@ -248,10 +203,8 @@ def test_pr16_runtime_knobs_have_documented_defaults(monkeypatch) -> None:
 
 
 def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
-    monkeypatch.setenv("TENDWIRE_EVENT_DEBOUNCE_SECONDS", "0.25")
     monkeypatch.setenv("TENDWIRE_RECONCILE_INTERVAL_SECONDS", "0")
     monkeypatch.setenv("TENDWIRE_EVENT_RETENTION_DAYS", "14")
-    monkeypatch.setenv("TENDWIRE_OUTPUT_EXCERPT_CHARS", "123")
     monkeypatch.setenv("TENDWIRE_MAX_WORKERS", "64")
     monkeypatch.setenv("TENDWIRE_MAX_OUTBOX_ATTEMPTS", "3")
     monkeypatch.setenv("TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS", "45")
@@ -263,10 +216,8 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
 
     env_config = load_config()
     explicit = load_config(
-        event_debounce_seconds="0.1",
         reconcile_interval_seconds="5",
         event_retention_days="2",
-        output_excerpt_chars="50",
         max_workers="9",
         max_outbox_attempts="4",
         connector_claim_ttl_seconds="15",
@@ -276,10 +227,8 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
         command_receipt_retention_seconds="691200",
         command_receipt_retention_count="12",
     )
-    assert env_config.event_debounce_seconds == 0.25
     assert env_config.reconcile_interval_seconds == 0
     assert env_config.event_retention_days == 14
-    assert env_config.output_excerpt_chars == 123
     assert env_config.max_workers == 64
     assert env_config.max_outbox_attempts == 3
     assert env_config.connector_claim_ttl_seconds == 45
@@ -288,10 +237,8 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
     assert env_config.command_retry_horizon_seconds == 120
     assert env_config.command_receipt_retention_seconds == 691_200
     assert env_config.command_receipt_retention_count == 99
-    assert explicit.event_debounce_seconds == 0.1
     assert explicit.reconcile_interval_seconds == 5
     assert explicit.event_retention_days == 2
-    assert explicit.output_excerpt_chars == 50
     assert explicit.max_workers == 9
     assert explicit.max_outbox_attempts == 4
     assert explicit.connector_claim_ttl_seconds == 15
@@ -305,10 +252,8 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("event_debounce_seconds", -0.1, "event_debounce_seconds must be non-negative"),
         ("reconcile_interval_seconds", -1, "reconcile_interval_seconds must be non-negative"),
         ("event_retention_days", 0, "event_retention_days must be >= 1"),
-        ("output_excerpt_chars", 0, "output_excerpt_chars must be >= 1"),
         ("max_workers", 0, "max_workers must be >= 1"),
         ("max_outbox_attempts", 0, "max_outbox_attempts must be >= 1"),
         ("connector_claim_ttl_seconds", 0, "connector_claim_ttl_seconds must be >= 1"),
@@ -615,43 +560,7 @@ def test_socket_group_defaults_private_and_normalizes_without_lookup(monkeypatch
     assert load_config(socket_group="   ").socket_group is None
 
 
-def test_herdr_backend_defaults_to_cli(monkeypatch) -> None:
-    monkeypatch.delenv("TENDWIRE_HERDR_BACKEND", raising=False)
-
-    assert Config().herdr_backend == "cli"
-    assert load_config().herdr_backend == "cli"
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        ("cli", "cli"),
-        ("socket", "socket"),
-        (" CLI ", "cli"),
-        ("SOCKET", "socket"),
-    ],
-)
-def test_herdr_backend_accepts_explicit_values(monkeypatch, raw: str, expected: str) -> None:
-    monkeypatch.delenv("TENDWIRE_HERDR_BACKEND", raising=False)
-
-    assert Config(herdr_backend=raw).herdr_backend == expected
-    assert load_config(herdr_backend=raw).herdr_backend == expected
-
-
-def test_herdr_backend_reads_environment(monkeypatch) -> None:
-    monkeypatch.setenv("TENDWIRE_HERDR_BACKEND", "socket")
-
-    assert load_config().herdr_backend == "socket"
-
-
-def test_herdr_backend_invalid_value_fails_clearly(monkeypatch) -> None:
-    monkeypatch.setenv("TENDWIRE_HERDR_BACKEND", "events")
-
-    with pytest.raises(ValueError, match="herdr_backend must be one of: cli, socket"):
-        load_config()
-
-
-def test_cli_default_import_does_not_load_socket_event_backend() -> None:
+def test_cli_default_import_does_not_load_socket_transport() -> None:
     code = """
 import sys
 before = set(sys.modules)
@@ -659,7 +568,6 @@ import tendwire.cli
 loaded = set(sys.modules) - before
 for name in sorted(loaded):
     if name in {
-        "tendwire.backends.herdr_events",
         "tendwire.backends.herdr_socket",
         "tendwire.backends.herdr_protocol",
     }:
