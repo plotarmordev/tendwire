@@ -193,7 +193,6 @@ def test_allowed_actions_frozen() -> None:
         "read_snapshot",
         "resolve_target",
         "send_instruction",
-        "answer_pending",
         "answer_decision",
     }
 
@@ -405,51 +404,8 @@ def test_canonical_send_instruction_fingerprint_changes_for_semantics(
     assert changed.fingerprint != baseline.fingerprint
 
 
-def test_build_canonical_answer_pending_has_hard_coded_v1_identity() -> None:
-    request = _answer_pending_request(request_id="not-canonical")
-
-    mutation = build_canonical_mutation(request, public_worker_id="worker-public-7")
-
-    assert mutation.canonical_version == 1
-    assert mutation.action == "answer_pending"
-    assert mutation.public_worker_id == "worker-public-7"
-    assert mutation.canonical_json == (
-        '{"action":"answer_pending","canonical_version":1,"options":{},'
-        '"pending":{"choice_id":"choice-public",'
-        '"pending_fingerprint":"pending-revision","pending_id":"pending-public"},'
-        '"target":{"worker_id":"worker-public-7"}}'
-    )
-    assert mutation.fingerprint == "1a88307fbc8afd0a1205eaca"
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("pending_id", "pending-public-changed"),
-        ("pending_fingerprint", "pending-revision-changed"),
-        ("choice_id", " choice-public "),
-    ],
-)
-def test_canonical_answer_pending_fingerprint_changes_for_exact_semantics(
-    field: str,
-    value: str,
-) -> None:
-    baseline = build_canonical_mutation(
-        _answer_pending_request(request_id="baseline"),
-        public_worker_id="worker-public-7",
-    )
-    params = {
-        "pending_id": "pending-public",
-        "pending_fingerprint": "pending-revision",
-        "choice_id": "choice-public",
-    }
-    params[field] = value
-    changed = build_canonical_mutation(
-        _answer_pending_request(request_id="changed", params=params),
-        public_worker_id="worker-public-7",
-    )
-
-    assert changed.fingerprint != baseline.fingerprint
 
 
 def test_command_envelope_shape_matches_contract() -> None:
@@ -646,7 +602,7 @@ def test_command_envelope_rejects_inconsistent_receipt_tuples(
 
 
 @pytest.mark.parametrize(
-    "action", ["send_instruction", "answer_pending", "answer_decision"]
+    "action", ["send_instruction", "answer_decision"]
 )
 @pytest.mark.parametrize("request_id", [None, "", "not canonical"])
 def test_command_envelope_live_mutations_require_canonical_request_ids(
@@ -657,23 +613,15 @@ def test_command_envelope_live_mutations_require_canonical_request_ids(
         action=action,
         request_id=request_id,
         dry_run=False,
-        target={"worker_id": "w-1"} if action != "answer_pending" else None,
+        target={"worker_id": "w-1"},
         instruction={"text": "hello"} if action == "send_instruction" else None,
         params=(
             {
-                "pending_id": "pending-1",
-                "pending_fingerprint": "revision-1",
-                "choice_id": "choice-1",
+                "decision_ref": "decision-1",
+                "selection": {"option_refs": ["1"]},
             }
-            if action == "answer_pending"
-            else (
-                {
-                    "decision_ref": "decision-1",
-                    "selection": {"option_refs": ["1"]},
-                }
-                if action == "answer_decision"
-                else None
-            )
+            if action == "answer_decision"
+            else None
         ),
     )
 
@@ -802,7 +750,7 @@ def test_answer_in_progress_allows_only_retryable_dispositions() -> None:
 
 
 @pytest.mark.parametrize(
-    "action", ["send_instruction", "answer_pending", "answer_decision"]
+    "action", ["send_instruction", "answer_decision"]
 )
 @pytest.mark.parametrize("ok", [False, True])
 @pytest.mark.parametrize("status", sorted(VALID_STATUSES))
@@ -833,7 +781,7 @@ def test_command_envelope_from_dict_enforces_terminal_rejected_matrix(
 
 
 @pytest.mark.parametrize(
-    "action", ["send_instruction", "answer_pending", "answer_decision"]
+    "action", ["send_instruction", "answer_decision"]
 )
 @pytest.mark.parametrize("dry_run", [False, True], ids=["live", "dry-run"])
 @pytest.mark.parametrize("ok", [False, True])
@@ -1349,7 +1297,6 @@ def test_mutation_request_id_accepts_exact_ascii_tokens_and_roundtrips(
             target={"worker_id": "w-1"},
             instruction={"text": "ok"},
         ),
-        _answer_pending_request(request_id=request_id),
     ]
 
     assert is_valid_request_id(request_id)
@@ -1417,7 +1364,6 @@ def test_mutation_request_id_rejects_everything_outside_exact_ascii_grammar(
             target={"worker_id": "w-1"},
             instruction={"text": "ok"},
         ),
-        _answer_pending_request(request_id=request_id),
     ]
 
     assert not is_valid_request_id(request_id)
@@ -1437,130 +1383,14 @@ def test_mutation_request_id_rejects_everything_outside_exact_ascii_grammar(
         assert parsed_error["code"] == STATUS_INVALID_REQUEST
 
 
-def _answer_pending_request(
-    *,
-    request_id: str | None = "answer-1",
-    dry_run: bool = False,
-    params: Any = None,
-) -> CommandRequest:
-    return CommandRequest(
-        action="answer_pending",
-        request_id=request_id,
-        dry_run=dry_run,
-        params=params
-        if params is not None
-        else {
-            "pending_id": "pending-public",
-            "pending_fingerprint": "pending-revision",
-            "choice_id": "choice-public",
-        },
-    )
 
 
-def test_parse_answer_pending_accepts_exact_opaque_params() -> None:
-    payload = {
-        "schema_version": 1,
-        "action": "answer_pending",
-        "request_id": "answer-1",
-        "dry_run": False,
-        "params": {
-            "pending_id": " opaque pending ",
-            "pending_fingerprint": " opaque revision ",
-            "choice_id": " opaque choice ",
-        },
-    }
-
-    request, parse_error = parse_command_request(json.dumps(payload))
-
-    assert parse_error is None
-    assert request is not None
-    assert validate_request(request) is None
-    assert request.params == payload["params"]
 
 
-@pytest.mark.parametrize(
-    "changes,field",
-    [
-        ({"target": {"worker_id": "w-1"}}, "target"),
-        ({"instruction": {"text": "private"}}, "instruction"),
-        ({"params": None}, "params"),
-        ({"params": {}}, "params"),
-        (
-            {
-                "params": {
-                    "pending_id": "pending-public",
-                    "pending_fingerprint": "pending-revision",
-                    "choice_id": "choice-public",
-                    "extra": "no",
-                }
-            },
-            "params",
-        ),
-        (
-            {
-                "params": {
-                    "pending_id": "",
-                    "pending_fingerprint": "pending-revision",
-                    "choice_id": "choice-public",
-                }
-            },
-            "params.pending_id",
-        ),
-        (
-            {
-                "params": {
-                    "pending_id": "pending-public",
-                    "pending_fingerprint": " \t",
-                    "choice_id": "choice-public",
-                }
-            },
-            "params.pending_fingerprint",
-        ),
-        (
-            {
-                "params": {
-                    "pending_id": "pending-public",
-                    "pending_fingerprint": "pending-revision",
-                    "choice_id": 1,
-                }
-            },
-            "params.choice_id",
-        ),
-    ],
-)
-def test_validate_answer_pending_rejects_non_exact_shape(
-    changes: dict[str, Any],
-    field: str,
-) -> None:
-    request = _answer_pending_request()
-    data = request.to_dict()
-    data.update(changes)
-
-    error = validate_request(CommandRequest.from_dict(data))
-
-    assert error is not None
-    assert error["code"] == STATUS_INVALID_REQUEST
-    assert field in str(error)
 
 
-@pytest.mark.parametrize(
-    "request_id",
-    [None, "", "   \t", " leading", "trailing ", "\twrapped\t"],
-)
-def test_validate_answer_pending_non_dry_run_requires_canonical_request_id(
-    request_id: str | None,
-) -> None:
-    error = validate_request(_answer_pending_request(request_id=request_id))
-
-    assert error is not None
-    assert error["code"] == STATUS_INVALID_REQUEST
-    assert "request_id" in error["message"]
 
 
-def test_validate_answer_pending_dry_run_does_not_require_request_id() -> None:
-    assert validate_request(
-        _answer_pending_request(request_id=None, dry_run=True)
-    ) is None
 
 
 @pytest.mark.parametrize(

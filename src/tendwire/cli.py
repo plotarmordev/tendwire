@@ -962,7 +962,7 @@ def command_envelope_from_payload(config: Config, payload: str) -> CommandEnvelo
     if validation_error is not None:
         return CommandEnvelope.from_error(request, validation_error)
 
-    if request.action in {"send_instruction", "answer_pending", "answer_decision"}:
+    if request.action in {"send_instruction", "answer_decision"}:
         from .command_submission import submit_command
 
         return submit_command(config, payload)
@@ -1038,7 +1038,7 @@ def cmd_command(
             and validation_error is None
             and parsed_request is not None
             and parsed_request.action
-            in {"send_instruction", "answer_pending", "answer_decision"}
+            in {"send_instruction", "answer_decision"}
             and parsed_request.dry_run
         )
         daemon_eligible = (

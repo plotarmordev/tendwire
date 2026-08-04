@@ -15,7 +15,6 @@ from pathlib import Path
 
 ACP_THOUGHT_POLICIES = frozenset({"disabled", "private_summary", "private_all"})
 ACP_CONSOLE_INPUT_POLICIES = frozenset({"preserve", "live_only"})
-DEFAULT_TURN_MODEL = "observed"
 DEFAULT_ACP_THOUGHT_POLICY = "disabled"
 DEFAULT_ACP_CONSOLE_INPUT_POLICY = "preserve"
 DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS = 30.0

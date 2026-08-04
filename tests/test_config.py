@@ -19,7 +19,6 @@ from tendwire.config import (
     DEFAULT_COMMAND_RETRY_HORIZON_SECONDS,
     DEFAULT_SUBMISSION_HARD_TTL_SECONDS,
     DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS,
-    DEFAULT_TURN_MODEL,
     MAX_COMMAND_RETRY_HORIZON_SECONDS,
     MIN_COMMAND_RECEIPT_RETENTION_SECONDS,
     MAX_MAINTENANCE_CADENCE_SECONDS,
@@ -114,7 +113,6 @@ def test_acp_bounds_reject_invalid_values(field: str, value: object) -> None:
 
 def test_runtime_turn_model_modes_are_removed(monkeypatch) -> None:
     monkeypatch.delenv("TENDWIRE_TURN_MODEL", raising=False)
-    assert DEFAULT_TURN_MODEL == "observed"
     assert not hasattr(load_config(), "turn_model")
 
     monkeypatch.setenv("TENDWIRE_TURN_MODEL", "shadow")

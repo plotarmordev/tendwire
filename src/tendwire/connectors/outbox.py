@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ..config import DEFAULT_CONNECTOR_ACK_TTL_SECONDS, DEFAULT_TURN_MODEL
+from ..config import DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 from ..core.models import sanitize_public_mapping, sanitize_public_value
 from ..store.sqlite import (
     ack_connector_delivery,
@@ -217,7 +217,6 @@ class ConnectorOutboxAPI:
         max_lease_seconds: int = 300,
         ack_ttl_seconds: int = DEFAULT_CONNECTOR_ACK_TTL_SECONDS,
         max_attempts: int = 10,
-        turn_model: str = DEFAULT_TURN_MODEL,
     ) -> None:
         self.db_path = Path(db_path) if db_path is not None else None
         self.host_id = str(host_id)
@@ -225,7 +224,6 @@ class ConnectorOutboxAPI:
         self.max_lease_seconds = max(1, int(max_lease_seconds))
         self.ack_ttl_seconds = max(1, int(ack_ttl_seconds))
         self.max_attempts = max(1, int(max_attempts))
-        self.turn_model = str(turn_model or DEFAULT_TURN_MODEL).strip().lower()
 
     def _require_store(self, name: str = "") -> dict[str, Any] | None:
         if self.db_path is None:
@@ -293,7 +291,6 @@ class ConnectorOutboxAPI:
                 presentation_version=version,
                 part_count=part_count,
                 source_ref=source_ref,
-                turn_model=self.turn_model,
             )
 
         if action == "recover":

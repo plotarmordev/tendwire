@@ -16,10 +16,10 @@ from tendwire.store.sqlite import (
     AppendProjectedAgentEventResult,
     TurnRefreshApplyResult,
     list_agent_events,
-    list_public_agent_events,
     save_snapshot,
     upsert_worker_bindings,
 )
+from .store_helpers import read_public_test_agent_events
 
 
 def _binding() -> WorkerBinding:
@@ -434,7 +434,7 @@ def test_live_prompt_echo_is_suppressed_but_load_replay_user_message_is_retained
     assert [event.event.kind for event in events] == ["user_message", "user_message"]
     assert events[0].event.payload["assembled_text"] == "one question"
     assert events[1].event.payload["assembled_text"] == "historical question"
-    assert list_public_agent_events(db_path, "host-a") == ()
+    assert read_public_test_agent_events(db_path, "host-a") == ()
 
 
 def test_steering_prompt_appends_to_active_turn_without_resetting_identity(
@@ -538,7 +538,7 @@ def test_stable_control_updates_persist_privately_and_replay_idempotently(
     assert events[0].event.payload["extension"] == (
         f"acp.session_update.{update_kind}"
     )
-    assert list_public_agent_events(db_path, "host-a") == ()
+    assert read_public_test_agent_events(db_path, "host-a") == ()
 
 
 def test_duplicate_durable_event_can_idempotently_repair_projection(tmp_path: Path) -> None:

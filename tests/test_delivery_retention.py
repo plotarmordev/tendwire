@@ -19,12 +19,12 @@ from tendwire.store import sqlite as store_sqlite
 from tendwire.store.sqlite import (
     cleanup_acknowledged_final_retention,
     init_store,
-    merge_turn_content,
     reclaim_expired_connector_leases,
     save_snapshot,
     store_status,
     turns_payload_from_store,
 )
+from .store_helpers import apply_test_turn_refresh
 
 
 HOST_ID = "retention-host"
@@ -91,7 +91,7 @@ def _merge_final(
     observed_at: str,
     host_id: str = HOST_ID,
 ) -> dict[str, Any]:
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         WORKER_ID,
@@ -369,7 +369,7 @@ def test_dead_letter_final_blocks_no_later_finals(tmp_path: Path) -> None:
         final_text="first owner later final",
         observed_at="2026-01-01T00:01:00+00:00",
     )
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         second_worker_id,
@@ -696,7 +696,7 @@ def test_new_authoritative_revision_supersedes_stale_lease_without_double_send(
     _finish_source(api, current_source, version="retention-current-revision")
     assert _anchor_state(db_path, current_source["key"])[0] == "delivered"
 
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         WORKER_ID,
@@ -708,7 +708,7 @@ def test_new_authoritative_revision_supersedes_stale_lease_without_double_send(
         },
         observed_at="2026-01-03T00:00:00+00:00",
     ) == 0
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         WORKER_ID,
@@ -803,7 +803,7 @@ def test_concurrent_final_merges_create_unique_anchors_drained_in_durable_order(
 
     def merge_one(index: int) -> int:
         barrier.wait(timeout=10)
-        return merge_turn_content(
+        return apply_test_turn_refresh(
             db_path,
             HOST_ID,
             WORKER_ID,
