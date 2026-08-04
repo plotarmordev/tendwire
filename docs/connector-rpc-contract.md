@@ -64,12 +64,14 @@ inner `ok: false` result.
 - `ref` is an attempt-scoped capability with prefix `twref1.`. It changes whenever
   a delivery is leased again. Only the ref from the current live lease may mutate
   that attempt; an older ref must be treated as stale or invalid.
-- `attempt` increases when a delivery is leased again.
+- `attempt` increases when a delivery is leased again within one retry generation.
+  It is not a lifetime counter: an explicit dead-letter `connector.retry` starts a
+  fresh generation whose first lease has `attempt: 1`.
 - `plan_token` (`twplan1.`), `content_revision` (`twrev1.`), and
   `final_identity` (`twfinal1.`) are opaque, case-sensitive values. Clients must
   preserve their exact UTF-8 bytes and must not parse, normalize, case-fold, or
-  regenerate them. The same rule applies when a token is nested in `payload`,
-  `turn`, `final`, or `content`.
+  regenerate them. The same rule applies to their supported positions in a polled
+  item payload and its nested `turn` and `content` objects.
 - Connector payloads are already public, backend-neutral projections. Private
   routing, terminal, provider, and credential fields are intentionally absent.
 
@@ -85,10 +87,12 @@ The correct provider-delivery transaction is:
 
 If the provider accepted the send but the ACK was lost, lease expiry followed by
 `connector.poll` (or an explicit `connector.reclaim` first) returns the same
-`key` and payload with a new `ref` and a higher `attempt`. The connector finds its
-existing binding, does not send again, and ACKs the new ref. `connector.poll`
-reclaims expired leases atomically before selecting work, so explicit reclaim is
-an optional eager-maintenance operation, not a correctness requirement.
+`key` and payload with a new `ref` and a higher attempt in the current retry
+generation. This remains true after a connector process restart: the connector
+reopens its durable provider binding, does not send again, and ACKs the new ref.
+`connector.poll` reclaims expired leases atomically before selecting work, so
+explicit reclaim is an optional eager-maintenance operation, not a correctness
+requirement.
 
 This is the only supported ACK-loss recovery behavior. Payload mutation across
 attempts or provider deduplication by `ref` would violate the contract.
@@ -136,13 +140,17 @@ must use the newest ref obtained after any re-poll.
 Params are `name`, live `ref`, and optional `reason`, public `response`,
 `available_at`, or `delay_seconds`. It records a failed attempt and either returns
 the item to the retry schedule or exhausts it according to Tendwire's configured
-attempt budget. Tendwire owns that budget and final state.
+attempt budget. If Tendwire marked a leased item `terminal_after_lease` because a
+newer authoritative plan superseded it, fail instead returns `superseded`, makes
+the item terminal, and does not schedule it. Tendwire owns the budget and final
+state.
 
 ### `connector.defer`
 
 Params have the same scheduling shape as `connector.fail`. Defer releases the
 current lease onto the requested future schedule without classifying the provider
-operation as a delivery failure.
+operation as a delivery failure. For an item marked `terminal_after_lease`, it
+instead returns `superseded`, makes the item terminal, and does not schedule it.
 
 ### `connector.renew`
 
@@ -152,9 +160,10 @@ lease within the same queue-specific bounds used by poll and returns status
 
 ### `connector.release`
 
-Params are `name` and live `ref`. It ends the current lease and makes the durable
-delivery eligible for another poll, which creates a new attempt/ref while retaining
-the key and payload.
+Params are `name` and live `ref`. Normally it ends the current lease and makes the
+durable delivery eligible for another poll, which creates a new attempt/ref while
+retaining the key and payload. For an item marked `terminal_after_lease`, it
+instead returns `superseded`, makes the item terminal, and does not requeue it.
 
 ### `connector.reclaim`
 
@@ -180,6 +189,14 @@ It is a strict four-action protocol:
 Each action accepts only its declared fields. Callers must retain returned opaque
 tokens exactly and honor the returned inner `ok` and `status`.
 
+The normal final delivery flow is source-bound. Poll the `final_ready` source,
+pass its live `source_ref` to both `begin` and `commit`, and then deliver the
+materialized parts. A successful source-bound commit atomically changes the source
+and its attempt from `leased` to `awaiting_ack`. The source becomes `delivered`
+only after all ordered parts are acknowledged. Source-less prepare exists for the
+store's explicitly validated source-less/recovery cases; it is not a connector
+shortcut around polling the normal source.
+
 ### `connector.inspect`
 
 This is the strict dead-letter query for turn-final work. Params are exactly
@@ -192,6 +209,12 @@ This is the strict operator retry for a turn-final dead letter. Params are exact
 `schema_version: 1`, `name: "turn-final"`, and one selector: either the durable
 revision delivery `key` or its `final_identity`. Tendwire validates the
 `turn-final:revision:twfinal1.*` identity form and owns the resulting transition.
+For an exact dead-letter final anchor, success returns `status: "requeued"` and
+`prior_attempt_count`, deletes the superseded per-attempt rows to keep history
+bounded, and makes the next poll start at `attempt: 1` with the same key. A later
+retry adds the new generation's attempts to `prior_attempt_count`. When the target
+identifies one uniquely recoverable failed presentation plan, Tendwire may perform
+the plan-recovery path instead and returns that recovery result.
 
 ## Failure handling
 

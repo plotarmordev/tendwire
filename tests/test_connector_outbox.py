@@ -2234,8 +2234,10 @@ def test_unrelated_plans_poll_concurrently_but_never_colease_siblings(
     assert {item["payload"]["sequence_index"] for item in items} == {0}
 
 
-def test_replacement_waits_for_old_lease_then_activates_without_requeue(
+@pytest.mark.parametrize("terminal_action", ["release", "fail", "defer"])
+def test_replacement_terminalizes_old_lease_then_activates_without_requeue(
     tmp_path: Path,
+    terminal_action: str,
 ) -> None:
     db_path = tmp_path / "prepare-replacement-barrier.db"
     turn_id, revision = _canonical_turn(db_path, final_text="abcdefgh")
@@ -2264,10 +2266,15 @@ def test_replacement_waits_for_old_lease_then_activates_without_requeue(
     assert new["state"] == "waiting_predecessor"
     assert api.poll({"name": "turn-final", "limit": 10})["items"] == []
 
-    terminalized = api.fail(
-        {"name": "turn-final", "ref": leased_old["ref"], "delay_seconds": 0}
-    )
+    terminal_params: dict[str, Any] = {
+        "name": "turn-final",
+        "ref": leased_old["ref"],
+    }
+    if terminal_action in {"fail", "defer"}:
+        terminal_params["delay_seconds"] = 0
+    terminalized = getattr(api, terminal_action)(terminal_params)
     assert terminalized["status"] == "superseded"
+    assert "available_at" not in terminalized
     activated = api.poll({"name": "turn-final", "limit": 10})["items"]
     assert len(activated) == 1
     assert activated[0]["payload"]["plan_token"] == new["plan_token"]
