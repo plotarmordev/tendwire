@@ -110,11 +110,15 @@ class HerdrSocketClient:
         timeout: float | None = None,
     ) -> Any:
         """Send one strictly correlated request and return its raw result payload."""
-        request_id, deadline = self._send_request(method, params, timeout=timeout)
-        response = self._read_response(request_id, deadline=deadline)
-        if is_error_response(response):
-            raise HerdrErrorResponse(error_payload(response), request_id)
-        return result_payload(response)
+        try:
+            request_id, deadline = self._send_request(method, params, timeout=timeout)
+            response = self._read_response(request_id, deadline=deadline)
+            if is_error_response(response):
+                raise HerdrErrorResponse(error_payload(response), request_id)
+            return result_payload(response)
+        finally:
+            # Herdr accepts exactly one request on each Unix connection.
+            self.close()
 
     def workspace_list(
         self,
@@ -229,18 +233,6 @@ class HerdrSocketClient:
         try:
             sock.settimeout(self._remaining(deadline))
             sock.sendall(payload)
-        except (BrokenPipeError, ConnectionResetError) as exc:
-            self.close()
-            try:
-                self.connect()
-                sock = self._active_socket()
-                sock.settimeout(self._remaining(deadline))
-                sock.sendall(payload)
-            except socket.timeout as retry_exc:
-                raise HerdrSocketTimeoutError("Herdr socket write timed out") from retry_exc
-            except OSError as retry_exc:
-                self.close()
-                raise HerdrSocketDisconnectedError("Herdr socket disconnected during write") from retry_exc
         except socket.timeout as exc:
             raise HerdrSocketTimeoutError("Herdr socket write timed out") from exc
         except OSError as exc:

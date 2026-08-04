@@ -203,7 +203,7 @@ def test_pr16_runtime_knobs_have_documented_defaults(monkeypatch) -> None:
 
 
 def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
-    monkeypatch.setenv("TENDWIRE_RECONCILE_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("TENDWIRE_RECONCILE_INTERVAL_SECONDS", "2")
     monkeypatch.setenv("TENDWIRE_EVENT_RETENTION_DAYS", "14")
     monkeypatch.setenv("TENDWIRE_MAX_WORKERS", "64")
     monkeypatch.setenv("TENDWIRE_MAX_OUTBOX_ATTEMPTS", "3")
@@ -227,7 +227,7 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
         command_receipt_retention_seconds="691200",
         command_receipt_retention_count="12",
     )
-    assert env_config.reconcile_interval_seconds == 0
+    assert env_config.reconcile_interval_seconds == 2
     assert env_config.event_retention_days == 14
     assert env_config.max_workers == 64
     assert env_config.max_outbox_attempts == 3
@@ -252,7 +252,16 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("reconcile_interval_seconds", -1, "reconcile_interval_seconds must be non-negative"),
+        (
+            "reconcile_interval_seconds",
+            0,
+            "reconcile_interval_seconds must be a finite positive number",
+        ),
+        (
+            "reconcile_interval_seconds",
+            -1,
+            "reconcile_interval_seconds must be a finite positive number",
+        ),
         ("event_retention_days", 0, "event_retention_days must be >= 1"),
         ("max_workers", 0, "max_workers must be >= 1"),
         ("max_outbox_attempts", 0, "max_outbox_attempts must be >= 1"),
@@ -268,6 +277,15 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
 def test_pr16_runtime_knobs_reject_invalid_values(field: str, value: object, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         Config(**{field: value})
+
+
+def test_reconcile_interval_rejects_disabled_environment(monkeypatch) -> None:
+    monkeypatch.setenv("TENDWIRE_RECONCILE_INTERVAL_SECONDS", "0")
+    with pytest.raises(
+        ValueError,
+        match="reconcile_interval_seconds must be a finite positive number",
+    ):
+        load_config()
 
 
 ACKNOWLEDGED_FINAL_RETENTION_ENV_NAMES = (

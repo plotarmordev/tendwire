@@ -544,17 +544,6 @@ class TendwireDaemon:
                 )
             else:
                 self.hooks.init_store(Path(self.config.db_path))
-            self._connector_periodic_tick()
-            self._start_acp_supervisor()
-            from .store.sqlite import latest_snapshot
-
-            self._snapshot = latest_snapshot(
-                Path(self.config.db_path), self.config.host_id
-            )
-            if self._snapshot is None:
-                raise RuntimeError("ACP supervisor did not publish a lifecycle snapshot")
-            self._after_snapshot_saved()
-
             api = TendwireDaemonAPI(
                 get_snapshot=self.get_snapshot,
                 get_health=self.get_health,
@@ -574,12 +563,21 @@ class TendwireDaemon:
                 prepare_parent=self._prepare_socket_parent,
                 periodic_callback=self._connector_periodic_tick,
             )
-            self._server = server
-            # Bind before ingestion starts. Managed store connections and the
-            # socket publisher lock the same parent directory, so allowing an
-            # initial refresh first can make the daemon deadlock with itself.
-            # Requests are not served until start() returns successfully.
+            # Bind before ACP runtime/consumer threads can take store locks.
+            # No connections are accepted until serve_forever(), after
+            # this startup transaction has succeeded.
             server.start()
+            self._connector_periodic_tick()
+            self._start_acp_supervisor()
+            from .store.sqlite import latest_snapshot
+
+            self._snapshot = latest_snapshot(
+                Path(self.config.db_path), self.config.host_id
+            )
+            if self._snapshot is None:
+                raise RuntimeError("ACP supervisor did not publish a lifecycle snapshot")
+            self._after_snapshot_saved()
+            self._server = server
 
         except Exception:
             self.stop_event.set()
@@ -959,6 +957,7 @@ class TendwireDaemon:
             "ready": acp_health["healthy"],
             "running": acp_health.get("state") == "running",
             "last_reconcile_at": acp_health.get("last_reconcile_at"),
+            "reconcile_enabled": True,
         }
         backend_maintenance = backend_runtime.get("automatic_maintenance")
         runtime_maintenance = (
@@ -1044,10 +1043,7 @@ class TendwireDaemon:
                 "outcome": backend_runtime.get("outcome"),
                 "ready": backend_runtime.get("ready"),
                 "running": backend_runtime.get("running"),
-                "reconcile_enabled": backend_runtime.get(
-                    "reconcile_enabled",
-                    self.config.reconcile_interval_seconds > 0,
-                ),
+                "reconcile_enabled": backend_runtime["reconcile_enabled"],
             },
             "acp": acp_health,
             "pending_ingestion": pending_ingestion,
