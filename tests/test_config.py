@@ -14,7 +14,6 @@ from tendwire.config import (
     DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS,
     DEFAULT_ACP_THOUGHT_POLICY,
-    DEFAULT_AGENT_EVENT_SOURCE,
     DEFAULT_COMMAND_RECEIPT_RETENTION_COUNT,
     DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS,
     DEFAULT_COMMAND_RETRY_HORIZON_SECONDS,
@@ -24,8 +23,6 @@ from tendwire.config import (
     DEFAULT_TURN_MODEL,
     MAX_COMMAND_RETRY_HORIZON_SECONDS,
     MIN_COMMAND_RECEIPT_RETENTION_SECONDS,
-    DEFAULT_TURN_REFRESH_INTERVAL_SECONDS,
-    DEFAULT_TURN_REFRESH_WORKERS,
     MAX_MAINTENANCE_CADENCE_SECONDS,
     MAX_RETENTION_DAYS,
     MAX_SQLITE_INTEGER,
@@ -74,7 +71,7 @@ def test_initial_reconcile_timeout_rejects_invalid_environment(
         load_config()
 
 
-def test_acp_event_source_defaults_to_legacy_with_thoughts_disabled(
+def test_acp_defaults_are_required_runtime_settings_with_thoughts_disabled(
     monkeypatch,
 ) -> None:
     for name in (
@@ -89,7 +86,7 @@ def test_acp_event_source_defaults_to_legacy_with_thoughts_disabled(
 
     config = load_config()
 
-    assert config.agent_event_source == DEFAULT_AGENT_EVENT_SOURCE == "legacy"
+    assert not hasattr(config, "agent_event_source")
     assert config.acp_thought_policy == DEFAULT_ACP_THOUGHT_POLICY == "disabled"
     assert config.acp_request_timeout_seconds == DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS == 30.0
     assert config.acp_shutdown_timeout_seconds == DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS == 5.0
@@ -107,7 +104,6 @@ def test_acp_configuration_uses_explicit_before_environment(monkeypatch) -> None
 
     environment = load_config()
     explicit = load_config(
-        agent_event_source="acp_required",
         acp_thought_policy="disabled",
         acp_request_timeout_seconds="7.5",
         acp_shutdown_timeout_seconds="2.5",
@@ -115,13 +111,12 @@ def test_acp_configuration_uses_explicit_before_environment(monkeypatch) -> None
         acp_console_input_policy="preserve",
     )
 
-    assert environment.agent_event_source == "acp_shadow"
+    assert not hasattr(environment, "agent_event_source")
     assert environment.acp_thought_policy == "private_all"
     assert environment.acp_request_timeout_seconds == 11.0
     assert environment.acp_shutdown_timeout_seconds == 3.0
     assert environment.acp_max_frame_bytes == 4096
     assert environment.acp_console_input_policy == "live_only"
-    assert explicit.agent_event_source == "acp_required"
     assert explicit.acp_thought_policy == "disabled"
     assert explicit.acp_request_timeout_seconds == 7.5
     assert explicit.acp_shutdown_timeout_seconds == 2.5
@@ -133,12 +128,6 @@ def test_acp_configuration_uses_explicit_before_environment(monkeypatch) -> None
 def test_acp_console_input_policy_rejects_unknown_values(value: str) -> None:
     with pytest.raises(ValueError, match="acp_console_input_policy must be one of"):
         Config(acp_console_input_policy=value)
-
-
-@pytest.mark.parametrize("value", ["", "acp", "preferred", "future"])
-def test_acp_event_source_rejects_unknown_values(value: str) -> None:
-    with pytest.raises(ValueError, match="agent_event_source must be one of"):
-        Config(agent_event_source=value)
 
 
 @pytest.mark.parametrize("value", ["", "public", "summary", "future"])
@@ -164,24 +153,13 @@ def test_acp_bounds_reject_invalid_values(field: str, value: object) -> None:
         Config(**{field: value})
 
 
-def test_turn_model_defaults_to_observed_and_accepts_compatibility_aliases(
-    monkeypatch,
-    caplog,
-) -> None:
+def test_runtime_turn_model_modes_are_removed(monkeypatch) -> None:
     monkeypatch.delenv("TENDWIRE_TURN_MODEL", raising=False)
     assert DEFAULT_TURN_MODEL == "observed"
-    assert load_config().turn_model == "observed"
+    assert not hasattr(load_config(), "turn_model")
 
     monkeypatch.setenv("TENDWIRE_TURN_MODEL", "shadow")
-    assert load_config().turn_model == "shadow"
-    assert load_config(turn_model="dual").turn_model == "dual"
-    assert "behaves as observed" in caplog.text
-
-
-@pytest.mark.parametrize("value", ["", "future", "legacy,dual"])
-def test_turn_model_rejects_unknown_values(value: str) -> None:
-    with pytest.raises(ValueError, match="turn_model must be one of"):
-        Config(turn_model=value)
+    assert not hasattr(load_config(), "turn_model")
 
 
 def test_submission_windows_have_defaults_and_explicit_precedence(monkeypatch) -> None:
@@ -534,83 +512,6 @@ def test_command_receipt_retention_must_strictly_exceed_retry_horizon(
             command_retry_horizon_seconds=horizon,
             command_receipt_retention_seconds=retention,
         )
-
-
-TURN_REFRESH_ENV_NAMES = (
-    "TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS",
-    "TENDWIRE_TURN_REFRESH_WORKERS",
-)
-
-
-def test_turn_refresh_knobs_have_documented_defaults(monkeypatch) -> None:
-    for name in TURN_REFRESH_ENV_NAMES:
-        monkeypatch.delenv(name, raising=False)
-
-    config = load_config()
-
-    assert DEFAULT_TURN_REFRESH_INTERVAL_SECONDS == 2.0
-    assert DEFAULT_TURN_REFRESH_WORKERS == 4
-    assert config.turn_refresh_interval_seconds == 2.0
-    assert config.turn_refresh_workers == 4
-
-
-def test_turn_refresh_knobs_use_explicit_before_environment(monkeypatch) -> None:
-    monkeypatch.setenv("TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS", "3.5")
-    monkeypatch.setenv("TENDWIRE_TURN_REFRESH_WORKERS", "8")
-
-    env_config = load_config(max_workers=16)
-    explicit = load_config(
-        max_workers=16,
-        turn_refresh_interval_seconds="0.25",
-        turn_refresh_workers="6",
-    )
-
-    assert env_config.turn_refresh_interval_seconds == 3.5
-    assert env_config.turn_refresh_workers == 8
-    assert explicit.turn_refresh_interval_seconds == 0.25
-    assert explicit.turn_refresh_workers == 6
-
-
-@pytest.mark.parametrize("value", [0, -0.01, "nan", "inf", "-inf"])
-def test_turn_refresh_interval_rejects_nonpositive_or_nonfinite(value: object) -> None:
-    with pytest.raises(
-        ValueError,
-        match="turn_refresh_interval_seconds must be a finite positive number",
-    ):
-        Config(turn_refresh_interval_seconds=value)
-
-
-@pytest.mark.parametrize(
-    ("value", "message"),
-    [
-        (True, "turn_refresh_workers must be an integer >= 1"),
-        (0, "turn_refresh_workers must be >= 1"),
-        (-1, "turn_refresh_workers must be >= 1"),
-        (33, "turn_refresh_workers must be <= 32"),
-        (1.5, "turn_refresh_workers must be an integer >= 1"),
-    ],
-)
-def test_turn_refresh_workers_reject_invalid_bounds(
-    value: object,
-    message: str,
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        Config(turn_refresh_workers=value)
-
-
-def test_turn_refresh_workers_cannot_exceed_observed_worker_max(monkeypatch) -> None:
-    with pytest.raises(
-        ValueError,
-        match="turn_refresh_workers must be <= max_workers",
-    ):
-        Config(max_workers=3, turn_refresh_workers=4)
-
-    monkeypatch.setenv("TENDWIRE_TURN_REFRESH_WORKERS", "5")
-    with pytest.raises(
-        ValueError,
-        match="turn_refresh_workers must be <= max_workers",
-    ):
-        load_config(max_workers=4)
 
 
 SNAPSHOT_MAINTENANCE_ENV_NAMES = (

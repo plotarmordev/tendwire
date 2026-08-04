@@ -388,7 +388,6 @@ def test_cli_command_mutation_dry_run_is_pure_and_creates_no_receipt(
     monkeypatch.setattr("tendwire.cli._try_daemon_attempt", forbidden)
     monkeypatch.setattr("tendwire.command_submission.get_command_request", forbidden)
     monkeypatch.setattr("tendwire.command_submission._current_snapshot", forbidden)
-    monkeypatch.setattr("tendwire.command_submission._validate_pending_choice", forbidden)
     monkeypatch.setattr("tendwire.command_submission.reserve_command_request", forbidden)
 
     db_path = tmp_path / f"{request_payload['action']}.db"
@@ -1260,7 +1259,6 @@ def test_cli_command_send_instruction_non_dry_run_requires_request_id(
         raise AssertionError("invalid request_id must stop before backend or store mutation")
 
     monkeypatch.setattr("tendwire.command_submission.reserve_command_request", guarded)
-    monkeypatch.setattr("tendwire.command_submission._default_socket_client_factory", guarded)
     payload: dict[str, Any] = {
         "schema_version": 1,
         "action": "send_instruction",
@@ -1719,7 +1717,6 @@ def test_cli_command_rejects_malformed_schema_version_before_pipeline(
         raise AssertionError("invalid schema_version must stop before pipeline work")
 
     monkeypatch.setattr("tendwire.command_submission.reserve_command_request", guarded)
-    monkeypatch.setattr("tendwire.command_submission._default_socket_client_factory", guarded)
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -1983,10 +1980,6 @@ def test_cli_command_uncertain_receipt_changed_payload_is_duplicate_without_retr
         calls.append("backend")
         raise AssertionError("changed duplicate receipt must not reach the backend")
 
-    monkeypatch.setattr(
-        "tendwire.command_submission._default_socket_client_factory",
-        guarded_backend,
-    )
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -2421,10 +2414,6 @@ def test_cli_command_raw_top_level_forbidden_rejects_before_pipeline(
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", guarded_fetch)
     monkeypatch.setattr("tendwire.cli.project_from_observations", guarded_project)
     monkeypatch.setattr("tendwire.cli.execute_command", guarded_execute)
-    monkeypatch.setattr(
-        "tendwire.command_submission._default_socket_client_factory",
-        guarded_send,
-    )
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(

@@ -29,16 +29,12 @@ background daemon; use [INSTALL.md](INSTALL.md) for persistent service setup.
 
 ## Relationship to Herdr, Herdres, and connectors
 
-Herdr is the only concrete runtime backend documented here. Tendwire can observe
-Herdr through the conservative CLI one-shot path or, when explicitly enabled,
-through the Herdr socket/event backend. Both paths normalize Herdr state into
-neutral Tendwire spaces, workers, attention, turns, pending interactions,
-command results, connector jobs, and backend health.
-
-ACP is the preferred semantic source for compatible, authenticated worker
-sessions while Herdr remains the process and identity authority. Source
-precedence, privacy, fallback behavior, and cross-repository rollout are
-defined in [docs/acp-migration.md](docs/acp-migration.md).
+Herdr supplies workspace, pane, and worker lifecycle plus ownership of private
+ACP endpoints. Tendwire can observe that lifecycle through the conservative CLI
+one-shot path or the Herdr socket/event backend. ACP is required for supported
+agent semantics and commands; Herdr is not used to read transcripts or inject
+pane input. The authority and privacy split is defined in
+[docs/acp-migration.md](docs/acp-migration.md).
 
 Herdres can use Tendwire as its source/control plane while Herdres remains the
 Telegram connector. Tendwire owns Herdr observation, private bindings,
@@ -555,10 +551,6 @@ variables:
 | `snapshot_retention_count` | `TENDWIRE_SNAPSHOT_RETENTION_COUNT` | `4096` | positive integer; includes each host's latest row |
 | `snapshot_maintenance_batch_size` | `TENDWIRE_SNAPSHOT_MAINTENANCE_BATCH_SIZE` | `100` | integer from 1 through 1000 |
 | `store_maintenance_cadence_seconds` | `TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS` | `3600` | positive integer |
-| `turn_refresh_interval_seconds` | `TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS` | `2.0` | finite positive float |
-| `turn_refresh_workers` | `TENDWIRE_TURN_REFRESH_WORKERS` | `4` | integer from 1 through 32 and no greater than `max_workers` |
-| `turn_model` | `TENDWIRE_TURN_MODEL` | `observed` | `observed`; `legacy`, `dual`, and `shadow` are deprecated aliases with identical observed behavior |
-| `agent_event_source` | `TENDWIRE_AGENT_EVENT_SOURCE` | `legacy` | `legacy`, `acp_shadow`, `acp_preferred`, or `acp_required`; ACP modes are experimental |
 | `acp_thought_policy` | `TENDWIRE_ACP_THOUGHT_POLICY` | `disabled` | `disabled`, `private_summary`, or `private_all`; never a public-delivery grant |
 | `acp_request_timeout_seconds` | `TENDWIRE_ACP_REQUEST_TIMEOUT_SECONDS` | `30.0` | finite positive float |
 | `acp_shutdown_timeout_seconds` | `TENDWIRE_ACP_SHUTDOWN_TIMEOUT_SECONDS` | `5.0` | finite positive float |
@@ -575,9 +567,12 @@ snapshot/projections instead of publishing a truncated authoritative snapshot.
 Incremental events that would add workers over the cap are ignored with the
 same public-safe degraded evidence.
 
-The stock daemon currently defaults to `legacy`. ACP modes use Herdr's private
-`agent.acp_endpoint` contract and accept only workers explicitly marked
-`acp_owned_ready`; ordinary PTY workers are never attached as sidecars.
+The stock daemon requires ACP for supported agents. It uses Herdr's private
+`agent.acp_endpoint` contract and accepts only workers explicitly marked
+`acp_owned_ready`; ordinary PTY workers are never attached as sidecars. A
+missing or unhealthy ACP endpoint degrades daemon health and fails command
+submission closed. There is no transcript-reader scheduler, shadow/preferred
+mode, or PTY fallback.
 Production ACP uses a bounded per-worker permission broker. It publishes only
 the sanitized tool title and numeric choices (option label and kind) through
 the durable pending-decision surface; ACP option IDs, arguments, session IDs,
@@ -585,16 +580,9 @@ and adapter metadata remain private. `answer_decision` is fenced to the exact
 worker binding, ACP session, and Herdr generation. A command is accepted only
 after the complete JSON-RPC permission-response frame is written. Missing or
 retired ACP authority fails closed without falling back to PTY input, and
-concurrent answers can produce at most one response.
-`acp_shadow` persists ACP events without projecting them, but no automated
-shadow comparator is implemented. For ACP-owned workers it is observation-only:
-legacy turn ingestion is excluded and commands fail `backend_unavailable`
-without sending on either transport. Validate real adapter execution with an
-isolated `acp_preferred` or `acp_required` canary. `acp_preferred` falls back
-only before an ACP reservation/send, while `acp_required` fails closed and
-never starts the legacy turn scheduler. None of these modes makes agent thoughts
-public: thought events remain private diagnostic data unless a separate,
-explicit sanitized projection is introduced.
+concurrent answers can produce at most one response. None of this makes agent
+thoughts public: thought events remain private diagnostic data unless a
+separate, explicit sanitized projection is introduced.
 
 Store maintenance retires expired structured agent-event payloads in bounded
 batches using `event_retention_days`. Compact identity tombstones remain so a
@@ -1512,10 +1500,6 @@ and one unlinked observation; larger components become `ambiguous`. Linkage is
 metadata and does not change observation-derived turn identity, turn-list order,
 Goal 10 delivery, or Herdres consumption. Lazy and periodic settlement cover
 both submission-first and observation-first arrival order.
-
-`TENDWIRE_TURN_MODEL` remains accepted for rollout compatibility. `legacy`,
-`dual`, and `shadow` emit a warning and use the same observation-authoritative
-behavior as `observed`.
 
 `disposition`, not `status` alone, is the receipt-authority and finality
 contract:

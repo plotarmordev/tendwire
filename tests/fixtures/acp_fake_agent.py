@@ -168,7 +168,13 @@ for line in sys.stdin:
         update("s-new", "agent_message_chunk", content={"type": "text", "text": "hi"})
         response(
             request_id,
-            {"sessionId": "s-new", "modes": {"currentModeId": "default"}},
+            {
+                "sessionId": "s-new",
+                "modes": {
+                    "currentModeId": "default",
+                    "availableModes": [{"id": "default", "name": "Default"}],
+                },
+            },
         )
     elif method == "session/load" or method == "session/resume":
         if MODE == "load_replay" and method == "session/load":
@@ -179,7 +185,20 @@ for line in sys.stdin:
                     messageId=f"replay-{index}",
                     content={"type": "text", "text": str(index)},
                 )
-        response(request_id, {"configOptions": [{"id": "model", "currentValue": "x"}]})
+        response(
+            request_id,
+            {
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "name": "Model",
+                        "type": "select",
+                        "currentValue": "x",
+                        "options": [{"value": "x", "name": "Model X"}],
+                    }
+                ]
+            },
+        )
     elif method == "session/close" or method == "session/delete":
         response(request_id, {"_meta": {"vendor.example": {"receipt": method}}})
     elif method == "session/list":
@@ -280,7 +299,9 @@ for line in sys.stdin:
             update(
                 pending_prompt_session,
                 "plan",
-                entries=[{"content": "done", "status": "completed"}],
+                entries=[
+                    {"content": "done", "priority": "medium", "status": "completed"}
+                ],
             )
             response(
                 pending_prompt_id,

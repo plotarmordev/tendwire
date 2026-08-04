@@ -534,7 +534,6 @@ def test_session_targeted_agent_adopts_matched_pane_identity_privately(tmp_path:
     assert len(records) == len(workers) == 1
     assert records[0].workspace_id == "wR9"
     assert records[0].pane_id == "wR9:pA"
-    assert records[0].turn_target_kind == "codex_session_id"
     assert _STABLE_KEY.fullmatch(_stable(workers[0]))
     public = json.dumps(workers[0].to_dict(), sort_keys=True)
     assert "wR9:pA" not in public
@@ -579,8 +578,6 @@ def test_matched_pane_overrides_conflicting_agent_continuity_and_workspace(
     assert merged_records[0].pane_id != agent_records[0].pane_id
     assert merged_workers[0].space_id == pane_workers[0].space_id == "wR9"
     assert merged_workers[0].space_id != agent_workers[0].space_id
-    assert merged_records[0].turn_target_kind == "codex_session_id"
-    assert merged_records[0].turn_target_value == pane["agent_session"]["value"]
     assert merged_workers[0].backend_target == {
         "kind": "agent_id",
         "value": "agent-send-secret",
@@ -590,8 +587,8 @@ def test_matched_pane_overrides_conflicting_agent_continuity_and_workspace(
     assert len(merged_bindings) == 1
     assert merged_bindings[0].target_kind == "agent_id"
     assert merged_bindings[0].target_value == "agent-send-secret"
-    assert merged_bindings[0].turn_target_kind == "codex_session_id"
-    assert merged_bindings[0].turn_target_value == pane["agent_session"]["value"]
+    assert merged_bindings[0].turn_target_kind is None
+    assert merged_bindings[0].turn_target_value is None
 
     public = json.dumps(merged_workers[0].to_dict(), sort_keys=True)
     for private_value in (
@@ -654,8 +651,6 @@ def test_matched_incomplete_or_invalid_pane_suppresses_agent_identity_derivation
     assert merged_records[0].workspace_id == pane_records[0].workspace_id
     assert merged_records[0].pane_id == pane_records[0].pane_id
     assert merged_workers[0].space_id == pane_workers[0].space_id
-    assert merged_records[0].turn_target_kind == "codex_session_id"
-    assert merged_records[0].turn_target_value == pane["agent_session"]["value"]
     assert merged_workers[0].backend_target is not None
     assert merged_workers[0].backend_target["kind"] == "agent_id"
     assert merged_workers[0].backend_target["value"] == "agent-send-secret"
@@ -683,8 +678,8 @@ def test_unmatched_agent_list_identity_never_authorizes_continuity(
         "sendable": True,
         "reason": None,
     }
-    assert bindings[0].turn_target_kind == "codex_session_id"
-    assert bindings[0].turn_target_value == agent["agent_session"]["value"]
+    assert bindings[0].turn_target_kind is None
+    assert bindings[0].turn_target_value is None
 
     public = json.dumps(workers[0].to_dict(), sort_keys=True)
     for private_value in (
@@ -729,8 +724,6 @@ def test_conflicting_match_keys_across_two_panes_fail_closed(
 
     assert len(records) == len(workers) == len(bindings) == 1
     assert records[0].pane_info_observed is False
-    assert records[0].turn_target_kind is None
-    assert records[0].turn_target_value is None
     assert "stable_key" not in workers[0].meta
     assert "stable_key_version" not in workers[0].meta
     assert workers[0].backend_target == {
@@ -787,8 +780,6 @@ def test_two_agents_claiming_one_pane_fail_closed_independent_of_order(
 
         assert len(records) == len(workers) == len(bindings) == 2
         assert all(record.pane_info_observed is False for record in records)
-        assert all(record.turn_target_kind is None for record in records)
-        assert all(record.turn_target_value is None for record in records)
         assert all("stable_key" not in worker.meta for worker in workers)
         assert all("stable_key_version" not in worker.meta for worker in workers)
         assert all(
@@ -888,8 +879,6 @@ def test_distinct_panes_with_shared_agent_owner_fail_closed_in_any_order(
 
         assert len(records) == len(workers) == len(bindings) == 2
         assert all(record.pane_info_observed is False for record in records)
-        assert all(record.turn_target_kind is None for record in records)
-        assert all(record.turn_target_value is None for record in records)
         assert all("stable_key" not in worker.meta for worker in workers)
         assert all(
             worker.backend_target is not None
@@ -957,8 +946,6 @@ def test_conflicting_pane_owner_key_fails_closed_independent_of_row_order(
 
         assert len(records) == len(workers) == len(bindings) == 2
         assert all(record.pane_info_observed is False for record in records)
-        assert all(record.turn_target_kind is None for record in records)
-        assert all(record.turn_target_value is None for record in records)
         assert all("stable_key" not in worker.meta for worker in workers)
         assert all("stable_key_version" not in worker.meta for worker in workers)
         assert all(
@@ -1010,8 +997,6 @@ def test_unmatched_agent_send_token_colliding_with_pane_fails_closed(
 
     assert len(records) == len(workers) == len(bindings) == 2
     assert all(record.pane_info_observed is False for record in records)
-    assert all(record.turn_target_kind is None for record in records)
-    assert all(record.turn_target_value is None for record in records)
     assert all(
         worker.backend_target is not None
         and worker.backend_target["sendable"] is False
@@ -1068,12 +1053,9 @@ def test_matched_pane_replaces_conflicting_pane_scoped_targets(
     }
     assert bindings[0].target_kind == "terminal_id"
     assert bindings[0].target_value == pane["terminal_id"]
-    assert bindings[0].turn_target_kind == "codex_session_id"
-    assert bindings[0].turn_target_value == pane["agent_session"]["value"]
-    assert agent["pane_id"] not in {
-        bindings[0].target_value,
-        bindings[0].turn_target_value,
-    }
+    assert bindings[0].turn_target_kind is None
+    assert bindings[0].turn_target_value is None
+    assert agent["pane_id"] != bindings[0].target_value
 
     public = json.dumps(workers[0].to_dict(), sort_keys=True)
     for private_value in (

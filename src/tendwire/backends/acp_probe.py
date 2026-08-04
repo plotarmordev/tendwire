@@ -25,7 +25,7 @@ from types import MappingProxyType
 from typing import Any
 
 from .acp_client import (
-    AcpClient,
+    BoundedAcpConnection,
     AcpProtocolVersionError,
     AcpRequestTimeoutError,
     AcpTransportError,
@@ -143,7 +143,7 @@ def probe_adapter(
             "close_timeout_seconds",
             maximum=MAX_PROBE_CLOSE_TIMEOUT_SECONDS,
         )
-        client = AcpClient(
+        client = BoundedAcpConnection(
             argv,
             cwd=cwd,
             env=env,

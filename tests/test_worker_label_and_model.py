@@ -6,7 +6,6 @@ from pathlib import Path
 
 from tendwire.backends.herdr_cli import _worker_from_item, _workers_and_bindings_from_records
 from tendwire.backends.herdr_events import HerdrEventBackend
-from tendwire.backends.herdr_turns import _TURN_CONTENT_KEYS
 from tendwire.config import Config
 from tendwire.core.turns import Turn
 from tendwire.core.projector import project_from_raw
@@ -92,35 +91,8 @@ def test_reconcile_drops_agent_and_pane_cwd_from_public_worker(tmp_path: Path) -
     assert "/root/pane-cwd" not in str(records[0].worker.to_dict())
 
 
-def test_reconcile_keeps_agent_turn_target_when_present(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    init_store(Path(config.db_path))
-    backend = HerdrEventBackend(config, debounce_seconds=0)
-    agent = {**_agent_item(), "agent": "codex", "name": "codex"}
-    records = backend._records_from_reconcile_payloads({"agents": [agent]}, {"panes": [_pane_item()]})
-
-    assert len(records) == 1
-    assert records[0].turn_target_kind == "codex_session_id"
-    assert records[0].turn_target_value == "sess-1"
-    assert records[0].worker.meta.get("label") == "review-pane"
 
 
-def test_reconcile_uses_matched_pane_turn_target_when_agent_lacks_one(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    init_store(Path(config.db_path))
-    backend = HerdrEventBackend(config, debounce_seconds=0)
-    agent = _agent_item()
-    agent.pop("pane_id")
-    records = backend._records_from_reconcile_payloads({"agents": [agent]}, {"panes": [_pane_item()]})
-    workers, bindings = _workers_and_bindings_from_records(config, records)
-
-    assert len(records) == 1
-    assert records[0].turn_target_kind == "pane_id"
-    assert records[0].turn_target_value == "ws-1:p2Q"
-    assert len(bindings) == 1
-    assert bindings[0].turn_target_kind == "pane_id"
-    assert bindings[0].turn_target_value == "ws-1:p2Q"
-    assert workers[0].meta.get("label") == "review-pane"
 
 
 def test_reconcile_only_fills_missing_agent_backend_target_from_pane(tmp_path: Path) -> None:
@@ -167,8 +139,6 @@ def test_turn_model_round_trip_and_id_stability() -> None:
     assert plain.fingerprint != with_model.fingerprint  # but the content fingerprint reflects it
 
 
-def test_turn_content_keys_include_model() -> None:
-    assert "model" in _TURN_CONTENT_KEYS
 
 
 def test_merge_turn_content_persists_model(tmp_path: Path) -> None:

@@ -6,7 +6,6 @@ No external config-file parser is required.
 
 from __future__ import annotations
 
-import logging
 import math
 import os
 import platform
@@ -15,14 +14,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 HERDR_BACKENDS = frozenset({"cli", "socket"})
-TURN_MODELS = frozenset({"legacy", "dual", "shadow", "observed"})
-AGENT_EVENT_SOURCES = frozenset(
-    {"legacy", "acp_shadow", "acp_preferred", "acp_required"}
-)
 ACP_THOUGHT_POLICIES = frozenset({"disabled", "private_summary", "private_all"})
 ACP_CONSOLE_INPUT_POLICIES = frozenset({"preserve", "live_only"})
 DEFAULT_TURN_MODEL = "observed"
-DEFAULT_AGENT_EVENT_SOURCE = "legacy"
 DEFAULT_ACP_THOUGHT_POLICY = "disabled"
 DEFAULT_ACP_CONSOLE_INPUT_POLICY = "preserve"
 DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS = 30.0
@@ -34,8 +28,6 @@ DEFAULT_RECONCILE_INTERVAL_SECONDS = 300.0
 DEFAULT_EVENT_RETENTION_DAYS = 7
 DEFAULT_OUTPUT_EXCERPT_CHARS = 200
 DEFAULT_MAX_WORKERS = 512
-DEFAULT_TURN_REFRESH_INTERVAL_SECONDS = 2.0
-DEFAULT_TURN_REFRESH_WORKERS = 4
 DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS = 60
 DEFAULT_SUBMISSION_HARD_TTL_SECONDS = 86_400
 DEFAULT_PENDING_STALE_GRACE_SECONDS = 30.0
@@ -61,7 +53,6 @@ MAX_SNAPSHOT_MAINTENANCE_BATCH_SIZE = 1000
 MAX_RETENTION_DAYS = 365_000
 MAX_SQLITE_INTEGER = (1 << 63) - 1
 MAX_MAINTENANCE_CADENCE_SECONDS = MAX_RETENTION_DAYS * 24 * 60 * 60
-_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -78,8 +69,6 @@ class Config:
         DEFAULT_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS
     )
     herdr_backend: str = "cli"
-    turn_model: str = DEFAULT_TURN_MODEL
-    agent_event_source: str = DEFAULT_AGENT_EVENT_SOURCE
     acp_thought_policy: str = DEFAULT_ACP_THOUGHT_POLICY
     acp_console_input_policy: str = DEFAULT_ACP_CONSOLE_INPUT_POLICY
     acp_request_timeout_seconds: float = DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS
@@ -90,8 +79,6 @@ class Config:
     event_retention_days: int = DEFAULT_EVENT_RETENTION_DAYS
     output_excerpt_chars: int = DEFAULT_OUTPUT_EXCERPT_CHARS
     max_workers: int = DEFAULT_MAX_WORKERS
-    turn_refresh_interval_seconds: float = DEFAULT_TURN_REFRESH_INTERVAL_SECONDS
-    turn_refresh_workers: int = DEFAULT_TURN_REFRESH_WORKERS
     submission_link_window_seconds: int = DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS
     submission_hard_ttl_seconds: int = DEFAULT_SUBMISSION_HARD_TTL_SECONDS
     pending_stale_grace_seconds: float = DEFAULT_PENDING_STALE_GRACE_SECONDS
@@ -151,21 +138,6 @@ class Config:
             allowed = ", ".join(sorted(HERDR_BACKENDS))
             raise ValueError(f"herdr_backend must be one of: {allowed}")
         object.__setattr__(self, "herdr_backend", backend)
-        turn_model = str(self.turn_model or "").strip().lower()
-        if turn_model not in TURN_MODELS:
-            allowed = ", ".join(sorted(TURN_MODELS))
-            raise ValueError(f"turn_model must be one of: {allowed}")
-        object.__setattr__(self, "turn_model", turn_model)
-        if turn_model != "observed":
-            _LOGGER.warning(
-                "turn_model=%s is a compatibility alias and behaves as observed",
-                turn_model,
-            )
-        agent_event_source = str(self.agent_event_source or "").strip().lower()
-        if agent_event_source not in AGENT_EVENT_SOURCES:
-            allowed = ", ".join(sorted(AGENT_EVENT_SOURCES))
-            raise ValueError(f"agent_event_source must be one of: {allowed}")
-        object.__setattr__(self, "agent_event_source", agent_event_source)
         acp_thought_policy = str(self.acp_thought_policy or "").strip().lower()
         if acp_thought_policy not in ACP_THOUGHT_POLICIES:
             allowed = ", ".join(sorted(ACP_THOUGHT_POLICIES))
@@ -238,25 +210,6 @@ class Config:
             "max_workers",
             _positive_int(self.max_workers, "max_workers", minimum=1),
         )
-        object.__setattr__(
-            self,
-            "turn_refresh_interval_seconds",
-            _positive_finite_float(
-                self.turn_refresh_interval_seconds,
-                "turn_refresh_interval_seconds",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "turn_refresh_workers",
-            _bounded_positive_int(
-                self.turn_refresh_workers,
-                "turn_refresh_workers",
-                maximum=32,
-            ),
-        )
-        if self.turn_refresh_workers > self.max_workers:
-            raise ValueError("turn_refresh_workers must be <= max_workers")
         object.__setattr__(
             self,
             "submission_link_window_seconds",
@@ -526,8 +479,6 @@ def load_config(
     herdr_timeout_seconds: float | str | None = None,
     herdr_initial_reconcile_timeout_seconds: float | str | None = None,
     herdr_backend: str | None = None,
-    turn_model: str | None = None,
-    agent_event_source: str | None = None,
     acp_thought_policy: str | None = None,
     acp_console_input_policy: str | None = None,
     acp_request_timeout_seconds: float | str | None = None,
@@ -538,8 +489,6 @@ def load_config(
     event_retention_days: int | str | None = None,
     output_excerpt_chars: int | str | None = None,
     max_workers: int | str | None = None,
-    turn_refresh_interval_seconds: float | str | None = None,
-    turn_refresh_workers: int | str | None = None,
     submission_link_window_seconds: int | str | None = None,
     submission_hard_ttl_seconds: int | str | None = None,
     pending_stale_grace_seconds: float | str | None = None,
@@ -628,16 +577,6 @@ def load_config(
             DEFAULT_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS,
         ),
         herdr_backend=resolved_herdr_backend,
-        turn_model=_resolve_value(
-            turn_model,
-            "TENDWIRE_TURN_MODEL",
-            DEFAULT_TURN_MODEL,
-        ),
-        agent_event_source=_resolve_value(
-            agent_event_source,
-            "TENDWIRE_AGENT_EVENT_SOURCE",
-            DEFAULT_AGENT_EVENT_SOURCE,
-        ),
         acp_thought_policy=_resolve_value(
             acp_thought_policy,
             "TENDWIRE_ACP_THOUGHT_POLICY",
@@ -687,16 +626,6 @@ def load_config(
             max_workers,
             "TENDWIRE_MAX_WORKERS",
             DEFAULT_MAX_WORKERS,
-        ),
-        turn_refresh_interval_seconds=_resolve_value(
-            turn_refresh_interval_seconds,
-            "TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS",
-            DEFAULT_TURN_REFRESH_INTERVAL_SECONDS,
-        ),
-        turn_refresh_workers=_resolve_value(
-            turn_refresh_workers,
-            "TENDWIRE_TURN_REFRESH_WORKERS",
-            DEFAULT_TURN_REFRESH_WORKERS,
         ),
         submission_link_window_seconds=_resolve_value(
             submission_link_window_seconds,

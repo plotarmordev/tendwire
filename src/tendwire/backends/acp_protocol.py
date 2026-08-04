@@ -14,6 +14,12 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, TypeAlias
 
+from acp.schema import (
+    RequestPermissionRequest as UpstreamRequestPermissionRequest,
+    SessionNotification as UpstreamSessionNotification,
+)
+from pydantic import ValidationError
+
 JSONRPC_VERSION = "2.0"
 ACP_PROTOCOL_VERSION = 1
 DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -508,6 +514,13 @@ def parse_session_update(params: Mapping[str, Any]) -> SessionUpdate:
     except ValueError:
         # ACP extensions and future stable revisions remain observable.
         kind = kind_value
+    else:
+        try:
+            UpstreamSessionNotification.model_validate(dict(params))
+        except ValidationError as exc:
+            raise AcpEnvelopeError(
+                "session/update params do not match the upstream ACP schema"
+            ) from exc
     meta = params.get("_meta")
     if meta is not None and not isinstance(meta, Mapping):
         meta = None
@@ -524,6 +537,25 @@ def parse_permission_request(request: JsonRpcRequest) -> PermissionRequest:
     if request.method != "session/request_permission":
         raise AcpEnvelopeError("request is not session/request_permission")
     params = request.params
+    try:
+        UpstreamRequestPermissionRequest.model_validate(dict(params))
+    except ValidationError as exc:
+        errors = exc.errors(include_url=False, include_input=False)
+        if any(
+            tuple(error.get("loc", ()))[-1:] == ("kind",)
+            for error in errors
+        ):
+            raise AcpEnvelopeError(
+                "permission option kind is not valid ACP v1"
+            ) from exc
+        locations = ", ".join(
+            ".".join(_upstream_alias(part) for part in error.get("loc", ()))
+            for error in errors
+        )
+        suffix = f" ({locations})" if locations else ""
+        raise AcpEnvelopeError(
+            f"permission request does not match the upstream ACP schema{suffix}"
+        ) from exc
     session_id = _required_string(params, "sessionId")
     tool_call = params.get("toolCall")
     if not isinstance(tool_call, Mapping):
@@ -564,6 +596,14 @@ def parse_permission_request(request: JsonRpcRequest) -> PermissionRequest:
         meta=_freeze_mapping(meta) if isinstance(meta, Mapping) else None,
         raw=_freeze_mapping(params),
     )
+
+
+def _upstream_alias(value: object) -> str:
+    """Render safe validation locations using ACP wire aliases."""
+
+    text = str(value)
+    head, *tail = text.split("_")
+    return head + "".join(part[:1].upper() + part[1:] for part in tail)
 
 
 def _required_string(value: Mapping[str, Any], key: str) -> str:

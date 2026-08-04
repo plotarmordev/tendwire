@@ -9,7 +9,7 @@ import pytest
 
 from tendwire.backends.acp_client import (
     AcpCapabilityError,
-    AcpClient,
+    BoundedAcpConnection as AcpClient,
     AcpEventQueueFullError,
     AcpRequestTimeoutError,
     AcpTransportError,
@@ -109,7 +109,10 @@ def test_initialize_capabilities_and_session_lifecycle() -> None:
             additional_directories=["/tmp/other"],
         )
         assert created.session_id == "s-new"
-        assert created.modes == {"currentModeId": "default"}
+        assert created.modes == {
+            "currentModeId": "default",
+            "availableModes": [{"id": "default", "name": "Default"}],
+        }
         streamed = acp.next_update(timeout=1)
         assert streamed.update_kind is SessionUpdateKind.AGENT_MESSAGE_CHUNK
 

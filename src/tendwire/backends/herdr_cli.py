@@ -65,8 +65,6 @@ class HerdrContinuityUnavailableError(RuntimeError):
 class _WorkerRecord:
     worker: Worker
     private_fingerprint: str
-    turn_target_kind: str | None = None
-    turn_target_value: str | None = None
     # Canonical public Herdr identity used exclusively for continuity. Raw
     # observations remain private and separate so routing compatibility can
     # never accidentally feed stable-key derivation.
@@ -110,9 +108,6 @@ _BACKEND_TARGET_KINDS = frozenset(
     {"agent_id", "terminal_id", "pane_id", "agent", "name", "label"}
 )
 _AGENT_SCOPED_BACKEND_TARGET_KINDS = frozenset({"agent_id", "agent"})
-_SESSION_SCOPED_TURN_TARGET_KINDS = frozenset(
-    {"codex_session_id", "omp_session_path"}
-)
 _DEADLINE_EXHAUSTED_OUTCOMES = frozenset({"timeout", "deadline_exhausted"})
 _UNAVAILABLE_HEALTH_OUTCOMES = frozenset({"missing_binary", "launch_error", "socket_disconnected"})
 _DEGRADED_HEALTH_OUTCOMES = frozenset(
@@ -1257,21 +1252,6 @@ def _backend_target_from_item(item: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _turn_target_from_item(item: Mapping[str, Any]) -> tuple[str, str] | None:
-    """Resolve the private Herdr structured-turn target from backend-observed fields."""
-    agent_name = (_first_text(item, ("agent", "name")) or "").strip().lower()
-    agent_session = _nested_text(item, "agent_session", "value")
-    if agent_name == "codex" and agent_session:
-        return "codex_session_id", agent_session
-    if agent_name == "omp" and agent_session:
-        # oh-my-pi reports its native session file path (herdr:omp source).
-        return "omp_session_path", agent_session
-    pane_id = _first_text(item, ("pane_id",))
-    if pane_id:
-        return "pane_id", pane_id
-    return None
-
-
 def _worker_with_id(worker: Worker, worker_id: str) -> Worker:
     """Return a worker copy with a disambiguated public id."""
     return Worker(
@@ -1445,7 +1425,6 @@ def _worker_record_from_item(
     item = _strip_turn_observation_fields(item)
     worker = _worker_from_item(item)
     worker = _worker_with_summary(worker, _bounded_excerpt(worker.summary, _output_excerpt_limit(config)))
-    turn_target = _turn_target_from_item(item)
     observed_workspace_id = _first_text(item, ("workspace_id", "workspaceId"))
     observed_pane_id = _first_text(item, ("pane_id", "paneId"))
     canonical_identity = canonical_herdr_pane_identity(
@@ -1456,8 +1435,6 @@ def _worker_record_from_item(
     return _WorkerRecord(
         worker=worker,
         private_fingerprint=_private_identity_from_item(item, config),
-        turn_target_kind=turn_target[0] if turn_target is not None else None,
-        turn_target_value=turn_target[1] if turn_target is not None else None,
         workspace_id=workspace_id,
         pane_id=pane_id,
         observed_workspace_id=observed_workspace_id,
@@ -1634,8 +1611,6 @@ def _record_with_worker(record: _WorkerRecord, worker: Worker) -> _WorkerRecord:
     return _WorkerRecord(
         worker=worker,
         private_fingerprint=record.private_fingerprint,
-        turn_target_kind=record.turn_target_kind,
-        turn_target_value=record.turn_target_value,
         workspace_id=record.workspace_id,
         pane_id=record.pane_id,
         observed_workspace_id=record.observed_workspace_id,
@@ -1793,8 +1768,6 @@ def _binding_from_worker_record(
         backend=_BACKEND_NAME,
         target_kind=target_kind,
         target_value=target_value,
-        turn_target_kind=record.turn_target_kind,
-        turn_target_value=record.turn_target_value,
         sendable=target.get("sendable") is True,
         reason=str(reason) if reason is not None else None,
         observed_at=observed_at,
@@ -2016,29 +1989,6 @@ def _compatible_backend_target(
     return pane_target if _backend_target_present(pane_target) else None
 
 
-def _compatible_turn_target(
-    agent_record: _WorkerRecord,
-    pane_record: _WorkerRecord,
-) -> tuple[str | None, str | None]:
-    """Prefer PaneInfo targets unless a compatible session target is more precise."""
-    agent_kind = agent_record.turn_target_kind
-    agent_value = agent_record.turn_target_value
-    pane_kind = pane_record.turn_target_kind
-    pane_value = pane_record.turn_target_value
-    if agent_kind in _SESSION_SCOPED_TURN_TARGET_KINDS and agent_value:
-        pane_session_id = pane_record.agent_session_id
-        if pane_session_id and pane_session_id != agent_value:
-            if pane_kind and pane_value:
-                return pane_kind, pane_value
-            return None, None
-        if pane_kind in _SESSION_SCOPED_TURN_TARGET_KINDS and pane_value:
-            return pane_kind, pane_value
-        return agent_kind, agent_value
-    if pane_kind and pane_value:
-        return pane_kind, pane_value
-    return None, None
-
-
 def _ambiguous_agent_record(
     record: _WorkerRecord,
     *,
@@ -2117,18 +2067,11 @@ def _merge_agent_pane_record(
             backend_target=backend_target,
         )
 
-    turn_target_kind, turn_target_value = _compatible_turn_target(
-        agent_record,
-        pane_record,
-    )
-
     workspace_id = pane_record.workspace_id
     pane_id = pane_record.pane_id
     terminal_id = pane_record.terminal_id
     if (
         worker == agent_record.worker
-        and turn_target_kind == agent_record.turn_target_kind
-        and turn_target_value == agent_record.turn_target_value
         and workspace_id == agent_record.workspace_id
         and pane_id == agent_record.pane_id
         and terminal_id == agent_record.terminal_id
@@ -2138,8 +2081,6 @@ def _merge_agent_pane_record(
     return _WorkerRecord(
         worker=worker,
         private_fingerprint=agent_record.private_fingerprint,
-        turn_target_kind=turn_target_kind,
-        turn_target_value=turn_target_value,
         workspace_id=workspace_id,
         pane_id=pane_id,
         observed_workspace_id=pane_record.observed_workspace_id,
@@ -2196,13 +2137,6 @@ def _record_ownership_keys(
             (
                 "backend_send_token",
                 str(backend_target.get("value") or ""),
-            )
-        )
-    if record.turn_target_kind and record.turn_target_value:
-        keys.add(
-            (
-                f"turn:{record.turn_target_kind}",
-                record.turn_target_value,
             )
         )
     return keys

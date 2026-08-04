@@ -28,11 +28,10 @@ from tendwire.store.sqlite import (
 def _store(
     tmp_path: Path,
     *,
-    source: str = "acp_preferred",
     stable_owner: bool = False,
 ) -> tuple[Config, WorkerBinding]:
     db_path = tmp_path / "events.db"
-    config = Config(host_id="host-a", db_path=db_path, agent_event_source=source)
+    config = Config(host_id="host-a", db_path=db_path)
     snapshot = project_from_raw(
         config,
         workers=[
@@ -519,22 +518,3 @@ def test_completion_failure_rolls_back_marker_and_final_then_retries(
     assert len(list_agent_events(config.db_path, config.host_id)) == 2
     turn = turns_payload_from_store(config.db_path, config.host_id)["turns"][0]
     assert turn["assistant_final_text"] == "answer"
-
-
-def test_shadow_mode_journals_completion_without_projecting_turn(
-    tmp_path: Path,
-) -> None:
-    config, binding = _store(tmp_path, source="acp_shadow")
-    ingestor = AcpSessionIngestor(
-        config,
-        session_id="session-a",
-        stream_generation="generation-a",
-        binding=binding,
-    )
-    ingestor.start_turn(producer_turn_id="producer-a")
-    ingestor.ingest_update(_update("answer"), source_event_id="message-event-a")
-    ingestor.mark_prompt_complete()
-
-    events = list_agent_events(config.db_path, config.host_id)
-    assert [item.event.kind for item in events] == ["agent_message", "extension"]
-    assert turns_payload_from_store(config.db_path, config.host_id)["turns"] == []

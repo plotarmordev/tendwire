@@ -19,7 +19,7 @@ import pytest
 
 from tendwire.backends import herdr_cli
 from tendwire.cli import _build_parser, main, observe_public_snapshot
-from tendwire.config import Config
+from tendwire.config import DEFAULT_TURN_MODEL, Config
 from tendwire.core.models import AttentionSignal, Snapshot, SuggestedAction, Worker, WorkerBinding
 from tendwire.core.projector import project_from_raw
 from tendwire.daemon_api import TendwireDaemonAPI, UnixSocketJSONServer
@@ -420,7 +420,7 @@ def test_cli_turns_parser_defaults_bounds_and_exclusive_positions() -> None:
         )
 
 
-def test_cli_turns_definite_unavailable_refreshes_once_then_reads_exact_page(
+def test_cli_turns_definite_unavailable_reads_durable_page_without_refresh(
     tmp_path: Path,
     capsys,
     monkeypatch,
@@ -460,7 +460,9 @@ def test_cli_turns_definite_unavailable_refreshes_once_then_reads_exact_page(
 
     db_path = tmp_path / "fallback.db"
     monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", UnavailableClient)
-    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", refresh)
+    monkeypatch.setattr(
+        "tendwire.cli.refresh_structured_turn_content", refresh, raising=False
+    )
     monkeypatch.setattr("tendwire.cli.turns_payload_from_store", read_page)
     monkeypatch.setattr("tendwire.cli._current_public_snapshot", forbidden_snapshot)
 
@@ -491,13 +493,7 @@ def test_cli_turns_definite_unavailable_refreshes_once_then_reads_exact_page(
             {"schema_version": 2, "limit": 7, "cursor": None, "since": None},
         )
     ]
-    assert refresh_calls == [
-        {
-            "adapter_timeout_seconds": 0.75,
-            "max_workers": 4,
-            "total_timeout_seconds": 1.75,
-        }
-    ]
+    assert refresh_calls == []
     assert store_calls == [
         (
             db_path,
@@ -507,8 +503,7 @@ def test_cli_turns_definite_unavailable_refreshes_once_then_reads_exact_page(
                 "limit": 7,
                 "cursor": None,
                 "since": None,
-                "turn_refresh_interval_seconds": 2.0,
-                "turn_model": os.environ.get("TENDWIRE_TURN_MODEL", "observed"),
+                "turn_model": DEFAULT_TURN_MODEL,
             },
         )
     ]
@@ -555,7 +550,11 @@ def test_cli_turns_continuation_unavailable_reads_cache_without_refresh(
         }
 
     monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", UnavailableClient)
-    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", forbidden_refresh)
+    monkeypatch.setattr(
+        "tendwire.cli.refresh_structured_turn_content",
+        forbidden_refresh,
+        raising=False,
+    )
     monkeypatch.setattr("tendwire.cli.turns_payload_from_store", read_page)
 
     code = main(
@@ -584,8 +583,7 @@ def test_cli_turns_continuation_unavailable_reads_cache_without_refresh(
             "limit": 9,
             "cursor": position_value if position_flag == "--cursor" else None,
             "since": position_value if position_flag == "--since" else None,
-            "turn_refresh_interval_seconds": 2.0,
-            "turn_model": os.environ.get("TENDWIRE_TURN_MODEL", "observed"),
+            "turn_model": DEFAULT_TURN_MODEL,
         }
     ]
 
@@ -685,7 +683,9 @@ def test_cli_turns_reachable_or_ambiguous_failure_never_reads_sources(
         raise AssertionError("ambiguous/reachable failures must not read any source")
 
     monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", FailingClient)
-    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", forbidden_read)
+    monkeypatch.setattr(
+        "tendwire.cli.refresh_structured_turn_content", forbidden_read, raising=False
+    )
     monkeypatch.setattr("tendwire.cli.turns_payload_from_store", forbidden_read)
     monkeypatch.setattr("tendwire.cli._current_public_snapshot", forbidden_read)
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", forbidden_read)
@@ -740,7 +740,9 @@ def test_cli_turns_reachable_invalid_or_expired_page_is_authoritative(
         raise AssertionError("reachable page result must be authoritative")
 
     monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", AuthoritativeClient)
-    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", forbidden_read)
+    monkeypatch.setattr(
+        "tendwire.cli.refresh_structured_turn_content", forbidden_read, raising=False
+    )
     monkeypatch.setattr("tendwire.cli.turns_payload_from_store", forbidden_read)
     monkeypatch.setattr("tendwire.cli._current_public_snapshot", forbidden_read)
 
@@ -1101,6 +1103,7 @@ def test_cli_long_content_pages_match_direct_store_and_daemon(
     monkeypatch.setattr(
         "tendwire.cli.refresh_structured_turn_content",
         lambda _config, **_kwargs: {"ok": True},
+        raising=False,
     )
 
     v1_code = main(
@@ -1289,6 +1292,7 @@ def test_cli_short_v1_compatibility_then_known_incomplete_refusal(
     monkeypatch.setattr(
         "tendwire.cli.refresh_structured_turn_content",
         lambda _config, **_kwargs: {"ok": True},
+        raising=False,
     )
     common = [
         "--host-id",
@@ -1382,7 +1386,9 @@ def test_cli_pending_missing_store_is_fixed_and_never_observes_sources(
 
     monkeypatch.setattr("tendwire.cli._current_public_snapshot", forbidden)
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", forbidden)
-    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", forbidden)
+    monkeypatch.setattr(
+        "tendwire.cli.refresh_structured_turn_content", forbidden, raising=False
+    )
 
     code = main(
         [
@@ -1464,7 +1470,9 @@ def test_cli_pending_structured_daemon_result_or_error_is_authoritative(
     monkeypatch.setattr("tendwire.cli.pending_payload_from_store", forbidden)
     monkeypatch.setattr("tendwire.cli._current_public_snapshot", forbidden)
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", forbidden)
-    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", forbidden)
+    monkeypatch.setattr(
+        "tendwire.cli.refresh_structured_turn_content", forbidden, raising=False
+    )
 
     code = main(
         [
@@ -1533,7 +1541,9 @@ def test_cli_pending_post_send_failure_never_reads_or_retries(
     monkeypatch.setattr("tendwire.cli.pending_payload_from_store", forbidden)
     monkeypatch.setattr("tendwire.cli._current_public_snapshot", forbidden)
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", forbidden)
-    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", forbidden)
+    monkeypatch.setattr(
+        "tendwire.cli.refresh_structured_turn_content", forbidden, raising=False
+    )
 
     code = main(
         [
@@ -1900,7 +1910,9 @@ def test_cli_pending_pre_send_unavailable_uses_durable_overlay_only(
     monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", UnavailableClient)
     monkeypatch.setattr("tendwire.cli._current_public_snapshot", forbidden)
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", forbidden)
-    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", forbidden)
+    monkeypatch.setattr(
+        "tendwire.cli.refresh_structured_turn_content", forbidden, raising=False
+    )
 
     code = main(
         [
@@ -2141,7 +2153,7 @@ def test_cli_snapshot_persistence_passes_explicit_observation_authority(
     assert captured_atomic == [
         ([], "herdr", health.status == "healthy", bool(workers))
     ]
-    assert captured_turn_models == [config.turn_model]
+    assert captured_turn_models == [DEFAULT_TURN_MODEL]
 
 
 def test_rejected_stale_snapshot_does_not_persist_stale_worker_bindings(
@@ -2320,7 +2332,7 @@ def test_cli_legacy_observation_cannot_claim_complete_authority(
     assert len(captured) == 1
     assert captured[0].authority == "none"
     assert captured_atomic == [([], "herdr")]
-    assert captured_turn_models == [config.turn_model]
+    assert captured_turn_models == [DEFAULT_TURN_MODEL]
 
 
 def test_cli_attention_json_reads_store_backed_lifecycle(
@@ -2691,13 +2703,7 @@ def test_cli_module_invocation() -> None:
         env=env,
     )
     assert result.returncode == 0, result.stderr
-    turn_model = env.get("TENDWIRE_TURN_MODEL", "observed").strip().lower()
-    expected_stderr = (
-        ""
-        if turn_model == "observed"
-        else f"turn_model={turn_model} is a compatibility alias and behaves as observed\n"
-    )
-    assert result.stderr == expected_stderr
+    assert result.stderr == ""
     payload = json.loads(result.stdout)
     assert payload["schema_version"] == 2
     assert payload["host_id"] == "module-host"

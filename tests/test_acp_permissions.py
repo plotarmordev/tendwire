@@ -21,21 +21,95 @@ from tendwire.backends.acp_protocol import (
     PermissionRequest,
     SessionResult,
 )
-from tendwire.backends.acp_runtime import AcpRuntime, SessionOpenMode
+from tendwire.backends.acp_runtime import AcpWorkerSession, SessionOpenMode
 from tendwire.command_submission import submit_command
-from tendwire.core.models import Worker
+from tendwire.config import Config
+from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
 from tendwire.daemon import TendwireDaemon
 from tendwire.store.sqlite import (
     expire_worker_bindings,
     get_command_request,
+    init_store,
     list_worker_bindings,
     pending_payload_from_store,
+    save_snapshot,
     upsert_worker_bindings,
 )
 
-from tests.test_answer_decision import _answer_request
-from tests.test_command_submission import _binding, _config, _seed
 from tests.test_acp_runtime import FakeClient, FakeIngestor
+
+
+def _config(tmp_path: Path) -> Config:
+    return Config(
+        host_id="cmd-host",
+        data_dir=tmp_path,
+        db_path=tmp_path / "commands.db",
+        herdr_backend="socket",
+    )
+
+
+def _binding(worker: Worker) -> WorkerBinding:
+    return WorkerBinding(
+        host_id="cmd-host",
+        worker_id=worker.id,
+        worker_fingerprint=worker.fingerprint,
+        backend="herdr",
+        target_kind="agent_id",
+        target_value="agent-secret",
+        turn_target_kind=None,
+        turn_target_value=None,
+        sendable=True,
+        reason=None,
+        observed_at="2026-01-01T00:00:00+00:00",
+        private_fingerprint="private-secret",
+    )
+
+
+def _seed(
+    config: Config,
+    workers: list[Worker],
+    bindings: list[WorkerBinding],
+) -> None:
+    assert config.db_path is not None
+    init_store(config.db_path)
+    save_snapshot(
+        config.db_path,
+        Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-01-01T00:00:00+00:00",
+            workers=workers,
+            backend_health=[
+                BackendHealth(
+                    name="herdr",
+                    status="healthy",
+                    outcome="healthy_non_empty",
+                    observed_at="2026-01-01T00:00:00+00:00",
+                    counts={"workers": len(workers)},
+                )
+            ],
+        ),
+    )
+    upsert_worker_bindings(config.db_path, bindings)
+
+
+def _answer_request(
+    decision_ref: str,
+    *,
+    request_id: str = "decision-request-1",
+    worker_id: str = "w-1",
+    selection: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "action": "answer_decision",
+        "request_id": request_id,
+        "dry_run": False,
+        "target": {"worker_id": worker_id},
+        "params": {
+            "decision_ref": decision_ref,
+            "selection": selection or {"option_refs": ["2"]},
+        },
+    }
 
 
 class _Router:
@@ -133,7 +207,7 @@ def test_permission_bridge_is_private_durable_and_frame_acknowledged(
     )[0]
     client = FakeClient()
     client.restored_session_result = SessionResult(session_id, None, (), {})
-    runtime = AcpRuntime(
+    runtime = AcpWorkerSession(
         client,
         config=config,
         binding=acp_binding,
@@ -202,16 +276,13 @@ def test_acp_permission_never_falls_back_to_legacy_socket(tmp_path: Path) -> Non
         ],
         reason="test_retired_before_answer",
     ) == 1
-    socket_calls: list[bool] = []
     result = submit_command(
         config,
         _answer_request(pending["meta"]["decision"]["decision_ref"]),
-        socket_client_factory=lambda _config: socket_calls.append(True),
         acp_permission_router=None,
     )
     assert result.ok is False
     assert result.disposition == "no_receipt"
-    assert socket_calls == []
     broker.close()
     thread.join(timeout=2)
 
@@ -379,11 +450,11 @@ def test_v27_provenance_migration_preserves_stale_pending_state(
         ).fetchone() == ("stale", "legacy")
 
 
-def test_shadow_daemon_routes_permission_answers_without_enabling_acp_prompts(
+def test_daemon_routes_acp_permission_answers_without_a_prompt_route(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = replace(_config(tmp_path), agent_event_source="acp_shadow")
+    config = _config(tmp_path)
 
     class Runtime:
         def answer_permission_decision(self, _decision: Any, *, timeout: float) -> None:
@@ -391,7 +462,7 @@ def test_shadow_daemon_routes_permission_answers_without_enabling_acp_prompts(
 
     runtime = Runtime()
     daemon = TendwireDaemon(config)
-    daemon._acp_runtime = runtime
+    daemon._acp_supervisor = runtime
     captured: dict[str, Any] = {}
 
     def submit(_config: Any, _payload: Any, **kwargs: Any) -> str:

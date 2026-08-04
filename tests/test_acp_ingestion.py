@@ -10,13 +10,14 @@ import pytest
 from tendwire.backends.acp_ingestion import AcpSessionIngestor
 from tendwire.config import Config
 from tendwire.core.agent_events import AgentEvent, AppendBoundAgentEventResult
-from tendwire.core.models import WorkerBinding
+from tendwire.core.models import Snapshot, Worker, WorkerBinding
 from tendwire.backends.acp_protocol import StopReason
 from tendwire.store.sqlite import (
     AppendProjectedAgentEventResult,
     TurnRefreshApplyResult,
     list_agent_events,
     list_public_agent_events,
+    save_snapshot,
     upsert_worker_bindings,
 )
 
@@ -81,11 +82,9 @@ def _persist(
 
 
 def _config(db_path: Path, **kwargs: object) -> Config:
-    agent_event_source = str(kwargs.pop("agent_event_source", "acp_preferred"))
     return Config(
         host_id="host-a",
         db_path=db_path,
-        agent_event_source=agent_event_source,
         **kwargs,
     )
 
@@ -155,44 +154,6 @@ def test_messages_are_journaled_privately_and_projected_without_thoughts(
     assert turns[-1]["user_text"] == "question"
     assert "private reasoning" not in repr(turns)
     assert turns[-1]["source_turn_id"] == turn_id
-
-
-def test_shadow_mode_journals_without_turn_projection(tmp_path: Path) -> None:
-    events: list[AgentEvent] = []
-
-    def append(
-        _path: Path | str,
-        _host: str,
-        event: AgentEvent,
-        **_kwargs,
-    ) -> AppendBoundAgentEventResult:
-        events.append(event)
-        return _appended(1, event)
-
-    def unexpected_turn(*_args, **_kwargs):
-        raise AssertionError("shadow mode must not project turns")
-
-    ingestor = AcpSessionIngestor(
-        _config(tmp_path / "events.db", agent_event_source="acp_shadow"),
-        session_id="session-a",
-        stream_generation="generation-a",
-        binding=_binding(),
-        persist_event=_persist(append, unexpected_turn),
-    )
-    result = ingestor.ingest_update(
-        _update(
-            "agent_message_chunk",
-            content={"type": "text", "text": "shadow"},
-        )
-    )
-
-    assert result.event is not None
-    assert result.turn is None
-    assert len(events) == 1
-    assert ingestor.source_turn_id is not None
-    assert ingestor.projector.project_turn_content("session-a")[
-        "assistant_stream_text"
-    ] == "shadow"
 
 
 def test_disabled_thought_policy_discards_before_persistence(tmp_path: Path) -> None:
@@ -295,6 +256,20 @@ def test_required_mode_fails_closed_when_durable_binding_is_stale(
 ) -> None:
     db_path = tmp_path / "events.db"
     binding = _binding()
+    save_snapshot(
+        db_path,
+        Snapshot(
+            host_id="host-a",
+            updated_at="2026-01-01T00:00:00+00:00",
+            workers=[
+                Worker(
+                    id=binding.worker_id,
+                    name="Worker A",
+                    fingerprint=binding.worker_fingerprint,
+                )
+            ],
+        ),
+    )
     upsert_worker_bindings(db_path, [binding])
     replacement = replace(
         binding,
@@ -304,7 +279,7 @@ def test_required_mode_fails_closed_when_durable_binding_is_stale(
     upsert_worker_bindings(db_path, [replacement])
 
     ingestor = AcpSessionIngestor(
-        _config(db_path, agent_event_source="acp_required"),
+        _config(db_path),
         session_id="session-a",
         stream_generation="generation-a",
         binding=binding,
@@ -334,7 +309,7 @@ def test_default_authority_check_accepts_the_current_durable_binding(
     binding = _binding()
     upsert_worker_bindings(db_path, [binding])
     ingestor = AcpSessionIngestor(
-        _config(db_path, agent_event_source="acp_required"),
+        _config(db_path),
         session_id="session-a",
         stream_generation="generation-a",
         binding=binding,
@@ -346,93 +321,6 @@ def test_default_authority_check_accepts_the_current_durable_binding(
     assert result.event.inserted
     assert result.ignored_reason is None
 
-
-def test_shadow_completion_never_projects_and_finality_is_idempotent(
-    tmp_path: Path,
-) -> None:
-    events: list[AgentEvent] = []
-
-    def append(
-        _path: Path | str,
-        _host: str,
-        event: AgentEvent,
-        **_kwargs,
-    ) -> AppendBoundAgentEventResult:
-        events.append(event)
-        return _appended(len(events), event)
-
-    def unexpected_turn(*_args, **_kwargs):
-        raise AssertionError("shadow mode must never project, including completion")
-
-    ingestor = AcpSessionIngestor(
-        _config(tmp_path / "events.db", agent_event_source="acp_shadow"),
-        session_id="session-a",
-        stream_generation="generation-a",
-        binding=_binding(),
-        persist_event=_persist(append, unexpected_turn),
-    )
-    ingestor.start_turn(producer_turn_id="turn-1")
-    ingestor.ingest_update(
-        _update(
-            "agent_message_chunk",
-            content={"type": "text", "text": "shadow final"},
-        )
-    )
-
-    completed = ingestor.mark_prompt_complete()
-    repeated = ingestor.mark_prompt_complete()
-    late = ingestor.ingest_update(
-        _update(
-            "agent_message_chunk",
-            content={"type": "text", "text": "late mutation"},
-        )
-    )
-
-    assert completed.turn is None
-    assert repeated.ignored_reason == "turn_already_complete"
-    assert late.ignored_reason == "turn_already_complete"
-    assert len(events) == 2
-    assert events[-1].kind == "extension"
-
-
-def test_required_mode_projects_messages_and_final_exactly_once(tmp_path: Path) -> None:
-    events: list[AgentEvent] = []
-    turns: list[dict[str, object]] = []
-
-    def append(
-        _path: Path | str,
-        _host: str,
-        event: AgentEvent,
-        **_kwargs,
-    ) -> AppendBoundAgentEventResult:
-        events.append(event)
-        return _appended(len(events), event)
-
-    def apply(_path: Path | str, _host: str, _worker: str, content, **_kwargs):
-        turns.append(dict(content))
-        return TurnRefreshApplyResult(1, False)
-
-    ingestor = AcpSessionIngestor(
-        _config(tmp_path / "events.db", agent_event_source="acp_required"),
-        session_id="session-a",
-        stream_generation="generation-a",
-        binding=_binding(),
-        persist_event=_persist(append, apply),
-    )
-    ingestor.start_turn(producer_turn_id="turn-1")
-    streamed = ingestor.ingest_update(
-        _update(
-            "agent_message_chunk",
-            content={"type": "text", "text": "answer"},
-        )
-    )
-    completed = ingestor.mark_prompt_complete()
-
-    assert streamed.turn is not None
-    assert completed.turn is not None
-    assert [turn["complete"] for turn in turns] == [False, True]
-    assert turns[-1]["assistant_final_text"] == "answer"
-    assert turns[-1]["assistant_stream_text"] == ""
 
 
 @pytest.mark.parametrize(
@@ -467,7 +355,7 @@ def test_outgoing_prompt_is_durable_before_no_echo_completion_stop_reason(
         return TurnRefreshApplyResult(len(turns), False)
 
     ingestor = AcpSessionIngestor(
-        _config(tmp_path / "events.db", agent_event_source="acp_required"),
+        _config(tmp_path / "events.db"),
         session_id="session-a",
         stream_generation="generation-a",
         binding=_binding(),
@@ -497,9 +385,23 @@ def test_live_prompt_echo_is_suppressed_but_load_replay_user_message_is_retained
 ) -> None:
     db_path = tmp_path / "events.db"
     binding = _binding()
+    save_snapshot(
+        db_path,
+        Snapshot(
+            host_id="host-a",
+            updated_at="2026-01-01T00:00:00+00:00",
+            workers=[
+                Worker(
+                    id=binding.worker_id,
+                    name="Worker A",
+                    fingerprint=binding.worker_fingerprint,
+                )
+            ],
+        ),
+    )
     upsert_worker_bindings(db_path, [binding])
     ingestor = AcpSessionIngestor(
-        _config(db_path, agent_event_source="acp_shadow"),
+        _config(db_path),
         session_id="session-a",
         stream_generation="generation-a",
         binding=binding,

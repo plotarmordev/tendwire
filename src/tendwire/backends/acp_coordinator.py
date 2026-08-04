@@ -32,10 +32,10 @@ from ..store.sqlite import (
     record_agent_event,
     upsert_worker_bindings,
 )
-from .acp_client import AcpClient
+from .acp_client import BoundedAcpConnection
 from .acp_permissions import AcpPermissionBroker
 from .acp_runtime import (
-    AcpRuntime,
+    AcpWorkerSession,
     PermissionCallback,
     RuntimeState,
     SessionOpenMode,
@@ -100,10 +100,10 @@ class HerdrAcpConsoleEndpoint:
 
 
 @dataclass(slots=True)
-class _RuntimeSlot:
+class _SessionSlot:
     continuity: WorkerBinding
     generation: str
-    runtime: AcpRuntime
+    runtime: AcpWorkerSession
     permission_broker: AcpPermissionBroker | None = None
     console: HerdrAcpConsoleEndpoint | None = None
     console_input_sequence: int = 0
@@ -121,9 +121,9 @@ class _RuntimeSlot:
 class _PromptRoute:
     def __init__(
         self,
-        owner: "AcpRuntimeCoordinator",
+        owner: "AcpSupervisor",
         worker: Worker,
-        slot: _RuntimeSlot,
+        slot: _SessionSlot,
     ) -> None:
         self._owner = owner
         self._worker = worker
@@ -196,12 +196,12 @@ class _PromptRoute:
 
 
 EndpointClientFactory = Callable[[Config], Any]
-RuntimeFactory = Callable[..., AcpRuntime]
-ClientFactory = Callable[..., AcpClient]
+WorkerSessionFactory = Callable[..., AcpWorkerSession]
+ConnectionFactory = Callable[..., BoundedAcpConnection]
 
 
-class AcpRuntimeCoordinator:
-    """Reconcile Herdr worker authority into per-generation ACP runtimes."""
+class AcpSupervisor:
+    """Reconcile Herdr endpoint ownership into per-worker ACP sessions."""
 
     def __init__(
         self,
@@ -209,8 +209,8 @@ class AcpRuntimeCoordinator:
         stop_event: threading.Event,
         *,
         endpoint_client_factory: EndpointClientFactory | None = None,
-        runtime_factory: RuntimeFactory = AcpRuntime,
-        client_factory: ClientFactory = AcpClient,
+        session_factory: WorkerSessionFactory = AcpWorkerSession,
+        connection_factory: ConnectionFactory = BoundedAcpConnection,
         reconcile_interval: float | None = None,
         permission_callback: PermissionCallback | None = None,
         require_permission_bridge: bool = False,
@@ -227,15 +227,15 @@ class AcpRuntimeCoordinator:
         self._endpoint_client_factory = (
             endpoint_client_factory or _default_endpoint_client_factory
         )
-        self._runtime_factory = runtime_factory
-        self._client_factory = client_factory
+        self._session_factory = session_factory
+        self._connection_factory = connection_factory
         self._permission_callback = permission_callback
         self._require_permission_bridge = bool(require_permission_bridge)
         self._durable_permission_bridge = bool(durable_permission_bridge)
         self._reconcile_interval = max(
             1.0,
             float(
-                config.turn_refresh_interval_seconds
+                config.reconcile_interval_seconds
                 if reconcile_interval is None
                 else reconcile_interval
             ),
@@ -247,8 +247,8 @@ class AcpRuntimeCoordinator:
         # after the fact by selecting whichever runtime happened to attach.
         self._reconcile_lock = threading.RLock()
         self._stop = threading.Event()
-        self._slots: dict[str, _RuntimeSlot] = {}
-        self._retired_slots: list[_RuntimeSlot] = []
+        self._slots: dict[str, _SessionSlot] = {}
+        self._retired_slots: list[_SessionSlot] = []
         self._thread: threading.Thread | None = None
         self._console_thread: threading.Thread | None = None
         self._state = RuntimeState.NEW
@@ -258,20 +258,11 @@ class AcpRuntimeCoordinator:
         self._console_failure_type: str | None = None
         self._console_failed_workers: set[str] = set()
         self._console_failed_claims: dict[str, str] = {}
-        # Exact ACP ownership survives runtime retirement. Preferred mode may
-        # use legacy PTY I/O only after Herdr positively stops publishing this
-        # exact worker identity, never merely because reminting failed.
+        # Exact ACP ownership survives runtime retirement so an outage remains
+        # distinguishable from a worker that Herdr has actually removed.
         self._published_acp_claims: dict[str, str] = {}
-        # Optional ACP policies discover workers from the same Herdr binding
-        # stream as legacy PTY agents. Remember an exact worker generation
-        # that positively reported it is not ACP-owned so the periodic pass
-        # does not issue a mutating endpoint-mint request every interval.
-        # Cached workers are checked with the non-ticketing status method, so
-        # a later ACP registration becomes attachable immediately without
-        # relying on mutable observation fingerprints.
-        self._optional_endpoint_absences: dict[str, str] = {}
 
-    def start(self) -> "AcpRuntimeCoordinator":
+    def start(self) -> "AcpSupervisor":
         with self._lock:
             if self._state is RuntimeState.RUNNING:
                 return self
@@ -293,7 +284,7 @@ class AcpRuntimeCoordinator:
             # Revoke any process-owned rows left by an unclean prior exit before
             # a fresh Herdr generation is allowed to attach.
             self._expire_orphaned_bindings()
-            self._reconcile(strict=self.config.agent_event_source == "acp_required")
+            self._reconcile(strict=True)
         except Exception as exc:
             with self._lock:
                 self._state = RuntimeState.FAILED
@@ -481,34 +472,6 @@ class AcpRuntimeCoordinator:
                 return None
         return _PromptRoute(self, worker, slot)
 
-    def owns_worker(self, worker_id: str, worker_fingerprint: str) -> bool:
-        """Return whether a healthy ACP slot currently owns this exact worker."""
-        with self._lock:
-            slot = self._slots.get(worker_id)
-        return bool(
-            slot is not None
-            and slot.continuity.worker_fingerprint == worker_fingerprint
-            and slot.runtime.status().healthy
-        )
-
-    def claims_worker(self, worker_id: str, worker_fingerprint: str) -> bool:
-        """Return whether ACP has published authority for this exact worker.
-
-        Unlike ``owns_worker``, this remains true across a console/runtime
-        outage so preferred mode cannot fall through to legacy pane I/O.
-        """
-
-        with self._lock:
-            slot = self._slots.get(worker_id)
-            return bool(
-                (
-                    slot is not None
-                    and slot.continuity.worker_fingerprint == worker_fingerprint
-                )
-                or self._console_failed_claims.get(worker_id) == worker_fingerprint
-                or self._published_acp_claims.get(worker_id) == worker_fingerprint
-            )
-
     def owns_permission_decision(self, decision: Any) -> bool:
         """Return whether one pending decision belongs to an exact live slot."""
         worker_id = str(getattr(decision, "worker_id", "") or "")
@@ -538,7 +501,7 @@ class AcpRuntimeCoordinator:
             # writing the complete JSON-RPC response frame.
             slot.permission_broker.answer(decision, timeout=timeout)
 
-    def _current_slot(self, worker: Worker) -> _RuntimeSlot:
+    def _current_slot(self, worker: Worker) -> _SessionSlot:
         with self._lock:
             if self._state is not RuntimeState.RUNNING:
                 raise AcpCoordinatorError("ACP coordinator is not running")
@@ -602,7 +565,7 @@ class AcpRuntimeCoordinator:
                 slot.console_bridge_thread = thread
                 thread.start()
 
-    def _bridge_console_slot_supervised(self, slot: _RuntimeSlot) -> None:
+    def _bridge_console_slot_supervised(self, slot: _SessionSlot) -> None:
         worker_id = slot.continuity.worker_id
         try:
             self._bridge_console_slot(slot)
@@ -660,7 +623,7 @@ class AcpRuntimeCoordinator:
                     # replacement slot completes a successful console pass.
                     pass
 
-    def _bridge_console_slot(self, slot: _RuntimeSlot) -> None:
+    def _bridge_console_slot(self, slot: _SessionSlot) -> None:
         with slot.lock:
             if slot.retired:
                 return
@@ -968,7 +931,7 @@ class AcpRuntimeCoordinator:
                 )
 
     def _submit_console_input(
-        self, slot: _RuntimeSlot, sequence: int, text: str
+        self, slot: _SessionSlot, sequence: int, text: str
     ) -> str:
         with self._reconcile_lock:
             self._require_reconcile_state(allow_starting=False)
@@ -981,7 +944,7 @@ class AcpRuntimeCoordinator:
             return self._submit_console_input_fenced(slot, sequence, text)
 
     def _submit_console_input_fenced(
-        self, slot: _RuntimeSlot, sequence: int, text: str
+        self, slot: _SessionSlot, sequence: int, text: str
     ) -> str:
         snapshot = latest_snapshot(Path(self.config.db_path), self.config.host_id)
         worker = next(
@@ -1070,9 +1033,6 @@ class AcpRuntimeCoordinator:
                 self.config,
                 json.dumps(request, sort_keys=True, separators=(",", ":")),
                 acp_prompt_router=self.prompt_route,
-                acp_worker_owner=self.claims_worker,
-                acp_required=True,
-                acp_observation_only=False,
                 acp_permission_router=self,
             )
         except Exception:
@@ -1157,10 +1117,6 @@ class AcpRuntimeCoordinator:
         with self._lock:
             failed_claims = tuple(self._console_failed_claims.items())
             published_claims = tuple(self._published_acp_claims.items())
-            for worker_id in tuple(self._optional_endpoint_absences):
-                binding = current.get(worker_id)
-                if binding is None:
-                    self._optional_endpoint_absences.pop(worker_id, None)
         exact_authorities = (
             self._herdr_authority_claims()
             if failed_claims or published_claims
@@ -1200,50 +1156,13 @@ class AcpRuntimeCoordinator:
         ]
         for worker_id, continuity in current.items():
             self._require_reconcile_state(allow_starting=True)
-            with self._lock:
-                existing = self._slots.get(worker_id)
-                optional_absence = worker_id in self._optional_endpoint_absences
-            if existing is None and optional_absence:
-                try:
-                    status = self._resolve_status(continuity)
-                except Exception as exc:  # noqa: BLE001
-                    if _optional_acp_absence(exc):
-                        with self._lock:
-                            self._optional_endpoint_absences[worker_id] = (
-                                continuity.worker_fingerprint
-                            )
-                        continue
-                    failures.append(exc)
-                    continue
-                if status.lifecycle != "acp_owned_ready":
-                    failures.append(
-                        AcpCoordinatorError(
-                            "ACP worker is attached without a local runtime"
-                        )
-                    )
-                    continue
-                with self._lock:
-                    self._optional_endpoint_absences.pop(worker_id, None)
             try:
                 self._reconcile_binding(continuity)
             except Exception as exc:  # noqa: BLE001
-                if (
-                    existing is None
-                    and self.config.agent_event_source
-                    in {"acp_shadow", "acp_preferred"}
-                    and _optional_acp_absence(exc)
-                ):
-                    with self._lock:
-                        self._optional_endpoint_absences[worker_id] = (
-                            continuity.worker_fingerprint
-                        )
-                    continue
                 failures.append(exc)
                 self._retire_worker(worker_id)
         with self._lock:
-            self._required_degraded = bool(failures) and (
-                self.config.agent_event_source == "acp_required"
-            )
+            self._required_degraded = bool(failures)
             if failures:
                 self._failure_type = type(failures[0]).__name__
             elif not self._required_degraded:
@@ -1272,8 +1191,8 @@ class AcpRuntimeCoordinator:
                                 claimed_fingerprint,
                             ) in self._herdr_authority_claims()
                         except Exception:
-                            # A failed ownership check cannot safely reopen PTY
-                            # fallback; the periodic reconcile can retry it.
+                            # A failed ownership check cannot prove that the
+                            # Herdr endpoint disappeared; retry periodically.
                             authority_remains = True
                     with self._lock:
                         if worker_id not in self._slots and not authority_remains:
@@ -1355,7 +1274,7 @@ class AcpRuntimeCoordinator:
                 runtime_binding.turn_target_value,
                 endpoint.console.generation,
             )
-        slot = _RuntimeSlot(
+        slot = _SessionSlot(
             continuity,
             endpoint.generation,
             runtime,
@@ -1412,7 +1331,7 @@ class AcpRuntimeCoordinator:
                 close()
         return _parse_status(continuity, result)
 
-    def _require_attached_generation(self, slot: _RuntimeSlot) -> None:
+    def _require_attached_generation(self, slot: _SessionSlot) -> None:
         try:
             status = self._resolve_status(slot.continuity)
         except Exception:
@@ -1429,7 +1348,7 @@ class AcpRuntimeCoordinator:
     def _submit_prompt(
         self,
         worker: Worker,
-        slot: _RuntimeSlot,
+        slot: _SessionSlot,
         text: str,
         *,
         producer_turn_id: str,
@@ -1459,7 +1378,7 @@ class AcpRuntimeCoordinator:
                 on_send_start=on_send_start,
             )
 
-    def _supports_steering(self, worker: Worker, slot: _RuntimeSlot) -> bool:
+    def _supports_steering(self, worker: Worker, slot: _SessionSlot) -> bool:
         try:
             return self._current_slot(worker) is slot and slot.runtime.can_steer()
         except Exception:
@@ -1468,7 +1387,7 @@ class AcpRuntimeCoordinator:
     def _submit_steering(
         self,
         worker: Worker,
-        slot: _RuntimeSlot,
+        slot: _SessionSlot,
         text: str,
         *,
         producer_turn_id: str,
@@ -1497,7 +1416,7 @@ class AcpRuntimeCoordinator:
     def _route_binding_fingerprint(
         self,
         worker: Worker,
-        slot: _RuntimeSlot,
+        slot: _SessionSlot,
     ) -> str:
         """Return authority only while this exact route remains current."""
 
@@ -1516,8 +1435,8 @@ class AcpRuntimeCoordinator:
         self,
         continuity: WorkerBinding,
         endpoint: HerdrAcpEndpoint,
-    ) -> tuple[AcpRuntime, AcpPermissionBroker | None]:
-        client = self._client_factory(
+    ) -> tuple[AcpWorkerSession, AcpPermissionBroker | None]:
+        client = self._connection_factory(
             endpoint.command,
             cwd=endpoint.cwd,
             request_timeout=self.config.acp_request_timeout_seconds,
@@ -1545,7 +1464,7 @@ class AcpRuntimeCoordinator:
             else None
         )
         try:
-            runtime = self._runtime_factory(
+            runtime = self._session_factory(
                 client,
                 config=self.config,
                 binding=binding,
@@ -1554,7 +1473,7 @@ class AcpRuntimeCoordinator:
                 session_id=endpoint.session_id,
                 # Herdr's generation authenticates the worker lease and can
                 # remain stable across several freshly minted adapter
-                # transports.  AcpRuntime deliberately creates a new stream
+                # transports. AcpWorkerSession deliberately creates a new stream
                 # nonce when this argument is omitted; reusing the Herdr
                 # generation would make synthetic notification identities
                 # collide after a Tendwire restart.
@@ -1592,7 +1511,7 @@ class AcpRuntimeCoordinator:
         self,
         worker_id: str,
         *,
-        expected: _RuntimeSlot | None = None,
+        expected: _SessionSlot | None = None,
         preserve_console_failure: bool = False,
     ) -> None:
         with self._reconcile_lock:
@@ -1604,7 +1523,7 @@ class AcpRuntimeCoordinator:
                 self._retired_slots.append(slot)
                 # A visible-console failure is an exact sticky ownership
                 # claim. Retirement, ambiguity, and failed reminting must not
-                # reopen legacy PTY fallback while Herdr still publishes that
+                # erase endpoint ownership while Herdr still publishes that
                 # identity. Only a successful current console pass or the
                 # positive-disappearance path in reconciliation may remove it.
                 if (
@@ -1624,7 +1543,9 @@ class AcpRuntimeCoordinator:
                 executor.shutdown(wait=False, cancel_futures=True)
             self._stop_runtime(slot.runtime)
 
-    def _stop_runtime(self, runtime: AcpRuntime, *, timeout: float | None = None) -> None:
+    def _stop_runtime(
+        self, runtime: AcpWorkerSession, *, timeout: float | None = None
+    ) -> None:
         binding = getattr(runtime, "_binding", None)
         try:
             runtime.stop(
@@ -1684,7 +1605,7 @@ class AcpRuntimeCoordinator:
             )
 
 
-def _slot_has_live_work(slot: _RuntimeSlot) -> bool:
+def _slot_has_live_work(slot: _SessionSlot) -> bool:
     with slot.lock:
         thread = slot.console_bridge_thread
         futures = tuple((slot.console_submissions or {}).values())
@@ -1759,18 +1680,6 @@ def _same_continuity(left: WorkerBinding, right: WorkerBinding) -> bool:
         right.private_fingerprint,
         right.sendable,
     )
-
-
-def _optional_acp_absence(exc: BaseException) -> bool:
-    """Recognize a positive, generation-scoped legacy/non-ACP classification."""
-
-    if not isinstance(exc, HerdrErrorResponse) or not isinstance(exc.error, Mapping):
-        return False
-    return exc.error.get("code") in {
-        "acp_worker_unauthenticated",
-        "acp_ownership_required",
-        "acp_adapter_unsupported",
-    }
 
 
 def _nonempty_text(value: Any, field: str) -> str:
@@ -2491,12 +2400,12 @@ def _console_permission_selection(
     return matches[0] if len(matches) == 1 else None
 
 
-def production_acp_runtime_factory(
+def production_acp_supervisor_factory(
     config: Config,
     stop_event: threading.Event,
-) -> AcpRuntimeCoordinator:
-    """Build the stock daemon's Herdr-backed multi-worker ACP coordinator."""
-    return AcpRuntimeCoordinator(
+) -> AcpSupervisor:
+    """Build the stock daemon's Herdr-backed ACP session supervisor."""
+    return AcpSupervisor(
         config,
         stop_event,
         require_permission_bridge=True,

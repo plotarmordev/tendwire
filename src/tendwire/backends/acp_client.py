@@ -24,6 +24,17 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, TypeVar
 
+from acp.schema import (
+    InitializeResponse as UpstreamInitializeResponse,
+    ListSessionsResponse as UpstreamListSessionsResponse,
+    LoadSessionResponse as UpstreamLoadSessionResponse,
+    NewSessionResponse as UpstreamNewSessionResponse,
+    PromptRequest as UpstreamPromptRequest,
+    PromptResponse as UpstreamPromptResponse,
+    ResumeSessionResponse as UpstreamResumeSessionResponse,
+)
+from pydantic import ValidationError
+
 from tendwire import __version__
 
 from .acp_protocol import (
@@ -134,8 +145,8 @@ _END = object()
 SessionEvent = SessionUpdate | PermissionRequest
 
 
-class AcpClient:
-    """Thread-safe, blocking ACP v1 client for one agent subprocess."""
+class BoundedAcpConnection:
+    """Thread-safe ACP connection with bounded subprocess stdio framing."""
 
     def __init__(
         self,
@@ -216,7 +227,7 @@ class AcpClient:
         self._exit: ProcessExit | None = None
         self._initialize_result: InitializeResult | None = None
 
-    def __enter__(self) -> "AcpClient":
+    def __enter__(self) -> "BoundedAcpConnection":
         self.start()
         return self
 
@@ -270,7 +281,7 @@ class AcpClient:
             data = b"".join(self._stderr_chunks)
         return data.decode("utf-8", errors="replace")
 
-    def start(self) -> "AcpClient":
+    def start(self) -> "BoundedAcpConnection":
         with self._state_lock:
             if self._state in {ClientState.RUNNING, ClientState.INITIALIZED}:
                 return self
@@ -361,6 +372,11 @@ class AcpClient:
                 require_initialized=False,
             )
             raw = _require_mapping(result, "initialize result")
+            _validate_upstream(
+                UpstreamInitializeResponse,
+                raw,
+                "initialize result",
+            )
             version = raw.get("protocolVersion")
             if (
                 not isinstance(version, int)
@@ -500,6 +516,7 @@ class AcpClient:
         )
         result = self.request("session/new", params, timeout=timeout)
         raw = _require_mapping(result, "session/new result")
+        _validate_upstream(UpstreamNewSessionResponse, raw, "session/new result")
         return _parse_session_result(raw, require_session_id=True)
 
     def load_session(
@@ -530,6 +547,7 @@ class AcpClient:
                 MappingProxyType({}),
             )
         raw = _require_mapping(result, "session/load result")
+        _validate_upstream(UpstreamLoadSessionResponse, raw, "session/load result")
         parsed = _parse_session_result(raw, require_session_id=False)
         return SessionResult(session_id, parsed.modes, parsed.config_options, parsed.raw)
 
@@ -551,6 +569,7 @@ class AcpClient:
         params["sessionId"] = _nonempty(session_id, "session_id")
         result = self.request("session/resume", params, timeout=timeout)
         raw = _require_mapping(result, "session/resume result")
+        _validate_upstream(UpstreamResumeSessionResponse, raw, "session/resume result")
         parsed = _parse_session_result(raw, require_session_id=False)
         return SessionResult(session_id, parsed.modes, parsed.config_options, parsed.raw)
 
@@ -569,6 +588,7 @@ class AcpClient:
             params["cursor"] = _nonempty(cursor, "cursor")
         result = self.request("session/list", params, timeout=timeout)
         raw = _require_mapping(result, "session/list result")
+        _validate_upstream(UpstreamListSessionsResponse, raw, "session/list result")
         raw_sessions = raw.get("sessions")
         if not isinstance(raw_sessions, list):
             raise AcpEnvelopeError("session/list result.sessions must be an array")
@@ -621,6 +641,11 @@ class AcpClient:
             self._active_prompts[session_id] = self._active_prompts.get(session_id, 0) + 1
         response_received = False
         try:
+            _validate_upstream(
+                UpstreamPromptRequest,
+                {"sessionId": session_id, "prompt": content},
+                "session/prompt params",
+            )
             result = self.request(
                 "session/prompt",
                 {"sessionId": session_id, "prompt": content},
@@ -639,6 +664,7 @@ class AcpClient:
                     if response_received:
                         self._cancelled_sessions.discard(session_id)
         raw = _require_mapping(result, "session/prompt result")
+        _validate_upstream(UpstreamPromptResponse, raw, "session/prompt result")
         stop_reason = raw.get("stopReason")
         try:
             parsed_reason = StopReason(stop_reason)
@@ -1599,6 +1625,17 @@ def _require_mapping(value: Any, name: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise AcpEnvelopeError(f"{name} must be an object")
     return value
+
+
+def _validate_upstream(model: Any, value: Mapping[str, Any], name: str) -> None:
+    """Validate one stable ACP payload with the official generated schema."""
+
+    try:
+        model.model_validate(dict(value))
+    except ValidationError as exc:
+        raise AcpEnvelopeError(
+            f"{name} does not match the upstream ACP schema"
+        ) from exc
 
 
 def _parse_session_result(

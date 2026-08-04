@@ -17,9 +17,9 @@ import pytest
 from tendwire.backends.acp_coordinator import (
     AcpConsoleInputGap,
     AcpCoordinatorError,
-    AcpRuntimeCoordinator,
+    AcpSupervisor as AcpRuntimeCoordinator,
     HerdrAcpConsoleEndpoint,
-    _RuntimeSlot,
+    _SessionSlot as _RuntimeSlot,
     _CONSOLE_BRIDGE_INTERVAL_SECONDS,
     _derived_binding,
     _console_event_output,
@@ -34,11 +34,10 @@ from tendwire.backends.acp_coordinator import (
     _parse_status,
     _prepare_console_event_cursor,
     _record_console_submission_outcome,
-    production_acp_runtime_factory,
+    production_acp_supervisor_factory as production_acp_runtime_factory,
 )
 from tendwire.backends.acp_runtime import RuntimeState, SessionOpenMode
 from tendwire.backends.herdr_protocol import HerdrErrorResponse
-from tendwire.backends.herdr_turns import TurnIngestionScheduler, TurnRefreshResult
 from tendwire.command_submission import submit_acp_command, submit_command
 from tendwire.config import Config
 from tendwire.core.models import (
@@ -59,14 +58,13 @@ from tendwire.store.sqlite import (
 )
 
 
-def _config(tmp_path: Path, *, policy: str = "acp_preferred") -> Config:
+def _config(tmp_path: Path) -> Config:
     return Config(
         host_id="acp-host",
         data_dir=tmp_path,
         db_path=tmp_path / "tendwire.db",
         herdr_backend="socket",
         herdr_bin="herdr",
-        agent_event_source=policy,
     )
 
 
@@ -646,7 +644,7 @@ def test_console_bridge_dispatches_slow_workers_independently(tmp_path: Path) ->
 
 def test_console_failure_remains_degraded_after_slot_disappears(tmp_path: Path) -> None:
     coordinator = AcpRuntimeCoordinator(
-        _config(tmp_path, policy="acp_required"),
+        _config(tmp_path),
         threading.Event(),
         reconcile_interval=60.0,
     )
@@ -675,7 +673,7 @@ def test_first_console_failure_immediately_fences_prompt_route_until_success(
     tmp_path: Path,
 ) -> None:
     coordinator = AcpRuntimeCoordinator(
-        _config(tmp_path, policy="acp_required"),
+        _config(tmp_path),
         threading.Event(),
         reconcile_interval=60.0,
     )
@@ -762,7 +760,7 @@ def test_superseded_console_success_cannot_clear_replacement_fence(
     tmp_path: Path,
 ) -> None:
     coordinator = AcpRuntimeCoordinator(
-        _config(tmp_path, policy="acp_required"),
+        _config(tmp_path),
         threading.Event(),
         reconcile_interval=60.0,
     )
@@ -795,195 +793,6 @@ def test_superseded_console_success_cannot_clear_replacement_fence(
     coordinator._bridge_console_slot_supervised(replacement)
     assert "worker-1" not in coordinator._console_failed_workers
     assert coordinator.status()["healthy"] is True
-
-
-def test_failed_remint_retains_exact_acp_claim_and_blocks_preferred_fallback(
-    tmp_path: Path,
-) -> None:
-    config = _config(tmp_path, policy="acp_preferred")
-    worker = _seed(config)
-    coordinator = AcpRuntimeCoordinator(
-        config,
-        threading.Event(),
-        reconcile_interval=60.0,
-    )
-    coordinator._state = RuntimeState.RUNNING
-    runtime = SimpleNamespace(
-        status=lambda: SimpleNamespace(healthy=True, failure_type=None),
-        stop=lambda *, timeout: None,
-        _binding=_binding(),
-    )
-    slot = _RuntimeSlot(
-        _binding(),
-        "42",
-        runtime,
-        console=HerdrAcpConsoleEndpoint(42, "console-lease"),
-    )
-    coordinator._slots[worker.id] = slot
-
-    def fail_console(_slot: _RuntimeSlot) -> None:
-        raise OSError("console unavailable")
-
-    coordinator._bridge_console_slot = fail_console  # type: ignore[method-assign]
-    coordinator._continuity_bindings = (  # type: ignore[method-assign]
-        lambda: ({worker.id: _binding()}, 0)
-    )
-
-    def fail_remint(_continuity: WorkerBinding) -> None:
-        raise AcpCoordinatorError("replacement attach failed")
-
-    coordinator._reconcile_binding = fail_remint  # type: ignore[method-assign]
-
-    for _attempt in range(3):
-        coordinator._bridge_console_slot_supervised(slot)
-
-    assert worker.id not in coordinator._slots
-    assert coordinator.claims_worker(worker.id, worker.fingerprint) is True
-    assert coordinator.prompt_route(worker) is None
-
-    def forbidden_legacy(_config: Config) -> Any:
-        raise AssertionError("retired ACP claim must not reopen legacy pane I/O")
-
-    envelope = submit_command(
-        config,
-        _request("failed-remint-no-fallback"),
-        socket_client_factory=forbidden_legacy,
-        acp_prompt_router=coordinator.prompt_route,
-        acp_worker_owner=coordinator.claims_worker,
-    )
-    assert envelope.status == "backend_unavailable"
-    assert envelope.disposition == "no_receipt"
-    assert get_command_request(
-        config.db_path,
-        config.host_id,
-        "failed-remint-no-fallback",
-    ) is None
-
-
-def test_failed_claim_clears_only_after_exact_herdr_authority_disappears(
-    tmp_path: Path,
-) -> None:
-    coordinator = AcpRuntimeCoordinator(
-        _config(tmp_path, policy="acp_preferred"),
-        threading.Event(),
-        reconcile_interval=60.0,
-    )
-    coordinator._state = RuntimeState.RUNNING
-    coordinator._console_failed_workers.add("worker-1")
-    coordinator._console_failed_claims["worker-1"] = "worker-fingerprint"
-    coordinator._console_degraded = True
-    coordinator._continuity_bindings = (  # type: ignore[method-assign]
-        lambda: ({}, 1)
-    )
-    coordinator._herdr_authority_claims = (  # type: ignore[method-assign]
-        lambda: {("worker-1", "worker-fingerprint")}
-    )
-
-    coordinator._reconcile_locked(strict=False)
-    assert coordinator.claims_worker("worker-1", "worker-fingerprint") is True
-    assert coordinator.status()["healthy"] is False
-
-    coordinator._herdr_authority_claims = lambda: set()  # type: ignore[method-assign]
-    coordinator._reconcile_locked(strict=False)
-    assert coordinator.claims_worker("worker-1", "worker-fingerprint") is False
-    assert coordinator._console_degraded is False
-
-
-def test_first_console_failure_survives_unique_route_ambiguity_and_retirement(
-    tmp_path: Path,
-) -> None:
-    coordinator = AcpRuntimeCoordinator(
-        _config(tmp_path, policy="acp_preferred"),
-        threading.Event(),
-        reconcile_interval=60.0,
-    )
-    coordinator._state = RuntimeState.RUNNING
-    runtime = SimpleNamespace(
-        status=lambda: SimpleNamespace(healthy=True, failure_type=None),
-        stop=lambda *, timeout: None,
-        _binding=_binding(),
-    )
-    slot = _RuntimeSlot(
-        _binding(),
-        "42",
-        runtime,
-        console=HerdrAcpConsoleEndpoint(42, "console-lease"),
-    )
-    coordinator._slots["worker-1"] = slot
-    coordinator._bridge_console_slot = (  # type: ignore[method-assign]
-        lambda _slot: (_ for _ in ()).throw(OSError("console unavailable"))
-    )
-    coordinator._bridge_console_slot_supervised(slot)
-    assert coordinator.claims_worker("worker-1", "worker-fingerprint") is True
-
-    # Two sendable routes make the worker non-unique. The old slot is stale,
-    # but exact Herdr authority remains and therefore so must the ACP claim.
-    coordinator._continuity_bindings = lambda: ({}, 1)  # type: ignore[method-assign]
-    coordinator._herdr_authority_claims = (  # type: ignore[method-assign]
-        lambda: {("worker-1", "worker-fingerprint")}
-    )
-    coordinator._reconcile_locked(strict=False)
-
-    assert "worker-1" not in coordinator._slots
-    assert coordinator.claims_worker("worker-1", "worker-fingerprint") is True
-    assert coordinator.status()["healthy"] is False
-
-
-def test_published_claim_survives_unhealthy_runtime_retire_and_failed_remint(
-    tmp_path: Path,
-) -> None:
-    config = _config(tmp_path, policy="acp_preferred")
-    worker = _seed(config)
-    coordinator = AcpRuntimeCoordinator(
-        config,
-        threading.Event(),
-        reconcile_interval=60.0,
-    )
-    coordinator._state = RuntimeState.RUNNING
-    runtime = SimpleNamespace(
-        status=lambda: SimpleNamespace(healthy=False, failure_type="runtime_failed"),
-        stop=lambda *, timeout: None,
-        _binding=_binding(),
-    )
-    slot = _RuntimeSlot(
-        _binding(),
-        "42",
-        runtime,
-        console=HerdrAcpConsoleEndpoint(42, "console-lease"),
-    )
-    coordinator._slots[worker.id] = slot
-    coordinator._published_acp_claims[worker.id] = worker.fingerprint
-    coordinator._continuity_bindings = (  # type: ignore[method-assign]
-        lambda: ({worker.id: _binding()}, 0)
-    )
-    coordinator._resolve_endpoint = (  # type: ignore[method-assign]
-        lambda _continuity: (_ for _ in ()).throw(
-            AcpCoordinatorError("replacement attach failed")
-        )
-    )
-
-    coordinator._reconcile_locked(strict=False)
-
-    assert worker.id not in coordinator._slots
-    assert coordinator.claims_worker(worker.id, worker.fingerprint) is True
-
-    def forbidden_legacy(_config: Config) -> Any:
-        raise AssertionError("published ACP ownership must survive failed remint")
-
-    envelope = submit_command(
-        config,
-        _request("unhealthy-runtime-failed-remint"),
-        socket_client_factory=forbidden_legacy,
-        acp_prompt_router=coordinator.prompt_route,
-        acp_worker_owner=coordinator.claims_worker,
-    )
-    assert envelope.status == "backend_unavailable"
-    assert envelope.disposition == "no_receipt"
-    assert get_command_request(
-        config.db_path,
-        config.host_id,
-        "unhealthy-runtime-failed-remint",
-    ) is None
 
 
 def test_console_submission_rejects_a_retired_generation_before_store_access(
@@ -1353,7 +1162,6 @@ def test_live_acp_route_uses_advertised_steering_despite_observer_lag(
         config,
         _request("request-active-steer"),
         acp_prompt_router=lambda routed: route if routed.id == observed.id else None,
-        acp_required=True,
     )
 
     assert envelope.status == "accepted"
@@ -1397,7 +1205,6 @@ def test_definite_acp_steering_failure_is_rejected_not_uncertain(
         config,
         _request("request-active-steer-failed"),
         acp_prompt_router=lambda _routed: route,
-        acp_required=True,
     )
 
     assert envelope.status == "rejected"
@@ -1443,7 +1250,6 @@ def test_acp_generation_preflight_failure_is_retryable_before_receipt(
         config,
         _request("request-preflight-retry"),
         acp_prompt_router=lambda routed: route if routed == worker else None,
-        acp_required=True,
     )
 
     assert envelope.status == "backend_unavailable"
@@ -1486,8 +1292,6 @@ def test_production_route_checks_generation_before_reserving_receipt(
         config,
         _request("request-production-preflight"),
         acp_prompt_router=coordinator.prompt_route,
-        acp_worker_owner=coordinator.claims_worker,
-        acp_required=True,
     )
 
     assert envelope.status == "backend_unavailable"
@@ -1510,7 +1314,6 @@ def test_acp_failure_before_transport_boundary_is_immediately_retryable(
         config,
         _request("request-prewrite-retry"),
         acp_prompt_router=lambda routed: failed_route if routed == worker else None,
-        acp_required=True,
     )
     assert first.status == "backend_unavailable"
     assert first.disposition == "no_receipt"
@@ -1528,7 +1331,6 @@ def test_acp_failure_before_transport_boundary_is_immediately_retryable(
         config,
         _request("request-prewrite-retry"),
         acp_prompt_router=lambda routed: good_route if routed == worker else None,
-        acp_required=True,
     )
     assert second.status == "accepted"
     assert second.disposition == "terminal_accepted"
@@ -1539,330 +1341,6 @@ def test_acp_failure_before_transport_boundary_is_immediately_retryable(
         "request-prewrite-retry",
     )
     assert receipt is not None and receipt["state"] == "accepted"
-
-
-def test_preferred_acp_owned_route_loss_fails_closed_without_receipt_or_legacy(
-    tmp_path: Path,
-) -> None:
-    config = _config(tmp_path, policy="acp_preferred")
-    worker = _seed(config)
-
-    def forbidden_legacy(_config: Config) -> Any:
-        raise AssertionError("ACP-owned console loss must not reach legacy pane I/O")
-
-    for _attempt in range(2):
-        envelope = submit_command(
-            config,
-            _request("preferred-owned-console-loss"),
-            socket_client_factory=forbidden_legacy,
-            acp_prompt_router=lambda _worker: None,
-            acp_worker_owner=lambda worker_id, fingerprint: (
-                worker_id == worker.id and fingerprint == worker.fingerprint
-            ),
-        )
-        assert envelope.status == "backend_unavailable"
-        assert envelope.disposition == "no_receipt"
-    assert get_command_request(
-        config.db_path,
-        config.host_id,
-        "preferred-owned-console-loss",
-    ) is None
-
-
-def test_preferred_non_acp_worker_still_uses_legacy_sender(tmp_path: Path) -> None:
-    config = _config(tmp_path, policy="acp_preferred")
-    _seed(config)
-    legacy_calls: list[str] = []
-
-    class LegacyClient:
-        def connect(self) -> "LegacyClient":
-            return self
-
-        def request(
-            self,
-            method: str,
-            params: dict[str, Any],
-            *,
-            timeout: float | None = None,
-        ) -> dict[str, Any]:
-            del timeout
-            legacy_calls.append(method)
-            if method == "agent.get":
-                return {"result": {"agent": {"pane_id": "pane-private"}}}
-            if method == "agent.prompt":
-                return {
-                    "type": "agent_prompted",
-                    "agent": {"pane_id": "pane-private"},
-                    "delivery": "submitted",
-                }
-            return {"accepted": True, "params": params}
-
-        def close(self) -> None:
-            return None
-
-    envelope = submit_command(
-        config,
-        _request("preferred-non-acp-worker"),
-        socket_client_factory=lambda _config: LegacyClient(),
-        acp_prompt_router=lambda _worker: None,
-        acp_worker_owner=lambda _worker_id, _fingerprint: False,
-    )
-
-    assert envelope.status == "accepted"
-    assert legacy_calls[-1] == "agent.prompt"
-
-
-def test_preferred_snapshot_failure_with_owner_oracle_never_falls_back(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path, policy="acp_preferred")
-    _seed(config)
-
-    def unavailable_snapshot(_config: Config) -> Snapshot:
-        raise OSError("authority store temporarily unavailable")
-
-    def forbidden_legacy(_config: Config) -> Any:
-        raise AssertionError("unknown ACP ownership must not reach legacy pane I/O")
-
-    monkeypatch.setattr(
-        "tendwire.command_submission._current_snapshot", unavailable_snapshot
-    )
-    envelope = submit_command(
-        config,
-        _request("preferred-authority-read-failure"),
-        socket_client_factory=forbidden_legacy,
-        acp_prompt_router=lambda _worker: None,
-        acp_worker_owner=lambda _worker_id, _fingerprint: False,
-    )
-
-    assert envelope.status == "backend_unavailable"
-    assert envelope.disposition == "no_receipt"
-    assert get_command_request(
-        config.db_path,
-        config.host_id,
-        "preferred-authority-read-failure",
-    ) is None
-
-
-def test_shadow_owned_command_is_observation_only_before_receipt(tmp_path: Path) -> None:
-    config = _config(tmp_path, policy="acp_shadow")
-    worker = replace(_seed(config), status="working")
-    assert config.db_path is not None
-    save_snapshot(
-        config.db_path,
-        Snapshot(
-            host_id=config.host_id,
-            updated_at="2026-07-31T00:00:01+00:00",
-            workers=[worker],
-            backend_health=[
-                BackendHealth(
-                    name="herdr",
-                    status="healthy",
-                    outcome="healthy_non_empty",
-                )
-            ],
-        ),
-    )
-    route = _Route()
-
-    envelope = submit_acp_command(
-        config,
-        _request("shadow-observation-only"),
-        prompt_router=lambda _worker: route,
-        observation_only=True,
-    )
-
-    assert envelope is not None
-    assert envelope.status == "backend_unavailable"
-    assert envelope.disposition == "no_receipt"
-    assert route.calls == []
-    assert get_command_request(
-        config.db_path,
-        config.host_id,
-        "shadow-observation-only",
-    ) is None
-
-
-def test_daemon_shadow_owned_command_never_reaches_legacy_sender(tmp_path: Path) -> None:
-    config = _config(tmp_path, policy="acp_shadow")
-    worker = _seed(config)
-    route = _Route()
-    legacy_calls: list[str] = []
-
-    class Runtime:
-        def prompt_route(self, routed: Worker) -> _Route | None:
-            return route if routed == worker else None
-
-    def legacy_sender(_config: Config, _payload: str) -> Any:
-        legacy_calls.append("calibrate-or-write")
-        raise AssertionError("ACP-owned shadow target must not use legacy PTY I/O")
-
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(submit_command=legacy_sender),
-    )
-    daemon._acp_runtime = Runtime()
-
-    envelope = daemon.submit_command(_request("shadow-daemon-fence"))
-
-    assert envelope.status == "backend_unavailable"
-    assert envelope.disposition == "no_receipt"
-    assert route.calls == []
-    assert legacy_calls == []
-
-
-def test_daemon_preferred_console_loss_uses_claim_to_block_legacy_sender(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path, policy="acp_preferred")
-    worker = _seed(config)
-
-    class Runtime:
-        def prompt_route(self, _worker: Worker) -> None:
-            return None
-
-        def claims_worker(self, worker_id: str, fingerprint: str) -> bool:
-            return worker_id == worker.id and fingerprint == worker.fingerprint
-
-    def forbidden_legacy(_config: Config) -> Any:
-        raise AssertionError("ACP-owned console loss must not use legacy pane I/O")
-
-    monkeypatch.setattr(
-        "tendwire.command_submission._default_socket_client_factory",
-        forbidden_legacy,
-    )
-    daemon = TendwireDaemon(config)
-    daemon._acp_runtime = Runtime()
-
-    envelope = daemon.submit_command(_request("daemon-preferred-console-loss"))
-
-    assert envelope.status == "backend_unavailable"
-    assert envelope.disposition == "no_receipt"
-    assert get_command_request(
-        config.db_path,
-        config.host_id,
-        "daemon-preferred-console-loss",
-    ) is None
-
-
-def test_daemon_shadow_preserves_ordinary_legacy_worker_submission(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path, policy="acp_shadow")
-    _seed(config)
-    legacy_calls: list[str] = []
-
-    class Runtime:
-        def prompt_route(self, _worker: Worker) -> None:
-            return None
-
-    class LegacyClient:
-        def connect(self) -> "LegacyClient":
-            return self
-
-        def request(
-            self,
-            method: str,
-            params: dict[str, Any],
-            *,
-            timeout: float | None = None,
-        ) -> dict[str, Any]:
-            del timeout
-            legacy_calls.append(method)
-            if method == "agent.get":
-                return {"result": {"agent": {"pane_id": "pane-private"}}}
-            if method == "agent.prompt":
-                return {
-                    "type": "agent_prompted",
-                    "agent": {"pane_id": "pane-private"},
-                    "delivery": "submitted",
-                }
-            return {"accepted": True, "params": params}
-
-        def close(self) -> None:
-            return None
-
-    monkeypatch.setattr(
-        "tendwire.command_submission._default_socket_client_factory",
-        lambda _config: LegacyClient(),
-    )
-    daemon = TendwireDaemon(config)
-    daemon._acp_runtime = Runtime()
-
-    envelope = daemon.submit_command(_request("shadow-legacy-worker"))
-
-    assert envelope.status == "accepted"
-    assert legacy_calls[-1] == "agent.prompt"
-
-
-def test_daemon_wires_shadow_ownership_fence_into_legacy_scheduler(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = replace(
-        _config(tmp_path, policy="acp_shadow"),
-        herdr_backend="cli",
-        socket_path=tmp_path / "shadow.sock",
-    )
-    callback: Any | None = None
-
-    class Runtime:
-        def start(self) -> None:
-            return None
-
-        def stop(self, *, timeout: float) -> None:
-            return None
-
-        def status(self) -> dict[str, Any]:
-            return {"state": "running", "healthy": True}
-
-        def owns_worker(self, worker_id: str, fingerprint: str) -> bool:
-            return worker_id == "worker-1" and fingerprint == "worker-fingerprint"
-
-    class Scheduler:
-        def set_worker_exclusion(self, value: Any) -> None:
-            nonlocal callback
-            callback = value
-
-        def start(self) -> None:
-            return None
-
-        def request_refresh(self) -> None:
-            return None
-
-        def stop(self, *, flush_timeout_seconds: float) -> None:
-            return None
-
-    def observe(_config: Config) -> Snapshot:
-        snapshot = Snapshot(
-            host_id=config.host_id,
-            updated_at="2026-07-31T00:00:00+00:00",
-            workers=[],
-            backend_health=[],
-        )
-        assert config.db_path is not None
-        save_snapshot(config.db_path, snapshot)
-        return snapshot
-
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(
-            observe_initial_snapshot=observe,
-            turn_scheduler_factory=lambda _config: Scheduler(),
-            acp_runtime_factory=lambda _config, _stop: Runtime(),
-        ),
-    )
-    monkeypatch.setattr("tendwire.daemon.UnixSocketJSONServer.start", lambda _self: None)
-    try:
-        daemon.start()
-        assert callable(callback)
-        assert callback("worker-1", "worker-fingerprint") is True
-        assert callback("legacy-worker", "legacy-fingerprint") is False
-    finally:
-        daemon.stop()
 
 
 def test_route_authority_failure_is_safe_before_receipt_reservation(tmp_path: Path) -> None:
@@ -1877,19 +1355,10 @@ def test_route_authority_failure_is_safe_before_receipt_reservation(tmp_path: Pa
         def prompt(self, *_args: Any, **_kwargs: Any) -> None:
             raise AssertionError("a route without authority must not send")
 
-    assert (
-        submit_acp_command(
-            config,
-            _request("route-race-preferred"),
-            prompt_router=lambda _worker: VanishedRoute(),
-        )
-        is None
-    )
     required = submit_acp_command(
         config,
         _request("route-race-required"),
         prompt_router=lambda _worker: VanishedRoute(),
-        required=True,
     )
     assert required is not None
     assert required.status == "backend_unavailable"
@@ -1945,13 +1414,12 @@ def test_concurrent_duplicate_acp_command_has_one_external_send(tmp_path: Path) 
 
 
 def test_required_has_no_legacy_fallback_when_route_is_absent(tmp_path: Path) -> None:
-    config = _config(tmp_path, policy="acp_required")
+    config = _config(tmp_path)
     _seed(config)
     envelope = submit_command(
         config,
         _request("request-required"),
         acp_prompt_router=lambda _worker: None,
-        acp_required=True,
     )
     assert envelope.status == "backend_unavailable"
     assert get_command_request(
@@ -2051,8 +1519,8 @@ def test_reconnect_remints_endpoint_instead_of_replaying_attach_ticket(tmp_path:
         config,
         threading.Event(),
         endpoint_client_factory=lambda _config: EndpointClient(),
-        client_factory=lambda *_args, **_kwargs: object(),
-        runtime_factory=Runtime,
+        connection_factory=lambda *_args, **_kwargs: object(),
+        session_factory=Runtime,
         reconcile_interval=60.0,
     ).start()
     try:
@@ -2138,8 +1606,8 @@ def test_concurrent_reconcile_mints_only_one_endpoint(tmp_path: Path) -> None:
         config,
         threading.Event(),
         endpoint_client_factory=lambda _config: EndpointClient(),
-        client_factory=lambda *_args, **_kwargs: object(),
-        runtime_factory=Runtime,
+        connection_factory=lambda *_args, **_kwargs: object(),
+        session_factory=Runtime,
         reconcile_interval=60.0,
     ).start()
     upsert_worker_bindings(config.db_path, [_binding()])
@@ -2194,8 +1662,8 @@ def test_stop_cannot_leave_inflight_reconcile_runtime_published(tmp_path: Path) 
         config,
         threading.Event(),
         endpoint_client_factory=lambda _config: EndpointClient(),
-        client_factory=lambda *_args, **_kwargs: object(),
-        runtime_factory=Runtime,
+        connection_factory=lambda *_args, **_kwargs: object(),
+        session_factory=Runtime,
         reconcile_interval=60.0,
     ).start()
     upsert_worker_bindings(config.db_path, [_binding()])
@@ -2276,8 +1744,8 @@ def test_stop_closes_permission_waiter_before_generation_fence_deadline(
         config,
         threading.Event(),
         endpoint_client_factory=lambda _config: EndpointClient(),
-        client_factory=lambda *_args, **_kwargs: object(),
-        runtime_factory=Runtime,
+        connection_factory=lambda *_args, **_kwargs: object(),
+        session_factory=Runtime,
         durable_permission_bridge=True,
         reconcile_interval=60.0,
     ).start()
@@ -2352,8 +1820,8 @@ def test_prompt_frame_acknowledgement_fences_generation_retirement(tmp_path: Pat
         config,
         threading.Event(),
         endpoint_client_factory=lambda _config: EndpointClient(),
-        client_factory=lambda *_args, **_kwargs: object(),
-        runtime_factory=Runtime,
+        connection_factory=lambda *_args, **_kwargs: object(),
+        session_factory=Runtime,
         reconcile_interval=60.0,
     ).start()
     worker = Worker(
@@ -2419,8 +1887,8 @@ def test_runtime_factory_failure_rolls_back_resumed_binding(tmp_path: Path) -> N
         config,
         threading.Event(),
         endpoint_client_factory=lambda _config: EndpointClient(),
-        client_factory=lambda *_args, **_kwargs: client,
-        runtime_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        connection_factory=lambda *_args, **_kwargs: client,
+        session_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("constructor failed with --ticket private")
         ),
         reconcile_interval=60.0,
@@ -2446,7 +1914,7 @@ def test_coordinator_start_revokes_orphaned_process_binding(tmp_path: Path) -> N
         config,
         threading.Event(),
         endpoint_client_factory=lambda _config: object(),
-        client_factory=lambda *_args, **_kwargs: object(),
+        connection_factory=lambda *_args, **_kwargs: object(),
         reconcile_interval=60.0,
     ).start()
     try:
@@ -2508,8 +1976,8 @@ def test_coordinator_forwards_explicit_permission_bridge(tmp_path: Path) -> None
         config,
         threading.Event(),
         endpoint_client_factory=lambda _config: EndpointClient(),
-        client_factory=lambda *_args, **_kwargs: object(),
-        runtime_factory=Runtime,
+        connection_factory=lambda *_args, **_kwargs: object(),
+        session_factory=Runtime,
         permission_callback=permission_bridge,
         require_permission_bridge=True,
         reconcile_interval=60.0,
@@ -2520,43 +1988,10 @@ def test_coordinator_forwards_explicit_permission_bridge(tmp_path: Path) -> None
         coordinator.stop()
 
 
-@pytest.mark.parametrize("policy", ["acp_shadow", "acp_preferred"])
-def test_acp_owned_worker_is_excluded_from_legacy_scheduler(
-    tmp_path: Path,
-    policy: str,
-) -> None:
-    config = _config(tmp_path, policy=policy)
-    assert config.db_path is not None
-    init_store(config.db_path)
-    upsert_worker_bindings(config.db_path, [_binding()])
-    read = threading.Event()
-
-    def reader(*_args: Any, **_kwargs: Any) -> TurnRefreshResult:
-        read.set()
-        return TurnRefreshResult("updated", 1)
-
-    scheduler = TurnIngestionScheduler(
-        config,
-        refresh_interval_seconds=0.05,
-        max_workers=1,
-        reader=reader,
-    )
-    scheduler.set_worker_exclusion(
-        lambda worker_id, fingerprint: (
-            worker_id == "worker-1" and fingerprint == "worker-fingerprint"
-        )
-    )
-    scheduler.start()
-    try:
-        assert not read.wait(0.2)
-    finally:
-        scheduler.stop(flush_timeout_seconds=1.0)
-
-
 def test_required_zero_workers_is_idle_healthy_then_new_unowned_worker_degrades(
     tmp_path: Path,
 ) -> None:
-    config = _config(tmp_path, policy="acp_required")
+    config = _config(tmp_path)
     assert config.db_path is not None
     init_store(config.db_path)
 
@@ -2584,89 +2019,8 @@ def test_required_zero_workers_is_idle_healthy_then_new_unowned_worker_degrades(
         coordinator.stop()
 
 
-def test_preferred_caches_exact_non_acp_generation_without_endpoint_churn(
-    tmp_path: Path,
-) -> None:
-    config = _config(tmp_path, policy="acp_preferred")
-    assert config.db_path is not None
-    init_store(config.db_path)
-    upsert_worker_bindings(config.db_path, [_binding()])
-    endpoint_calls = 0
-    status_calls = 0
-    registered = False
-
-    class NonAcpClient:
-        def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
-            nonlocal endpoint_calls
-            endpoint_calls += 1
-            if registered:
-                return _endpoint()
-            raise HerdrErrorResponse(
-                {
-                    "code": "acp_worker_unauthenticated",
-                    "message": "worker is not ACP-owned",
-                },
-                "request-private",
-            )
-
-        def agent_acp_status(self, _target: Any, *, timeout: float) -> Any:
-            nonlocal status_calls
-            status_calls += 1
-            if registered:
-                return _status(lifecycle="acp_owned_ready")
-            raise HerdrErrorResponse(
-                {
-                    "code": "acp_worker_unauthenticated",
-                    "message": "worker is not ACP-owned",
-                },
-                "request-private",
-            )
-
-        def close(self) -> None:
-            return None
-
-    class Runtime:
-        def __init__(self, _client: Any, **kwargs: Any) -> None:
-            self._binding = kwargs["binding"]
-            self.stopped = False
-
-        def start(self) -> None:
-            return None
-
-        def stop(self, *, timeout: float) -> None:
-            self.stopped = True
-
-        def status(self) -> Any:
-            return SimpleNamespace(healthy=not self.stopped, failure_type=None)
-
-    coordinator = AcpRuntimeCoordinator(
-        config,
-        threading.Event(),
-        endpoint_client_factory=lambda _config: NonAcpClient(),
-        client_factory=lambda *_args, **_kwargs: object(),
-        runtime_factory=Runtime,
-        reconcile_interval=60.0,
-    ).start()
-    try:
-        assert endpoint_calls == 1
-        assert coordinator.status()["healthy"] is True
-        coordinator._reconcile(strict=False)
-        coordinator._reconcile(strict=False)
-        assert endpoint_calls == 1
-        assert status_calls == 2
-        assert coordinator.status()["failure_type"] is None
-
-        registered = True
-        coordinator._reconcile(strict=False)
-        assert endpoint_calls == 2
-        assert status_calls == 3
-        assert "worker-1" in coordinator._slots
-    finally:
-        coordinator.stop()
-
-
 def test_required_does_not_cache_non_acp_endpoint_failure(tmp_path: Path) -> None:
-    config = _config(tmp_path, policy="acp_required")
+    config = _config(tmp_path)
     assert config.db_path is not None
     init_store(config.db_path)
     upsert_worker_bindings(config.db_path, [_binding()])

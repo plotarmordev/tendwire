@@ -69,7 +69,7 @@ class RuntimeState(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
-class AcpRuntimeStatus:
+class AcpWorkerSessionStatus:
     """Public-safe runtime health and counters.
 
     This type intentionally has no command, process, session, worker, target,
@@ -117,8 +117,8 @@ class SessionBindingCallback(Protocol):
     ) -> WorkerBinding: ...
 
 
-class AcpRuntimeClient(Protocol):
-    """Adapter-neutral client surface required by :class:`AcpRuntime`."""
+class AcpSessionConnection(Protocol):
+    """Bounded ACP connection required by :class:`AcpWorkerSession`."""
 
     def initialize(
         self,
@@ -199,7 +199,7 @@ class AcpRuntimeClient(Protocol):
     def close(self) -> None: ...
 
 
-class AcpRuntime:
+class AcpWorkerSession:
     """Run and durably ingest exactly one ACP session for one worker binding.
 
     Permission requests fail closed: the default response is ``cancelled``.
@@ -209,7 +209,7 @@ class AcpRuntime:
 
     def __init__(
         self,
-        client: AcpRuntimeClient,
+        client: AcpSessionConnection,
         *,
         config: Config,
         binding: WorkerBinding,
@@ -323,7 +323,7 @@ class AcpRuntime:
         self._prompts_failed = 0
         self._cancellation_requests = 0
 
-    def __enter__(self) -> "AcpRuntime":
+    def __enter__(self) -> "AcpWorkerSession":
         return self.start()
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
@@ -333,7 +333,7 @@ class AcpRuntime:
             if exc is None:
                 raise
 
-    def start(self) -> "AcpRuntime":
+    def start(self) -> "AcpWorkerSession":
         """Initialize capabilities, open one session, and start consumers."""
 
         with self._lifecycle_lock:
@@ -634,11 +634,11 @@ class AcpRuntime:
             self._record_failure(exc)
             raise
 
-    def status(self) -> AcpRuntimeStatus:
+    def status(self) -> AcpWorkerSessionStatus:
         """Return redacted health and counters safe for a public status API."""
 
         with self._state_lock:
-            return AcpRuntimeStatus(
+            return AcpWorkerSessionStatus(
                 state=self._state,
                 healthy=self._state is RuntimeState.RUNNING and self._failure is None,
                 updates_ingested=self._updates_ingested,
@@ -1161,7 +1161,7 @@ def _permission_source_event_id(request_id: RequestId) -> str:
 
 
 def _prepare_prompt_content(
-    client: AcpRuntimeClient,
+    client: AcpSessionConnection,
     prompt: str | Sequence[Mapping[str, Any]],
 ) -> tuple[Mapping[str, Any], ...]:
     """Validate before persistence when the transport exposes its validator."""
@@ -1255,13 +1255,13 @@ def _outcome_has_persisted_event(outcome: object) -> bool:
 
 
 __all__ = [
-    "AcpRuntime",
+    "AcpWorkerSession",
     "AcpRuntimeBindingError",
-    "AcpRuntimeClient",
+    "AcpSessionConnection",
     "AcpRuntimeError",
     "AcpRuntimeProtocolError",
     "AcpRuntimeStateError",
-    "AcpRuntimeStatus",
+    "AcpWorkerSessionStatus",
     "AcpRuntimeStopTimeout",
     "PermissionCallback",
     "RuntimeState",

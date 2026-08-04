@@ -32,8 +32,6 @@ from ..config import (
     DEFAULT_SUBMISSION_HARD_TTL_SECONDS,
     DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS,
     DEFAULT_TURN_MODEL,
-    DEFAULT_TURN_REFRESH_INTERVAL_SECONDS,
-    TURN_MODELS,
 )
 from ..local_state import (
     EntryIdentity,
@@ -206,6 +204,8 @@ _ATTENTION_SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 _LOGGER = logging.getLogger(__name__)
 _SUBMISSION_LINK_SWEEP_LAST_AT: dict[tuple[str, str, str], float] = {}
 _SUBMISSION_LINK_SWEEP_LOCK = threading.Lock()
+TURN_MODELS = frozenset({"legacy", "dual", "shadow", "observed"})
+DEFAULT_SUBMISSION_LINK_SWEEP_INTERVAL_SECONDS = 2.0
 _SUBMISSION_LINK_BACKOFF: dict[
     tuple[str, str, str, str], datetime | None
 ] = {}
@@ -24462,7 +24462,7 @@ def _turn_delta_payload_from_store(
             host,
             purpose="submission_links",
             current_clock=clock,
-            refresh_interval_seconds=DEFAULT_TURN_REFRESH_INTERVAL_SECONDS,
+            refresh_interval_seconds=DEFAULT_SUBMISSION_LINK_SWEEP_INTERVAL_SECONDS,
         )
         if sweep_due:
             try:

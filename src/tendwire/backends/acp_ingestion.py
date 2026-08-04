@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..config import Config
+from ..config import DEFAULT_TURN_MODEL, Config
 from ..core.agent_events import AgentEvent, agent_event
 from ..core.models import WorkerBinding, stable_fingerprint
 from ..store.sqlite import (
@@ -74,8 +74,6 @@ class AcpSessionIngestor:
             or binding.turn_target_value != session_id.strip()
         ):
             raise ValueError("ACP session does not match the private worker binding")
-        if config.agent_event_source == "legacy":
-            raise ValueError("ACP ingestion is disabled by agent_event_source=legacy")
         self.config = config
         self.session_id = session_id.strip()
         self.stream_generation = stream_generation.strip()
@@ -417,13 +415,9 @@ class AcpSessionIngestor:
                 self.config.host_id,
                 marker,
                 expected_binding=self.binding,
-                content=(
-                    None
-                    if self.config.agent_event_source == "acp_shadow"
-                    else content
-                ),
+                content=content,
                 observed_at=marker.observed_at,
-                turn_model=self.config.turn_model,
+                turn_model=DEFAULT_TURN_MODEL,
             )
         except BaseException:
             self._restore_speculation(checkpoint, prior_turn_state)
@@ -502,7 +496,6 @@ class AcpSessionIngestor:
             projection: Mapping[str, Any] | None = None
             if (
                 kind in {"user_message", "agent_message"}
-                and self.config.agent_event_source != "acp_shadow"
                 and project_turn
             ):
                 content = self.projector.project_turn_content(self.session_id)
@@ -516,7 +509,7 @@ class AcpSessionIngestor:
                 expected_binding=self.binding,
                 content=projection,
                 observed_at=event.observed_at,
-                turn_model=self.config.turn_model,
+                turn_model=DEFAULT_TURN_MODEL,
             )
         except BaseException:
             self._restore_speculation(checkpoint, prior_turn_state)

@@ -189,10 +189,11 @@ def test_extension_count_uses_only_spec_reserved_meta_locations() -> None:
     assert _extension_capability_count({"forbiddenRootExtension": {}}) == 0
 
 
-def test_authentication_count_skips_invalid_stable_schema_items() -> None:
+def test_upstream_schema_rejects_invalid_authentication_items() -> None:
     payload = probe_adapter(adapter_argv("auth_shapes")).to_payload()
-    assert payload["initialization_compatible"] is True
+    assert payload["initialization_compatible"] is False
     assert payload["authentication"] == {
-        "method_count": 1,
+        "method_count": 0,
         "method_count_capped": False,
     }
+    assert payload["failure"] == "protocol_error"

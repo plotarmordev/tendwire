@@ -606,10 +606,10 @@ def test_herdr_backend_target_precedence_and_pane_fallback(monkeypatch) -> None:
     assert by_id["pane-public"].backend_target["kind"] == "terminal_id"
     assert by_id["pane-public"].backend_target["value"] == "term-send"
     assert by_id["pane-public"].backend_target["sendable"] is True
-    assert bindings_by_id["public-id"].turn_target_kind == "pane_id"
-    assert bindings_by_id["public-id"].turn_target_value == "pane-fallback"
-    assert bindings_by_id["pane-public"].turn_target_kind == "pane_id"
-    assert bindings_by_id["pane-public"].turn_target_value == "pane-send"
+    assert bindings_by_id["public-id"].turn_target_kind is None
+    assert bindings_by_id["public-id"].turn_target_value is None
+    assert bindings_by_id["pane-public"].turn_target_kind is None
+    assert bindings_by_id["pane-public"].turn_target_value is None
     assert all(
         (worker.backend_target or {}).get("value") != "sess-not-sendable"
         for worker in workers

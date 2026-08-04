@@ -12,7 +12,10 @@ from typing import Any
 
 import pytest
 
-from tendwire.backends.acp_client import AcpClient, AcpRequestTimeoutError
+from tendwire.backends.acp_client import (
+    AcpRequestTimeoutError,
+    BoundedAcpConnection as AcpClient,
+)
 from tendwire.backends.acp_protocol import (
     PermissionOption,
     PermissionOptionKind,
@@ -26,7 +29,7 @@ from tendwire.backends.acp_protocol import (
     SteeringResult,
 )
 from tendwire.backends.acp_runtime import (
-    AcpRuntime,
+    AcpWorkerSession as AcpRuntime,
     AcpRuntimeBindingError,
     AcpRuntimeProtocolError,
     AcpRuntimeStateError,
@@ -314,7 +317,6 @@ def runtime(
         config=Config(
             host_id="host-a",
             db_path=db_path,
-            agent_event_source="acp_required",
         ),
         binding=continuity,
         cwd=tmp_path,
@@ -340,7 +342,6 @@ def bound_runtime(
         config=Config(
             host_id="host-a",
             db_path=db_path,
-            agent_event_source="acp_required",
         ),
         binding=current_binding,
         cwd=tmp_path,
@@ -504,7 +505,6 @@ def test_load_and_resume_use_requested_session(
         config=Config(
             host_id="host-a",
             db_path=db_path,
-            agent_event_source="acp_required",
         ),
         binding=existing,
         cwd=tmp_path,
@@ -551,7 +551,6 @@ def test_load_and_resume_reject_agent_session_mismatch_and_close(
         config=Config(
             host_id="host-a",
             db_path=db_path,
-            agent_event_source="acp_required",
         ),
         binding=existing,
         cwd=tmp_path,
@@ -592,7 +591,6 @@ def test_load_and_resume_reject_non_acp_binding_before_transport(
             config=Config(
                 host_id="host-a",
                 db_path=tmp_path / "events.db",
-                agent_event_source="acp_required",
             ),
             binding=legacy,
             cwd=tmp_path,
@@ -1539,7 +1537,6 @@ def test_load_drains_replay_larger_than_client_queue_before_response(
         config=Config(
             host_id="host-a",
             db_path=db_path,
-            agent_event_source="acp_required",
         ),
         binding=current,
         cwd=tmp_path,

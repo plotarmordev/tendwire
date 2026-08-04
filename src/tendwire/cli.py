@@ -23,8 +23,7 @@ from .backends.herdr_cli import (
     herdr_backend_health,
     rehydrate_workers_from_bindings,
 )
-from .backends.herdr_turns import refresh_structured_turn_content
-from .config import Config, load_config
+from .config import DEFAULT_TURN_MODEL, Config, load_config
 from .core.actions import CommandContext, execute_command
 from .core.attention import attention_payload_from_snapshot
 from .core.commands import (
@@ -698,7 +697,7 @@ def observe_public_snapshot(
         save_snapshot(
             config.db_path,
             snapshot,
-            turn_model=config.turn_model,
+            turn_model=DEFAULT_TURN_MODEL,
             observation=SnapshotObservationContext(
                 authority=authority,
                 observed_at=health.observed_at,
@@ -1099,13 +1098,6 @@ def cmd_turns(
                 "status": "store_unavailable",
             }
         else:
-            if cursor is None and since is None:
-                refresh_structured_turn_content(
-                    config,
-                    adapter_timeout_seconds=config.herdr_timeout_seconds,
-                    max_workers=config.turn_refresh_workers,
-                    total_timeout_seconds=config.herdr_timeout_seconds + 1.0,
-                )
             payload = turns_payload_from_store(
                 config.db_path,
                 config.host_id,
@@ -1113,8 +1105,7 @@ def cmd_turns(
                 limit=limit,
                 cursor=cursor,
                 since=since,
-                turn_refresh_interval_seconds=config.turn_refresh_interval_seconds,
-                turn_model=config.turn_model,
+                turn_model=DEFAULT_TURN_MODEL,
             )
     elif daemon_attempt.error_kind == "timeout":
         payload = {
@@ -1195,7 +1186,7 @@ def cmd_turn_content_get(config: Config, args: argparse.Namespace) -> int:
             field=args.field,
             cursor=args.cursor,
             schema_version=1,
-            turn_model=config.turn_model,
+            turn_model=DEFAULT_TURN_MODEL,
         )
     print(_content_payload_json(payload, indent=2))
     return 0 if payload.get("ok") is not False and isinstance(payload.get("text"), str) else 1
@@ -1295,7 +1286,7 @@ def cmd_turn_delta(config: Config, args: argparse.Namespace) -> int:
             watermark=args.watermark,
             cursor=args.cursor,
             limit=args.limit,
-            turn_model=config.turn_model,
+            turn_model=DEFAULT_TURN_MODEL,
         )
     elif daemon_attempt.error_kind == "timeout":
         payload = {
@@ -1647,7 +1638,7 @@ def cmd_connector(config: Config, args: argparse.Namespace) -> int:
         max_lease_seconds=config.connector_max_claim_ttl_seconds,
         ack_ttl_seconds=config.connector_ack_ttl_seconds,
         max_attempts=config.max_outbox_attempts,
-        turn_model=config.turn_model,
+        turn_model=DEFAULT_TURN_MODEL,
     ).dispatch(method, params)
     print(_connector_payload_json(payload, indent=2))
     return 0 if payload.get("ok") is not False else 1
