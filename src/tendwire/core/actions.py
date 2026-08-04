@@ -13,9 +13,6 @@ from dataclasses import dataclass
 from ..config import Config
 from .commands import (
     STATUS_AMBIGUOUS_TARGET,
-    STATUS_AMBIGUOUS_BACKEND_TARGET,
-    STATUS_BACKEND_UNSUPPORTED,
-    STATUS_DRY_RUN,
     STATUS_NOOP,
     STATUS_NOT_FOUND,
     STATUS_REJECTED,
@@ -30,7 +27,6 @@ from .commands import (
     resolve_target,
     snapshot_result,
     validate_request,
-    worker_candidate,
 )
 from .projector import project_from_observations
 
@@ -110,84 +106,6 @@ def _resolve_target_result(request: CommandRequest, workers: list[Worker]) -> Co
     )
 
 
-def _send_instruction_result(request: CommandRequest, context: CommandContext) -> CommandEnvelope:
-    resolved, candidates, status = resolve_target(
-        request.target,
-        context.workers,
-        allow_disallowed_status=True,
-        include_backend_target=True,
-    )
-    if status != STATUS_RESOLVED:
-        return _resolve_target_result(request, context.workers)
-
-    # Even though resolve_target succeeded, send_instruction must reject workers
-    # whose current status is closed, failed, or unknown.
-    resolved_worker = next(
-        (w for w in context.workers if w.id == (resolved or {}).get("worker_id")),
-        None,
-    )
-    disallowed = {"closed", "failed", "unknown"}
-    if resolved_worker is not None and resolved_worker.status in disallowed:
-        return CommandEnvelope.from_result(
-            request,
-            ok=False,
-            status=STATUS_REJECTED,
-            result={"candidates": [worker_candidate(resolved_worker)]},
-            error=error_value(
-                STATUS_REJECTED,
-                f"target worker status does not allow instructions: {resolved_worker.status!r}",
-            ),
-        )
-
-    instruction = request.instruction or {}
-    target = resolved or {}
-    text = instruction.get("text", "")
-
-    if request.dry_run:
-        public_target = worker_candidate(resolved_worker) if resolved_worker is not None else target
-        return CommandEnvelope.from_result(
-            request,
-            ok=True,
-            status=STATUS_DRY_RUN,
-            result={"target": public_target, "instruction": {"text": text}},
-        )
-
-    backend_target = target.get("backend_target")
-    backend_reason = ""
-    if isinstance(backend_target, dict):
-        backend_reason = str(backend_target.get("reason") or "")
-    if not isinstance(backend_target, dict) or backend_target.get("sendable") is not True:
-        if backend_reason in {"duplicate_backend_target", "not_unique"}:
-            return CommandEnvelope.from_result(
-                request,
-                ok=False,
-                status=STATUS_AMBIGUOUS_BACKEND_TARGET,
-                error=error_value(
-                    STATUS_AMBIGUOUS_BACKEND_TARGET,
-                    "target resolves to an ambiguous backend send target",
-                ),
-            )
-        return CommandEnvelope.from_result(
-            request,
-            ok=False,
-            status=STATUS_BACKEND_UNSUPPORTED,
-            error=error_value(
-                STATUS_BACKEND_UNSUPPORTED,
-                "target has no backend-owned sendable private binding",
-            ),
-        )
-
-    return CommandEnvelope.from_result(
-        request,
-        ok=False,
-        status=STATUS_BACKEND_UNSUPPORTED,
-        error=error_value(
-            STATUS_BACKEND_UNSUPPORTED,
-            "live mutations require the authoritative command submission path",
-        ),
-    )
-
-
 def execute_command(request: CommandRequest, context: CommandContext) -> CommandEnvelope:
     """Execute a validated command request and return a neutral envelope."""
     validation_error = validate_request(request)
@@ -209,9 +127,6 @@ def execute_command(request: CommandRequest, context: CommandContext) -> Command
 
     if request.action == "resolve_target":
         return _resolve_target_result(request, context.workers)
-
-    if request.action == "send_instruction":
-        return _send_instruction_result(request, context)
 
     return CommandEnvelope.from_error(
         request,

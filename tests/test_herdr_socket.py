@@ -586,7 +586,6 @@ def test_existing_production_backend_files_do_not_import_socket_client() -> None
     for relative in (
         "src/tendwire/cli.py",
         "src/tendwire/backends/herdr_cli.py",
-        "src/tendwire/backends/herdr_command.py",
     ):
         text = (root / relative).read_text(encoding="utf-8")
         assert "herdr_socket" not in text
