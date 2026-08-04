@@ -10,6 +10,7 @@ part of the public health surface.
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from collections import Counter
@@ -254,14 +255,14 @@ class AcpSupervisor:
         self._permission_callback = permission_callback
         self._require_permission_bridge = bool(require_permission_bridge)
         self._durable_permission_bridge = bool(durable_permission_bridge)
-        self._reconcile_interval = max(
-            1.0,
-            float(
-                config.reconcile_interval_seconds
-                if reconcile_interval is None
-                else reconcile_interval
-            ),
+        resolved_reconcile_interval = float(
+            config.reconcile_interval_seconds
+            if reconcile_interval is None
+            else reconcile_interval
         )
+        if not math.isfinite(resolved_reconcile_interval) or resolved_reconcile_interval <= 0:
+            raise ValueError("reconcile_interval must be finite and positive")
+        self._reconcile_interval = resolved_reconcile_interval
         self._lock = threading.RLock()
         # Endpoint minting, runtime publication, prompt lease validation, and
         # shutdown are one private generation transaction. Herdr

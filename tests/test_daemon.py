@@ -1345,7 +1345,7 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
     config = Config(
         host_id="health-host",
         db_path=db_path,
-        reconcile_interval_seconds=0,
+        reconcile_interval_seconds=2,
         event_retention_days=3,
         max_workers=8,
         max_outbox_attempts=4,
@@ -1454,7 +1454,7 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
         "backlog": False,
     }
     assert health["limits"] == {
-        "reconcile_interval_seconds": 0,
+        "reconcile_interval_seconds": 2,
         "event_retention_days": 3,
         "max_workers": 8,
         "max_outbox_attempts": 4,
@@ -1476,6 +1476,7 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
         "counts": {"fresh": 0, "stale": 0, "total": 0},
         "bounds": {"stale_grace_seconds": 31.0},
     }
+    assert health["backend"]["reconcile_enabled"] is True
     assert "health.db" not in encoded
     assert str(tmp_path) not in encoded
     assert "sentinel-private" not in encoded

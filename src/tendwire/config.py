@@ -161,7 +161,10 @@ class Config:
         object.__setattr__(
             self,
             "reconcile_interval_seconds",
-            _non_negative_float(self.reconcile_interval_seconds, "reconcile_interval_seconds"),
+            _positive_finite_float(
+                self.reconcile_interval_seconds,
+                "reconcile_interval_seconds",
+            ),
         )
         object.__setattr__(
             self,

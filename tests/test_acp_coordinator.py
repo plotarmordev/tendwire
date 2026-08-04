@@ -1958,6 +1958,15 @@ def test_production_coordinator_installs_durable_permission_bridge(
         coordinator.stop()
 
 
+def test_coordinator_rejects_disabled_reconciliation(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="reconcile_interval must be finite and positive"):
+        AcpRuntimeCoordinator(
+            _config(tmp_path),
+            threading.Event(),
+            reconcile_interval=0,
+        )
+
+
 def test_coordinator_forwards_explicit_permission_bridge(tmp_path: Path) -> None:
     config = _config(tmp_path)
     assert config.db_path is not None

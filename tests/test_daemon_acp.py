@@ -12,6 +12,7 @@ import pytest
 from tendwire.config import Config
 from tendwire.core.models import BackendHealth, Snapshot
 from tendwire.daemon import DaemonHooks, TendwireDaemon
+from tendwire.daemon_api import UnixSocketJSONServer
 from tendwire.store.sqlite import init_store, save_snapshot
 
 
@@ -96,25 +97,39 @@ def _hooks(
     )
 
 
-def test_daemon_requires_an_acp_supervisor_before_binding_socket(tmp_path: Path) -> None:
+def test_daemon_binds_then_removes_socket_when_acp_supervisor_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = _config(tmp_path)
     calls: list[str] = []
+    original_start = UnixSocketJSONServer.start
+
+    def record_bind(server: Any) -> None:
+        calls.append("socket_bind")
+        original_start(server)
+
+    monkeypatch.setattr("tendwire.daemon.UnixSocketJSONServer.start", record_bind)
     daemon = TendwireDaemon(config, hooks=_hooks(config, None, calls))
 
     with pytest.raises(RuntimeError, match="ACP supervisor is required"):
         daemon.start()
 
     assert not config.socket_path.exists()
-    assert calls == ["init_store"]
+    assert calls == ["init_store", "socket_bind"]
 
 
 def test_daemon_starts_required_acp_and_exposes_only_public_health(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("tendwire.daemon.UnixSocketJSONServer.start", lambda _self: None)
     config = _config(tmp_path)
     calls: list[str] = []
+
+    def record_bind(_server: Any) -> None:
+        calls.append("socket_bind")
+
+    monkeypatch.setattr("tendwire.daemon.UnixSocketJSONServer.start", record_bind)
     supervisor = _Supervisor(calls)
     daemon = TendwireDaemon(
         config,
@@ -130,7 +145,7 @@ def test_daemon_starts_required_acp_and_exposes_only_public_health(
         assert health["acp"]["state"] == "running"
         assert health["acp"]["counters"]["updates_ingested"] == 7
         assert "sentinel-private" not in json.dumps(health)
-        assert calls[:2] == ["init_store", "acp_start"]
+        assert calls[:3] == ["init_store", "socket_bind", "acp_start"]
     finally:
         daemon.stop()
 

@@ -38,28 +38,51 @@ def _serve(path, responses, requests) -> threading.Thread:
     return thread
 
 
-def test_lifecycle_and_acp_methods_use_frozen_socket_shapes(tmp_path) -> None:
+def test_discovery_lists_use_one_request_per_connection(tmp_path) -> None:
     path = tmp_path / "herdr.sock"
     requests: list[dict] = []
     thread = _serve(
         path,
         [
+            {"result": {"workspaces": []}},
             {"result": {"panes": []}},
+            {"result": {"agents": []}},
+        ],
+        requests,
+    )
+    client = HerdrSocketClient(str(path), timeout=1)
+    assert client.workspace_list() == {"workspaces": []}
+    assert client._socket is None
+    assert client.pane_list() == {"panes": []}
+    assert client._socket is None
+    assert client.agent_list() == {"agents": []}
+    assert client._socket is None
+    thread.join(2)
+    assert [item["method"] for item in requests] == [
+        "workspace.list",
+        "pane.list",
+        "agent.list",
+    ]
+
+
+def test_acp_methods_use_frozen_socket_shapes_without_connection_reuse(tmp_path) -> None:
+    path = tmp_path / "herdr.sock"
+    requests: list[dict] = []
+    thread = _serve(
+        path,
+        [
             {"result": {"type": "agent_acp_status"}},
             {"result": {"type": "agent_acp_endpoint"}},
         ],
         requests,
     )
     client = HerdrSocketClient(str(path), timeout=1)
-    assert client.pane_list() == {"panes": []}
-    client.close()
     assert client.agent_acp_status("term") == {"type": "agent_acp_status"}
-    client.close()
+    assert client._socket is None
     assert client.agent_acp_endpoint("term") == {"type": "agent_acp_endpoint"}
-    client.close()
+    assert client._socket is None
     thread.join(2)
     assert [(item["method"], item["params"]) for item in requests] == [
-        ("pane.list", {}),
         ("agent.acp_status", {"target": "term"}),
         ("agent.acp_endpoint", {"target": "term"}),
     ]
