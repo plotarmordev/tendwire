@@ -1033,20 +1033,18 @@ class AcpSupervisor:
                 existing = None
         if existing is not None:
             self._retire_worker(continuity.worker_id, expected=existing)
-        endpoint = self._resolve_endpoint(continuity)
+        endpoint = _parse_endpoint(
+            self.config,
+            continuity,
+            self._herdr_request("agent_acp_endpoint", continuity.target_value),
+        )
         runtime, permission_broker, owned_bindings = self._build_runtime(
             continuity,
             endpoint,
         )
-        try:
-            runtime.start()
-        except Exception:
-            permission_broker.close()
-            owned = owned_bindings[0] if owned_bindings else None
-            self._stop_runtime(runtime, owned_binding=owned)
-            raise
         console_executor: ThreadPoolExecutor | None = None
         try:
+            runtime.start()
             self._require_reconcile_state(allow_starting=True)
             runtime_binding = getattr(runtime, "_binding", None)
             console_cursor = 0
@@ -1085,14 +1083,6 @@ class AcpSupervisor:
             self._stop_runtime(runtime, owned_binding=owned)
             raise
 
-    def _resolve_endpoint(self, continuity: WorkerBinding) -> HerdrAcpEndpoint:
-        result = self._herdr_request("agent_acp_endpoint", continuity.target_value)
-        return _parse_endpoint(self.config, continuity, result)
-
-    def _resolve_status(self, continuity: WorkerBinding) -> tuple[str, str, str]:
-        result = self._herdr_request("agent_acp_status", continuity.target_value)
-        return _parse_status(continuity, result)
-
     def _herdr_request(self, method: str, target: str) -> Any:
         client = self._endpoint_client_factory(self.config)
         try:
@@ -1103,7 +1093,12 @@ class AcpSupervisor:
 
     def _require_attached_generation(self, slot: _SessionSlot) -> None:
         try:
-            status = self._resolve_status(slot.continuity)
+            status = _parse_status(
+                slot.continuity,
+                self._herdr_request(
+                    "agent_acp_status", slot.continuity.target_value
+                ),
+            )
         except Exception:
             self._retire_worker(slot.continuity.worker_id, expected=slot)
             raise
@@ -1174,7 +1169,8 @@ class AcpSupervisor:
                 session_id: str,
                 anchor: WorkerBinding,
             ) -> WorkerBinding:
-                bound = self._bind_new_session(session_id, anchor)
+                bound = _derived_binding(anchor, session_id)
+                upsert_worker_bindings(Path(self.config.db_path), [bound])
                 owned_bindings[:] = [bound]
                 return bound
         else:
@@ -1222,15 +1218,6 @@ class AcpSupervisor:
                 except Exception:
                     pass
             raise
-
-    def _bind_new_session(
-        self,
-        session_id: str,
-        continuity: WorkerBinding,
-    ) -> WorkerBinding:
-        bound = _derived_binding(continuity, session_id)
-        upsert_worker_bindings(Path(self.config.db_path), [bound])
-        return bound
 
     def _retire_worker(
         self,

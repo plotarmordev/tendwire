@@ -745,7 +745,13 @@ class AcpWorkerSession:
                 selected = None
                 selection = None
         except BaseException:
-            self._cancel_permission(request.request_id)
+            # Fail closed only before any response bytes have been attempted.
+            try:
+                self._client.respond_permission(request.request_id, cancelled=True)
+            except BaseException:
+                pass
+            else:
+                self._increment("permissions_cancelled")
             raise
         try:
             self._client.respond_permission(
@@ -763,15 +769,6 @@ class AcpWorkerSession:
         self._increment(counter)
         if callback_failure is not None:
             raise callback_failure
-
-    def _cancel_permission(self, request_id: object) -> None:
-        """Fail closed only before any response bytes have been attempted."""
-
-        try:
-            self._client.respond_permission(request_id, cancelled=True)
-        except BaseException:
-            return
-        self._increment("permissions_cancelled")
 
     def _wait_for_event_idle(
         self,

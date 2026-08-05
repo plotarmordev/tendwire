@@ -326,7 +326,9 @@ class BoundedAcpConnection:
                 response = waiter.result()
             return response.result_or_raise()
         finally:
-            self._discard_pending(request_id, waiter)
+            with self._pending_lock:
+                if self._pending.get(request_id) is waiter:
+                    self._pending.pop(request_id, None)
 
     def new_session(
         self,
@@ -714,11 +716,6 @@ class BoundedAcpConnection:
                 raise AcpClientStateError("ACP request ID space exhausted")
             self._next_id += 1
         return request_id
-
-    def _discard_pending(self, request_id: RequestId, waiter: ResponseWaiter) -> None:
-        with self._pending_lock:
-            if self._pending.get(request_id) is waiter:
-                self._pending.pop(request_id, None)
 
     def _write(
         self,

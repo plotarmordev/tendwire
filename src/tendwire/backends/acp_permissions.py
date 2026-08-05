@@ -69,8 +69,6 @@ class AcpPermissionBroker:
         labels = tuple(
             _option_label(option.name, option.kind) for option in request.options
         )
-        if not labels:
-            return None
         nonce = secrets.token_urlsafe(24)
         source_revision = stable_fingerprint(
             {
