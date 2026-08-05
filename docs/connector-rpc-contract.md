@@ -137,8 +137,8 @@ must use the newest ref obtained after any re-poll.
 
 ### `connector.fail`
 
-Params are `name`, live `ref`, and optional `reason`, public `response`,
-`available_at`, or `delay_seconds`. It records a failed attempt and either returns
+Params require `name`, live `ref`, and `reason`; public `response`, `available_at`,
+and `delay_seconds` are optional. It records a failed attempt and either returns
 the item to the retry schedule or exhausts it according to Tendwire's configured
 attempt budget. If Tendwire marked a leased item `terminal_after_lease` because a
 newer authoritative plan superseded it, fail instead returns `superseded`, makes
@@ -154,7 +154,7 @@ instead returns `superseded`, makes the item terminal, and does not schedule it.
 
 ### `connector.renew`
 
-Params are `name`, live `ref`, and optional `lease_seconds`. It extends the current
+Params require `name`, live `ref`, and `lease_seconds`. It extends the current
 lease within the same queue-specific bounds used by poll and returns status
 `renewed`. It does not create a new delivery identity.
 
@@ -176,11 +176,11 @@ Prepare is valid only for `name: "turn-final"` and requires `schema_version: 1`.
 It is a strict four-action protocol:
 
 - `begin`: `action`, `turn_id`, `content_revision`, `presentation_version`,
-  `part_count`, and optional live `source_ref`.
+  `part_count`, and live `source_ref`.
 - `part`: `action`, `plan_token`, zero-based `ordinal`, and non-empty `spans`.
   Each span is exactly `{field,start_char,end_char}`, where `field` is
   `user_text` or `assistant_final_text` and the range is a valid non-empty slice.
-- `commit`: `action`, `plan_token`, and optional live `source_ref`. Commit
+- `commit`: `action`, `plan_token`, and live `source_ref`. Commit
   materializes durable ordered delivery jobs.
 - `recover`: `action`, `failed_plan_token`, and idempotency `request_id`. Recovery
   retains the acknowledged prefix and creates executable work for the remaining
@@ -193,9 +193,8 @@ The normal final delivery flow is source-bound. Poll the `final_ready` source,
 pass its live `source_ref` to both `begin` and `commit`, and then deliver the
 materialized parts. A successful source-bound commit atomically changes the source
 and its attempt from `leased` to `awaiting_ack`. The source becomes `delivered`
-only after all ordered parts are acknowledged. Source-less prepare exists for the
-store's explicitly validated source-less/recovery cases; it is not a connector
-shortcut around polling the normal source.
+only after all ordered parts are acknowledged. Source-less begin and commit are not
+supported; recovery uses the separate `recover` action and its failed plan token.
 
 ### `connector.inspect`
 
