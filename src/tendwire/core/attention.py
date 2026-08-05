@@ -115,41 +115,23 @@ def attention_for_worker(
     """Return deterministic attention signals for a single worker."""
     status = normalize_status(worker.status)
     source_updated_at = _worker_attention_updated_at(worker)
-
     if status == "failed":
-        return [
-            _worker_attention_signal(
-                worker,
-                host_id=host_id,
-                severity="critical",
-                reason=f"Worker {worker.name!r} reports status {status!r}",
-                updated_at=source_updated_at,
-            )
-        ]
-
-    if status in {"blocked", "warning"}:
-        return [
-            _worker_attention_signal(
-                worker,
-                host_id=host_id,
-                severity="warning",
-                reason=f"Worker {worker.name!r} may need attention: {status!r}",
-                updated_at=source_updated_at,
-            )
-        ]
-
-    if status == "waiting" and _worker_needs_human(worker):
-        return [
-            _worker_attention_signal(
-                worker,
-                host_id=host_id,
-                severity="warning",
-                reason=f"Worker {worker.name!r} is waiting for human input or approval",
-                updated_at=source_updated_at,
-            )
-        ]
-
-    return []
+        severity, reason = "critical", f"Worker {worker.name!r} reports status {status!r}"
+    elif status in {"blocked", "warning"}:
+        severity, reason = "warning", f"Worker {worker.name!r} may need attention: {status!r}"
+    elif status == "waiting" and _worker_needs_human(worker):
+        severity, reason = "warning", f"Worker {worker.name!r} is waiting for human input or approval"
+    else:
+        return []
+    return [
+        _worker_attention_signal(
+            worker,
+            host_id=host_id,
+            severity=severity,
+            reason=reason,
+            updated_at=source_updated_at,
+        )
+    ]
 
 
 def attention_from_snapshot(snapshot: Snapshot) -> list[AttentionSignal]:
