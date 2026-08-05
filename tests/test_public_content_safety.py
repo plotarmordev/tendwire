@@ -11,7 +11,6 @@ import pytest
 from tendwire.cli import cmd_snapshot
 from tendwire.config import Config
 from tendwire.connectors import ConnectorOutboxAPI
-from tendwire.core.attention import attention_payload_from_snapshot
 
 from tendwire.core.models import (
     AttentionSignal,
@@ -19,6 +18,7 @@ from tendwire.core.models import (
     Space,
     SuggestedAction,
     Worker,
+    WorkerBinding,
     sanitize_canonical_turn_text,
     public_json_dumps,
     sanitize_public_text,
@@ -27,23 +27,17 @@ from tendwire.core.models import (
 from tendwire.core.turns import (
     InteractionChoice,
     PendingInteraction,
-    Turn,
     segment_canonical_text,
-    payload_to_json,
-    pending_payload_from_snapshot,
-    turns_payload_from_snapshot,
 )
 from tendwire.daemon_api import error_response, success_response
-from tendwire.store.sqlite import (
+from tendwire.store.projection import (
     SnapshotObservationContext,
     attention_payload_from_store,
-    init_store,
-    get_turn_content,
     save_snapshot,
-    tail_event_metadata,
-    turns_payload_from_store,
 )
-from .store_helpers import apply_test_turn_refresh
+from tendwire.store.schema import init_store
+from tendwire.store.turns import get_turn_content, turns_payload_from_store
+from .store_helpers import apply_test_turn_refresh, upsert_test_worker_bindings
 
 
 def _sentinel_corpus() -> dict[str, str]:
@@ -385,6 +379,43 @@ def test_public_submission_verdict_is_closed_vocabulary() -> None:
     assert sanitize_public_value({"submission_verdict": 1}) == {}
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"nested": 1},
+        "1",
+        -1,
+        True,
+        2**63,
+    ],
+)
+def test_nested_public_outbox_count_rejects_non_bounded_integers(value: object) -> None:
+    sanitized = sanitize_public_value({"store": {"counts": {"outbox": value}}})
+    assert "outbox" not in sanitized.get("store", {}).get("counts", {})
+
+
+@pytest.mark.parametrize("value", [0, 2**63 - 1])
+def test_nested_public_outbox_count_accepts_bounded_integers(value: int) -> None:
+    assert sanitize_public_value(
+        {"store": {"counts": {"outbox": value}}}
+    )["store"]["counts"]["outbox"] == value
+
+
+def test_public_route_generation_requires_exact_typed_token_shape() -> None:
+    valid = "twroute1." + ("A" * 43)
+    assert sanitize_public_value({"route_generation": valid}) == {
+        "route_generation": valid
+    }
+    for malformed in (
+        "route1." + ("A" * 43),
+        "twroute1." + ("A" * 42),
+        "twroute1." + ("A" * 44),
+        "twroute1." + ("A" * 42) + "+",
+        "twroute1." + ("A" * 42) + "=",
+    ):
+        assert sanitize_public_value({"route_generation": malformed}) == {}
+
+
 def test_public_submission_diagnostics_drop_composer_state() -> None:
     assert sanitize_public_value(
         {
@@ -427,149 +458,6 @@ def test_public_structural_field_provenance_still_rejects_private_value_shapes(
     assert sanitize_public_value({"host_id": private_value}) == {}
 
 
-def test_snapshot_turn_and_pending_keep_public_structural_opaque_values() -> None:
-    space = Space(
-        id="space-" + ("8" * 24),
-        name="Public Space",
-        fingerprint="9" * 24,
-    )
-    worker = Worker(
-        id="worker-" + ("a" * 24),
-        name="Public Worker",
-        space_id=space.id,
-        fingerprint="b" * 24,
-    )
-    action = SuggestedAction(
-        action_id="inspect-worker",
-        label="Inspect worker",
-        tendwire_action="snapshot",
-        params={"worker_id": worker.id},
-    )
-    signal = AttentionSignal(
-        id="attn-" + ("c" * 24),
-        kind="worker_status",
-        severity="warning",
-        status="waiting",
-        reason="Review public progress",
-        source=f"worker:{worker.id}",
-        suggested_actions=[action],
-        fingerprint="d" * 24,
-        meta={"worker_id": worker.id, "space_id": space.id},
-        host_id="structural-host",
-    )
-    snapshot = Snapshot(
-        host_id="structural-host",
-        updated_at="2026-07-10T00:00:00+00:00",
-        spaces=[space],
-        workers=[worker],
-        attention=[signal],
-    )
-    turn = Turn(
-        host_id=snapshot.host_id,
-        worker_id=worker.id,
-        worker_fingerprint=worker.fingerprint,
-        space_id=space.id,
-        status="working",
-        source_turn_id="turnsrc-" + ("e" * 24),
-        origin_command_id="command-public",
-    )
-    choice = InteractionChoice(
-        choice_id="choice-" + ("f" * 24),
-        label="Continue",
-    )
-    pending = PendingInteraction(
-        host_id=snapshot.host_id,
-        worker_id=worker.id,
-        worker_fingerprint=worker.fingerprint,
-        space_id=space.id,
-        question="Continue?",
-        choices=[choice],
-        meta={"attention_id": signal.id},
-    )
-    private_key = "provider_runtime_id"
-    private_value = "session_PUBLICSAFETY123456"
-    worker.meta[private_key] = "private-key-value"
-    worker.meta["late_value"] = private_value
-    signal.meta[private_key] = "private-key-value"
-    signal.meta["late_value"] = private_value
-    turn.meta[private_key] = "private-key-value"
-    turn.meta["late_value"] = private_value
-    pending.meta[private_key] = "private-key-value"
-    pending.meta["late_value"] = private_value
-
-    snapshot_payload = snapshot.to_dict()
-    turn_payload = turn.to_dict()
-    pending_payload = pending.to_dict()
-    attention_wrapper = attention_payload_from_snapshot(snapshot)
-    turns_wrapper = turns_payload_from_snapshot(snapshot)
-    pending_wrapper = pending_payload_from_snapshot(snapshot)
-
-    assert snapshot_payload["host_id"] == snapshot.host_id
-    assert snapshot_payload["content_fingerprint"] == snapshot.content_fingerprint
-    assert snapshot_payload["spaces"][0]["id"] == space.id
-    assert snapshot_payload["spaces"][0]["fingerprint"] == space.fingerprint
-    assert snapshot_payload["workers"][0]["id"] == worker.id
-    assert snapshot_payload["workers"][0]["space_id"] == space.id
-    assert snapshot_payload["workers"][0]["fingerprint"] == worker.fingerprint
-    assert snapshot_payload["attention"][0]["id"] == signal.id
-    assert snapshot_payload["attention"][0]["fingerprint"] == signal.fingerprint
-    assert snapshot_payload["attention"][0]["meta"]["worker_id"] == worker.id
-    assert snapshot_payload["attention"][0]["meta"]["space_id"] == space.id
-    assert (
-        snapshot_payload["attention"][0]["suggested_actions"][0]["action_id"]
-        == action.action_id
-    )
-    assert (
-        snapshot_payload["attention"][0]["suggested_actions"][0]["params"]["worker_id"]
-        == worker.id
-    )
-    assert turn_payload["id"] == turn.id
-    assert turn_payload["fingerprint"] == turn.fingerprint
-    assert turn_payload["host_id"] == snapshot.host_id
-    assert turn_payload["worker_id"] == worker.id
-    assert turn_payload["worker_fingerprint"] == worker.fingerprint
-    assert turn_payload["space_id"] == space.id
-    assert turn_payload["source_turn_id"] == turn.source_turn_id
-    assert turn_payload["origin_command_id"] == turn.origin_command_id
-    assert pending_payload["id"] == pending.id
-    assert pending_payload["fingerprint"] == pending.fingerprint
-    assert pending_payload["host_id"] == snapshot.host_id
-    assert pending_payload["worker_id"] == worker.id
-    assert pending_payload["worker_fingerprint"] == worker.fingerprint
-    assert pending_payload["space_id"] == space.id
-    assert pending_payload["meta"]["attention_id"] == signal.id
-    assert pending_payload["choices"][0]["choice_id"] == choice.choice_id
-    assert attention_wrapper["host_id"] == snapshot.host_id
-    assert attention_wrapper["content_fingerprint"]
-    assert attention_wrapper["attention"][0]["id"] == signal.id
-    assert turns_wrapper["host_id"] == snapshot.host_id
-    assert turns_wrapper["content_fingerprint"]
-    assert turns_wrapper["turns"][0]["id"]
-    assert turns_wrapper["turns"][0]["fingerprint"]
-    assert turns_wrapper["turns"][0]["worker_id"] == worker.id
-    assert turns_wrapper["turns"][0]["worker_fingerprint"] == worker.fingerprint
-    assert pending_wrapper["host_id"] == snapshot.host_id
-    assert pending_wrapper["content_fingerprint"]
-    assert pending_wrapper["pending_health"] == {
-        "status": "healthy",
-        "counts": {"fresh": 0, "stale": 0, "total": 0},
-    }
-    assert pending_wrapper["pending_interactions"][0]["id"]
-    assert pending_wrapper["pending_interactions"][0]["fingerprint"]
-    assert pending_wrapper["pending_interactions"][0]["worker_id"] == worker.id
-    assert pending_wrapper["pending_interactions"][0]["worker_fingerprint"] == worker.fingerprint
-    assert pending_wrapper["pending_interactions"][0]["meta"]["attention_id"] == signal.id
-    for payload in (
-        snapshot_payload,
-        turn_payload,
-        pending_payload,
-        attention_wrapper,
-        turns_wrapper,
-        pending_wrapper,
-    ):
-        encoded = json.dumps(payload, sort_keys=True)
-        assert private_key not in encoded
-        assert private_value not in encoded
 
 
 @pytest.mark.parametrize(
@@ -630,102 +518,6 @@ def test_numeric_telegram_chat_ids_are_private_but_ordinary_integers_are_not() -
     assert sanitize_public_value(telegram_chat_id) is None
 
 
-def test_snapshot_turn_pending_and_wrappers_resanitize_mutable_values() -> None:
-    corpus = _sentinel_corpus()
-    dynamic_keys = _sentinels_as_dynamic_keys(corpus)
-    safe_markdown = "## Progress\n\n- Read `README.md`\n\n```text\nall good\n```\n\nhttps://example.com/help"
-    worker = Worker(
-        id="worker-1",
-        name="Worker One",
-        status="waiting",
-        space_id="space-1",
-        summary=safe_markdown,
-        meta={"safe": "kept"},
-    )
-    signal = AttentionSignal(
-        kind="worker_status",
-        severity="warning",
-        status="waiting",
-        reason="Review public progress",
-        source="worker:worker-1",
-        meta={"worker_id": "worker-1", "needs_human": True, "safe": "kept"},
-        host_id="public-safety-host",
-    )
-    snapshot = Snapshot(
-        host_id="public-safety-host",
-        updated_at="2026-07-10T00:00:00+00:00",
-        spaces=[Space(id="space-1", name="Public Project")],
-        workers=[worker],
-        attention=[signal],
-    )
-    worker.meta["late_values"] = list(corpus.values())
-    signal.meta["late_values"] = list(corpus.values())
-    worker.meta["late_dynamic_keys"] = dynamic_keys.copy()
-    signal.meta["late_dynamic_keys"] = dynamic_keys.copy()
-    turn = Turn(
-        host_id=snapshot.host_id,
-        worker_id=worker.id,
-        status="working",
-        kind="task",
-        user_text=safe_markdown,
-        assistant_stream_text=_unsafe_prompt(corpus),
-        source_turn_id=corpus["session_id"],
-        meta={"safe": "kept"},
-    )
-    turn.meta["late_values"] = list(corpus.values())
-    turn.meta["late_dynamic_keys"] = dynamic_keys.copy()
-    choice = InteractionChoice(
-        choice_id=corpus["tool_use_id"],
-        label="Review safely",
-        value={"safe": "approve", "sent": corpus["shell_command"]},
-        description=_unsafe_prompt(corpus),
-        params={"safe": "kept"},
-    )
-    choice.params["late_values"] = list(corpus.values())
-    choice.params["late_dynamic_keys"] = dynamic_keys.copy()
-    pending = PendingInteraction(
-        host_id=snapshot.host_id,
-        worker_id=worker.id,
-        question=_unsafe_prompt(corpus),
-        kind="question",
-        choices=[choice],
-        meta={"safe": "kept"},
-    )
-    pending.meta["late_values"] = list(corpus.values())
-    pending.meta["late_dynamic_keys"] = dynamic_keys.copy()
-
-    surfaces = {
-        "snapshot": snapshot.to_dict(),
-        "turn": turn.to_dict(),
-        "pending": pending.to_dict(),
-        "turn_wrapper": turns_payload_from_snapshot(snapshot),
-        "attention_wrapper": attention_payload_from_snapshot(snapshot),
-        "pending_wrapper": pending_payload_from_snapshot(snapshot),
-        "turn_json": json.loads(payload_to_json({"turns": [turn.to_dict()]})),
-        "pending_json": json.loads(payload_to_json({"pending_interactions": [pending.to_dict()]})),
-        "final_json": json.loads(
-            public_json_dumps(
-                {
-                    "snapshot": snapshot.to_dict(),
-                    "turn": turn.to_dict(),
-                    "dynamic_keys": dynamic_keys,
-                }
-            )
-        ),
-    }
-
-    assert surfaces["snapshot"]["workers"][0]["summary"] == safe_markdown
-    assert surfaces["snapshot"]["workers"][0]["meta"]["late_dynamic_keys"] == {}
-    assert surfaces["turn"]["meta"]["late_dynamic_keys"] == {}
-    assert surfaces["final_json"]["dynamic_keys"] == {}
-    assert surfaces["turn"]["user_text"] == safe_markdown
-    assert surfaces["turn"]["source_turn_id"].startswith("turnsrc-")
-    assert surfaces["pending"]["choices"] == [
-        {"choice_id": choice.choice_id, "label": "Review safely"}
-    ]
-    assert choice.choice_id.startswith("choice-")
-    for surface in surfaces.values():
-        _assert_sentinels_absent(surface, corpus)
 
 
 def test_daemon_response_builders_apply_final_value_sanitization() -> None:
@@ -872,10 +664,7 @@ def test_store_feed_outbox_and_connector_facade_resanitize_before_delivery(tmp_p
 
     with sqlite3.connect(str(db_path)) as conn:
         snapshot_rows = [
-            json.loads(row[0]) for row in conn.execute("SELECT payload FROM snapshots")
-        ]
-        event_rows = [
-            json.loads(row[0]) for row in conn.execute("SELECT payload_json FROM events")
+            json.loads(row[0]) for row in conn.execute("SELECT payload_json FROM snapshots")
         ]
         attention_rows = [
             json.loads(row[0])
@@ -887,11 +676,6 @@ def test_store_feed_outbox_and_connector_facade_resanitize_before_delivery(tmp_p
                 "SELECT payload_json FROM connector_outbox ORDER BY id"
             )
         ]
-
-    tail = tail_event_metadata(db_path, host_id, limit=100)
-    connector_payload = ConnectorOutboxAPI(db_path, host_id).poll(
-        {"name": "attention", "limit": 10}
-    )
 
     # Re-open the exact current schema and prove that every store-backed public
     # edge re-sanitizes persisted data after initialization as well as in the
@@ -915,33 +699,20 @@ def test_store_feed_outbox_and_connector_facade_resanitize_before_delivery(tmp_p
     assert escalated_feed is not None
     assert [item["severity"] for item in escalated_feed["attention"]] == ["critical"]
     assert pending_feed is not None
-    assert pending_feed["attention"] == escalated_feed["attention"]
+    assert pending_feed["attention"] == []
     assert resolved_feed is not None
     assert resolved_feed["attention"] == []
     assert recurrence_feed is not None
     assert [item["severity"] for item in recurrence_feed["attention"]] == ["warning"]
-    assert [
-        payload["event_type"] for payload in pre_migration_outbox_rows
-    ] == [
-        "attention_created",
-        "attention_escalated",
-        "attention_created",
-    ]
+    assert pre_migration_outbox_rows == []
 
     assert reloaded_feed is not None
     assert len(reloaded_feed["attention"]) == 1
     assert reloaded_feed["attention"][0]["reason"] == "Review the safe public result"
-    assert connector_payload["ok"] is True
-    assert connector_payload["items"]
-    assert all(
-        item["payload"]["attention"]["meta"]["safe"] == "kept"
-        for item in connector_payload["items"]
-    )
     assert snapshot_rows
-    assert event_rows
     assert attention_rows
     assert reloaded_attention_rows
-    assert reloaded_outbox_rows
+    assert reloaded_outbox_rows == []
 
     public_attention_surfaces = (
         initial_feed,
@@ -956,7 +727,6 @@ def test_store_feed_outbox_and_connector_facade_resanitize_before_delivery(tmp_p
     outbox_payload_surfaces = (
         pre_migration_outbox_rows,
         reloaded_outbox_rows,
-        [item["payload"] for item in connector_payload["items"]],
     )
     for surface in public_attention_surfaces + outbox_payload_surfaces:
         _assert_internal_lifecycle_keys_absent(surface)
@@ -965,9 +735,6 @@ def test_store_feed_outbox_and_connector_facade_resanitize_before_delivery(tmp_p
         *public_attention_surfaces,
         *outbox_payload_surfaces,
         snapshot_rows,
-        event_rows,
-        tail,
-        connector_payload,
     ):
         _assert_sentinels_absent(surface, private_values)
 
@@ -1085,12 +852,26 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
     )
     init_store(db_path)
     save_snapshot(db_path, snapshot)
+    upsert_test_worker_bindings(
+        db_path,
+        [
+            WorkerBinding(
+                host_id=host_id,
+                worker_id=worker_id,
+                worker_fingerprint=snapshot.workers[0].fingerprint,
+                backend="herdr",
+                target_kind="agent_id",
+                target_value="private",
+                private_fingerprint="private-boundary",
+            )
+        ],
+    )
     assert apply_test_turn_refresh(
         db_path,
         host_id,
         worker_id,
         {
-            "source_turn_id": "boundary-content-source",
+            "source_turn_id": "turn-boundary-content-source",
             "assistant_final_text": dirty_final,
             "complete": True,
             "has_open_turn": False,
@@ -1155,7 +936,7 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
             "source_ref": ready_ref,
         }
     )
-    assert begun["ok"] is True
+    assert begun["ok"] is True, begun
     plan_token = begun["plan_token"]
     prepared_parts: list[dict[str, Any]] = []
     start_char = 0
@@ -1215,7 +996,7 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
     with sqlite3.connect(str(db_path)) as conn:
         canonical_row = conn.execute(
             """
-            SELECT assistant_final_text, final_char_length, final_byte_length
+            SELECT assistant_final_text
             FROM turn_content_revisions
             WHERE host_id = ? AND turn_id = ? AND content_revision = ?
             """,
@@ -1227,24 +1008,12 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
                 (host_id, turn["id"]),
             ).fetchone()[0]
         )
-        stored_plans = conn.execute(
-            """
-            SELECT name, plan_token, turn_id, content_revision,
-                   presentation_version, part_count, state
-            FROM turn_presentation_plans
-            WHERE host_id = ?
-            """,
-            (host_id,),
-        ).fetchall()
         stored_jobs = conn.execute(
             """
-            SELECT operation, part_ordinal, sequence_index, outbox_id, spans_json
-            FROM turn_presentation_jobs
-            WHERE plan_id = (
-                SELECT id FROM turn_presentation_plans
-                WHERE host_id = ? AND plan_token = ?
-            )
-            ORDER BY sequence_index
+            SELECT kind, logical_ordinal, logical_sequence, payload_json
+            FROM connector_outbox
+            WHERE host_id = ? AND plan_token = ?
+            ORDER BY logical_sequence
             """,
             (host_id, plan_token),
         ).fetchall()
@@ -1260,9 +1029,10 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
             )
         ]
 
-    assert canonical_row == (expected, len(expected), len(expected.encode("utf-8")))
-    assert "assistant_final_text" not in stored_turn
-    assert len(stored_plans) == 1
+    assert canonical_row == (expected,)
+    assert len(canonical_row[0]) == len(expected)
+    assert len(canonical_row[0].encode("utf-8")) == len(expected.encode("utf-8"))
+    assert stored_turn["assistant_final_text"] == expected
     assert len(stored_jobs) == len(pages)
     assert len(stored_outbox) == len(pages) + 1
 
@@ -1277,7 +1047,6 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
         ack_surfaces,
         canonical_row,
         stored_turn,
-        stored_plans,
         stored_jobs,
         stored_outbox,
     )

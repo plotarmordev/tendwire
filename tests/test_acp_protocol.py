@@ -3,26 +3,27 @@ from __future__ import annotations
 import pytest
 
 from tendwire.backends.acp_protocol import (
-    AgentCapabilities,
     AcpEnvelopeError,
     AcpFramingError,
     AcpRemoteError,
     JsonRpcNotification,
     JsonRpcRequest,
     JsonRpcResponse,
-    PermissionOptionKind,
-    SessionUpdateKind,
     decode_json_line,
     encode_message,
     parse_permission_request,
     parse_session_update,
-    request_envelope,
     validate_envelope,
 )
 
 
 def test_strict_json_line_round_trip() -> None:
-    envelope = request_envelope(7, "session/new", {"cwd": "/tmp", "mcpServers": []})
+    envelope = {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "session/new",
+        "params": {"cwd": "/tmp", "mcpServers": []},
+    }
     encoded = encode_message(envelope)
     assert encoded.endswith(b"\n")
     assert decode_json_line(encoded) == JsonRpcRequest(
@@ -75,13 +76,13 @@ def test_notification_and_session_update_are_typed_but_extension_safe() -> None:
     assert isinstance(message, JsonRpcNotification)
     update = parse_session_update(message.params)
     assert update.session_id == "s1"
-    assert update.update_kind is SessionUpdateKind.AGENT_THOUGHT_CHUNK
-    assert update.update["content"]["text"] == "summary"
+    assert update.raw["update"]["sessionUpdate"] == "agent_thought_chunk"
+    assert update.raw["update"]["content"]["text"] == "summary"
 
     extension = parse_session_update(
         {"sessionId": "s1", "update": {"sessionUpdate": "vendor_progress"}}
     )
-    assert extension.update_kind == "vendor_progress"
+    assert extension.raw["update"]["sessionUpdate"] == "vendor_progress"
 
 
 def test_permission_request_validation_and_typed_options() -> None:
@@ -98,43 +99,7 @@ def test_permission_request_validation_and_typed_options() -> None:
     )
     parsed = parse_permission_request(request)
     assert parsed.request_id == 42
-    assert parsed.options[0].kind is PermissionOptionKind.ALLOW_ONCE
-
-
-def test_capability_presence_uses_acp_object_semantics() -> None:
-    capabilities = AgentCapabilities.from_mapping(
-        {
-            "loadSession": True,
-            "sessionCapabilities": {
-                "list": {},
-                "delete": {},
-                "resume": {},
-                "close": {},
-                "additionalDirectories": {},
-            },
-            "promptCapabilities": {
-                "image": True,
-                "audio": True,
-                "embeddedContext": True,
-            },
-            "mcpCapabilities": {"http": True, "sse": True},
-            "auth": {"logout": {}},
-            "_meta": {"vendor.example": {"revision": 3}},
-        }
-    )
-    assert capabilities.load_session
-    assert capabilities.session_list
-    assert capabilities.session_resume
-    assert capabilities.session_close
-    assert capabilities.session_delete
-    assert capabilities.additional_directories
-    assert capabilities.prompt_image
-    assert capabilities.prompt_audio
-    assert capabilities.prompt_embedded_context
-    assert capabilities.mcp_http
-    assert capabilities.mcp_sse
-    assert capabilities.auth_logout
-    assert capabilities.raw["_meta"] == {"vendor.example": {"revision": 3}}
+    assert parsed.options[0].kind == "allow_once"
 
 
 def test_request_ids_follow_acp_json_rpc_domain() -> None:
@@ -225,6 +190,6 @@ def test_unknown_update_and_nested_extension_payload_are_preserved() -> None:
             "_meta": {"vendor.example/trace": "abc"},
         }
     )
-    assert extension.update_kind == "vendor/future_progress"
-    assert extension.update["opaque"] == {"revision": 7, "items": [1, 2]}
-    assert extension.meta == {"vendor.example/trace": "abc"}
+    assert extension.raw["update"]["sessionUpdate"] == "vendor/future_progress"
+    assert extension.raw["update"]["opaque"] == {"revision": 7, "items": [1, 2]}
+    assert extension.raw["_meta"] == {"vendor.example/trace": "abc"}

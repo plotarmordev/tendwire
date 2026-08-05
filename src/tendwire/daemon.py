@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import signal
 import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,15 +39,6 @@ def _nonnegative_int(value: Any) -> int:
     return max(0, value)
 
 
-def _nonnegative_float(value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    converted = float(value)
-    if converted < 0 or converted != converted or converted in {float("inf"), float("-inf")}:
-        return None
-    return converted
-
-
 def _public_failure_type(value: Any) -> str | None:
     """Return a bounded exception type label, never arbitrary failure text."""
     if not isinstance(value, str) or not value or len(value) > 128:
@@ -56,360 +48,19 @@ def _public_failure_type(value: Any) -> str | None:
     return value
 
 
-_STORE_COUNT_FIELDS = (
-    "snapshots",
-    "events",
-    "spaces",
-    "workers",
-    "turns",
-    "pending_interactions",
-    "attention_items",
-    "commands",
-    "command_receipts",
-    "backend_health",
-)
-_OUTBOX_PUBLIC_STATUSES = frozenset(
-    {
-        "queued",
-        "leased",
-        "awaiting_ack",
-        "delivered",
-        "deferred",
-        "retry",
-        "dead_letter",
-        "superseded",
-        "unknown",
-    }
-)
-
-
-def _validated_nonnegative_int(value: Any) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return None
-    return value
-
-
-def _store_counts_health(value: Any) -> tuple[dict[str, int], bool]:
-    fallback = {field: 0 for field in _STORE_COUNT_FIELDS}
-    if not isinstance(value, Mapping) or set(value) != set(_STORE_COUNT_FIELDS):
-        return fallback, False
-    parsed = {
-        field: _validated_nonnegative_int(value.get(field))
-        for field in _STORE_COUNT_FIELDS
-    }
-    if any(count is None for count in parsed.values()):
-        return fallback, False
-    return {field: int(parsed[field]) for field in _STORE_COUNT_FIELDS}, True
-
-
-def _outbox_health(value: Any) -> tuple[dict[str, Any], bool]:
-    fallback = {
-        "pending": 0,
-        "leased": 0,
-        "completed": 0,
-        "by_status": {},
-        "due": 0,
-        "oldest_due_at": None,
-        "overdue_awaiting_ack": 0,
-        "drain_target_seconds": 30,
-        "starved": False,
-    }
-    if not isinstance(value, Mapping) or set(value) != {
-        "pending",
-        "leased",
-        "completed",
-        "by_status",
-        "due",
-        "oldest_due_at",
-        "overdue_awaiting_ack",
-        "drain_target_seconds",
-        "starved",
-    }:
-        return fallback, False
-    by_status_value = value.get("by_status")
-    if not isinstance(by_status_value, Mapping):
-        return fallback, False
-    by_status: dict[str, int] = {}
-    for key, count_value in by_status_value.items():
-        if not isinstance(key, str) or key not in _OUTBOX_PUBLIC_STATUSES:
-            return fallback, False
-        count = _validated_nonnegative_int(count_value)
-        if count is None:
-            return fallback, False
-        by_status[key] = count
-    pending = _validated_nonnegative_int(value.get("pending"))
-    leased = _validated_nonnegative_int(value.get("leased"))
-    completed = _validated_nonnegative_int(value.get("completed"))
-    due = _validated_nonnegative_int(value.get("due"))
-    overdue_awaiting_ack = _validated_nonnegative_int(
-        value.get("overdue_awaiting_ack")
-    )
-    drain_target_seconds = _validated_nonnegative_int(
-        value.get("drain_target_seconds")
-    )
-    oldest_due_at = value.get("oldest_due_at")
-    starved = value.get("starved")
-    if (
-        pending is None
-        or leased is None
-        or completed is None
-        or due is None
-        or overdue_awaiting_ack is None
-        or drain_target_seconds != 30
-        or not isinstance(starved, bool)
-        or (
-            oldest_due_at is not None
-            and _valid_observation_timestamp(oldest_due_at) is None
-        )
-        or due > pending
-        or (due == 0 and oldest_due_at is not None)
-        or (due > 0 and oldest_due_at is None)
-        or pending
-        != sum(by_status.get(status, 0) for status in ("queued", "deferred", "retry"))
-        or leased != by_status.get("leased", 0)
-        or completed
-        != sum(by_status.get(status, 0) for status in ("delivered", "superseded"))
-    ):
-        return fallback, False
-    return {
-        "pending": pending,
-        "leased": leased,
-        "completed": completed,
-        "by_status": by_status,
-        "due": due,
-        "oldest_due_at": oldest_due_at,
-        "overdue_awaiting_ack": overdue_awaiting_ack,
-        "drain_target_seconds": drain_target_seconds,
-        "starved": starved,
-    }, True
-
-
-def _maintenance_health(
-    config: Config,
-    value: Any,
-) -> tuple[dict[str, Any], bool]:
-    fallback = {
-        "last_completed_at": None,
-        "status": "not_initialized",
-        "snapshot_count": 0,
-        "snapshot_retention_days": config.snapshot_retention_days,
-        "snapshot_retention_count": config.snapshot_retention_count,
-        "maintenance_batch_size": config.snapshot_maintenance_batch_size,
-        "maintenance_cadence_seconds": config.store_maintenance_cadence_seconds,
-        "backlog": False,
-    }
-    if not isinstance(value, Mapping) or set(value) != set(fallback):
-        return fallback, False
-    snapshot_count = _validated_nonnegative_int(value.get("snapshot_count"))
-    last_completed_value = value.get("last_completed_at")
-    last_completed_at = (
-        None
-        if last_completed_value is None
-        else _valid_observation_timestamp(
-            last_completed_value if isinstance(last_completed_value, str) else None
-        )
-    )
-    status = value.get("status")
-    policy_values = (
-        ("snapshot_retention_days", config.snapshot_retention_days),
-        ("snapshot_retention_count", config.snapshot_retention_count),
-        ("maintenance_batch_size", config.snapshot_maintenance_batch_size),
-        ("maintenance_cadence_seconds", config.store_maintenance_cadence_seconds),
-    )
-    valid = (
-        isinstance(status, str)
-        and status in {"not_initialized", "never", "ok", "failed"}
-        and snapshot_count is not None
-        and (
-            last_completed_value is None
-            or last_completed_at is not None
-        )
-        and all(
-            type(value.get(field)) is int
-            and value.get(field) == expected
-            for field, expected in policy_values
-        )
-        and isinstance(value.get("backlog"), bool)
-    )
-    if not valid:
-        return fallback, False
-    return {
-        **fallback,
-        "last_completed_at": last_completed_at,
-        "status": str(value["status"]),
-        "snapshot_count": snapshot_count,
-        "backlog": bool(value["backlog"]),
-    }, True
-
-
-_FINAL_RETENTION_COUNT_FIELDS = (
-    "acknowledged",
-    "unresolved",
-    "queued",
-    "leased",
-    "deferred",
-    "retry",
-    "dead_letter",
-    "awaiting_ack",
-    "eligible",
-)
-
-
-def _final_retention_health(
-    config: Config,
-    value: Any,
-) -> tuple[dict[str, Any], bool]:
-    """Validate the fixed public retention aggregate without exposing row data."""
-    fallback = {
-        **{key: 0 for key in _FINAL_RETENTION_COUNT_FIELDS},
-        "acknowledged_final_retention_days": (
-            config.acknowledged_final_retention_days
-        ),
-        "acknowledged_final_retention_count": (
-            config.acknowledged_final_retention_count
-        ),
-        "storage_pressure": False,
-    }
-    if not isinstance(value, Mapping):
-        return fallback, False
-    counts = tuple(value.get(key) for key in _FINAL_RETENTION_COUNT_FIELDS)
-    valid_counts = all(
-        isinstance(count, int) and not isinstance(count, bool) and count >= 0
-        for count in counts
-    )
-    days_value = value.get("acknowledged_final_retention_days")
-    count_value = value.get("acknowledged_final_retention_count")
-    valid_policy = (
-        type(days_value) is int
-        and days_value == config.acknowledged_final_retention_days
-        and type(count_value) is int
-        and count_value == config.acknowledged_final_retention_count
-    )
-    storage_pressure = value.get("storage_pressure")
-    component_counts = counts[2:-1]
-    if (
-        not valid_counts
-        or not valid_policy
-        or not isinstance(storage_pressure, bool)
-        or counts[-1] > counts[0]
-        or any(component > counts[1] for component in component_counts)
-        or sum(component_counts) > counts[1]
-        or (
-            (counts[-1] > 0 or counts[1] > config.acknowledged_final_retention_count)
-            and storage_pressure is not True
-        )
-    ):
-        return fallback, False
-    return {
-        **dict(zip(_FINAL_RETENTION_COUNT_FIELDS, counts, strict=True)),
-        "acknowledged_final_retention_days": (
-            config.acknowledged_final_retention_days
-        ),
-        "acknowledged_final_retention_count": (
-            config.acknowledged_final_retention_count
-        ),
-        "storage_pressure": storage_pressure,
-    }, True
-
-
-_COMMAND_REQUEST_STATES = (
-    "reserved",
-    "send_started",
-    "accepted",
-    "rejected",
-    "uncertain",
-)
-
-
-def _command_requests_health(
-    config: Config,
-    value: Any,
-) -> tuple[dict[str, Any], bool]:
-    """Validate the fixed public command-request aggregate without row data."""
-    fallback = {
-        "total": 0,
-        "states": {state: 0 for state in _COMMAND_REQUEST_STATES},
-        "stale_active": 0,
-        "eligible": 0,
-        "retry_horizon_seconds": config.command_retry_horizon_seconds,
-        "retention_seconds": config.command_receipt_retention_seconds,
-        "retention_count": config.command_receipt_retention_count,
-        "storage_pressure": False,
-    }
-    if not isinstance(value, Mapping) or set(value) != set(fallback):
-        return fallback, False
-    states_value = value.get("states")
-    if (
-        not isinstance(states_value, Mapping)
-        or set(states_value) != set(_COMMAND_REQUEST_STATES)
-    ):
-        return fallback, False
-    states = {
-        state: _validated_nonnegative_int(states_value.get(state))
-        for state in _COMMAND_REQUEST_STATES
-    }
-    total = _validated_nonnegative_int(value.get("total"))
-    stale_active = _validated_nonnegative_int(value.get("stale_active"))
-    eligible = _validated_nonnegative_int(value.get("eligible"))
-    storage_pressure = value.get("storage_pressure")
-    valid_policy = all(
-        type(value.get(field)) is int and value.get(field) == expected
-        for field, expected in (
-            ("retry_horizon_seconds", config.command_retry_horizon_seconds),
-            ("retention_seconds", config.command_receipt_retention_seconds),
-            ("retention_count", config.command_receipt_retention_count),
-        )
-    )
-    if (
-        any(count is None for count in states.values())
-        or total is None
-        or stale_active is None
-        or eligible is None
-        or not valid_policy
-        or not isinstance(storage_pressure, bool)
-    ):
-        return fallback, False
-    state_counts = {state: int(states[state]) for state in _COMMAND_REQUEST_STATES}
-    eligible_pool = (
-        state_counts["reserved"]
-        + state_counts["accepted"]
-        + state_counts["rejected"]
-        + state_counts["uncertain"]
-    )
-    if (
-        total != sum(state_counts.values())
-        or stale_active > state_counts["send_started"]
-        or eligible
-        > max(0, eligible_pool - config.command_receipt_retention_count)
-        or storage_pressure is not bool(stale_active or eligible)
-    ):
-        return fallback, False
-    return {
-        **fallback,
-        "total": total,
-        "states": state_counts,
-        "stale_active": stale_active,
-        "eligible": eligible,
-        "storage_pressure": storage_pressure,
-    }, True
-
-
 def _pending_ingestion_health(config: Config) -> dict[str, Any]:
     """Return the fixed durable pending aggregate without exposing row identity."""
     unavailable = {
         "status": "store_unavailable",
         "counts": {"fresh": 0, "stale": 0, "total": 0},
     }
-    raw: Mapping[str, Any] = unavailable
-    if config.db_path is not None:
-        try:
-            from .store.sqlite import backend_pending_health
+    try:
+        from .store.projection import backend_pending_health
 
-            value = backend_pending_health(Path(config.db_path), config.host_id)
-        except Exception:
-            value = unavailable
-        if isinstance(value, Mapping):
-            raw = value
+        value = backend_pending_health(Path(config.db_path), config.host_id)
+    except Exception:
+        value = unavailable
+    raw: Mapping[str, Any] = value if isinstance(value, Mapping) else unavailable
     raw_counts = raw.get("counts")
     status = raw.get("status")
     count_values = (
@@ -436,9 +87,6 @@ def _pending_ingestion_health(config: Config) -> dict[str, Any]:
     return {
         "status": status,
         "counts": counts,
-        "bounds": {
-            "stale_grace_seconds": config.pending_stale_grace_seconds,
-        },
     }
 
 
@@ -450,7 +98,7 @@ def default_socket_path(config: Config) -> Path:
 
 
 def _default_init_store(db_path: Path) -> None:
-    from .store.sqlite import init_store
+    from .store.schema import init_store
 
     init_store(db_path)
 
@@ -494,6 +142,7 @@ class TendwireDaemon:
         self._acp_startup_failure_type: str | None = None
         self._stop_lock = threading.Lock()
         self._automatic_maintenance_status: dict[str, Any] | None = None
+        self._last_retention_cycle_monotonic: float | None = None
 
     @property
     def snapshot(self) -> Snapshot | None:
@@ -508,9 +157,6 @@ class TendwireDaemon:
             return
         if self.stop_event.is_set():
             raise RuntimeError("daemon cannot start after shutdown")
-        if self.config.db_path is None:
-            raise RuntimeError("daemon requires a sqlite db path")
-
         server: UnixSocketJSONServer | None = None
         try:
             repair_config_state(
@@ -555,7 +201,7 @@ class TendwireDaemon:
             server.start()
             self._connector_periodic_tick()
             self._start_acp_supervisor()
-            from .store.sqlite import latest_snapshot
+            from .store.projection import latest_snapshot
 
             self._snapshot = latest_snapshot(
                 Path(self.config.db_path), self.config.host_id
@@ -730,81 +376,34 @@ class TendwireDaemon:
         }
 
     def _after_snapshot_saved(self) -> None:
-        if self.config.db_path is None:
-            return
-        from .store.sqlite import (
-            SnapshotRetentionPolicy,
-            compact_turn_change_journal,
-            maybe_run_automatic_store_maintenance,
-        )
+        from .store.retention import RetentionPolicy, run_retention_cycle
 
-        policy = SnapshotRetentionPolicy(
-            retention_days=self.config.snapshot_retention_days,
-            retention_count=self.config.snapshot_retention_count,
+        now = time.monotonic()
+        previous = self._last_retention_cycle_monotonic
+        if previous is not None and now - previous < self.config.store_maintenance_cadence_seconds:
+            return
+        self._last_retention_cycle_monotonic = now
+        policy = RetentionPolicy(
+            event_retention_days=self.config.event_retention_days,
+            snapshot_retention_days=self.config.snapshot_retention_days,
+            targetable_retention_days=max(
+                30, self.config.acknowledged_final_retention_days
+            ),
+            route_content_retention_days=max(
+                45, self.config.acknowledged_final_retention_days
+            ),
+            command_retention_days=(
+                self.config.command_receipt_retention_seconds + 86_399
+            ) // 86_400,
             batch_size=self.config.snapshot_maintenance_batch_size,
+            turn_change_retention_days=self.config.turn_change_retention_days,
+            turn_change_batch_size=self.config.turn_change_compaction_batch_size,
         )
         try:
-            result = maybe_run_automatic_store_maintenance(
-                Path(self.config.db_path),
-                policy=policy,
-                agent_event_host_id=self.config.host_id,
-                agent_event_retention_days=self.config.event_retention_days,
-                acknowledged_final_retention_days=(
-                    self.config.acknowledged_final_retention_days
-                ),
-                acknowledged_final_retention_count=(
-                    self.config.acknowledged_final_retention_count
-                ),
-                command_retry_horizon_seconds=(
-                    self.config.command_retry_horizon_seconds
-                ),
-                command_receipt_retention_seconds=(
-                    self.config.command_receipt_retention_seconds
-                ),
-                command_receipt_retention_count=(
-                    self.config.command_receipt_retention_count
-                ),
-                cadence_seconds=self.config.store_maintenance_cadence_seconds,
-            )
-            turn_change_result: Mapping[str, Any] = {"ok": True}
-            if bool(result.get("due")):
-                turn_change_result = compact_turn_change_journal(
-                    Path(self.config.db_path),
-                    self.config.host_id,
-                    retention_days=self.config.turn_change_retention_days,
-                    retention_count=self.config.turn_change_retention_count,
-                    batch_size=self.config.turn_change_compaction_batch_size,
-                )
-            snapshot_result = result.get("snapshot")
-            snapshot_counts = snapshot_result if isinstance(snapshot_result, Mapping) else {}
-            agent_event_result = result.get("agent_events")
-            agent_event_counts = (
-                agent_event_result
-                if isinstance(agent_event_result, Mapping)
-                else {}
-            )
-            maintenance_status = {
-                "ok": bool(result.get("ok")) and bool(turn_change_result.get("ok")),
-                "status": (
-                    str(result.get("status") or "unknown")
-                    if bool(turn_change_result.get("ok"))
-                    else "failed"
-                ),
-                "due": bool(result.get("due")),
-                "examined": int(snapshot_counts.get("examined") or 0),
-                "deleted": int(snapshot_counts.get("deleted") or 0),
-                "remaining_candidates": bool(snapshot_counts.get("remaining_candidates")),
-                "agent_events_examined": int(
-                    agent_event_counts.get("examined") or 0
-                ),
-                "agent_events_deleted": int(
-                    agent_event_counts.get("deleted") or 0
-                ),
-                "agent_events_remaining_candidates": bool(
-                    agent_event_counts.get("remaining_candidates")
-                ),
-            }
+            result = run_retention_cycle(Path(self.config.db_path), policy=policy)
+            maintenance_status = {"ok": True, "status": "ok", "due": True, "result": result}
         except Exception:
+            self._last_retention_cycle_monotonic = previous
             self._automatic_maintenance_status = {
                 "ok": False,
                 "status": "failed",
@@ -820,269 +419,106 @@ class TendwireDaemon:
             self._automatic_maintenance_status = maintenance_status
 
     def get_snapshot(self) -> Snapshot:
-        if self.config.db_path is not None:
-            from .store.sqlite import latest_snapshot
+        from .store.projection import latest_snapshot
 
-            snapshot = latest_snapshot(Path(self.config.db_path), self.config.host_id)
-            if snapshot is not None:
-                self._snapshot = snapshot
-                return snapshot
+        snapshot = latest_snapshot(Path(self.config.db_path), self.config.host_id)
+        if snapshot is not None:
+            self._snapshot = snapshot
+            return snapshot
         if self._snapshot is not None:
             return self._snapshot
         raise RuntimeError("daemon has no initial snapshot")
 
     def get_health(self) -> dict[str, Any]:
         snapshot = self.get_snapshot()
-        command_requests_default, _ = _command_requests_health(self.config, None)
-        store_payload: dict[str, Any] = {
-            "schema_version": 1,
-            "ok": False,
-            "status": "store_unavailable",
-            "host_id": self.config.host_id,
-            "counts": {},
-            "outbox": {
-                "pending": 0,
-                "leased": 0,
-                "completed": 0,
-                "by_status": {},
-                "due": 0,
-                "oldest_due_at": None,
-                "overdue_awaiting_ack": 0,
-                "drain_target_seconds": 30,
-                "starved": False,
-            },
-            "final_retention": {
-                **{key: 0 for key in _FINAL_RETENTION_COUNT_FIELDS},
-                "acknowledged_final_retention_days": (
-                    self.config.acknowledged_final_retention_days
-                ),
-                "acknowledged_final_retention_count": (
-                    self.config.acknowledged_final_retention_count
-                ),
-                "storage_pressure": False,
-            },
-            "command_requests": command_requests_default,
-            "maintenance": {
-                "last_completed_at": None,
-                "status": "not_initialized",
-                "snapshot_count": 0,
-                "snapshot_retention_days": self.config.snapshot_retention_days,
-                "snapshot_retention_count": self.config.snapshot_retention_count,
-                "maintenance_batch_size": self.config.snapshot_maintenance_batch_size,
-                "maintenance_cadence_seconds": self.config.store_maintenance_cadence_seconds,
-                "backlog": False,
-            },
-        }
-        if self.config.db_path is not None:
-            from .store.sqlite import store_status
+        from .store.db import store_status
+        from .store.schema import STORE_SCHEMA_VERSION
 
-            store_payload = store_status(
-                Path(self.config.db_path),
-                self.config.host_id,
-                acknowledged_final_retention_days=(
-                    self.config.acknowledged_final_retention_days
-                ),
-                acknowledged_final_retention_count=(
-                    self.config.acknowledged_final_retention_count
-                ),
-                snapshot_retention_days=self.config.snapshot_retention_days,
-                snapshot_retention_count=self.config.snapshot_retention_count,
-                maintenance_batch_size=self.config.snapshot_maintenance_batch_size,
-                maintenance_cadence_seconds=self.config.store_maintenance_cadence_seconds,
-                command_retry_horizon_seconds=(
-                    self.config.command_retry_horizon_seconds
-                ),
-                command_receipt_retention_seconds=(
-                    self.config.command_receipt_retention_seconds
-                ),
-                command_receipt_retention_count=(
-                    self.config.command_receipt_retention_count
-                ),
-            )
-        store_origin_valid = (
-            type(store_payload.get("schema_version")) is int
-            and store_payload.get("schema_version") == 1
-            and
-            store_payload.get("ok") is True
-            and store_payload.get("status") == "ok"
-            and store_payload.get("host_id") == self.config.host_id
+        raw_store = store_status(Path(self.config.db_path), self.config.host_id)
+        raw_counts = raw_store.get("counts")
+        store_ok = (
+            type(raw_store.get("schema_version")) is int
+            and raw_store.get("schema_version") == 1
+            and raw_store.get("ok") is True
+            and raw_store.get("status") == "ok"
+            and raw_store.get("host_id") == self.config.host_id
+            and type(raw_store.get("store_schema_version")) is int
+            and raw_store.get("store_schema_version") == STORE_SCHEMA_VERSION
+            and isinstance(raw_counts, Mapping)
+            and set(raw_counts) == {"turns", "agent_events", "connector_outbox"}
+            and all(type(value) is int and value >= 0 for value in raw_counts.values())
         )
-        counts, counts_valid = _store_counts_health(
-            store_payload.get("counts") if store_origin_valid else None
-        )
-        outbox, outbox_valid = _outbox_health(
-            store_payload.get("outbox") if store_origin_valid else None
-        )
-        final_retention, final_retention_valid = _final_retention_health(
-            self.config,
-            store_payload.get("final_retention") if store_origin_valid else None,
-        )
-        command_requests, command_requests_valid = _command_requests_health(
-            self.config,
-            store_payload.get("command_requests") if store_origin_valid else None,
-        )
-        maintenance, maintenance_valid = _maintenance_health(
-            self.config,
-            store_payload.get("maintenance") if store_origin_valid else None,
-        )
-        if maintenance["snapshot_count"] != counts["snapshots"]:
-            maintenance, maintenance_valid = _maintenance_health(self.config, None)
-        store_ok = bool(
-            store_origin_valid
-            and counts_valid
-            and outbox_valid
-            and final_retention_valid
-            and command_requests_valid
-            and maintenance_valid
+        counts = (
+            {
+                "turns": raw_counts["turns"],
+                "agent_events": raw_counts["agent_events"],
+                "outbox": raw_counts["connector_outbox"],
+            }
+            if store_ok
+            else {"turns": 0, "agent_events": 0, "outbox": 0}
         )
         acp_health = self._acp_supervisor_health()
-        backend_runtime: dict[str, Any] = {
-            "status": "healthy" if acp_health["healthy"] else "degraded",
-            "outcome": "healthy_non_empty" if acp_health.get("worker_count", 0) else "empty_healthy",
-            "ready": acp_health["healthy"],
-            "running": acp_health.get("state") == "running",
-            "last_reconcile_at": acp_health.get("last_reconcile_at"),
-            "reconcile_enabled": True,
-        }
-        backend_maintenance = backend_runtime.get("automatic_maintenance")
-        runtime_maintenance = (
-            backend_maintenance
-            if isinstance(backend_maintenance, Mapping)
-            else self._automatic_maintenance_status
+        maintenance = self._automatic_maintenance_status
+        maintenance_ok = maintenance is None or maintenance.get("ok") is True
+        pending = _pending_ingestion_health(self.config)
+        healthy = (
+            store_ok and maintenance_ok and acp_health["healthy"] is True
+            and pending["status"] == "healthy"
         )
-        if runtime_maintenance is not None:
-            maintenance["last_check"] = dict(runtime_maintenance)
-        maintenance_degraded = (
-            not maintenance_valid
-            or maintenance.get("status") == "failed"
-            or bool(maintenance.get("backlog"))
-            or (
-                runtime_maintenance is not None
-                and not bool(runtime_maintenance.get("ok"))
-            )
-            or not final_retention_valid
-            or bool(final_retention["storage_pressure"])
-            or not command_requests_valid
-            or bool(command_requests["storage_pressure"])
-            or bool(outbox["starved"])
-        )
-        pending_ingestion = _pending_ingestion_health(self.config)
-        stored_last_event_at = _valid_observation_timestamp(
-            store_payload.get("last_event_at")
-            if store_ok and isinstance(store_payload.get("last_event_at"), str)
-            else None
-        )
-        stored_last_snapshot_at = _valid_observation_timestamp(
-            store_payload.get("last_snapshot_at")
-            if store_ok and isinstance(store_payload.get("last_snapshot_at"), str)
-            else None
-        )
-        last_event_at = backend_runtime.get("last_event_at") or stored_last_event_at
-        last_snapshot_at = (
-            backend_runtime.get("last_snapshot_at")
-            or stored_last_snapshot_at
-            or snapshot.updated_at
-        )
-        payload = {
+        return sanitize_public_mapping({
             "schema_version": 1,
-            "status": (
-                "ok"
-                if store_ok
-                and not maintenance_degraded
-                and pending_ingestion["status"] == "healthy"
-                and acp_health["healthy"] is True
-                else "degraded"
-            ),
+            "status": "ok" if healthy else "degraded",
             "host_id": self.config.host_id,
-            "daemon": {
-                "status": "healthy",
-                "started_at": self.started_at,
-            },
+            "daemon": {"status": "healthy", "started_at": self.started_at},
             "store": {
                 "status": (
-                    "unavailable"
-                    if not store_ok
-                    else "degraded"
-                    if maintenance_degraded
-                    else "healthy"
+                    "unavailable" if not store_ok else "healthy" if maintenance_ok else "degraded"
                 ),
+                "schema_version": raw_store.get("store_schema_version") if store_ok else None,
                 "counts": counts,
-                "outbox": outbox,
-                "final_retention": final_retention,
-                "command_requests": command_requests,
-                "last_event_at": stored_last_event_at,
-                "last_snapshot_at": stored_last_snapshot_at,
-                "maintenance": maintenance,
+                "maintenance": None if maintenance is None else dict(maintenance),
             },
             "snapshot": {
                 "updated_at": snapshot.updated_at,
                 "content_fingerprint": snapshot.content_fingerprint,
             },
             "timestamps": {
-                "last_snapshot_at": last_snapshot_at,
-                "last_event_at": last_event_at,
-                "last_reconcile_at": backend_runtime.get("last_reconcile_at"),
+                "last_snapshot_at": snapshot.updated_at,
+                "last_reconcile_at": acp_health.get("last_reconcile_at"),
             },
             "backend": {
-                "status": backend_runtime.get("status"),
-                "outcome": backend_runtime.get("outcome"),
-                "ready": backend_runtime.get("ready"),
-                "running": backend_runtime.get("running"),
-                "reconcile_enabled": backend_runtime["reconcile_enabled"],
+                "status": "healthy" if acp_health["healthy"] else "degraded",
+                "ready": acp_health["healthy"],
+                "running": acp_health.get("state") == "running",
             },
             "acp": acp_health,
-            "pending_ingestion": pending_ingestion,
+            "pending_ingestion": pending,
             "limits": {
                 "reconcile_interval_seconds": self.config.reconcile_interval_seconds,
                 "event_retention_days": self.config.event_retention_days,
-                "max_workers": self.config.max_workers,
                 "max_outbox_attempts": self.config.max_outbox_attempts,
-                "outbox_claim_ttl_seconds": self.config.connector_claim_ttl_seconds,
-                "outbox_max_claim_ttl_seconds": (
-                    self.config.connector_max_claim_ttl_seconds
-                ),
-                "outbox_ack_ttl_seconds": self.config.connector_ack_ttl_seconds,
-                "acknowledged_final_retention_days": (
-                    self.config.acknowledged_final_retention_days
-                ),
-                "acknowledged_final_retention_count": (
-                    self.config.acknowledged_final_retention_count
-                ),
-                "command_retry_horizon_seconds": (
-                    self.config.command_retry_horizon_seconds
-                ),
-                "command_receipt_retention_seconds": (
-                    self.config.command_receipt_retention_seconds
-                ),
-                "command_receipt_retention_count": (
-                    self.config.command_receipt_retention_count
-                ),
-                "snapshot_retention_days": self.config.snapshot_retention_days,
-                "snapshot_retention_count": self.config.snapshot_retention_count,
-                "snapshot_maintenance_batch_size": self.config.snapshot_maintenance_batch_size,
-                "store_maintenance_cadence_seconds": self.config.store_maintenance_cadence_seconds,
             },
             "backend_health": [health.to_dict() for health in snapshot.backend_health],
-        }
-        return sanitize_public_mapping(payload)
+        })
 
     def get_attention(self) -> Mapping[str, Any]:
-        if self.config.db_path is not None:
-            from .store.sqlite import attention_payload_from_store
+        from .store.projection import attention_payload_from_store
 
-            payload = attention_payload_from_store(
-                Path(self.config.db_path),
-                self.config.host_id,
-            )
-            if payload is not None:
-                return payload
-        from .core.attention import attention_payload_from_snapshot
-
-        return attention_payload_from_snapshot(self.get_snapshot())
+        payload = attention_payload_from_store(
+            Path(self.config.db_path),
+            self.config.host_id,
+        )
+        return payload or {
+            "schema_version": 1,
+            "host_id": self.config.host_id,
+            "ok": False,
+            "status": "store_unavailable",
+            "attention": [],
+        }
 
     def get_pending(self) -> Mapping[str, Any]:
-        """Return the durable pending projection shared with the CLI fallback."""
-        from .store.sqlite import pending_payload_from_store
+        """Return the durable pending projection exposed by the daemon."""
+        from .store.pending import pending_payload_from_store
 
         return pending_payload_from_store(
             Path(self.config.db_path),
@@ -1097,14 +533,7 @@ class TendwireDaemon:
         cursor: str | None = None,
         since: str | None = None,
     ) -> Mapping[str, Any]:
-        if self.config.db_path is None:
-            return {
-                "schema_version": schema_version,
-                "host_id": self.config.host_id,
-                "ok": False,
-                "status": "store_unavailable",
-            }
-        from .store.sqlite import turns_payload_from_store
+        from .store.turns import turns_payload_from_store
 
         return turns_payload_from_store(
             Path(self.config.db_path),
@@ -1118,17 +547,7 @@ class TendwireDaemon:
 
     def get_turn_content(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
         """turn.content.get: return one immutable bounded canonical page."""
-        if self.config.db_path is None:
-            return {
-                "schema_version": 1,
-                "ok": False,
-                "status": "store_unavailable",
-                "error": {
-                    "code": "store_unavailable",
-                    "message": "daemon requires a sqlite db path for this method",
-                },
-            }
-        from .store.sqlite import get_turn_content
+        from .store.turns import get_turn_content
 
         return get_turn_content(
             Path(self.config.db_path),
@@ -1148,15 +567,7 @@ class TendwireDaemon:
         limit: int = 100,
     ) -> Mapping[str, Any]:
         """Read one cache-only delta page; this surface has no delivery authority."""
-        if self.config.db_path is None:
-            return {
-                "schema_version": 1,
-                "projection_schema_version": 2,
-                "host_id": self.config.host_id,
-                "ok": False,
-                "status": "store_unavailable",
-            }
-        from .store.sqlite import turn_delta_payload_from_store
+        from .store.turns import turn_delta_payload_from_store
 
         return turn_delta_payload_from_store(
             Path(self.config.db_path),
@@ -1167,18 +578,6 @@ class TendwireDaemon:
         )
 
     def connector_call(self, method: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
-        if self.config.db_path is None:
-            return {
-                "schema_version": 1,
-                "ok": False,
-                "status": "store_unavailable",
-                "host_id": self.config.host_id,
-                "name": str(params.get("name") or ""),
-                "error": {
-                    "code": "store_unavailable",
-                    "message": "daemon requires a sqlite db path for this method",
-                },
-            }
         from .connectors import ConnectorOutboxAPI
 
         return ConnectorOutboxAPI(
@@ -1192,9 +591,7 @@ class TendwireDaemon:
 
     def _connector_periodic_tick(self) -> None:
         """Eagerly reclaim expired connector work without waiting for a poll."""
-        if self.config.db_path is None:
-            return
-        from .store.sqlite import (
+        from .store.outbox import (
             connector_reclaim_due,
             reclaim_expired_connector_leases,
         )

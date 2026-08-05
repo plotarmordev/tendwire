@@ -12,36 +12,28 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from ..config import Config
 from ..core.models import WorkerBinding, stable_fingerprint
-from ..store.sqlite import expire_worker_bindings, list_worker_bindings
+from ..store.projection import expire_worker_bindings, list_worker_bindings
 from .acp_ingestion import AcpSessionIngestor
 from .acp_protocol import (
     PermissionRequest,
-    PromptResult,
-    RequestId,
-    SessionResult,
     SessionUpdate,
     StopReason,
     SteeringOutcome,
-    SteeringResult,
 )
 
 
-class AcpRuntimeError(RuntimeError):
-    """Base error raised by the supervised ACP runtime."""
-
-
-class AcpRuntimeStateError(AcpRuntimeError):
+class AcpRuntimeStateError(RuntimeError):
     """An operation is invalid for the runtime's current lifecycle state."""
 
 
-class AcpRuntimeProtocolError(AcpRuntimeError):
+class AcpRuntimeProtocolError(RuntimeError):
     """The ACP client returned data that cannot be safely bound or finalized."""
 
 
@@ -49,7 +41,7 @@ class AcpRuntimeBindingError(AcpRuntimeProtocolError):
     """The runtime's authenticated worker binding is no longer current."""
 
 
-class AcpRuntimeStopTimeout(AcpRuntimeError, TimeoutError):
+class AcpRuntimeStopTimeout(RuntimeError, TimeoutError):
     """The runtime could not stop all supervised work within its deadline."""
 
 
@@ -107,96 +99,10 @@ PermissionCallback = Callable[[PermissionRequest], str | PermissionSelection | N
 IngestorFactory = Callable[..., AcpSessionIngestor]
 
 
-class SessionBindingCallback(Protocol):
-    """Atomically persist an ACP binding derived from one continuity anchor."""
-
-    def __call__(
-        self,
-        session_id: str,
-        continuity_binding: WorkerBinding,
-    ) -> WorkerBinding: ...
-
-
-class AcpSessionConnection(Protocol):
-    """Bounded ACP connection required by :class:`AcpWorkerSession`."""
-
-    def initialize(
-        self,
-        *,
-        client_capabilities: Mapping[str, Any] | None = None,
-    ) -> object: ...
-
-    def new_session(
-        self,
-        cwd: Path,
-        *,
-        mcp_servers: Sequence[Mapping[str, Any]] = (),
-        additional_directories: Sequence[Path] = (),
-    ) -> SessionResult: ...
-
-    def load_session(
-        self,
-        session_id: str,
-        cwd: Path,
-        *,
-        mcp_servers: Sequence[Mapping[str, Any]] = (),
-        additional_directories: Sequence[Path] = (),
-    ) -> SessionResult: ...
-
-    def resume_session(
-        self,
-        session_id: str,
-        cwd: Path,
-        *,
-        mcp_servers: Sequence[Mapping[str, Any]] = (),
-        additional_directories: Sequence[Path] = (),
-    ) -> SessionResult: ...
-
-    def prompt(
-        self,
-        session_id: str,
-        prompt: str | Sequence[Mapping[str, Any]],
-        *,
-        timeout: float | None = None,
-        on_send_start: Callable[[], None] | None = None,
-        on_submitted: Callable[[], None] | None = None,
-    ) -> PromptResult: ...
-
-    def prepare_prompt(
-        self,
-        prompt: str | Sequence[Mapping[str, Any]],
-    ) -> tuple[Mapping[str, Any], ...]: ...
-
-    @property
-    def steering_supported(self) -> bool: ...
-
-    def steer_session(
-        self,
-        session_id: str,
-        prompt: str | Sequence[Mapping[str, Any]],
-        *,
-        timeout: float | None = None,
-        on_send_start: Callable[[], None] | None = None,
-        on_submitted: Callable[[], None] | None = None,
-    ) -> SteeringResult: ...
-
-    def cancel(self, session_id: str) -> None: ...
-
-    def next_session_event(
-        self,
-        *,
-        timeout: float,
-    ) -> SessionUpdate | PermissionRequest: ...
-
-    def respond_permission(
-        self,
-        request_id: RequestId,
-        *,
-        option_id: str | None = None,
-        cancelled: bool = False,
-    ) -> None: ...
-
-    def close(self) -> None: ...
+SessionBindingCallback = Callable[[str, WorkerBinding], WorkerBinding]
+# BoundedAcpConnection is the one concrete transport contract. Repeating its
+# complete surface here created a second client layer that could drift.
+AcpSessionConnection = Any
 
 
 class AcpWorkerSession:
@@ -217,12 +123,8 @@ class AcpWorkerSession:
         session_mode: SessionOpenMode | str = SessionOpenMode.NEW,
         session_id: str | None = None,
         stream_generation: str | None = None,
-        client_capabilities: Mapping[str, Any] | None = None,
-        mcp_servers: Sequence[Mapping[str, Any]] = (),
-        additional_directories: Sequence[str | Path] = (),
         permission_callback: PermissionCallback | None = None,
         session_binding_callback: SessionBindingCallback | None = None,
-        ingestor: AcpSessionIngestor | None = None,
         ingestor_factory: IngestorFactory = AcpSessionIngestor,
         poll_timeout: float = 0.05,
         stop_timeout: float = 3.0,
@@ -259,8 +161,6 @@ class AcpWorkerSession:
                 raise ValueError("ACP runtime requires an ACP session worker binding")
             if binding.turn_target_value != session_id:
                 raise ValueError("ACP runtime session does not match the worker binding")
-        if config.db_path is None:
-            raise ValueError("ACP runtime requires a sqlite db path")
         resolved_cwd = Path(cwd)
         if not resolved_cwd.is_absolute():
             raise ValueError("ACP runtime cwd must be absolute")
@@ -274,14 +174,8 @@ class AcpWorkerSession:
         self._session_mode = mode
         self._requested_session_id = session_id
         self._stream_generation = stream_generation or uuid.uuid4().hex
-        self._client_capabilities = _runtime_client_capabilities(
-            client_capabilities
-        )
-        self._mcp_servers = tuple(dict(server) for server in mcp_servers)
-        self._additional_directories = tuple(Path(path) for path in additional_directories)
         self._permission_callback = permission_callback
         self._session_binding_callback = session_binding_callback
-        self._provided_ingestor = ingestor
         self._ingestor_factory = ingestor_factory
         self._poll_timeout = float(poll_timeout)
         self._stop_timeout = float(stop_timeout)
@@ -306,11 +200,13 @@ class AcpWorkerSession:
         # NEW acquires authority through its binder during start. LOAD/RESUME
         # are handed an existing live ACP lease and own releasing it once the
         # runtime stops or fails.
-        self._provisional_binding: WorkerBinding | None = (
-            binding if mode is not SessionOpenMode.NEW else None
+        self._provisional_bindings: dict[tuple[str, str, str], WorkerBinding] = (
+            {_binding_release_key(binding): binding}
+            if mode is not SessionOpenMode.NEW
+            else {}
         )
         self._close_thread: threading.Thread | None = None
-        self._close_failures: list[BaseException] = []
+        self._close_failure: BaseException | None = None
         self._prompt_threads: set[threading.Thread] = set()
 
         self._updates_ingested = 0
@@ -322,16 +218,6 @@ class AcpWorkerSession:
         self._prompts_completed = 0
         self._prompts_failed = 0
         self._cancellation_requests = 0
-
-    def __enter__(self) -> "AcpWorkerSession":
-        return self.start()
-
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        try:
-            self.stop()
-        except BaseException:
-            if exc is None:
-                raise
 
     def start(self) -> "AcpWorkerSession":
         """Initialize capabilities, open one session, and start consumers."""
@@ -347,29 +233,29 @@ class AcpWorkerSession:
                 self._state = RuntimeState.STARTING
             try:
                 self._require_current_binding(self._binding)
-                self._client.initialize(client_capabilities=self._client_capabilities)
+                self._client.initialize()
                 if self._session_mode is SessionOpenMode.LOAD:
                     assert self._requested_session_id is not None
                     # ACP load may synchronously replay more updates than the
                     # bounded client queue can hold before returning.  Bind and
-                    # drain the ordered stream before issuing the request.
+                    # drain it before issuing the request. Historical replay is
+                    # intentionally discarded; Tendwire only projects live work.
                     self._session_id = self._requested_session_id
-                    self._ingestor = self._make_ingestor(self._requested_session_id)
                     self._setup_replay = True
                     self._start_consumer()
                 session = self._open_session()
-                if not isinstance(session, SessionResult) or not session.session_id:
+                if not isinstance(session, str) or not session:
                     raise AcpRuntimeProtocolError(
                         "ACP session setup returned an invalid response"
                     )
                 if self._session_mode is SessionOpenMode.NEW:
-                    self._binding = self._bind_new_session(session.session_id)
+                    self._binding = self._bind_new_session(session)
                 else:
-                    if session.session_id != self._binding.turn_target_value:
+                    if session != self._binding.turn_target_value:
                         raise AcpRuntimeProtocolError(
                             "ACP session setup did not return the bound session"
                         )
-                    if session.session_id != self._requested_session_id:
+                    if session != self._requested_session_id:
                         raise AcpRuntimeProtocolError(
                             "ACP session setup returned an unexpected session"
                         )
@@ -379,20 +265,22 @@ class AcpWorkerSession:
                         self._stop_timeout,
                         allowed_state=RuntimeState.STARTING,
                     )
-                    with self._ingest_lock:
-                        self._require_ingestor().reset_after_load()
+                    self._ingestor = self._make_ingestor(session)
                     self._setup_replay = False
                 else:
-                    self._session_id = session.session_id
-                    self._ingestor = self._make_ingestor(session.session_id)
+                    self._session_id = session
+                    self._ingestor = self._make_ingestor(session)
                     self._start_consumer()
                 with self._state_lock:
                     if self._failure is not None:
                         raise self._failure
                     self._state = RuntimeState.RUNNING
             except BaseException as exc:
-                self._release_derived_binding(reason="acp_startup_rollback")
-                self._record_failure(exc)
+                try:
+                    self._release_derived_bindings(reason="acp_startup_rollback")
+                except BaseException:
+                    pass
+                self._record_failure(exc, release_bindings=False)
                 # ``__enter__`` is never completed when start fails, so no
                 # caller cleanup can be assumed. Bound shutdown prevents an
                 # initialized adapter or a partially started consumer leaking.
@@ -409,7 +297,7 @@ class AcpWorkerSession:
         drain_timeout: float | None = None,
         on_send_start: Callable[[], None] | None = None,
         on_submitted: Callable[[], None] | None = None,
-    ) -> PromptResult:
+    ) -> StopReason:
         """Submit one prompt and finalize only after its prior updates drain."""
 
         wait_limit = self._stop_timeout if drain_timeout is None else float(drain_timeout)
@@ -457,7 +345,7 @@ class AcpWorkerSession:
                 self._close_failed_prompt(session_id, ingestor)
                 self._record_failure(exc)
                 raise
-            if not isinstance(result, PromptResult):
+            if not isinstance(result, StopReason):
                 error = AcpRuntimeProtocolError(
                     "ACP prompt returned an invalid response"
                 )
@@ -474,7 +362,7 @@ class AcpWorkerSession:
             try:
                 self._wait_for_event_idle(wait_limit)
                 with self._ingest_lock:
-                    completion = ingestor.mark_prompt_complete(result.stop_reason)
+                    completion = ingestor.mark_prompt_complete(result)
                     _raise_for_binding_rejection(completion)
             except BaseException as exc:
                 with self._state_lock:
@@ -552,19 +440,14 @@ class AcpWorkerSession:
     def can_steer(self) -> bool:
         """Return whether this runtime can append to a live ACP turn."""
 
-        try:
-            supported = getattr(self._client, "steering_supported", False) is True
-        except Exception:
-            supported = False
-        if not supported:
+        if self._client.steering_supported is not True:
             return False
         with self._state_lock:
             if self._state is not RuntimeState.RUNNING or self._failure is not None:
                 return False
         with self._ingest_lock:
             ingestor = self._ingestor
-            can_append = getattr(ingestor, "can_append_prompt", None)
-            return bool(callable(can_append) and can_append())
+            return bool(ingestor is not None and ingestor.can_append_prompt())
 
     def submit_steering(
         self,
@@ -573,7 +456,7 @@ class AcpWorkerSession:
         producer_turn_id: str,
         acknowledgement_timeout: float,
         on_send_start: Callable[[], None] | None = None,
-    ) -> SteeringResult:
+    ) -> SteeringOutcome:
         """Inject one input into the current turn through ACP steering."""
 
         if acknowledgement_timeout <= 0:
@@ -604,7 +487,7 @@ class AcpWorkerSession:
                 timeout=acknowledgement_timeout,
                 on_send_start=start_and_record,
             )
-            if result.outcome is not SteeringOutcome.FAILED:
+            if result is not SteeringOutcome.FAILED:
                 return result
 
             # The steering extension defines ``failed`` as a definite
@@ -716,12 +599,18 @@ class AcpWorkerSession:
                 self._record_failure(error)
                 raise error
 
-            self._release_derived_binding(reason="acp_runtime_stopped")
-
+            cleanup_failure: BaseException | None = None
+            try:
+                self._release_derived_bindings(reason="acp_runtime_stopped")
+            except BaseException as exc:
+                cleanup_failure = exc
             with self._state_lock:
                 failure = self._failure
-            if self._close_failures and failure is None:
-                failure = self._close_failures[0]
+            if failure is None and cleanup_failure is not None:
+                failure = cleanup_failure
+                self._record_failure(failure, release_bindings=False)
+            if self._close_failure is not None and failure is None:
+                failure = self._close_failure
                 self._record_failure(failure)
             with self._state_lock:
                 if failure is None:
@@ -740,7 +629,7 @@ class AcpWorkerSession:
                 try:
                     self._client.close()
                 except BaseException as exc:
-                    self._close_failures.append(exc)
+                    self._close_failure = exc
 
             self._close_thread = threading.Thread(
                 target=close_client,
@@ -762,28 +651,19 @@ class AcpWorkerSession:
         )
         return not self._close_thread.is_alive() and consumers_joined
 
-    def _open_session(self) -> SessionResult:
-        options = {
-            "mcp_servers": self._mcp_servers,
-            "additional_directories": self._additional_directories,
-        }
+    def _open_session(self) -> str:
         if self._session_mode is SessionOpenMode.NEW:
-            return self._client.new_session(self._cwd, **options)
+            return self._client.new_session(self._cwd)
         assert self._requested_session_id is not None
         if self._session_mode is SessionOpenMode.LOAD:
             return self._client.load_session(
-                self._requested_session_id, self._cwd, **options
+                self._requested_session_id, self._cwd
             )
         return self._client.resume_session(
-            self._requested_session_id, self._cwd, **options
+            self._requested_session_id, self._cwd
         )
 
     def _make_ingestor(self, session_id: str) -> AcpSessionIngestor:
-        if self._provided_ingestor is not None:
-            existing_session = getattr(self._provided_ingestor, "session_id", session_id)
-            if existing_session != session_id:
-                raise ValueError("provided ACP ingestor is bound to another session")
-            return self._provided_ingestor
         return self._ingestor_factory(
             self._config,
             session_id=session_id,
@@ -797,7 +677,10 @@ class AcpWorkerSession:
             raise AcpRuntimeBindingError("ACP session binding is unavailable")
         continuity = self._binding
         self._require_current_binding(continuity)
-        existing_acp = self._binding_fingerprints(continuity.host_id, backend="acp")
+        existing_acp = {
+            item.private_fingerprint
+            for item in self._authority_acp_bindings(continuity)
+        }
         try:
             bound = callback(session_id, continuity)
             with self._state_lock:
@@ -838,84 +721,108 @@ class AcpWorkerSession:
             # repurpose or overwrite the Herdr continuity row it was given.
             self._require_current_binding(continuity)
             self._require_current_binding(bound)
+            created = [
+                item for item in self._authority_acp_bindings(continuity)
+                if item.private_fingerprint not in existing_acp
+            ]
+            if len(created) != 1 or not _same_binding_authority(created[0], bound):
+                raise AcpRuntimeBindingError(
+                    "ACP session binder did not establish one exact binding"
+                )
         except BaseException:
-            self._expire_new_acp_bindings(continuity.host_id, existing_acp)
+            try:
+                self._expire_new_acp_bindings(continuity, existing_acp)
+            except BaseException:
+                pass
             raise
-        if bound.private_fingerprint not in existing_acp:
-            self._provisional_binding = bound
+        with self._state_lock:
+            self._provisional_bindings[_binding_release_key(bound)] = bound
         return bound
 
-    def _binding_fingerprints(self, host_id: str, *, backend: str) -> set[str]:
-        db_path = self._config.db_path
-        if db_path is None:  # pragma: no cover - constructor invariant
-            return set()
-        return {
-            item.private_fingerprint
-            for item in list_worker_bindings(Path(db_path), host_id, backend=backend)
-        }
+    def _authority_acp_bindings(
+        self,
+        continuity: WorkerBinding,
+    ) -> list[WorkerBinding]:
+        return [
+            item
+            for item in list_worker_bindings(
+                Path(self._config.db_path), continuity.host_id, backend="acp"
+            )
+            if item.worker_id == continuity.worker_id
+            and item.worker_fingerprint == continuity.worker_fingerprint
+        ]
 
     def _expire_new_acp_bindings(
         self,
-        host_id: str,
+        continuity: WorkerBinding,
         existing_fingerprints: set[str],
     ) -> None:
-        db_path = self._config.db_path
-        if db_path is None:  # pragma: no cover - constructor invariant
-            return
-        current = list_worker_bindings(Path(db_path), host_id, backend="acp")
         created = [
-            item
-            for item in current
+            item for item in self._authority_acp_bindings(continuity)
             if item.private_fingerprint not in existing_fingerprints
         ]
-        for item in created:
-            expire_worker_bindings(
-                Path(db_path),
-                host_id,
-                backend="acp",
-                private_fingerprints=[item.private_fingerprint],
-                # Callback clocks are untrusted.  Using the row's own
-                # observation instant guarantees a future-dated provisional
-                # lease is still revocable.
-                now=item.observed_at,
-                reason="acp_startup_rollback",
-            )
+        with self._state_lock:
+            for item in created:
+                self._provisional_bindings[_binding_release_key(item)] = item
+        self._release_derived_bindings(reason="acp_startup_rollback")
 
-    def _release_derived_binding(self, *, reason: str) -> None:
-        bound = self._provisional_binding
-        self._provisional_binding = None
-        if bound is None or self._config.db_path is None:
-            return
-        expire_worker_bindings(
-            Path(self._config.db_path),
-            bound.host_id,
-            backend="acp",
-            private_fingerprints=[bound.private_fingerprint],
-            now=bound.observed_at,
-            reason=reason,
-        )
+    def _release_derived_bindings(self, *, reason: str) -> None:
+        with self._state_lock:
+            pending = tuple(self._provisional_bindings.items())
+        failures: list[BaseException] = []
+        for key, bound in pending:
+            try:
+                expire_worker_bindings(
+                    Path(self._config.db_path),
+                    bound.host_id,
+                    backend="acp",
+                    worker_id=bound.worker_id,
+                    private_fingerprints=[bound.private_fingerprint],
+                    observed_before=bound.observed_at,
+                    reason=reason,
+                )
+                live = next(
+                    (
+                        item
+                        for item in list_worker_bindings(
+                            Path(self._config.db_path),
+                            bound.host_id,
+                            backend="acp",
+                        )
+                        if _binding_release_key(item) == key
+                    ),
+                    None,
+                )
+            except BaseException as exc:
+                failures.append(exc)
+                continue
+            with self._state_lock:
+                if self._provisional_bindings.get(key) is not bound:
+                    continue
+                if live is None:
+                    self._provisional_bindings.pop(key, None)
+                else:
+                    self._provisional_bindings[key] = live
+                    failures.append(
+                        AcpRuntimeBindingError(
+                            "ACP derived binding changed during cleanup"
+                        )
+                    )
+        if failures:
+            raise failures[0]
 
     def _require_current_binding(self, expected: WorkerBinding) -> None:
         db_path = self._config.db_path
-        if db_path is None:  # pragma: no cover - constructor invariant
-            raise AcpRuntimeBindingError("ACP binding store is unavailable")
         current = list_worker_bindings(
             Path(db_path),
             expected.host_id,
             backend=expected.backend,
         )
-        # Herdr may refresh only the observation lease while an ACP endpoint
-        # is being initialized.  That does not change routing authority and
-        # must not invalidate the in-flight generation transaction.  Every
-        # identity and routing field remains exact; process-owned ACP rows are
-        # still checked byte-for-byte so their revocation cannot be masked.
-        if expected.backend == "herdr":
-            present = any(
-                _same_binding_authority(item, expected)
-                for item in current
-            )
-        else:
-            present = expected in current
+        # Observation timestamps are lease metadata, not route authority.
+        # The store canonicalizes them and Herdr may refresh them while an
+        # endpoint starts. Revocation is still fail-closed because the query
+        # excludes expired rows and every identity/routing field remains exact.
+        present = any(_same_binding_authority(item, expected) for item in current)
         if not present:
             raise AcpRuntimeBindingError("ACP worker binding is not current")
 
@@ -943,6 +850,10 @@ class AcpWorkerSession:
                         return
                     continue
                 setup_replay = self._setup_replay
+                if setup_replay:
+                    if isinstance(event, PermissionRequest):
+                        self._client.respond_permission(event.request_id, cancelled=True)
+                    continue
                 if isinstance(event, SessionUpdate):
                     if event.session_id != self._session_id:
                         raise AcpRuntimeProtocolError(
@@ -952,18 +863,13 @@ class AcpWorkerSession:
                     with self._ingest_lock:
                         outcome = ingestor.ingest_update(
                             event.raw,
-                            replay=setup_replay,
-                            setup_replay=setup_replay,
                         )
                         _raise_for_binding_rejection(outcome)
-                    if _outcome_has_persisted_event(outcome):
+                    if getattr(outcome, "event", None) is not None:
                         with self._state_lock:
                             self._updates_ingested += 1
                 elif isinstance(event, PermissionRequest):
-                    self._handle_permission(
-                        event,
-                        setup_replay=setup_replay,
-                    )
+                    self._handle_permission(event)
                 else:  # pragma: no cover - typed protocol invariant
                     raise AcpRuntimeProtocolError("ACP session event type is invalid")
         except BaseException as exc:
@@ -973,8 +879,6 @@ class AcpWorkerSession:
     def _handle_permission(
         self,
         request: PermissionRequest,
-        *,
-        setup_replay: bool = False,
     ) -> None:
         """Journal then resolve one permission, failing closed before response."""
 
@@ -988,12 +892,12 @@ class AcpWorkerSession:
             with self._ingest_lock:
                 outcome = ingestor.ingest_permission_request(
                     request.raw,
-                    source_event_id=_permission_source_event_id(request.request_id),
-                    replay=setup_replay,
-                    setup_replay=setup_replay,
+                    source_event_id="permission:" + stable_fingerprint(
+                        {"request_id": request.request_id}
+                    ),
                 )
                 _raise_for_binding_rejection(outcome)
-            if _outcome_has_persisted_event(outcome):
+            if getattr(outcome, "event", None) is not None:
                 with self._state_lock:
                     self._permissions_ingested += 1
 
@@ -1144,8 +1048,18 @@ class AcpWorkerSession:
         except BaseException:
             pass
 
-    def _record_failure(self, failure: BaseException) -> None:
-        self._release_derived_binding(reason="acp_runtime_failed")
+    def _record_failure(
+        self,
+        failure: BaseException,
+        *,
+        release_bindings: bool = True,
+    ) -> None:
+        if release_bindings:
+            try:
+                self._release_derived_bindings(reason="acp_runtime_failed")
+            except BaseException:
+                # Keep failed cleanup handles for the bounded stop/restart retry.
+                pass
         with self._idle_condition:
             if self._failure is None:
                 self._failure = failure
@@ -1154,81 +1068,33 @@ class AcpWorkerSession:
             self._idle_condition.notify_all()
 
 
-def _permission_source_event_id(request_id: RequestId) -> str:
-    """Return a bounded opaque ID while preserving JSON-RPC ID types."""
-
-    return f"permission:{stable_fingerprint({'request_id': request_id})}"
-
-
 def _prepare_prompt_content(
     client: AcpSessionConnection,
     prompt: str | Sequence[Mapping[str, Any]],
 ) -> tuple[Mapping[str, Any], ...]:
     """Validate before persistence when the transport exposes its validator."""
 
-    prepare = getattr(client, "prepare_prompt", None)
-    if callable(prepare):
-        prepared = tuple(prepare(prompt))
-    elif isinstance(prompt, str):
-        prepared = ({"type": "text", "text": prompt},)
-    else:
-        prepared = tuple(dict(block) for block in prompt)
+    prepared = tuple(client.prepare_prompt(prompt))
     if not prepared or any(not isinstance(block, Mapping) for block in prepared):
         raise ValueError("prompt must contain at least one content block")
     return tuple(dict(block) for block in prepared)
 
 
-def _runtime_client_capabilities(
-    capabilities: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    """Return only client capabilities this runtime can actually service.
-
-    The runtime handles ACP session updates and permission requests, neither of
-    which is advertised through ``clientCapabilities``. It has no handlers for
-    filesystem, terminal, elicitation, or session-config requests. Known keys
-    are therefore stripped even when supplied by an embedding caller. Unknown
-    top-level keys could advertise extension methods and are rejected.
-    """
-    if capabilities is None:
-        return {}
-    if not isinstance(capabilities, Mapping):
-        raise ValueError("client_capabilities must be a mapping or None")
-    known = {"fs", "terminal", "session", "elicitation", "_meta"}
-    if any(not isinstance(key, str) or key not in known for key in capabilities):
-        raise ValueError(
-            "ACP runtime cannot advertise unsupported client capabilities"
-        )
-    return {}
+def _binding_release_key(binding: WorkerBinding) -> tuple[str, str, str]:
+    return (
+        binding.worker_id,
+        binding.worker_fingerprint,
+        binding.private_fingerprint,
+    )
 
 
 def _same_binding_authority(left: WorkerBinding, right: WorkerBinding) -> bool:
     """Compare durable route authority while ignoring observer lease refreshes."""
-
-    return (
-        left.host_id,
-        left.worker_id,
-        left.worker_fingerprint,
-        left.backend,
-        left.target_kind,
-        left.target_value,
-        left.turn_target_kind,
-        left.turn_target_value,
-        left.sendable,
-        left.reason,
-        left.private_fingerprint,
-    ) == (
-        right.host_id,
-        right.worker_id,
-        right.worker_fingerprint,
-        right.backend,
-        right.target_kind,
-        right.target_value,
-        right.turn_target_kind,
-        right.turn_target_value,
-        right.sendable,
-        right.reason,
-        right.private_fingerprint,
-    )
+    return replace(
+        left,
+        observed_at=right.observed_at,
+        expires_at=right.expires_at,
+    ) == right
 
 
 def _raise_for_binding_rejection(outcome: object) -> None:
@@ -1246,25 +1112,3 @@ def _raise_for_binding_rejection(outcome: object) -> None:
         or turn_stale is True
     ):
         raise AcpRuntimeBindingError("ACP worker binding is no longer current")
-
-
-def _outcome_has_persisted_event(outcome: object) -> bool:
-    """Count only updates that reached the durable event boundary."""
-
-    return getattr(outcome, "event", None) is not None
-
-
-__all__ = [
-    "AcpWorkerSession",
-    "AcpRuntimeBindingError",
-    "AcpSessionConnection",
-    "AcpRuntimeError",
-    "AcpRuntimeProtocolError",
-    "AcpRuntimeStateError",
-    "AcpWorkerSessionStatus",
-    "AcpRuntimeStopTimeout",
-    "PermissionCallback",
-    "RuntimeState",
-    "SessionBindingCallback",
-    "SessionOpenMode",
-]

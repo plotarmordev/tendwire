@@ -1,20 +1,11 @@
-"""Neutral data models for Tendwire snapshots.
-
-These models are intentionally device-neutral. They contain no Telegram,
-Herdres delivery, chat/topic/message ID, or connector-specific routing state.
-"""
-
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import threading
 import unicodedata
-from collections import OrderedDict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -22,294 +13,68 @@ from typing import Any
 SCHEMA_VERSION = 2
 FINGERPRINT_HEX_CHARS = 24
 
-CANONICAL_STATUSES = frozenset(
-    {"unknown", "active", "idle", "waiting", "blocked", "warning", "done", "failed", "closed"}
+CANONICAL_STATUSES = frozenset("unknown active idle waiting blocked warning done failed closed".split())
+
+_STATUS_ALIASES = dict(
+    item.split("=", 1) for item in """
+    =unknown ok=active okay=active ready=active running=active run=active
+    online=active connected=active healthy=active success=done open=active working=active
+    busy=active processing=active in-progress=active in_progress=active thinking=active executing=active
+    responding=waiting awaiting-input=waiting awaiting_input=waiting needs-input=waiting needs_input=waiting paused=idle
+    pause=idle sleeping=idle wait=waiting pending=waiting queued=waiting queue=waiting
+    blocked=blocked block=blocked stalled=blocked stuck=blocked warn=warning warning=warning
+    degraded=warning error=failed errors=failed fail=failed failure=failed crashed=failed
+    crash=failed panic=failed closed=closed complete=done completed=done done=done
+    stopped=closed exited=closed terminated=closed
+    """.split()
 )
 
-_STATUS_ALIASES = {
-    "": "unknown",
-    "ok": "active",
-    "okay": "active",
-    "ready": "active",
-    "running": "active",
-    "run": "active",
-    "online": "active",
-    "connected": "active",
-    "healthy": "active",
-    "success": "done",
-    "open": "active",
-    "working": "active",
-    "busy": "active",
-    "processing": "active",
-    "in-progress": "active",
-    "in_progress": "active",
-    "thinking": "active",
-    "executing": "active",
-    "responding": "waiting",
-    "awaiting-input": "waiting",
-    "awaiting_input": "waiting",
-    "needs-input": "waiting",
-    "needs_input": "waiting",
-    "paused": "idle",
-    "pause": "idle",
-    "sleeping": "idle",
-    "wait": "waiting",
-    "pending": "waiting",
-    "queued": "waiting",
-    "queue": "waiting",
-    "blocked": "blocked",
-    "block": "blocked",
-    "stalled": "blocked",
-    "stuck": "blocked",
-    "warn": "warning",
-    "warning": "warning",
-    "degraded": "warning",
-    "error": "failed",
-    "errors": "failed",
-    "fail": "failed",
-    "failure": "failed",
-    "crashed": "failed",
-    "crash": "failed",
-    "panic": "failed",
-    "closed": "closed",
-    "complete": "done",
-    "completed": "done",
-    "done": "done",
-    "stopped": "closed",
-    "exited": "closed",
-    "terminated": "closed",
-}
-
-_SEVERITY_ALIASES = {
-    "": "info",
-    "warn": "warning",
-    "warning": "warning",
-    "critical": "critical",
-    "error": "critical",
-    "failed": "critical",
-    "failure": "critical",
-    "info": "info",
-    "notice": "info",
-    "debug": "info",
-}
+_SEVERITY_ALIASES = dict(
+    item.split("=", 1) for item in """
+    =info warn=warning warning=warning critical=critical error=critical failed=critical
+    failure=critical info=info notice=info debug=info
+    """.split()
+)
 
 FORBIDDEN_FIELD_NAMES = frozenset(
-    {
-        "telegram",
-        "telegram_chat_id",
-        "telegram_chat_ids",
-        "telegram_id",
-        "telegram_ids",
-        "telegram_message_id",
-        "telegram_message_ids",
-        "telegram_thread_id",
-        "telegram_thread_ids",
-        "telegram_topic_id",
-        "telegram_topic_ids",
-        "chat_id",
-        "chat_ids",
-        "topic_id",
-        "topic_ids",
-        "message_id",
-        "message_ids",
-        "thread_id",
-        "thread_ids",
-        "token",
-        "tokens",
-        "bot_token",
-        "bot_tokens",
-        "auth",
-        "auth_token",
-        "auth_tokens",
-        "authorization",
-        "authorization_header",
-        "authorization_headers",
-        "bearer_token",
-        "bearer_tokens",
-        "cookie",
-        "cookies",
-        "credential",
-        "credentials",
-        "delivery",
-        "delivery_id",
-        "delivery_ids",
-        "deliveries",
-        "route",
-        "route_id",
-        "route_ids",
-        "routes",
-        "connector",
-        "connector_id",
-        "connector_ids",
-        "connectors",
-        "herdres_delivery",
-        "backend_target",
-        "backend_target_id",
-        "backend_target_ids",
-        "backend_targets",
-        "terminal",
-        "terminal_id",
-        "terminal_ids",
-        "terminals",
-        "pane_id",
-        "pane_ids",
-        "tab_id",
-        "tab_ids",
-        "window_id",
-        "window_ids",
-        "tty",
-        "pty",
-        "pid",
-        "pids",
-        "process_id",
-        "process_ids",
-        "process",
-        "tmux",
-        "tmux_session",
-        "tmux_session_id",
-        "tmux_session_ids",
-        "tmux_sessions",
-        "tmux_window",
-        "tmux_window_id",
-        "tmux_window_ids",
-        "tmux_windows",
-        "tmux_pane",
-        "tmux_pane_id",
-        "tmux_pane_ids",
-        "tmux_panes",
-        "screen",
-        "screen_session",
-        "screen_session_id",
-        "screen_session_ids",
-        "screen_sessions",
-        "screen_window",
-        "screen_window_id",
-        "screen_window_ids",
-        "screen_windows",
-        "agent_session",
-        "agent_session_id",
-        "agent_session_ids",
-        "agent_sessions",
-        "session",
-        "session_id",
-        "session_ids",
-        "sessions",
-        "herdr_state",
-        "herdres_state",
-        "target_kind",
-        "target_value",
-        "turn_target_kind",
-        "turn_target_value",
-        "private",
-        "private_binding",
-        "private_bindings",
-        "private_fingerprint",
-        "private_fingerprints",
-        "argv",
-        "args",
-        "command",
-        "command_arg",
-        "command_args",
-        "command_argv",
-        "command_argvs",
-        "command_line",
-        "command_lines",
-        "command_payload",
-        "command_payloads",
-        "command_text",
-        "command_texts",
-        "env",
-        "environment",
-        "raw_arg",
-        "raw_args",
-        "raw_argv",
-        "raw_argvs",
-        "raw_command",
-        "raw_command_line",
-        "raw_command_lines",
-        "raw_payload",
-        "raw_payloads",
-        "raw_control",
-        "raw_controls",
-        "shell_command",
-        "shell_commands",
-        "terminal_control",
-        "terminal_controls",
-        "control_sequence",
-        "control_sequences",
-        "escape_sequence",
-        "escape_sequences",
-        "ansi_escape",
-        "stdin",
-        "stderr",
-        "stdout",
-        "shell",
-        "secret",
-        "secrets",
-        "password",
-        "passwords",
-        "api_keys",
-        "api_key",
-        "tool_id",
-        "tool_ids",
-        "tool_use_id",
-        "tool_use_ids",
-        "tool_call_id",
-        "tool_call_ids",
-        "decision_id",
-        "decision_ids",
-        "pending_decision_id",
-        "pending_decision_ids",
-        "cwd",
-        "workdir",
-        "working_dir",
-        "working_directory",
-        "project_root",
-        "repository_root",
-        "repo_root",
-        "path",
-        "paths",
-        "file_path",
-        "file_paths",
-        "filepath",
-        "filepaths",
-        "socket_path",
-        "socket_paths",
-        "url",
-        "urls",
-        "endpoint",
-        "endpoints",
-        "network_endpoint",
-        "network_endpoints",
-        "ip",
-        "ip_address",
-        "port",
-        "headers",
-        "output",
-    }
+    """
+    agent_session agent_session_id agent_session_ids agent_sessions ansi_escape api_key api_keys args
+    argv auth auth_token auth_tokens authorization authorization_header authorization_headers backend_target
+    backend_target_id backend_target_ids backend_targets bearer_token bearer_tokens bot_token bot_tokens chat_id
+    chat_ids command command_arg command_args command_argv command_argvs command_line command_lines
+    command_payload command_payloads command_text command_texts connector connector_id connector_ids connectors
+    control_sequence control_sequences cookie cookies credential credentials cwd decision_id
+    decision_ids deliveries delivery delivery_id delivery_ids endpoint endpoints env
+    environment escape_sequence escape_sequences file_path file_paths filepath filepaths headers
+    herdr_state herdres_delivery herdres_state ip ip_address message_id message_ids network_endpoint
+    network_endpoints output pane_id pane_ids password passwords path paths
+    pending_decision_id pending_decision_ids pid pids port private private_binding private_bindings
+    private_fingerprint private_fingerprints process process_id process_ids project_root pty raw_arg
+    raw_args raw_argv raw_argvs raw_command raw_command_line raw_command_lines raw_control raw_controls
+    raw_payload raw_payloads repo_root repository_root route route_id route_ids routes
+    screen screen_session screen_session_id screen_session_ids screen_sessions screen_window screen_window_id screen_window_ids
+    screen_windows secret secrets session session_id session_ids sessions shell
+    shell_command shell_commands socket_path socket_paths stderr stdin stdout tab_id
+    tab_ids target_kind target_value telegram telegram_chat_id telegram_chat_ids telegram_id telegram_ids
+    telegram_message_id telegram_message_ids telegram_thread_id telegram_thread_ids telegram_topic_id telegram_topic_ids terminal terminal_control
+    terminal_controls terminal_id terminal_ids terminals thread_id thread_ids tmux tmux_pane
+    tmux_pane_id tmux_pane_ids tmux_panes tmux_session tmux_session_id tmux_session_ids tmux_sessions tmux_window
+    tmux_window_id tmux_window_ids tmux_windows token tokens tool_call_id tool_call_ids tool_id
+    tool_ids tool_use_id tool_use_ids topic_id topic_ids tty turn_target_kind turn_target_value
+    url urls window_id window_ids workdir working_dir working_directory
+    """.split()
 )
 _FORBIDDEN_FIELD_COMPACT = frozenset(name.replace("_", "") for name in FORBIDDEN_FIELD_NAMES)
 _FORBIDDEN_BACKEND_NAME_TEXT = frozenset(
-    {
-        "private",
-        "raw",
-        "secret",
-        "token",
-    }
+    """
+    private raw secret token
+    """.split()
 )
 _PUBLIC_TEXT_ALLOWED_FIELD_WORDS = frozenset(
-    {
-        "connector",
-        "connectors",
-        "delivery",
-        "deliveries",
-        "herdres",
-        "herdr",
-        "outbox",
-        "telegram",
-        "terminal",
-        "terminals",
-    }
+    """
+    connector connectors deliveries delivery herdr herdres outbox telegram
+    terminal terminals
+    """.split()
 )
 _PUBLIC_TEXT_ALLOWED_FIELD_WORDS_COMPACT = frozenset(
     word.replace("_", "") for word in _PUBLIC_TEXT_ALLOWED_FIELD_WORDS
@@ -442,35 +207,12 @@ _PUBLIC_SENSITIVE_CROSSING_RE = re.compile(
     r")\Z"
 )
 _PUBLIC_ALLOWED_MAPPING_KEYS = frozenset(
-    {
-        "action_id",
-        "active_tab_id",
-        "attention_id",
-        "choice_id",
-        "content_fingerprint",
-        "delivery_state",
-        "fingerprint",
-        "host_id",
-        "id",
-        "max_outbox_attempts",
-        "origin_command_id",
-        "outbox_ack_ttl_seconds",
-        "outbox_claim_ttl_seconds",
-        "outbox_max_claim_ttl_seconds",
-        "output_excerpt_chars",
-        "raw_status",
-        "request_id",
-        "row_id",
-        "segment_id",
-        "source_turn_id",
-        "space_id",
-        "submission_verdict",
-        "submission_id",
-        "transport_state",
-        "turn_id",
-        "worker_fingerprint",
-        "worker_id",
-    }
+    """
+    action_id active_tab_id attention_id choice_id content_fingerprint delivery_state fingerprint host_id
+    id max_outbox_attempts origin_command_id outbox_ack_ttl_seconds outbox_claim_ttl_seconds outbox_max_claim_ttl_seconds output_excerpt_chars raw_status
+    request_id route_generation row_id segment_id source_turn_id space_id submission_id submission_verdict
+    transport_state turn_id worker_fingerprint worker_id
+    """.split()
 )
 _PUBLIC_STRUCTURAL_MAPPING_KEY_SUFFIXES = (
     "_id",
@@ -480,45 +222,22 @@ _PUBLIC_STRUCTURAL_MAPPING_KEY_SUFFIXES = (
 )
 _PUBLIC_VALUE_TEXT_MAX_CHARS = 12000
 _PUBLIC_SUBMISSION_VERDICTS = frozenset(
-    {
-        "submitted",
-        "written_to_pty",
-        "agent_not_ready",
-        "agent_target_ambiguous",
-        "agent_prompt_not_received",
-        "agent_prompt_unsubmitted",
-        "agent_input_pending",
-        "agent_prompt_stalled",
-        "steering_failed",
-        "unknown",
-    }
+    """
+    agent_input_pending agent_not_ready agent_prompt_not_received agent_prompt_stalled agent_prompt_unsubmitted agent_target_ambiguous steering_failed submitted
+    unknown written_to_pty
+    """.split()
 )
-_PUBLIC_SANITIZE_CACHE_DEFAULT_SIZE = 2048
-_PUBLIC_SANITIZER_CONFIG_VERSION = 1
 _PUBLIC_FREE_TEXT_KEYS = frozenset(
-    {
-        "assistant_final_text",
-        "assistant_stream_text",
-        "description",
-        "detail",
-        "fields",
-        "label",
-        "message",
-        "name",
-        "prompt",
-        "question",
-        "raw_status",
-        "reason",
-        "status_line",
-        "request_id",
-        "summary",
-        "title",
-        "user_text",
-    }
+    """
+    assistant_final_text assistant_stream_text description detail fields label message name
+    prompt question raw_status reason request_id status_line summary title
+    user_text
+    """.split()
 )
 _PUBLIC_OPAQUE_ID_RE = re.compile(
     r"^(?:attn|choice|pending|space|turn|turnsrc|worker)-[0-9a-f]{24}$"
 )
+_PUBLIC_ROUTE_GENERATION_RE = re.compile(r"^twroute1\.[A-Za-z0-9_-]{43}$")
 
 WORKER_BINDING_ACTIVE_EXPIRES_AT = "9999-12-31T23:59:59+00:00"
 
@@ -604,40 +323,23 @@ def _public_tendwire_action_value(value: Any) -> str | None:
 
 _SNAPSHOT_CONTENT_IGNORED_KEYS = frozenset({"updated_at", "observed_at", "content_fingerprint"})
 
-BACKEND_HEALTH_STATUSES = frozenset({"healthy", "degraded", "unavailable", "unknown"})
+BACKEND_HEALTH_STATUSES = frozenset("degraded healthy unavailable unknown".split())
 BACKEND_HEALTH_OUTCOMES = frozenset(
-    {
-        "healthy_non_empty",
-        "empty_healthy",
-        "missing_binary",
-        "launch_error",
-        "timeout",
-        "deadline_exhausted",
-        "nonzero",
-        "malformed_json",
-        "protocol_error",
-        "socket_disconnected",
-        "worker_cap_exceeded",
-        "continuity_unavailable",
-        "unknown",
-    }
+    """
+    continuity_unavailable deadline_exhausted empty_healthy healthy_non_empty launch_error malformed_json missing_binary nonzero
+    protocol_error socket_disconnected timeout unknown worker_cap_exceeded
+    """.split()
 )
-BACKEND_HEALTH_COUNT_KEYS = frozenset({"spaces", "workers"})
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+BACKEND_HEALTH_COUNT_KEYS = frozenset("spaces workers".split())
 
 
 def utc_timestamp(dt: datetime | None = None) -> str:
-    """Return an ISO-8601 UTC timestamp string."""
     if dt is None:
-        dt = _utc_now()
+        dt = datetime.now(timezone.utc)
     return dt.astimezone(timezone.utc).isoformat()
 
 
 def stable_json_dumps(value: Any, *, indent: int | None = None) -> str:
-    """Serialize JSON deterministically for hashing and snapshot output."""
     return json.dumps(
         sanitize_forbidden_fields(value),
         ensure_ascii=False,
@@ -647,23 +349,6 @@ def stable_json_dumps(value: Any, *, indent: int | None = None) -> str:
     )
 
 
-def stable_sha256(value: Any) -> str:
-    """Return the SHA-256 hex digest of Tendwire's stable JSON encoding."""
-    return hashlib.sha256(stable_json_dumps(value).encode("utf-8")).hexdigest()
-
-
-def private_stable_sha256(value: Any) -> str:
-    """Return a deterministic digest for private, non-public identity material."""
-    encoded = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def worker_binding_private_fingerprint(
     *,
     host_id: str,
@@ -671,28 +356,21 @@ def worker_binding_private_fingerprint(
     identity_material: Any,
     length: int = FINGERPRINT_HEX_CHARS,
 ) -> str:
-    """Return a host/backend-scoped private binding identity fingerprint.
-
-    Unlike public snapshot fingerprints, this deliberately does not sanitize
-    backend identity material before hashing. Callers must not serialize the
-    returned value into public snapshot or command payloads.
-    """
-    return private_stable_sha256(
-        {
-            "host_id": str(host_id),
-            "backend": str(backend),
-            "identity": identity_material,
-        }
-    )[:length]
+    encoded = json.dumps(
+        {"host_id": str(host_id), "backend": str(backend), "identity": identity_material},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:length]
 
 
 def stable_fingerprint(value: Any, *, length: int = FINGERPRINT_HEX_CHARS) -> str:
-    """Return a fixed-width stable fingerprint for Tendwire content."""
-    return stable_sha256(value)[:length]
+    return hashlib.sha256(stable_json_dumps(value).encode("utf-8")).hexdigest()[:length]
 
 
 def normalize_status(status: Any) -> str:
-    """Map arbitrary adapter status values into Tendwire's canonical set."""
     raw = "" if status is None else str(status).strip().lower().replace("_", "-")
     if raw in CANONICAL_STATUSES:
         return raw
@@ -700,13 +378,11 @@ def normalize_status(status: Any) -> str:
 
 
 def normalize_severity(severity: Any) -> str:
-    """Normalize historical attention levels into a compact severity string."""
     raw = "" if severity is None else str(severity).strip().lower().replace("_", "-")
     return _SEVERITY_ALIASES.get(raw, raw or "info")
 
 
 def sanitize_forbidden_fields(value: Any) -> Any:
-    """Return a JSON-safe value with connector/routing field names removed."""
     if isinstance(value, datetime):
         return utc_timestamp(value)
     if isinstance(value, Mapping):
@@ -719,9 +395,6 @@ def sanitize_forbidden_fields(value: Any) -> Any:
         return sanitized
     if isinstance(value, tuple | list):
         return [sanitize_forbidden_fields(item) for item in value]
-    if isinstance(value, set | frozenset):
-        items = [sanitize_forbidden_fields(item) for item in value]
-        return sorted(items, key=stable_json_dumps)
     if value is None or isinstance(value, str | int | float | bool):
         return value
     return str(value)
@@ -832,7 +505,6 @@ def _contains_connector_private_text(value: str) -> bool:
 
 
 def _redact_and_truncate_public_text(text: str, max_chars: int | None) -> str:
-    """Redact a bounded prefix plus any sensitive value crossing its boundary."""
     if max_chars is None:
         return _PUBLIC_SENSITIVE_TEXT_RE.sub("[redacted]", text)
 
@@ -859,49 +531,6 @@ def _redact_and_truncate_public_text(text: str, max_chars: int | None) -> str:
     return redacted[:prefix_limit].rstrip() + marker
 
 
-def _public_sanitize_cache_size() -> int:
-    raw = os.environ.get(
-        "TENDWIRE_SANITIZE_CACHE_SIZE",
-        str(_PUBLIC_SANITIZE_CACHE_DEFAULT_SIZE),
-    )
-    try:
-        return max(0, min(65536, int(raw)))
-    except ValueError:
-        return _PUBLIC_SANITIZE_CACHE_DEFAULT_SIZE
-
-
-_PUBLIC_SANITIZE_CACHE_SIZE = _public_sanitize_cache_size()
-_PUBLIC_SANITIZE_CACHE: OrderedDict[tuple[Any, ...], str] = OrderedDict()
-_PUBLIC_SANITIZE_CACHE_LOCK = threading.RLock()
-
-
-def _public_sanitize_cache_key(
-    value: str,
-    *,
-    max_chars: int | None,
-    collapse_whitespace: bool,
-    strip_outer: bool,
-) -> tuple[Any, ...]:
-    digest = hashlib.blake2b(
-        value.encode("utf-8", errors="surrogatepass"),
-        digest_size=16,
-    ).digest()
-    return (
-        _PUBLIC_SANITIZER_CONFIG_VERSION,
-        max_chars,
-        collapse_whitespace,
-        strip_outer,
-        len(value),
-        digest,
-    )
-
-
-def _clear_public_sanitize_cache() -> None:
-    """Clear the process-local text sanitizer cache (primarily for tests)."""
-    with _PUBLIC_SANITIZE_CACHE_LOCK:
-        _PUBLIC_SANITIZE_CACHE.clear()
-
-
 def sanitize_public_text(
     value: Any,
     *,
@@ -909,32 +538,8 @@ def sanitize_public_text(
     collapse_whitespace: bool = False,
     strip_outer: bool = True,
 ) -> str:
-    """Redact recognizable private values while preserving ordinary public prose.
-
-    This deliberately does not claim to detect arbitrary shapeless secrets copied
-    into free-form model text. Known private source shapes, labelled private data,
-    provider credentials, endpoints, and generated metadata are blocked here;
-    tool adapters must still construct progress from allowlisted fields.
-
-    Redaction semantically precedes truncation, including when an arbitrarily long
-    credential crosses the visible boundary. ``strip_outer=False`` is reserved for
-    already-typed canonical text whose remaining code points must be lossless.
-    """
     if not isinstance(value, str):
         return ""
-    cache_key: tuple[Any, ...] | None = None
-    if _PUBLIC_SANITIZE_CACHE_SIZE:
-        cache_key = _public_sanitize_cache_key(
-            value,
-            max_chars=max_chars,
-            collapse_whitespace=collapse_whitespace,
-            strip_outer=strip_outer,
-        )
-        with _PUBLIC_SANITIZE_CACHE_LOCK:
-            cached = _PUBLIC_SANITIZE_CACHE.get(cache_key)
-            if cached is not None:
-                _PUBLIC_SANITIZE_CACHE.move_to_end(cache_key)
-                return cached
     text = unicodedata.normalize("NFKC", value).replace("\x00", "")
     text = _PUBLIC_ZERO_WIDTH_RE.sub("", text)
     text = _redact_and_truncate_public_text(text, max_chars)
@@ -942,23 +547,10 @@ def sanitize_public_text(
         text = " ".join(text.split())
     elif strip_outer:
         text = text.strip()
-    if cache_key is not None:
-        with _PUBLIC_SANITIZE_CACHE_LOCK:
-            _PUBLIC_SANITIZE_CACHE[cache_key] = text
-            _PUBLIC_SANITIZE_CACHE.move_to_end(cache_key)
-            while len(_PUBLIC_SANITIZE_CACHE) > _PUBLIC_SANITIZE_CACHE_SIZE:
-                _PUBLIC_SANITIZE_CACHE.popitem(last=False)
     return text
 
 
 def sanitize_canonical_turn_text(value: object) -> str | None:
-    """Return lossless public-safe canonical turn text.
-
-    Canonical turn content uses the same NFKC, forbidden-code-point removal,
-    and recognizable-private-value redaction as other public text, but it is
-    never truncated and its remaining leading/trailing whitespace is retained.
-    Non-string values are absent rather than being stringified.
-    """
     if not isinstance(value, str):
         return None
     return sanitize_public_text(value, max_chars=None, strip_outer=False)
@@ -971,13 +563,6 @@ def sanitize_public_value(
     _field: str = "",
     _nested: bool = False,
 ) -> Any:
-    """Return one recursively sanitized JSON-safe public value.
-
-    Mapping keys are untrusted text and are retained only when their original
-    spelling is already public-safe. Recognizable numeric Telegram chat IDs are
-    private. Ordinary numeric topic/message IDs are ambiguous and require key
-    provenance at the adapter boundary.
-    """
     normalized_field = str(_field).strip().lower().replace("-", "_")
     if normalized_field == "composer_state":
         return _PUBLIC_DROP if _nested else None
@@ -991,6 +576,10 @@ def sanitize_public_value(
         if verdict not in _PUBLIC_SUBMISSION_VERDICTS:
             return _PUBLIC_DROP if _nested else None
         return verdict
+    if normalized_field == "route_generation":
+        if isinstance(value, str) and _PUBLIC_ROUTE_GENERATION_RE.fullmatch(value):
+            return value
+        return _PUBLIC_DROP if _nested else None
     if isinstance(value, datetime):
         return utc_timestamp(value)
     if isinstance(value, Mapping):
@@ -1002,8 +591,12 @@ def sanitize_public_value(
                 max_chars=_PUBLIC_VALUE_TEXT_MAX_CHARS,
             ) != key_text:
                 continue
-            structured_outbox = key_text == "outbox" and isinstance(item, Mapping)
-            if not structured_outbox and (
+            bounded_outbox_count = (
+                key_text == "outbox"
+                and type(item) is int
+                and 0 <= item <= 2**63 - 1
+            )
+            if not bounded_outbox_count and (
                 _is_forbidden_field_name(key_text)
                 or _is_forbidden_public_mapping_key(key_text)
             ):
@@ -1029,20 +622,6 @@ def sanitize_public_value(
             if sanitized is not _PUBLIC_DROP:
                 result_list.append(sanitized)
         return result_list
-    if isinstance(value, set | frozenset):
-        result_set = [
-            sanitize_public_value(
-                item,
-                backend_neutral=backend_neutral,
-                _field=_field,
-                _nested=True,
-            )
-            for item in value
-        ]
-        return sorted(
-            (item for item in result_set if item is not _PUBLIC_DROP),
-            key=stable_json_dumps,
-        )
     if isinstance(value, str):
         text = sanitize_public_text(value, max_chars=_PUBLIC_VALUE_TEXT_MAX_CHARS)
         field_text = str(_field)
@@ -1088,7 +667,6 @@ def sanitize_public_mapping(value: Any, *, backend_neutral: bool = False) -> dic
     return clean if isinstance(clean, dict) else {}
 
 def public_json_dumps(value: Any, *, indent: int | None = None) -> str:
-    """Serialize a final public value after recursive value sanitization."""
     return json.dumps(
         sanitize_public_value(value),
         ensure_ascii=False,
@@ -1186,70 +764,23 @@ def _backend_health_counts(value: Any) -> dict[str, int]:
             continue
         if isinstance(item, bool):
             continue
-        if isinstance(item, int):
-            count = item
-        elif isinstance(item, str) and item.isdigit():
-            count = int(item)
-        else:
+        if not isinstance(item, int):
             continue
-        if count < 0:
+        if item < 0:
             continue
-        counts[key_text] = count
+        counts[key_text] = item
     return counts
-
-
-def _is_turn_api_volatile_key(key: object) -> bool:
-    normalized = str(key).strip().lower().replace("-", "_").replace(".", "_")
-    return (
-        normalized
-        in (
-            "turn",
-            "turn_epoch",
-            "last_completed_turn",
-            "outcome",
-            "state_change_seq",
-        )
-        or normalized.startswith("turn_")
-    )
-
-
-def _strip_turn_api_volatile(value: Any) -> Any:
-    """Drop Herdr turn-API counters from identity-bearing metadata.
-
-    These values advance as panes complete turns or change state. Hashing them
-    into worker or space fingerprints re-keys identity per observation, so the
-    exclusion belongs at the shared model choke point.
-    """
-    if isinstance(value, Mapping):
-        return {
-            key: _strip_turn_api_volatile(item)
-            for key, item in value.items()
-            if not _is_turn_api_volatile_key(key)
-        }
-    if isinstance(value, list):
-        return [_strip_turn_api_volatile(item) for item in value]
-    return value
 
 
 def _status_and_meta(status: Any, meta: Any) -> tuple[str, dict[str, Any]]:
     raw_status = _string_value(status, "unknown").strip()
     normalized = normalize_status(raw_status)
-    clean_meta = _strip_turn_api_volatile(sanitize_public_mapping(meta))
+    clean_meta = sanitize_public_mapping(meta)
     if raw_status and raw_status.lower().replace("_", "-") != normalized:
         public_raw_status = _public_safe_text(raw_status)
         if public_raw_status:
             clean_meta["raw_status"] = public_raw_status
     return normalized, clean_meta
-
-
-def _merge_meta(data: Mapping[str, Any], known_keys: set[str]) -> dict[str, Any]:
-    explicit_meta = data.get("meta", {})
-    merged: dict[str, Any] = {
-        str(key): value for key, value in data.items() if str(key) not in known_keys
-    }
-    if isinstance(explicit_meta, Mapping):
-        merged.update(explicit_meta)
-    return sanitize_public_mapping(merged)
 
 
 def _strip_snapshot_content_volatile(value: Any) -> Any:
@@ -1264,26 +795,6 @@ def _strip_snapshot_content_volatile(value: Any) -> Any:
     return value
 
 
-def attention_identity_payload(
-    *,
-    host_id: str,
-    source: str,
-    kind: str,
-    severity: str,
-    reason: str,
-    status: str,
-) -> dict[str, str]:
-    """Return the stable identity payload for an attention condition."""
-    return {
-        "host_id": str(host_id),
-        "source": str(source),
-        "kind": str(kind),
-        "severity": normalize_severity(severity),
-        "reason": str(reason),
-        "status": normalize_status(status),
-    }
-
-
 def attention_fingerprint(
     *,
     host_id: str,
@@ -1293,35 +804,18 @@ def attention_fingerprint(
     reason: str,
     status: str,
 ) -> str:
-    """Return the deterministic fingerprint for an attention condition."""
-    return stable_fingerprint(
-        attention_identity_payload(
-            host_id=host_id,
-            source=source,
-            kind=kind,
-            severity=severity,
-            reason=reason,
-            status=status,
-        )
-    )
-
-
-def attention_id(
-    *,
-    host_id: str,
-    source: str,
-    kind: str,
-    severity: str,
-    reason: str,
-    status: str,
-) -> str:
-    """Return the deterministic public ID for an attention condition."""
-    return f"attn-{attention_fingerprint(host_id=host_id, source=source, kind=kind, severity=severity, reason=reason, status=status)}"
+    return stable_fingerprint({
+        "host_id": str(host_id),
+        "source": str(source),
+        "kind": str(kind),
+        "severity": normalize_severity(severity),
+        "reason": str(reason),
+        "status": normalize_status(status),
+    })
 
 
 @dataclass(frozen=True, init=False)
 class SuggestedAction:
-    """A neutral action suggestion with no connector delivery state."""
 
     action_id: str = ""
     label: str = ""
@@ -1334,14 +828,10 @@ class SuggestedAction:
         label: str = "",
         tendwire_action: str = "",
         params: Mapping[str, Any] | None = None,
-        *,
-        command: str | None = None,
     ) -> None:
         label = _public_safe_text(label, default="Action")
         tendwire_action = _string_value(tendwire_action)
-        command_alias = _optional_string(command)
         public_tendwire_action = _public_tendwire_action_value(tendwire_action)
-        explicit_tendwire_action = public_tendwire_action is not None
         params = sanitize_public_mapping(params)
         action_id = _public_safe_text(action_id) or stable_fingerprint(
             {"label": label, "tendwire_action": public_tendwire_action or "", "params": params}
@@ -1350,18 +840,6 @@ class SuggestedAction:
         object.__setattr__(self, "label", label)
         object.__setattr__(self, "tendwire_action", tendwire_action)
         object.__setattr__(self, "params", params)
-        object.__setattr__(self, "_command", command_alias)
-        object.__setattr__(self, "_explicit_tendwire_action", explicit_tendwire_action)
-
-    @property
-    def command(self) -> str:
-        """Backward-compatible in-process alias; not serialized."""
-        return getattr(self, "_command", None) or self.tendwire_action
-
-    @property
-    def has_public_tendwire_action(self) -> bool:
-        """Whether tendwire_action came from the explicit public field."""
-        return bool(getattr(self, "_explicit_tendwire_action", False))
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -1370,7 +848,7 @@ class SuggestedAction:
             "params": sanitize_public_mapping(self.params),
         }
         public_tendwire_action = _public_tendwire_action_value(self.tendwire_action)
-        if self.has_public_tendwire_action and public_tendwire_action is not None:
+        if public_tendwire_action is not None:
             payload["tendwire_action"] = public_tendwire_action
         return sanitize_public_mapping(payload)
 
@@ -1378,20 +856,17 @@ class SuggestedAction:
     def from_dict(cls, data: "SuggestedAction | Mapping[str, Any]") -> "SuggestedAction":
         if isinstance(data, SuggestedAction):
             return data
-        command = data.get("command") if isinstance(data, Mapping) else None
         clean = sanitize_public_mapping(data if isinstance(data, Mapping) else {})
         return cls(
             action_id=_string_value(clean.get("action_id")),
             label=_string_value(clean.get("label")),
             tendwire_action=_string_value(clean.get("tendwire_action")),
             params=clean.get("params", {}),
-            command=_optional_string(command),
         )
 
 
 @dataclass(frozen=True)
 class Space:
-    """A neutral space observation (e.g. a Herdr space / project context)."""
 
     id: str
     name: str
@@ -1440,22 +915,20 @@ class Space:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Space":
         clean = sanitize_forbidden_fields(data)
-        known = {"id", "name", "status", "meta", "updated_at", "status_line", "summary", "fingerprint"}
-        space_id = _string_value(clean.get("id", clean.get("name", "unknown")), "unknown")
+        space_id = _string_value(clean.get("id"), "unknown")
         return cls(
             id=space_id,
             name=_string_value(clean.get("name", space_id), space_id),
             status=clean.get("status", "unknown"),
-            meta=_merge_meta(clean, known),
+            meta=clean.get("meta", {}),
             updated_at=clean.get("updated_at"),
-            status_line=clean.get("status_line", clean.get("summary")),
+            status_line=clean.get("status_line"),
             fingerprint=_string_value(clean.get("fingerprint")),
         )
 
 
 @dataclass(frozen=True)
 class Worker:
-    """A neutral worker observation (e.g. a running terminal agent)."""
 
     id: str
     name: str
@@ -1514,35 +987,21 @@ class Worker:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Worker":
         clean = sanitize_forbidden_fields(data)
-        known = {
-            "id",
-            "name",
-            "status",
-            "space_id",
-            "space",
-            "meta",
-            "last_seen_at",
-            "updated_at",
-            "summary",
-            "status_line",
-            "fingerprint",
-        }
-        worker_id = _string_value(clean.get("id", clean.get("name", "unknown")), "unknown")
+        worker_id = _string_value(clean.get("id"), "unknown")
         return cls(
             id=worker_id,
             name=_string_value(clean.get("name", worker_id), worker_id),
             status=clean.get("status", "unknown"),
-            space_id=clean.get("space_id", clean.get("space")),
-            meta=_merge_meta(clean, known),
-            last_seen_at=clean.get("last_seen_at", clean.get("updated_at")),
-            summary=clean.get("summary", clean.get("status_line")),
+            space_id=clean.get("space_id"),
+            meta=clean.get("meta", {}),
+            last_seen_at=clean.get("last_seen_at"),
+            summary=clean.get("summary"),
             fingerprint=_string_value(clean.get("fingerprint")),
         )
 
 
 @dataclass(frozen=True, init=False)
 class AttentionSignal:
-    """A pure, neutral attention signal produced from snapshot state."""
 
     id: str
     kind: str
@@ -1558,7 +1017,6 @@ class AttentionSignal:
     def __init__(
         self,
         id: str | None = None,
-        level: str | None = None,
         reason: str = "",
         source: str = "",
         *,
@@ -1572,12 +1030,17 @@ class AttentionSignal:
         host_id: str | None = None,
     ) -> None:
         resolved_kind = _public_safe_text(kind, default="general")
-        resolved_severity = normalize_severity(severity if severity is not None else level)
+        resolved_severity = normalize_severity(severity)
         resolved_status, clean_meta = _status_and_meta(status, meta or {})
         resolved_reason = _public_safe_text(reason)
         resolved_source = _public_safe_text(source, default="unknown")
         resolved_updated_at = _optional_timestamp(updated_at)
-        actions = self._coerce_actions(suggested_actions)
+        if suggested_actions is None:
+            actions = []
+        elif isinstance(suggested_actions, SuggestedAction | Mapping):
+            actions = [SuggestedAction.from_dict(suggested_actions)]
+        else:
+            actions = [SuggestedAction.from_dict(action) for action in suggested_actions]
         resolved_fingerprint = _public_safe_fingerprint(fingerprint) or attention_fingerprint(
             host_id=_string_value(host_id),
             source=resolved_source,
@@ -1599,21 +1062,6 @@ class AttentionSignal:
         object.__setattr__(self, "fingerprint", resolved_fingerprint)
         object.__setattr__(self, "meta", clean_meta)
 
-    @staticmethod
-    def _coerce_actions(
-        suggested_actions: Iterable[SuggestedAction | Mapping[str, Any]] | SuggestedAction | Mapping[str, Any] | None,
-    ) -> list[SuggestedAction]:
-        if suggested_actions is None:
-            return []
-        if isinstance(suggested_actions, SuggestedAction) or isinstance(suggested_actions, Mapping):
-            return [SuggestedAction.from_dict(suggested_actions)]
-        return [SuggestedAction.from_dict(action) for action in suggested_actions]
-
-    @property
-    def level(self) -> str:
-        """Backward-compatible alias for severity."""
-        return self.severity
-
     def to_dict(self) -> dict[str, Any]:
         return sanitize_public_mapping({
             "id": self.id,
@@ -1631,23 +1079,8 @@ class AttentionSignal:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "AttentionSignal":
         clean = sanitize_forbidden_fields(data)
-        known = {
-            "id",
-            "kind",
-            "severity",
-            "level",
-            "status",
-            "reason",
-            "source",
-            "updated_at",
-            "suggested_actions",
-            "fingerprint",
-            "meta",
-            "host_id",
-        }
         return cls(
             id=_string_value(clean.get("id")) or None,
-            level=clean.get("level"),
             kind=_string_value(clean.get("kind", "general"), "general"),
             severity=clean.get("severity"),
             status=_string_value(clean.get("status", "unknown"), "unknown"),
@@ -1656,14 +1089,13 @@ class AttentionSignal:
             updated_at=clean.get("updated_at"),
             suggested_actions=clean.get("suggested_actions", []),
             fingerprint=_string_value(clean.get("fingerprint")) or None,
-            meta=_merge_meta(clean, known),
+            meta=clean.get("meta", {}),
             host_id=_string_value(clean.get("host_id")),
         )
 
 
 @dataclass(frozen=True)
 class BackendHealth:
-    """Public-safe backend observation health for a snapshot or command path."""
 
     name: str
     status: str
@@ -1679,10 +1111,6 @@ class BackendHealth:
         object.__setattr__(self, "observed_at", _optional_timestamp(self.observed_at))
         object.__setattr__(self, "message", _public_safe_backend_message(self.message))
         object.__setattr__(self, "counts", _backend_health_counts(self.counts))
-
-    @property
-    def healthy(self) -> bool:
-        return self.status == "healthy"
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -1713,7 +1141,6 @@ class BackendHealth:
 
 @dataclass(frozen=True)
 class Snapshot:
-    """Device-neutral top-level snapshot shape."""
 
     host_id: str
     updated_at: str
@@ -1722,7 +1149,7 @@ class Snapshot:
     attention: list[AttentionSignal] = field(default_factory=list)
     backend_health: list[BackendHealth] = field(default_factory=list)
     schema_version: int = SCHEMA_VERSION
-    content_fingerprint: str = ""
+    content_fingerprint: str = field(init=False, default="")
 
     def __post_init__(self) -> None:
         host_id = _string_value(self.host_id, "unknown")
@@ -1757,7 +1184,7 @@ class Snapshot:
         object.__setattr__(self, "attention", list(attention))
         object.__setattr__(self, "backend_health", list(backend_health))
         object.__setattr__(self, "schema_version", SCHEMA_VERSION)
-        object.__setattr__(self, "content_fingerprint", self.compute_content_fingerprint())
+        object.__setattr__(self, "content_fingerprint", stable_fingerprint(self._content_dict()))
 
     def _content_dict(self) -> dict[str, Any]:
         return _strip_snapshot_content_volatile(
@@ -1771,10 +1198,6 @@ class Snapshot:
             }
         )
 
-    def compute_content_fingerprint(self) -> str:
-        """Return the deterministic fingerprint excluding volatile timestamps."""
-        return stable_fingerprint(self._content_dict())
-
     def to_dict(self) -> dict[str, Any]:
         return sanitize_public_mapping({
             "schema_version": self.schema_version,
@@ -1787,9 +1210,6 @@ class Snapshot:
             "content_fingerprint": self.content_fingerprint,
         })
 
-    def to_json(self, indent: int | None = None) -> str:
-        return public_json_dumps(self.to_dict(), indent=indent)
-
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Snapshot":
         clean = sanitize_forbidden_fields(data)
@@ -1801,17 +1221,10 @@ class Snapshot:
             attention=[AttentionSignal.from_dict(signal) for signal in clean.get("attention", [])],
             backend_health=[BackendHealth.from_dict(health) for health in clean.get("backend_health", [])],
             schema_version=SCHEMA_VERSION,
-            content_fingerprint=_string_value(clean.get("content_fingerprint")),
         )
-
-    @classmethod
-    def from_json(cls, payload: str) -> "Snapshot":
-        return cls.from_dict(json.loads(payload))
-
 
 @dataclass(frozen=True)
 class WorkerBinding:
-    """Private local binding between a public worker and backend send target."""
 
     host_id: str
     worker_id: str
@@ -1868,7 +1281,6 @@ class WorkerBinding:
         object.__setattr__(self, "private_fingerprint", private_fingerprint)
 
     def backend_target(self) -> dict[str, Any]:
-        """Return the private in-memory backend target shape for command routing."""
         return {
             "kind": self.target_kind,
             "value": self.target_value,
@@ -1877,85 +1289,41 @@ class WorkerBinding:
         }
 
 
-def _worker_binding_duplicate_group_key(binding: WorkerBinding) -> tuple[str, str, str]:
-    return (binding.host_id, binding.backend, binding.private_fingerprint)
-
-
-def _worker_binding_private_row_key(
-    binding: WorkerBinding,
-) -> tuple[str, str, str, str, str | None, str | None]:
-    return (
-        binding.worker_id,
-        binding.worker_fingerprint,
-        binding.target_kind,
-        binding.target_value,
-        binding.turn_target_kind,
-        binding.turn_target_value,
-    )
-
-
-def _duplicate_worker_binding_private_fingerprint(binding: WorkerBinding) -> str:
-    return worker_binding_private_fingerprint(
-        host_id=binding.host_id,
-        backend=binding.backend,
-        identity_material={
-            "duplicate_backend_target": True,
-            "original_private_fingerprint": binding.private_fingerprint,
-            "worker_id": binding.worker_id,
-            "worker_fingerprint": binding.worker_fingerprint,
-            "target_kind": binding.target_kind,
-            "target_value": binding.target_value,
-            "turn_target_kind": binding.turn_target_kind,
-            "turn_target_value": binding.turn_target_value,
-            "host_id": binding.host_id,
-            "backend": binding.backend,
-        },
-    )
-
-
-def _duplicate_separated_worker_binding(binding: WorkerBinding) -> WorkerBinding:
-    private_fingerprint = _duplicate_worker_binding_private_fingerprint(binding)
-    if (
-        binding.private_fingerprint == private_fingerprint
-        and binding.sendable is False
-        and binding.reason == "duplicate_backend_target"
-    ):
-        return binding
-    return WorkerBinding(
-        host_id=binding.host_id,
-        worker_id=binding.worker_id,
-        worker_fingerprint=binding.worker_fingerprint,
-        backend=binding.backend,
-        target_kind=binding.target_kind,
-        target_value=binding.target_value,
-        turn_target_kind=binding.turn_target_kind,
-        turn_target_value=binding.turn_target_value,
-        sendable=False,
-        reason="duplicate_backend_target",
-        observed_at=binding.observed_at,
-        expires_at=binding.expires_at,
-        private_fingerprint=private_fingerprint,
-    )
-
-
 def separate_duplicate_worker_bindings(bindings: Iterable[WorkerBinding]) -> list[WorkerBinding]:
-    """Split colliding private binding identities into unsendable private rows."""
     binding_list = list(bindings)
-    groups: dict[tuple[str, str, str], list[WorkerBinding]] = {}
+    groups: dict[tuple[str, str, str], set[tuple[Any, ...]]] = {}
     for binding in binding_list:
-        groups.setdefault(_worker_binding_duplicate_group_key(binding), []).append(binding)
-
-    duplicate_keys = {
-        key
-        for key, group in groups.items()
-        if len({_worker_binding_private_row_key(binding) for binding in group}) > 1
-    }
+        group = (binding.host_id, binding.backend, binding.private_fingerprint)
+        row = (
+            binding.worker_id, binding.worker_fingerprint, binding.target_kind,
+            binding.target_value, binding.turn_target_kind, binding.turn_target_value,
+        )
+        groups.setdefault(group, set()).add(row)
+    duplicate_keys = {key for key, rows in groups.items() if len(rows) > 1}
     if not duplicate_keys:
         return binding_list
-
-    return [
-        _duplicate_separated_worker_binding(binding)
-        if _worker_binding_duplicate_group_key(binding) in duplicate_keys
-        else binding
-        for binding in binding_list
-    ]
+    result: list[WorkerBinding] = []
+    for binding in binding_list:
+        group = (binding.host_id, binding.backend, binding.private_fingerprint)
+        if group not in duplicate_keys:
+            result.append(binding)
+            continue
+        identity = {
+            "duplicate_backend_target": True,
+            "original_private_fingerprint": binding.private_fingerprint,
+            **{name: getattr(binding, name) for name in (
+                "worker_id", "worker_fingerprint", "target_kind", "target_value",
+                "turn_target_kind", "turn_target_value", "host_id", "backend",
+            )},
+        }
+        result.append(replace(
+            binding,
+            sendable=False,
+            reason="duplicate_backend_target",
+            private_fingerprint=worker_binding_private_fingerprint(
+                host_id=binding.host_id,
+                backend=binding.backend,
+                identity_material=identity,
+            ),
+        ))
+    return result

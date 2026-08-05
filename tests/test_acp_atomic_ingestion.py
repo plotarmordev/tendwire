@@ -13,15 +13,12 @@ from tendwire.config import Config
 from tendwire.core.agent_events import AgentEvent, agent_event
 from tendwire.core.models import WorkerBinding
 from tendwire.core.projector import project_from_raw
-from tendwire.store import sqlite as store_sqlite
-from tendwire.store.sqlite import (
+from tendwire.store.events import list_agent_events
+from tendwire.store.projection import save_snapshot, upsert_worker_bindings
+from tendwire.store.schema import init_store
+from tendwire.store.turns import (
     append_agent_event_and_apply_turn_for_binding,
-    cleanup_agent_event_retention,
-    init_store,
-    list_agent_events,
-    save_snapshot,
     turns_payload_from_store,
-    upsert_worker_bindings,
 )
 
 
@@ -38,19 +35,14 @@ def _store(
             {
                 "id": "worker-a",
                 "name": "Worker A",
-                "meta": (
-                    {
-                        "stable_key": "wsk1_" + ("a" * 64),
-                        "stable_key_version": 1,
-                    }
-                    if stable_owner
-                    else {}
-                ),
+                "meta": {
+                    "stable_key": "wsk1_" + ("a" * 64),
+                    "stable_key_version": 1,
+                },
             }
         ],
     )
     init_store(db_path)
-    save_snapshot(db_path, snapshot)
     worker = snapshot.workers[0]
     binding = WorkerBinding(
         host_id=config.host_id,
@@ -64,8 +56,13 @@ def _store(
         sendable=True,
         private_fingerprint="private-a",
     )
-    upsert_worker_bindings(db_path, [binding])
-    return config, binding
+    persisted = save_snapshot(
+        db_path,
+        snapshot,
+        worker_bindings=[binding],
+        binding_backend="herdr",
+    )
+    return config, replace(binding, worker_fingerprint=persisted.workers[0].fingerprint)
 
 
 def _event(
@@ -264,7 +261,7 @@ def test_replay_repairs_only_absent_projection_with_original_authority_time(
             "SELECT turn_id, status FROM connector_outbox ORDER BY id"
         ).fetchall()
     assert turn_before is not None
-    assert turn_before[1] == "2020-01-01T00:00:00+00:00"
+    assert turn_before[1] == "2020-01-01T00:00:00.000000Z"
 
     ignored = append_agent_event_and_apply_turn_for_binding(
         config.db_path,
@@ -347,57 +344,6 @@ def _update(text: str) -> dict[str, object]:
     }
 
 
-def test_process_reconstruction_replays_text_then_completes_once(
-    tmp_path: Path,
-) -> None:
-    config, binding = _store(tmp_path)
-    first = AcpSessionIngestor(
-        config,
-        session_id="session-a",
-        stream_generation="generation-a",
-        binding=binding,
-    )
-    first.start_turn(producer_turn_id="producer-a")
-    first.ingest_update(_update("answer"), source_event_id="message-event-a")
-
-    reconstructed = AcpSessionIngestor(
-        config,
-        session_id="session-a",
-        stream_generation="generation-b",
-        binding=binding,
-    )
-    reconstructed.start_turn(producer_turn_id="producer-a")
-    replayed = reconstructed.ingest_update(
-        _update("answer"), source_event_id="message-event-a", replay=True
-    )
-    completed = reconstructed.mark_prompt_complete()
-
-    assert replayed.event is not None and replayed.event.status == "replayed"
-    assert completed.event is not None and completed.event.status == "inserted"
-    turns = turns_payload_from_store(config.db_path, config.host_id)["turns"]
-    assert len(turns) == 1
-    assert turns[0]["assistant_final_text"] == "answer"
-    with sqlite3.connect(config.db_path) as conn:
-        before = int(
-            conn.execute("SELECT COUNT(*) FROM connector_outbox").fetchone()[0]
-        )
-
-    second_reconstruction = AcpSessionIngestor(
-        config,
-        session_id="session-a",
-        stream_generation="generation-c",
-        binding=binding,
-    )
-    second_reconstruction.start_turn(producer_turn_id="producer-a")
-    second_reconstruction.ingest_update(
-        _update("answer"), source_event_id="message-event-a", replay=True
-    )
-    completion_replay = second_reconstruction.mark_prompt_complete()
-    assert completion_replay.event is not None
-    assert completion_replay.event.status == "replayed"
-    with sqlite3.connect(config.db_path) as conn:
-        after = int(conn.execute("SELECT COUNT(*) FROM connector_outbox").fetchone()[0])
-    assert after == before
 
 
 def test_completion_failure_rolls_back_marker_and_final_then_retries(

@@ -33,14 +33,14 @@ def canonical_herdr_pane_identity(workspace_id: str | None, pane_id: str | None)
     if not isinstance(workspace_id, str) or not workspace_id.startswith("w"):
         return None
     workspace_number = workspace_id[1:]
-    legacy_workspace = bool(workspace_number) and all(
+    public_id_workspace = bool(workspace_number) and all(
         character in _HERDR_PUBLIC_ID_ALPHABET for character in workspace_number
     )
     current_hex_workspace = (
         len(workspace_number) == _HERDR_HEX_WORKSPACE_ID_LENGTH
         and all(character in "0123456789abcdef" for character in workspace_number)
     )
-    if not legacy_workspace and not current_hex_workspace:
+    if not public_id_workspace and not current_hex_workspace:
         return None
     if not isinstance(pane_id, str):
         return None

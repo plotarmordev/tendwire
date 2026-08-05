@@ -13,7 +13,8 @@ from tendwire.config import Config
 from tendwire.core.models import BackendHealth, Snapshot
 from tendwire.daemon import DaemonHooks, TendwireDaemon
 from tendwire.daemon_api import UnixSocketJSONServer
-from tendwire.store.sqlite import init_store, save_snapshot
+from tendwire.store.projection import save_snapshot
+from tendwire.store.schema import init_store
 
 
 def _snapshot() -> Snapshot:

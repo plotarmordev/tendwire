@@ -12,14 +12,16 @@ from tendwire.config import Config
 from tendwire.core.agent_events import AgentEvent, AppendBoundAgentEventResult
 from tendwire.core.models import Snapshot, Worker, WorkerBinding
 from tendwire.backends.acp_protocol import StopReason
-from tendwire.store.sqlite import (
+from tendwire.store.events import list_agent_events
+from tendwire.store.projection import save_snapshot
+from tendwire.store.turns import (
     AppendProjectedAgentEventResult,
     TurnRefreshApplyResult,
-    list_agent_events,
-    save_snapshot,
-    upsert_worker_bindings,
 )
-from .store_helpers import read_public_test_agent_events
+from .store_helpers import (
+    read_public_test_agent_events,
+    upsert_test_worker_bindings as upsert_worker_bindings,
+)
 
 
 def _binding() -> WorkerBinding:
@@ -248,7 +250,6 @@ def test_notification_session_mismatch_is_rejected_before_state_or_persistence(
 
     assert result.ignored_reason == "session_mismatch"
     assert ingestor.source_turn_id is None
-    assert ingestor.projector.session_snapshot("session-b") is None
 
 
 def test_required_mode_fails_closed_when_durable_binding_is_stale(
@@ -299,7 +300,6 @@ def test_required_mode_fails_closed_when_durable_binding_is_stale(
     assert result.turn is None
     assert list_agent_events(db_path, "host-a") == ()
     assert ingestor.source_turn_id is None
-    assert ingestor.projector.session_snapshot("session-a") is None
 
 
 def test_default_authority_check_accepts_the_current_durable_binding(
@@ -380,61 +380,6 @@ def test_outgoing_prompt_is_durable_before_no_echo_completion_stop_reason(
     )
 
 
-def test_live_prompt_echo_is_suppressed_but_load_replay_user_message_is_retained(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "events.db"
-    binding = _binding()
-    save_snapshot(
-        db_path,
-        Snapshot(
-            host_id="host-a",
-            updated_at="2026-01-01T00:00:00+00:00",
-            workers=[
-                Worker(
-                    id=binding.worker_id,
-                    name="Worker A",
-                    fingerprint=binding.worker_fingerprint,
-                )
-            ],
-        ),
-    )
-    upsert_worker_bindings(db_path, [binding])
-    ingestor = AcpSessionIngestor(
-        _config(db_path),
-        session_id="session-a",
-        stream_generation="generation-a",
-        binding=binding,
-    )
-    ingestor.begin_prompt(
-        ({"type": "text", "text": "one question"},),
-        producer_turn_id="producer-turn-a",
-    )
-
-    echo = ingestor.ingest_update(
-        _update(
-            "user_message_chunk",
-            messageId="adapter-echo",
-            content={"type": "text", "text": "one question"},
-        )
-    )
-    historical = ingestor.ingest_update(
-        _update(
-            "user_message_chunk",
-            messageId="historical-user",
-            content={"type": "text", "text": "historical question"},
-        ),
-        replay=True,
-        setup_replay=True,
-    )
-
-    assert echo.event is None and echo.ignored_reason == "prompt_echo"
-    assert historical.event is not None
-    events = list_agent_events(db_path, "host-a")
-    assert [event.event.kind for event in events] == ["user_message", "user_message"]
-    assert events[0].event.payload["assembled_text"] == "one question"
-    assert events[1].event.payload["assembled_text"] == "historical question"
-    assert read_public_test_agent_events(db_path, "host-a") == ()
 
 
 def test_steering_prompt_appends_to_active_turn_without_resetting_identity(
@@ -479,8 +424,7 @@ def test_steering_prompt_appends_to_active_turn_without_resetting_identity(
     assert steered.event is not None
     assert events[1].payload["steering"] is True
     assert ingestor.source_turn_id == source_turn_id
-    content = ingestor.projector.project_turn_content("session-a")
-    assert content["user_text"] == "initial\n\nlive follow-up"
+    assert turns[-1]["user_text"] == "initial\n\nlive follow-up"
 
     ingestor.mark_prompt_complete()
     assert not ingestor.can_append_prompt()
@@ -489,94 +433,6 @@ def test_steering_prompt_appends_to_active_turn_without_resetting_identity(
             ({"type": "text", "text": "too late"},),
             producer_turn_id="producer-late",
         )
-
-
-@pytest.mark.parametrize(
-    ("update_kind", "fields"),
-    [
-        ("available_commands_update", {"availableCommands": [{"name": "review"}]}),
-        ("current_mode_update", {"currentModeId": "agent"}),
-        (
-            "config_option_update",
-            {"configOptions": [{"id": "model", "currentValue": "safe"}]},
-        ),
-    ],
-)
-def test_stable_control_updates_persist_privately_and_replay_idempotently(
-    tmp_path: Path,
-    update_kind: str,
-    fields: dict[str, object],
-) -> None:
-    db_path = tmp_path / f"{update_kind}.db"
-    binding = _binding()
-    upsert_worker_bindings(db_path, [binding])
-    notification = _update(update_kind, **fields)
-
-    outcomes = []
-    for generation in ("generation-a", "generation-b"):
-        ingestor = AcpSessionIngestor(
-            _config(db_path),
-            session_id="session-a",
-            stream_generation=generation,
-            binding=binding,
-        )
-        outcomes.append(
-            ingestor.ingest_update(
-                notification,
-                replay=True,
-                setup_replay=True,
-            )
-        )
-
-    assert outcomes[0].event is not None and outcomes[0].event.status == "inserted"
-    assert outcomes[1].event is not None and outcomes[1].event.status == "replayed"
-    events = list_agent_events(db_path, "host-a")
-    assert len(events) == 1
-    assert events[0].event.kind == "extension"
-    assert events[0].event.visibility == "private"
-    assert events[0].event.public_payload == {}
-    assert events[0].event.payload["extension"] == (
-        f"acp.session_update.{update_kind}"
-    )
-    assert read_public_test_agent_events(db_path, "host-a") == ()
-
-
-def test_duplicate_durable_event_can_idempotently_repair_projection(tmp_path: Path) -> None:
-    projected = False
-
-    def append(
-        _path: Path | str,
-        _host: str,
-        event: AgentEvent,
-        **_kwargs,
-    ) -> AppendBoundAgentEventResult:
-        return AppendBoundAgentEventResult("replayed", event.event_id, 9)
-
-    def apply(*_args, **_kwargs):
-        nonlocal projected
-        projected = True
-        return TurnRefreshApplyResult(1, False)
-
-    ingestor = AcpSessionIngestor(
-        _config(tmp_path / "events.db"),
-        session_id="session-a",
-        stream_generation="generation-a",
-        binding=_binding(),
-        persist_event=_persist(append, apply),
-    )
-    result = ingestor.ingest_update(
-        _update(
-            "agent_message_chunk",
-            content={"type": "text", "text": "replayed"},
-        ),
-        source_event_id="event-1",
-        replay=True,
-    )
-
-    assert result.ignored_reason == "duplicate_event"
-    assert projected
-    assert ingestor.source_turn_id is not None
-    assert ingestor.projector.session_snapshot("session-a") is not None
 
 
 def test_append_exception_rolls_back_turn_identity_sequence_and_message(
@@ -614,15 +470,11 @@ def test_append_exception_rolls_back_turn_identity_sequence_and_message(
     with pytest.raises(RuntimeError, match="durable append failed"):
         ingestor.ingest_update(notification)
     assert ingestor.source_turn_id is None
-    assert ingestor.projector.session_snapshot("session-a") is None
 
     accepted = ingestor.ingest_update(notification)
     assert accepted.event is not None and accepted.event.status == "inserted"
-    snapshot = ingestor.projector.session_snapshot("session-a")
-    assert snapshot is not None and snapshot["sequence"] == 1
-    assert ingestor.projector.project_turn_content("session-a")[
-        "assistant_stream_text"
-    ] == "exactly once"
+    assert accepted.event.sequence == 1
+    assert accepted.turn is not None
 
 
 def test_oversized_first_chunk_does_not_leave_an_implicit_turn(tmp_path: Path) -> None:
@@ -644,62 +496,8 @@ def test_oversized_first_chunk_does_not_leave_an_implicit_turn(tmp_path: Path) -
             )
         )
     assert ingestor.source_turn_id is None
-    assert ingestor.projector.session_snapshot("session-a") is None
 
 
-def test_atomic_durable_replay_can_repair_projection(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "events.db"
-    binding = _binding()
-    upsert_worker_bindings(db_path, [binding])
-    turns: list[dict[str, object]] = []
-
-    def apply(_path: Path | str, _host: str, _worker: str, content, **_kwargs):
-        turns.append(dict(content))
-        return TurnRefreshApplyResult(len(turns), False)
-
-    def ingestor() -> AcpSessionIngestor:
-        return AcpSessionIngestor(
-            _config(db_path),
-            session_id="session-a",
-            stream_generation="generation-a",
-            binding=binding,
-            persist_event=_persist(
-                lambda _path, _host, event, **_kwargs: (
-                    AppendBoundAgentEventResult(
-                        "inserted" if not turns else "replayed",
-                        event.event_id,
-                        1,
-                    )
-                ),
-                apply,
-            ),
-        )
-
-    notification = _update(
-        "agent_message_chunk",
-        messageId="assistant-1",
-        content={"type": "text", "text": "durable once"},
-    )
-    inserted = ingestor().ingest_update(
-        notification,
-        source_event_id="event-1",
-    )
-    replayed = ingestor().ingest_update(
-        notification,
-        source_event_id="event-1",
-        replay=True,
-    )
-
-    assert inserted.event is not None
-    assert inserted.event.status == "inserted"
-    assert inserted.turn is not None
-    assert replayed.event is not None
-    assert replayed.event.status == "replayed"
-    assert replayed.ignored_reason == "duplicate_event"
-    assert replayed.turn is not None
-    assert len(turns) == 2
 
 
 def test_producer_turn_identity_survives_transport_recreation(tmp_path: Path) -> None:

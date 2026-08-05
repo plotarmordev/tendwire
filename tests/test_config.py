@@ -10,20 +10,15 @@ import pytest
 
 from tendwire.config import (
     DEFAULT_ACP_MAX_FRAME_BYTES,
-    DEFAULT_ACP_CONSOLE_INPUT_POLICY,
     DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS,
     DEFAULT_ACP_THOUGHT_POLICY,
-    DEFAULT_COMMAND_RECEIPT_RETENTION_COUNT,
     DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS,
-    DEFAULT_COMMAND_RETRY_HORIZON_SECONDS,
     DEFAULT_SUBMISSION_HARD_TTL_SECONDS,
     DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS,
-    MAX_COMMAND_RETRY_HORIZON_SECONDS,
     MIN_COMMAND_RECEIPT_RETENTION_SECONDS,
     MAX_MAINTENANCE_CADENCE_SECONDS,
     MAX_RETENTION_DAYS,
-    MAX_SQLITE_INTEGER,
     Config,
     load_config,
 )
@@ -38,7 +33,6 @@ def test_acp_defaults_are_required_runtime_settings_with_thoughts_disabled(
         "TENDWIRE_ACP_REQUEST_TIMEOUT_SECONDS",
         "TENDWIRE_ACP_SHUTDOWN_TIMEOUT_SECONDS",
         "TENDWIRE_ACP_MAX_FRAME_BYTES",
-        "TENDWIRE_ACP_CONSOLE_INPUT_POLICY",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -49,7 +43,6 @@ def test_acp_defaults_are_required_runtime_settings_with_thoughts_disabled(
     assert config.acp_request_timeout_seconds == DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS == 30.0
     assert config.acp_shutdown_timeout_seconds == DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS == 5.0
     assert config.acp_max_frame_bytes == DEFAULT_ACP_MAX_FRAME_BYTES == 8 * 1024 * 1024
-    assert config.acp_console_input_policy == DEFAULT_ACP_CONSOLE_INPUT_POLICY == "preserve"
 
 
 def test_acp_configuration_uses_explicit_before_environment(monkeypatch) -> None:
@@ -58,7 +51,6 @@ def test_acp_configuration_uses_explicit_before_environment(monkeypatch) -> None
     monkeypatch.setenv("TENDWIRE_ACP_REQUEST_TIMEOUT_SECONDS", "11")
     monkeypatch.setenv("TENDWIRE_ACP_SHUTDOWN_TIMEOUT_SECONDS", "3")
     monkeypatch.setenv("TENDWIRE_ACP_MAX_FRAME_BYTES", "4096")
-    monkeypatch.setenv("TENDWIRE_ACP_CONSOLE_INPUT_POLICY", "live_only")
 
     environment = load_config()
     explicit = load_config(
@@ -66,7 +58,6 @@ def test_acp_configuration_uses_explicit_before_environment(monkeypatch) -> None
         acp_request_timeout_seconds="7.5",
         acp_shutdown_timeout_seconds="2.5",
         acp_max_frame_bytes="8192",
-        acp_console_input_policy="preserve",
     )
 
     assert not hasattr(environment, "agent_event_source")
@@ -74,18 +65,10 @@ def test_acp_configuration_uses_explicit_before_environment(monkeypatch) -> None
     assert environment.acp_request_timeout_seconds == 11.0
     assert environment.acp_shutdown_timeout_seconds == 3.0
     assert environment.acp_max_frame_bytes == 4096
-    assert environment.acp_console_input_policy == "live_only"
     assert explicit.acp_thought_policy == "disabled"
     assert explicit.acp_request_timeout_seconds == 7.5
     assert explicit.acp_shutdown_timeout_seconds == 2.5
     assert explicit.acp_max_frame_bytes == 8192
-    assert explicit.acp_console_input_policy == "preserve"
-
-
-@pytest.mark.parametrize("value", ["", "drop", "future"])
-def test_acp_console_input_policy_rejects_unknown_values(value: str) -> None:
-    with pytest.raises(ValueError, match="acp_console_input_policy must be one of"):
-        Config(acp_console_input_policy=value)
 
 
 @pytest.mark.parametrize("value", ["", "public", "summary", "future"])
@@ -175,14 +158,11 @@ def test_pr16_runtime_knobs_have_documented_defaults(monkeypatch) -> None:
     for name in (
         "TENDWIRE_RECONCILE_INTERVAL_SECONDS",
         "TENDWIRE_EVENT_RETENTION_DAYS",
-        "TENDWIRE_MAX_WORKERS",
         "TENDWIRE_MAX_OUTBOX_ATTEMPTS",
         "TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS",
         "TENDWIRE_CONNECTOR_MAX_CLAIM_TTL_SECONDS",
         "TENDWIRE_CONNECTOR_ACK_TTL_SECONDS",
-        "TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS",
         "TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS",
-        "TENDWIRE_COMMAND_RECEIPT_RETENTION_COUNT",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -190,61 +170,46 @@ def test_pr16_runtime_knobs_have_documented_defaults(monkeypatch) -> None:
 
     assert config.reconcile_interval_seconds == 15.0
     assert config.event_retention_days == 7
-    assert config.max_workers == 512
     assert config.max_outbox_attempts == 10
     assert config.connector_claim_ttl_seconds == 60
     assert config.connector_max_claim_ttl_seconds == 300
     assert config.connector_ack_ttl_seconds == 60
-    assert config.command_retry_horizon_seconds == 604_800
     assert config.command_receipt_retention_seconds == 2_592_000
-    assert config.command_receipt_retention_count == 4096
 
 
 def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
     monkeypatch.setenv("TENDWIRE_RECONCILE_INTERVAL_SECONDS", "2")
     monkeypatch.setenv("TENDWIRE_EVENT_RETENTION_DAYS", "14")
-    monkeypatch.setenv("TENDWIRE_MAX_WORKERS", "64")
     monkeypatch.setenv("TENDWIRE_MAX_OUTBOX_ATTEMPTS", "3")
     monkeypatch.setenv("TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS", "45")
     monkeypatch.setenv("TENDWIRE_CONNECTOR_MAX_CLAIM_TTL_SECONDS", "240")
     monkeypatch.setenv("TENDWIRE_CONNECTOR_ACK_TTL_SECONDS", "180")
-    monkeypatch.setenv("TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS", "120")
     monkeypatch.setenv("TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS", "691200")
-    monkeypatch.setenv("TENDWIRE_COMMAND_RECEIPT_RETENTION_COUNT", "99")
 
     env_config = load_config()
     explicit = load_config(
         reconcile_interval_seconds="5",
         event_retention_days="2",
-        max_workers="9",
         max_outbox_attempts="4",
         connector_claim_ttl_seconds="15",
         connector_max_claim_ttl_seconds="120",
         connector_ack_ttl_seconds="90",
-        command_retry_horizon_seconds="60",
         command_receipt_retention_seconds="691200",
-        command_receipt_retention_count="12",
     )
     assert env_config.reconcile_interval_seconds == 2
     assert env_config.event_retention_days == 14
-    assert env_config.max_workers == 64
     assert env_config.max_outbox_attempts == 3
     assert env_config.connector_claim_ttl_seconds == 45
     assert env_config.connector_max_claim_ttl_seconds == 240
     assert env_config.connector_ack_ttl_seconds == 180
-    assert env_config.command_retry_horizon_seconds == 120
     assert env_config.command_receipt_retention_seconds == 691_200
-    assert env_config.command_receipt_retention_count == 99
     assert explicit.reconcile_interval_seconds == 5
     assert explicit.event_retention_days == 2
-    assert explicit.max_workers == 9
     assert explicit.max_outbox_attempts == 4
     assert explicit.connector_claim_ttl_seconds == 15
     assert explicit.connector_max_claim_ttl_seconds == 120
     assert explicit.connector_ack_ttl_seconds == 90
-    assert explicit.command_retry_horizon_seconds == 60
     assert explicit.command_receipt_retention_seconds == 691_200
-    assert explicit.command_receipt_retention_count == 12
 
 
 @pytest.mark.parametrize(
@@ -261,7 +226,6 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
             "reconcile_interval_seconds must be a finite positive number",
         ),
         ("event_retention_days", 0, "event_retention_days must be >= 1"),
-        ("max_workers", 0, "max_workers must be >= 1"),
         ("max_outbox_attempts", 0, "max_outbox_attempts must be >= 1"),
         ("connector_claim_ttl_seconds", 0, "connector_claim_ttl_seconds must be >= 1"),
         (
@@ -288,7 +252,6 @@ def test_reconcile_interval_rejects_disabled_environment(monkeypatch) -> None:
 
 ACKNOWLEDGED_FINAL_RETENTION_ENV_NAMES = (
     "TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_DAYS",
-    "TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_COUNT",
 )
 
 
@@ -301,32 +264,26 @@ def test_acknowledged_final_retention_has_conservative_documented_defaults(
     config = load_config()
 
     assert config.acknowledged_final_retention_days == 30
-    assert config.acknowledged_final_retention_count == 4096
 
 
 def test_acknowledged_final_retention_uses_explicit_before_environment(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_DAYS", "45")
-    monkeypatch.setenv("TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_COUNT", "8192")
 
     env_config = load_config()
     explicit = load_config(
         acknowledged_final_retention_days="14",
-        acknowledged_final_retention_count="1024",
     )
 
     assert env_config.acknowledged_final_retention_days == 45
-    assert env_config.acknowledged_final_retention_count == 8192
     assert explicit.acknowledged_final_retention_days == 14
-    assert explicit.acknowledged_final_retention_count == 1024
 
 
 @pytest.mark.parametrize(
     "field",
     [
         "acknowledged_final_retention_days",
-        "acknowledged_final_retention_count",
     ],
 )
 @pytest.mark.parametrize(
@@ -357,17 +314,7 @@ def test_acknowledged_final_retention_rejects_invalid_values(
             MAX_RETENTION_DAYS + 1,
             MAX_RETENTION_DAYS,
         ),
-        (
-            "acknowledged_final_retention_count",
-            MAX_SQLITE_INTEGER + 1,
-            MAX_SQLITE_INTEGER,
-        ),
         ("snapshot_retention_days", MAX_RETENTION_DAYS + 1, MAX_RETENTION_DAYS),
-        (
-            "snapshot_retention_count",
-            MAX_SQLITE_INTEGER + 1,
-            MAX_SQLITE_INTEGER,
-        ),
         (
             "store_maintenance_cadence_seconds",
             MAX_MAINTENANCE_CADENCE_SECONDS + 1,
@@ -385,9 +332,7 @@ def test_retention_policies_reject_values_above_sqlite_time_bounds(
 
 
 COMMAND_RECEIPT_ENV_NAMES = (
-    "TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS",
     "TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS",
-    "TENDWIRE_COMMAND_RECEIPT_RETENTION_COUNT",
 )
 
 
@@ -395,39 +340,17 @@ def test_command_receipt_retention_defaults_and_constants(monkeypatch) -> None:
     for name in COMMAND_RECEIPT_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     config = load_config()
-    assert DEFAULT_COMMAND_RETRY_HORIZON_SECONDS == 604_800
     assert DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS == 2_592_000
-    assert DEFAULT_COMMAND_RECEIPT_RETENTION_COUNT == 4096
     assert MIN_COMMAND_RECEIPT_RETENTION_SECONDS == 691_200
-    assert config.command_retry_horizon_seconds == DEFAULT_COMMAND_RETRY_HORIZON_SECONDS
     assert (
         config.command_receipt_retention_seconds
         == DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS
-    )
-    assert (
-        config.command_receipt_retention_count
-        == DEFAULT_COMMAND_RECEIPT_RETENTION_COUNT
-    )
-
-
-def test_command_receipt_retention_exceeds_maximum_connector_retry_horizon() -> None:
-    assert MAX_COMMAND_RETRY_HORIZON_SECONDS == 604_800
-    assert MIN_COMMAND_RECEIPT_RETENTION_SECONDS == 691_200
-    assert (
-        DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS
-        > MIN_COMMAND_RECEIPT_RETENTION_SECONDS
-        > MAX_COMMAND_RETRY_HORIZON_SECONDS
     )
 
 
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        (
-            "command_retry_horizon_seconds",
-            MAX_COMMAND_RETRY_HORIZON_SECONDS + 1,
-            rf"command_retry_horizon_seconds must be <= {MAX_COMMAND_RETRY_HORIZON_SECONDS}",
-        ),
         (
             "command_receipt_retention_seconds",
             0,
@@ -437,11 +360,6 @@ def test_command_receipt_retention_exceeds_maximum_connector_retry_horizon() -> 
             "command_receipt_retention_seconds",
             MIN_COMMAND_RECEIPT_RETENTION_SECONDS - 1,
             rf"command_receipt_retention_seconds must be >= {MIN_COMMAND_RECEIPT_RETENTION_SECONDS}",
-        ),
-        (
-            "command_receipt_retention_count",
-            True,
-            "command_receipt_retention_count must be an integer >= 1",
         ),
     ],
 )
@@ -453,31 +371,8 @@ def test_command_receipt_retention_rejects_invalid_bounds(
     with pytest.raises(ValueError, match=message):
         Config(**{field: value})
 
-
-@pytest.mark.parametrize(
-    ("horizon", "retention"),
-    [(604_800, 604_800), (604_800, 604_799), (10, 1)],
-)
-def test_command_receipt_retention_must_strictly_exceed_retry_horizon(
-    horizon: int,
-    retention: int,
-) -> None:
-    with pytest.raises(
-        ValueError,
-        match=(
-            "command_receipt_retention_seconds must be greater than "
-            "command_retry_horizon_seconds"
-        ),
-    ):
-        Config(
-            command_retry_horizon_seconds=horizon,
-            command_receipt_retention_seconds=retention,
-        )
-
-
 SNAPSHOT_MAINTENANCE_ENV_NAMES = (
     "TENDWIRE_SNAPSHOT_RETENTION_DAYS",
-    "TENDWIRE_SNAPSHOT_RETENTION_COUNT",
     "TENDWIRE_SNAPSHOT_MAINTENANCE_BATCH_SIZE",
     "TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS",
 )
@@ -490,31 +385,26 @@ def test_snapshot_maintenance_knobs_have_documented_defaults(monkeypatch) -> Non
     config = load_config()
 
     assert config.snapshot_retention_days == 14
-    assert config.snapshot_retention_count == 4096
     assert config.snapshot_maintenance_batch_size == 100
     assert config.store_maintenance_cadence_seconds == 3600
 
 
 def test_snapshot_maintenance_knobs_use_constructor_before_environment(monkeypatch) -> None:
     monkeypatch.setenv("TENDWIRE_SNAPSHOT_RETENTION_DAYS", "21")
-    monkeypatch.setenv("TENDWIRE_SNAPSHOT_RETENTION_COUNT", "5000")
     monkeypatch.setenv("TENDWIRE_SNAPSHOT_MAINTENANCE_BATCH_SIZE", "250")
     monkeypatch.setenv("TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS", "1800")
 
     env_config = load_config()
     explicit = load_config(
         snapshot_retention_days="7",
-        snapshot_retention_count="2048",
         snapshot_maintenance_batch_size="50",
         store_maintenance_cadence_seconds="7200",
     )
 
     assert env_config.snapshot_retention_days == 21
-    assert env_config.snapshot_retention_count == 5000
     assert env_config.snapshot_maintenance_batch_size == 250
     assert env_config.store_maintenance_cadence_seconds == 1800
     assert explicit.snapshot_retention_days == 7
-    assert explicit.snapshot_retention_count == 2048
     assert explicit.snapshot_maintenance_batch_size == 50
     assert explicit.store_maintenance_cadence_seconds == 7200
 
@@ -523,7 +413,6 @@ def test_snapshot_maintenance_knobs_use_constructor_before_environment(monkeypat
     "field",
     [
         "snapshot_retention_days",
-        "snapshot_retention_count",
         "snapshot_maintenance_batch_size",
         "store_maintenance_cadence_seconds",
     ],

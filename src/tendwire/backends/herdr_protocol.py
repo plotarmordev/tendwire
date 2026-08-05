@@ -156,17 +156,6 @@ def frame_request(request: Mapping[str, Any]) -> bytes:
     return payload.encode("utf-8") + b"\n"
 
 
-def build_request_line(
-    method: str,
-    params: Mapping[str, Any] | None = None,
-    *,
-    request_id: str | None = None,
-) -> tuple[str, bytes]:
-    """Build and frame a request, returning its id and newline-terminated bytes."""
-    request = build_request(method, params, request_id=request_id)
-    return str(request["id"]), frame_request(request)
-
-
 def parse_json_line(line: bytes | str) -> dict[str, Any]:
     """Decode one UTF-8 JSON object line."""
     if isinstance(line, bytes):

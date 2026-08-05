@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import socket
 import sys
 from dataclasses import dataclass
@@ -16,7 +15,6 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .config import Config, load_config
-from .core.actions import CommandContext, execute_command
 from .core.commands import (
     STATUS_BACKEND_UNAVAILABLE,
     CommandEnvelope,
@@ -26,7 +24,6 @@ from .core.commands import (
 )
 from .core.models import (
     public_json_dumps,
-    sanitize_public_mapping,
 )
 from .core.turns import (
     TURN_DELTA_DEFAULT_LIMIT,
@@ -35,13 +32,6 @@ from .core.turns import (
     TURN_LIST_MAX_LIMIT,
 )
 from .local_state import repair_config_state
-from .store.sqlite import (
-    CompactionOptions,
-    compact_store,
-    run_store_maintenance,
-    store_status,
-    tail_event_metadata,
-)
 
 
 _DAEMON_FAST_CLIENT_TIMEOUT_SECONDS = 2.0
@@ -61,10 +51,14 @@ class _DaemonAttempt:
 
 def _daemon_client_timeout_seconds(config: Config, method: str) -> float:
     if method == "command.submit":
+        herdr = float(config.herdr_timeout_seconds)
+        acp = float(config.acp_request_timeout_seconds)
+        shutdown = float(config.acp_shutdown_timeout_seconds)
         return max(
             _DAEMON_COMMAND_CLIENT_TIMEOUT_FLOOR_SECONDS,
-            float(config.herdr_timeout_seconds) + _DAEMON_COMMAND_CLIENT_TIMEOUT_GRACE_SECONDS,
-        )
+            6 * herdr + 3 * acp + 2 * shutdown,
+            4 * herdr + 2 * acp + 3 * shutdown,
+        ) + _DAEMON_COMMAND_CLIENT_TIMEOUT_GRACE_SECONDS
     if method in {"turn.list", "turn.content.get", "turn.delta"}:
         return _DAEMON_CONTENT_CLIENT_TIMEOUT_SECONDS
     if method.startswith("connector."):
@@ -72,38 +66,28 @@ def _daemon_client_timeout_seconds(config: Config, method: str) -> float:
     return _DAEMON_FAST_CLIENT_TIMEOUT_SECONDS
 
 
-def _turn_list_limit(value: str) -> int:
+def _bounded_limit(value: str, maximum: int) -> int:
     try:
         limit = int(value)
     except (TypeError, ValueError) as exc:
         raise argparse.ArgumentTypeError("limit must be an integer") from exc
-    if not 1 <= limit <= TURN_LIST_MAX_LIMIT:
+    if not 1 <= limit <= maximum:
         raise argparse.ArgumentTypeError(
-            f"limit must be between 1 and {TURN_LIST_MAX_LIMIT}"
+            f"limit must be between 1 and {maximum}"
         )
     return limit
+
+
+def _turn_list_limit(value: str) -> int:
+    return _bounded_limit(value, TURN_LIST_MAX_LIMIT)
 
 
 def _turn_delta_limit(value: str) -> int:
-    try:
-        limit = int(value)
-    except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError("limit must be an integer") from exc
-    if not 1 <= limit <= TURN_DELTA_MAX_LIMIT:
-        raise argparse.ArgumentTypeError(
-            f"limit must be between 1 and {TURN_DELTA_MAX_LIMIT}"
-        )
-    return limit
+    return _bounded_limit(value, TURN_DELTA_MAX_LIMIT)
 
 
 def _connector_inspect_limit(value: str) -> int:
-    try:
-        limit = int(value)
-    except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError("limit must be an integer") from exc
-    if not 1 <= limit <= 100:
-        raise argparse.ArgumentTypeError("limit must be between 1 and 100")
-    return limit
+    return _bounded_limit(value, 100)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -201,13 +185,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Opaque token for turns newer than a completed traversal.",
     )
-    turns_parser.add_argument(
-        "--db-path",
-        dest="db_path",
-        default=None,
-        help="SQLite database path for store-backed turns (default: config path).",
-    )
-
     turn_parser = subparsers.add_parser(
         "turn",
         help="Access bounded canonical turn content.",
@@ -225,7 +202,6 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     content_get.add_argument("--cursor", default=None)
-    content_get.add_argument("--db-path", dest="db_path", default=None)
     delta_parser = turn_actions.add_parser(
         "delta",
         help="Read one cache-only public turn change page.",
@@ -237,11 +213,10 @@ def _build_parser() -> argparse.ArgumentParser:
     delta_position = delta_parser.add_mutually_exclusive_group()
     delta_position.add_argument("--watermark", default=None)
     delta_position.add_argument("--cursor", default=None)
-    delta_parser.add_argument("--db-path", dest="db_path", default=None)
 
     pending_parser = subparsers.add_parser(
         "pending",
-        help="Print neutral public pending interactions from daemon or durable store state.",
+        help="Print neutral public pending interactions from the daemon.",
     )
     pending_parser.add_argument(
         "--json",
@@ -250,13 +225,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Print pending interactions as JSON (default).",
     )
-    pending_parser.add_argument(
-        "--db-path",
-        dest="db_path",
-        default=None,
-        help="SQLite database path for store-backed pending fallback (default: config path).",
-    )
-
     command_parser = subparsers.add_parser(
         "command",
         help="Read a JSON command request from stdin and print a JSON result.",
@@ -268,13 +236,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Print result as JSON (default).",
     )
-    command_parser.add_argument(
-        "--db-path",
-        dest="db_path",
-        default=None,
-        help="SQLite database path for command receipts (default: config path).",
-    )
-
     daemon_parser = subparsers.add_parser(
         "daemon",
         help="Run the local Tendwire JSON request daemon.",
@@ -311,118 +272,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print diagnostics as JSON (default).",
     )
 
-    _add_store_parser(subparsers)
     _add_connector_parser(subparsers)
 
     return parser
-
-
-def _add_store_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    store_parser = subparsers.add_parser(
-        "store",
-        help="Run bounded public-safe store operations with JSON-only output.",
-    )
-    actions = store_parser.add_subparsers(dest="store_action", required=True)
-
-    def add_common(action_parser: argparse.ArgumentParser) -> None:
-        action_parser.add_argument("--db-path", dest="db_path", default=None)
-
-    status_parser = actions.add_parser("status", help="Print host-scoped store status.")
-    add_common(status_parser)
-
-    tail_parser = actions.add_parser("events-tail", help="Print bounded event metadata.")
-    add_common(tail_parser)
-    tail_parser.add_argument("--limit", type=int, default=20)
-
-    cleanup_parser = actions.add_parser("cleanup", help="Run bounded maintenance cleanup.")
-    add_common(cleanup_parser)
-    cleanup_parser.add_argument("--dry-run", dest="dry_run", action="store_true", default=False)
-    cleanup_parser.add_argument("--retention-days", dest="retention_days", type=int, default=None)
-    cleanup_parser.add_argument("--max-outbox-attempts", dest="max_outbox_attempts", type=int, default=None)
-    cleanup_parser.add_argument(
-        "--acknowledged-final-retention-days",
-        dest="acknowledged_final_retention_days",
-        type=int,
-        default=None,
-        metavar="DAYS",
-        help=(
-            "Retain proven acknowledged finals for this age window "
-            "(default: configured policy)."
-        ),
-    )
-    cleanup_parser.add_argument(
-        "--acknowledged-final-retention-count",
-        dest="acknowledged_final_retention_count",
-        type=int,
-        default=None,
-        metavar="COUNT",
-        help=(
-            "Retain this many newest proven acknowledged finals "
-            "(default: configured policy)."
-        ),
-    )
-    cleanup_parser.add_argument(
-        "--snapshot-retention-days",
-        dest="snapshot_retention_days",
-        type=int,
-        default=None,
-    )
-    cleanup_parser.add_argument(
-        "--snapshot-retention-count",
-        dest="snapshot_retention_count",
-        type=int,
-        default=None,
-    )
-    cleanup_parser.add_argument(
-        "--snapshot-batch-size",
-        dest="snapshot_batch_size",
-        type=int,
-        default=None,
-    )
-
-    compact_parser = actions.add_parser(
-        "compact",
-        help="Inspect or explicitly compact the current store while offline.",
-    )
-    add_common(compact_parser)
-    compact_mode = compact_parser.add_mutually_exclusive_group(required=True)
-    compact_mode.add_argument(
-        "--dry-run",
-        dest="compact_dry_run",
-        action="store_true",
-        default=False,
-    )
-    compact_mode.add_argument(
-        "--execute",
-        dest="compact_execute",
-        action="store_true",
-        default=False,
-    )
-    compact_parser.add_argument(
-        "--acknowledge-offline",
-        dest="acknowledge_offline",
-        action="store_true",
-        default=False,
-    )
-    compact_parser.add_argument("--backup-path", dest="backup_path", default=None)
-    compact_parser.add_argument(
-        "--snapshot-retention-days",
-        dest="snapshot_retention_days",
-        type=int,
-        default=None,
-    )
-    compact_parser.add_argument(
-        "--snapshot-retention-count",
-        dest="snapshot_retention_count",
-        type=int,
-        default=None,
-    )
-    compact_parser.add_argument(
-        "--batch-size",
-        dest="snapshot_batch_size",
-        type=int,
-        default=None,
-    )
 
 
 def _add_connector_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -433,7 +285,6 @@ def _add_connector_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     actions = connector_parser.add_subparsers(dest="connector_action", required=True)
 
     def add_common(action_parser: argparse.ArgumentParser) -> None:
-        action_parser.add_argument("--db-path", dest="db_path", default=None)
         action_parser.add_argument("--name", required=True, help="Neutral connector queue name.")
 
     prepare_parser = actions.add_parser(
@@ -490,8 +341,6 @@ def _try_daemon_attempt(
     config: Config,
     method: str,
     params: dict[str, Any] | None = None,
-    *,
-    preserve_content_text: bool = False,
 ) -> _DaemonAttempt:
     """Return one result from the daemon's authoritative socket API."""
     from .daemon import default_socket_path
@@ -544,7 +393,7 @@ def _try_daemon_attempt(
         if isinstance(response.get("error"), dict):
             return _DaemonAttempt(
                 error_kind="daemon_error",
-                response_error=sanitize_public_mapping(response),
+                response_error=dict(response),
                 request_started=True,
             )
         return _DaemonAttempt(error_kind="protocol", request_started=True)
@@ -558,16 +407,7 @@ def _try_daemon_attempt(
             except (TypeError, ValueError):
                 return _DaemonAttempt(error_kind="protocol", request_started=True)
             return _DaemonAttempt(result=command_result, request_started=True)
-        sanitized = sanitize_public_mapping(result)
-        if preserve_content_text:
-            _restore_cli_content_text(sanitized, result)
-        if method == "turn.list":
-            _restore_cli_turn_list_text(sanitized, result)
-        if method == "turn.delta":
-            _restore_cli_turn_delta_text(sanitized, result)
-        if method.startswith("connector."):
-            _restore_cli_plan_token(sanitized, result)
-        return _DaemonAttempt(result=sanitized, request_started=True)
+        return _DaemonAttempt(result=dict(result), request_started=True)
     return _DaemonAttempt(error_kind="protocol", request_started=True)
 
 
@@ -577,226 +417,21 @@ def cmd_snapshot(
     json_output: bool = True,
 ) -> int:
     """Read the daemon's current neutral snapshot."""
-    if json_output:
-        daemon_attempt = _try_daemon_attempt(config, "snapshot.get")
-        if daemon_attempt.result is not None:
-            payload = daemon_attempt.result
-            code = 0
-        elif daemon_attempt.response_error is not None:
-            payload = daemon_attempt.response_error
-            code = 1
-        elif daemon_attempt.error_kind == "timeout":
-            payload = {
-                "schema_version": 2,
-                "ok": False,
-                "status": "daemon_timeout",
-                "error": {
-                    "code": "daemon_timeout",
-                    "message": "Tendwire daemon request timed out",
-                },
-            }
-            code = 1
-        else:
-            payload = {
-                "schema_version": 2,
-                "ok": False,
-                "status": (
-                    "daemon_unavailable"
-                    if daemon_attempt.request_started is False
-                    else "daemon_protocol_error"
-                ),
-                "error": {
-                    "code": (
-                        "daemon_unavailable"
-                        if daemon_attempt.request_started is False
-                        else "daemon_protocol_error"
-                    ),
-                    "message": (
-                        "Tendwire daemon is unavailable"
-                        if daemon_attempt.request_started is False
-                        else "Tendwire daemon returned an invalid response"
-                    ),
-                },
-            }
-            code = 1
-        print(public_json_dumps(payload, indent=2))
-    else:
-        # Non-JSON output is out of scope; reject cleanly.
+    if not json_output:
         print("error: only --json output is supported", file=sys.stderr)
         return 2
-
-    return code
-
-
-def _restore_cli_turn_list_text(
-    sanitized: dict[str, Any],
-    original: dict[str, Any],
-) -> None:
-    if original.get("schema_version") not in {1, 2}:
-        return
-    original_turns = original.get("turns")
-    sanitized_turns = sanitized.get("turns")
-    if not isinstance(original_turns, list) or not isinstance(sanitized_turns, list):
-        return
-    by_id = {
-        item.get("id"): item
-        for item in sanitized_turns
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    }
-    for original_turn in original_turns:
-        if not isinstance(original_turn, dict):
-            continue
-        target = by_id.get(original_turn.get("id"))
-        if not isinstance(target, dict):
-            continue
-        descriptors = (original_turn.get("content") or {}).get("fields", {})
-        for field in ("user_text", "assistant_final_text"):
-            text = original_turn.get(field)
-            descriptor = descriptors.get(field) if isinstance(descriptors, dict) else None
-            trusted_inline = original.get("schema_version") == 1 or (
-                isinstance(descriptor, dict)
-                and descriptor.get("availability") == "complete"
-                and descriptor.get("inline") is True
-            )
-            if trusted_inline and isinstance(text, str):
-                target[field] = text
-        for preview_key in ("user_preview", "assistant_final_preview"):
-            preview = original_turn.get(preview_key)
-            if isinstance(preview, str):
-                target[preview_key] = preview
-
-
-def _turn_list_payload_json(payload: dict[str, Any], *, indent: int | None = None) -> str:
-    sanitized = sanitize_public_mapping(payload)
-    _restore_cli_turn_list_text(sanitized, payload)
-    return json.dumps(
-        sanitized,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        indent=indent,
+    payload = _daemon_read_payload(
+        _try_daemon_attempt(config, "snapshot.get"),
+        schema_version=2,
     )
+    print(public_json_dumps(payload, indent=2))
+    return 0 if payload.get("ok") is not False else 1
 
 
-def _restore_cli_turn_delta_text(
-    sanitized: dict[str, Any],
-    original: Mapping[str, Any],
-) -> None:
-    """Restore trusted schema-v2 inline fields inside delta upserts."""
-    original_changes = original.get("changes")
-    target_changes = sanitized.get("changes")
-    if not isinstance(original_changes, list) or not isinstance(target_changes, list):
-        return
-    for original_change, target_change in zip(
-        original_changes, target_changes, strict=False
-    ):
-        if not isinstance(original_change, Mapping) or not isinstance(target_change, dict):
-            continue
-        original_turn = original_change.get("turn")
-        target_turn = target_change.get("turn")
-        if isinstance(original_turn, Mapping) and isinstance(target_turn, dict):
-            _restore_cli_turn_list_text(
-                {"turns": [target_turn]},
-                {"schema_version": 2, "turns": [original_turn]},
-            )
-
-
-def _turn_delta_payload_json(payload: dict[str, Any], *, indent: int | None = None) -> str:
-    sanitized = sanitize_public_mapping(payload)
-    _restore_cli_turn_delta_text(sanitized, payload)
+def _daemon_payload_json(payload: dict[str, Any], *, indent: int | None = None) -> str:
+    """Serialize a response already validated by the local daemon boundary."""
     return json.dumps(
-        sanitized,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        indent=indent,
-    )
-
-
-def _restore_cli_content_text(
-    sanitized: dict[str, Any],
-    original: dict[str, Any],
-) -> None:
-    text = original.get("text")
-    if (
-        isinstance(text, str)
-        and original.get("schema_version") == 1
-        and original.get("field") in {"user_text", "assistant_final_text"}
-        and original.get("availability") == "complete"
-    ):
-        sanitized["text"] = text
-        content_revision = original.get("content_revision")
-        if isinstance(content_revision, str) and re.fullmatch(
-            r"twrev1\.[A-Za-z0-9_-]+", content_revision
-        ):
-            sanitized["content_revision"] = content_revision
-
-
-def _restore_cli_plan_token(
-    sanitized: dict[str, Any],
-    original: dict[str, Any],
-) -> None:
-    for key in (
-        "plan_token",
-        "failed_plan_token",
-        "recovered_plan_token",
-        "replaces_plan_token",
-        "recovers_plan_token",
-    ):
-        token = original.get(key)
-        if isinstance(token, str) and re.fullmatch(
-            r"twplan1\.[A-Za-z0-9_-]+", token
-        ):
-            sanitized[key] = token
-    final_identity = original.get("final_identity")
-    if isinstance(final_identity, str) and re.fullmatch(
-        r"twfinal1\.[A-Za-z0-9_-]+", final_identity
-    ):
-        sanitized["final_identity"] = final_identity
-    content_revision = original.get("content_revision")
-    if isinstance(content_revision, str) and re.fullmatch(
-        r"twrev1\.[A-Za-z0-9_-]+", content_revision
-    ):
-        sanitized["content_revision"] = content_revision
-    delivery_key = original.get("key")
-    if isinstance(delivery_key, str) and re.fullmatch(
-        r"turn-final:revision:twfinal1\.[A-Za-z0-9_-]+", delivery_key
-    ):
-        sanitized["key"] = delivery_key
-    for nested_key in ("turn", "final", "payload", "content"):
-        nested_original = original.get(nested_key)
-        nested_sanitized = sanitized.get(nested_key)
-        if isinstance(nested_original, dict) and isinstance(nested_sanitized, dict):
-            _restore_cli_plan_token(nested_sanitized, nested_original)
-    original_items = original.get("items")
-    sanitized_items = sanitized.get("items")
-    if isinstance(original_items, list) and isinstance(sanitized_items, list):
-        for sanitized_item, original_item in zip(
-            sanitized_items,
-            original_items,
-            strict=False,
-        ):
-            if isinstance(sanitized_item, dict) and isinstance(original_item, dict):
-                _restore_cli_plan_token(sanitized_item, original_item)
-
-
-def _connector_payload_json(payload: dict[str, Any], *, indent: int | None = None) -> str:
-    sanitized = sanitize_public_mapping(payload)
-    _restore_cli_plan_token(sanitized, payload)
-    return json.dumps(
-        sanitized,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        indent=indent,
-    )
-
-
-def _content_payload_json(payload: dict[str, Any], *, indent: int | None = None) -> str:
-    sanitized = sanitize_public_mapping(payload)
-    _restore_cli_content_text(sanitized, payload)
-    return json.dumps(
-        sanitized,
+        payload,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -863,7 +498,7 @@ def cmd_turns(
         schema_version=schema_version,
         extra={"host_id": config.host_id},
     )
-    print(_turn_list_payload_json(payload, indent=2))
+    print(_daemon_payload_json(payload, indent=2))
     return 0 if payload.get("ok") is not False else 1
 
 
@@ -878,14 +513,9 @@ def cmd_turn_content_get(config: Config, args: argparse.Namespace) -> int:
     if args.cursor is not None:
         params["cursor"] = args.cursor
     payload = _daemon_read_payload(
-        _try_daemon_attempt(
-            config,
-            "turn.content.get",
-            params,
-            preserve_content_text=True,
-        )
+        _try_daemon_attempt(config, "turn.content.get", params)
     )
-    print(_content_payload_json(payload, indent=2))
+    print(_daemon_payload_json(payload, indent=2))
     return 0 if payload.get("ok") is not False and isinstance(payload.get("text"), str) else 1
 
 
@@ -929,7 +559,7 @@ def cmd_turn_delta(config: Config, args: argparse.Namespace) -> int:
         _try_daemon_attempt(config, "turn.delta", params),
         extra={"projection_schema_version": 2},
     )
-    print(_turn_delta_payload_json(payload, indent=2))
+    print(_daemon_payload_json(payload, indent=2))
     return 0 if payload.get("ok") is not False else 1
 
 
@@ -945,38 +575,6 @@ def cmd_doctor(
     payload = _daemon_read_payload(_try_daemon_attempt(config, "health.get"))
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0 if payload.get("status") == "ok" and payload.get("ok") is not False else 1
-
-
-def command_envelope_from_payload(config: Config, payload: str) -> CommandEnvelope:
-    """Execute a JSON command request through the authoritative command path."""
-    request, parse_error = parse_command_request(payload)
-    if parse_error is not None:
-        if request is not None:
-            return CommandEnvelope.from_error(request, parse_error)
-        return CommandEnvelope.from_error(
-            None,
-            parse_error or error_value("invalid_request", "unknown parse error"),
-        )
-
-    validation_error = validate_request(request)
-    if validation_error is not None:
-        return CommandEnvelope.from_error(request, validation_error)
-
-    if request.action in {"send_instruction", "answer_decision"}:
-        from .command_submission import submit_command
-
-        return submit_command(config, payload)
-
-    if request.action == "noop":
-        return execute_command(
-            request,
-            CommandContext(host_id=config.host_id, workers=[]),
-        )
-
-    return CommandEnvelope.from_error(
-        request,
-        error_value(STATUS_BACKEND_UNAVAILABLE, "Tendwire daemon backend is unavailable"),
-    )
 
 
 def _command_exit_code(envelope: CommandEnvelope) -> int:
@@ -1022,62 +620,40 @@ def cmd_command(
 ) -> int:
     """Read a JSON command request from stdin and print a JSON result envelope."""
     payload = sys.stdin.read()
-    if json_output:
-        try:
-            request_payload = json.loads(payload)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            request_payload = None
-        parsed_request, parse_error = parse_command_request(payload)
-        validation_error = (
-            None
-            if parse_error is not None or parsed_request is None
-            else validate_request(parsed_request)
+    if not json_output:
+        print("error: only --json output is supported", file=sys.stderr)
+        return 2
+    try:
+        request_payload = json.loads(payload)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        request_payload = None
+    request, parse_error = parse_command_request(payload)
+    if parse_error is not None or request is None:
+        envelope = CommandEnvelope.from_error(request, parse_error or error_value(
+            "invalid_request", "unknown parse error"
+        ))
+        print(envelope.to_json(indent=2))
+        return _command_exit_code(envelope)
+    validation_error = validate_request(request)
+    if validation_error is not None or not isinstance(request_payload, dict):
+        envelope = CommandEnvelope.from_error(
+            request,
+            validation_error or error_value("invalid_request", "request must be an object"),
         )
-        pure_mutation_dry_run = (
-            parse_error is None
-            and validation_error is None
-            and parsed_request is not None
-            and parsed_request.action
-            in {"send_instruction", "answer_decision"}
-            and parsed_request.dry_run
-        )
-        daemon_eligible = (
-            isinstance(request_payload, dict)
-            and parse_error is None
-            and validation_error is None
-            and not pure_mutation_dry_run
-        )
-        if daemon_eligible:
-            daemon_attempt = _try_daemon_attempt(config, "command.submit", request_payload)
-            daemon_result = daemon_attempt.result
-            if daemon_result is not None and parsed_request is not None:
-                daemon_envelope = _strict_daemon_command_envelope(
-                    parsed_request,
-                    daemon_result,
-                )
-                if daemon_envelope is not None:
-                    print(daemon_envelope.to_json(indent=2))
-                    return _command_exit_code(daemon_envelope)
-                daemon_attempt = _DaemonAttempt(
-                    error_kind="protocol",
-                    request_started=True,
-                )
-            if parsed_request is not None and not parsed_request.dry_run:
-                if daemon_attempt.request_started is False:
-                    envelope = _daemon_backend_failure_envelope(
-                        parsed_request,
-                        daemon_attempt,
-                    )
-                    print(envelope.to_json(indent=2))
-                    return _command_exit_code(envelope)
-                print(
-                    "error: Tendwire daemon command result is unresolved",
-                    file=sys.stderr,
-                )
-                return 2
-    envelope = command_envelope_from_payload(config, payload)
-    print(envelope.to_json(indent=2))
-    return _command_exit_code(envelope)
+        print(envelope.to_json(indent=2))
+        return _command_exit_code(envelope)
+    attempt = _try_daemon_attempt(config, "command.submit", request_payload)
+    if attempt.result is not None:
+        envelope = _strict_daemon_command_envelope(request, attempt.result)
+        if envelope is not None:
+            print(envelope.to_json(indent=2))
+            return _command_exit_code(envelope)
+    if attempt.request_started is False:
+        envelope = _daemon_backend_failure_envelope(request, attempt)
+        print(envelope.to_json(indent=2))
+        return _command_exit_code(envelope)
+    print("error: Tendwire daemon command result is unresolved", file=sys.stderr)
+    return 2
 
 
 def _connector_params_from_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -1155,10 +731,10 @@ def cmd_connector(config: Config, args: argparse.Namespace) -> int:
         return 2
     daemon_attempt = _try_daemon_attempt(config, method, params)
     if daemon_attempt.result is not None:
-        print(_connector_payload_json(daemon_attempt.result, indent=2))
+        print(_daemon_payload_json(daemon_attempt.result, indent=2))
         return 0 if daemon_attempt.result.get("ok") is not False else 1
     if daemon_attempt.response_error is not None:
-        print(_connector_payload_json(daemon_attempt.response_error, indent=2))
+        print(_daemon_payload_json(daemon_attempt.response_error, indent=2))
         return 1
     if daemon_attempt.request_started is not False:
         status = (
@@ -1181,126 +757,14 @@ def cmd_connector(config: Config, args: argparse.Namespace) -> int:
                 ),
             },
         }
-        print(_connector_payload_json(payload, indent=2))
+        print(_daemon_payload_json(payload, indent=2))
         return 1
     payload = _daemon_read_payload(
         daemon_attempt,
         extra={"host_id": config.host_id, "name": params.get("name", "")},
     )
-    print(_connector_payload_json(payload, indent=2))
+    print(_daemon_payload_json(payload, indent=2))
     return 1
-
-
-def cmd_store(config: Config, args: argparse.Namespace) -> int:
-    """Run a bounded store operation and print one JSON object."""
-    if config.db_path is None:
-        payload = {
-            "schema_version": 1,
-            "ok": False,
-            "status": "store_unavailable",
-            "host_id": config.host_id,
-            "error": {
-                "code": "store_unavailable",
-                "message": "command requires --db-path or a configured store",
-            },
-        }
-        print(public_json_dumps(payload, indent=2))
-        return 1
-    if args.store_action == "status":
-        payload = store_status(
-            config.db_path,
-            config.host_id,
-            acknowledged_final_retention_days=config.acknowledged_final_retention_days,
-            acknowledged_final_retention_count=config.acknowledged_final_retention_count,
-            snapshot_retention_days=config.snapshot_retention_days,
-            snapshot_retention_count=config.snapshot_retention_count,
-            maintenance_batch_size=config.snapshot_maintenance_batch_size,
-            maintenance_cadence_seconds=config.store_maintenance_cadence_seconds,
-            command_retry_horizon_seconds=config.command_retry_horizon_seconds,
-            command_receipt_retention_seconds=config.command_receipt_retention_seconds,
-            command_receipt_retention_count=config.command_receipt_retention_count,
-        )
-    elif args.store_action == "events-tail":
-        payload = tail_event_metadata(config.db_path, config.host_id, limit=args.limit)
-    elif args.store_action == "cleanup":
-        payload = run_store_maintenance(
-            config.db_path,
-            config.host_id,
-            retention_days=args.retention_days
-            if args.retention_days is not None
-            else config.event_retention_days,
-            max_outbox_attempts=args.max_outbox_attempts
-            if args.max_outbox_attempts is not None
-            else config.max_outbox_attempts,
-            acknowledged_final_retention_days=(
-                args.acknowledged_final_retention_days
-                if args.acknowledged_final_retention_days is not None
-                else config.acknowledged_final_retention_days
-            ),
-            acknowledged_final_retention_count=(
-                args.acknowledged_final_retention_count
-                if args.acknowledged_final_retention_count is not None
-                else config.acknowledged_final_retention_count
-            ),
-            command_retry_horizon_seconds=config.command_retry_horizon_seconds,
-            command_receipt_retention_seconds=config.command_receipt_retention_seconds,
-            command_receipt_retention_count=config.command_receipt_retention_count,
-            dry_run=args.dry_run,
-            snapshot_retention_days=args.snapshot_retention_days
-            if args.snapshot_retention_days is not None
-            else config.snapshot_retention_days,
-            snapshot_retention_count=args.snapshot_retention_count
-            if args.snapshot_retention_count is not None
-            else config.snapshot_retention_count,
-            snapshot_batch_size=args.snapshot_batch_size
-            if args.snapshot_batch_size is not None
-            else config.snapshot_maintenance_batch_size,
-            turn_change_retention_days=config.turn_change_retention_days,
-            turn_change_retention_count=config.turn_change_retention_count,
-            turn_change_batch_size=config.turn_change_compaction_batch_size,
-        )
-    elif args.store_action == "compact":
-        try:
-            options = CompactionOptions(
-                dry_run=bool(args.compact_dry_run),
-                acknowledge_offline=bool(args.acknowledge_offline),
-                backup_path=Path(args.backup_path)
-                if args.backup_path is not None
-                else None,
-                snapshot_retention_days=args.snapshot_retention_days
-                if args.snapshot_retention_days is not None
-                else config.snapshot_retention_days,
-                snapshot_retention_count=args.snapshot_retention_count
-                if args.snapshot_retention_count is not None
-                else config.snapshot_retention_count,
-                batch_size=args.snapshot_batch_size
-                if args.snapshot_batch_size is not None
-                else config.snapshot_maintenance_batch_size,
-            )
-        except (TypeError, ValueError):
-            options = CompactionOptions(dry_run=True)
-            payload = {
-                "schema_version": 1,
-                "ok": False,
-                "status": "invalid_request",
-                "command": "store.compact",
-                "scope": "database",
-                "dry_run": bool(args.compact_dry_run),
-            }
-        else:
-            payload = compact_store(config.db_path, options=options)
-    else:
-        payload = {
-            "schema_version": 1,
-            "ok": False,
-            "status": "invalid_params",
-            "host_id": config.host_id,
-        }
-    if args.store_action == "compact":
-        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
-    else:
-        print(public_json_dumps(payload, indent=2))
-    return 0 if payload.get("ok") is not False else 1
 
 
 def cmd_daemon(config: Config) -> int:
@@ -1335,9 +799,7 @@ def main(argv: list[str] | None = None) -> int:
         socket_group=getattr(args, "socket_group", None),
         herdr_timeout_seconds=args.herdr_timeout_seconds,
     )
-    if args.command in {"daemon", "store"} and not (
-        args.command == "store" and args.store_action == "compact"
-    ):
+    if args.command == "daemon":
         repair_config_state(
             config.data_dir,
             config.db_path,
@@ -1383,9 +845,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "connector":
         return cmd_connector(config, args)
-
-    if args.command == "store":
-        return cmd_store(config, args)
 
     if args.command == "daemon":
         return cmd_daemon(config)

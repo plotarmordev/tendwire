@@ -22,7 +22,6 @@ from .models import (
     public_json_dumps,
     sanitize_public_mapping,
     sanitize_public_text,
-    sanitize_public_value,
     stable_fingerprint,
     stable_json_dumps,
     _optional_string,
@@ -97,94 +96,44 @@ DISPOSITION_TERMINAL_ACCEPTED: CommandDisposition = "terminal_accepted"
 DISPOSITION_TERMINAL_REJECTED: CommandDisposition = "terminal_rejected"
 DISPOSITION_TERMINAL_UNCERTAIN: CommandDisposition = "terminal_uncertain"
 VALID_DISPOSITIONS = frozenset(
-    {
-        DISPOSITION_NO_RECEIPT,
-        DISPOSITION_IN_PROGRESS,
-        DISPOSITION_TERMINAL_ACCEPTED,
-        DISPOSITION_TERMINAL_REJECTED,
-        DISPOSITION_TERMINAL_UNCERTAIN,
-    }
+    {DISPOSITION_NO_RECEIPT, DISPOSITION_IN_PROGRESS, DISPOSITION_TERMINAL_ACCEPTED,
+     DISPOSITION_TERMINAL_REJECTED, DISPOSITION_TERMINAL_UNCERTAIN}
 )
 
 VALID_STATUSES = frozenset(
-    {
-        STATUS_NOOP,
-        STATUS_SNAPSHOT,
-        STATUS_RESOLVED,
-        STATUS_DRY_RUN,
-        STATUS_ACCEPTED,
-        STATUS_REJECTED,
-        STATUS_NOT_FOUND,
-        STATUS_AMBIGUOUS_TARGET,
-        STATUS_STALE_TARGET,
-        STATUS_BACKEND_UNAVAILABLE,
-        STATUS_BACKEND_UNSUPPORTED,
-        STATUS_AMBIGUOUS_BACKEND_TARGET,
-        STATUS_BACKEND_FAILED,
-        STATUS_DUPLICATE_REQUEST,
-        STATUS_REQUEST_STATE_UNCERTAIN,
-        STATUS_INVALID_REQUEST,
-        STATUS_PENDING,
-        STATUS_ANSWER_IN_PROGRESS,
-        STATUS_DECISION_NOT_PENDING,
-        STATUS_UNKNOWN_WORKER,
-        STATUS_INVALID_SELECTION,
-        STATUS_UNSUPPORTED_DECISION,
-    }
+    {STATUS_NOOP, STATUS_SNAPSHOT, STATUS_RESOLVED, STATUS_DRY_RUN, STATUS_ACCEPTED,
+     STATUS_REJECTED, STATUS_NOT_FOUND, STATUS_AMBIGUOUS_TARGET, STATUS_STALE_TARGET,
+     STATUS_BACKEND_UNAVAILABLE, STATUS_BACKEND_UNSUPPORTED, STATUS_AMBIGUOUS_BACKEND_TARGET,
+     STATUS_BACKEND_FAILED, STATUS_DUPLICATE_REQUEST, STATUS_REQUEST_STATE_UNCERTAIN,
+     STATUS_INVALID_REQUEST, STATUS_PENDING, STATUS_ANSWER_IN_PROGRESS,
+     STATUS_DECISION_NOT_PENDING, STATUS_UNKNOWN_WORKER, STATUS_INVALID_SELECTION,
+     STATUS_UNSUPPORTED_DECISION}
 )
 
 # Durable rejections are possible only after a live mutation has a canonical
 # identity. Keep this explicit so a new neutral, success, pending, or uncertain
 # status cannot silently become valid stored rejection evidence.
 TERMINAL_MUTATION_REJECTION_STATUSES = frozenset(
-    {
-        STATUS_REJECTED,
-        STATUS_STALE_TARGET,
-        STATUS_BACKEND_UNAVAILABLE,
-        STATUS_BACKEND_UNSUPPORTED,
-        STATUS_AMBIGUOUS_BACKEND_TARGET,
-        STATUS_BACKEND_FAILED,
-        STATUS_DUPLICATE_REQUEST,
-        STATUS_DECISION_NOT_PENDING,
-        STATUS_UNKNOWN_WORKER,
-        STATUS_INVALID_SELECTION,
-        STATUS_UNSUPPORTED_DECISION,
-    }
+    {STATUS_REJECTED, STATUS_STALE_TARGET, STATUS_BACKEND_UNAVAILABLE,
+     STATUS_BACKEND_UNSUPPORTED, STATUS_AMBIGUOUS_BACKEND_TARGET, STATUS_BACKEND_FAILED,
+     STATUS_DUPLICATE_REQUEST, STATUS_DECISION_NOT_PENDING, STATUS_UNKNOWN_WORKER,
+     STATUS_INVALID_SELECTION, STATUS_UNSUPPORTED_DECISION}
 )
 
 # A live no-receipt failure has no durable authority. These statuses cover
 # validation/target failures and the intermediate pre-reservation envelopes
 # used by the authoritative submission path before it terminalizes a failure.
 LIVE_MUTATION_NO_RECEIPT_REJECTION_STATUSES = frozenset(
-    {
-        STATUS_INVALID_REQUEST,
-        STATUS_REJECTED,
-        STATUS_NOT_FOUND,
-        STATUS_AMBIGUOUS_TARGET,
-        STATUS_STALE_TARGET,
-        STATUS_BACKEND_UNAVAILABLE,
-        STATUS_BACKEND_UNSUPPORTED,
-        STATUS_AMBIGUOUS_BACKEND_TARGET,
-        STATUS_BACKEND_FAILED,
-        STATUS_ANSWER_IN_PROGRESS,
-        STATUS_DECISION_NOT_PENDING,
-        STATUS_UNKNOWN_WORKER,
-        STATUS_INVALID_SELECTION,
-        STATUS_UNSUPPORTED_DECISION,
-    }
+    TERMINAL_MUTATION_REJECTION_STATUSES - {STATUS_DUPLICATE_REQUEST}
+    | {STATUS_INVALID_REQUEST, STATUS_NOT_FOUND, STATUS_AMBIGUOUS_TARGET,
+       STATUS_ANSWER_IN_PROGRESS}
 )
 
-# Dry-run mutations may fail only during validation or public target
-# resolution. Backend failures cannot describe a preview that performs no I/O.
+# Dry-run mutations still require the authoritative daemon even though the
+# requested mutation performs no external I/O.
 DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES = frozenset(
-    {
-        STATUS_INVALID_REQUEST,
-        STATUS_INVALID_SELECTION,
-        STATUS_REJECTED,
-        STATUS_NOT_FOUND,
-        STATUS_AMBIGUOUS_TARGET,
-        STATUS_STALE_TARGET,
-    }
+    {STATUS_INVALID_REQUEST, STATUS_INVALID_SELECTION, STATUS_REJECTED, STATUS_NOT_FOUND,
+     STATUS_AMBIGUOUS_TARGET, STATUS_STALE_TARGET, STATUS_BACKEND_UNAVAILABLE}
 )
 
 # Neutral target fields permitted in command requests.
@@ -223,42 +172,24 @@ _STABLE_WORKER_KEY_RE = re.compile(r"wsk1_[0-9a-f]{64}", re.ASCII)
 _TURN_SUBMISSION_ID_RE = re.compile(r"twsub1\.[0-9a-f]{64}", re.ASCII)
 _INSTRUCTION_FINGERPRINT_DOMAIN = b"tendwire.instruction-fingerprint.v1"
 _TURN_SUBMISSION_ID_DOMAIN = b"tendwire.turn-submission-id.v1"
+_EDGE_INSTRUCTION_CONTROLS = "".join(
+    chr(code) for code in (*range(9), *range(11, 32), *range(127, 160))
+)
 
 # Workers that must not receive instructions.
 _DISALLOWED_WORKER_STATUSES = frozenset({"closed", "failed", "unknown"})
 
 
-def _compact_field_name(key: Any) -> str:
-    return str(key).lower().replace("-", "_").replace(".", "_").replace("_", "")
-
-
 def _is_forbidden_request_field(key: Any) -> bool:
     normalized = str(key).lower().replace("-", "_").replace(".", "_")
-    compact = _compact_field_name(key)
+    compact = normalized.replace("_", "")
     return normalized in FORBIDDEN_REQUEST_FIELDS or compact in _FORBIDDEN_REQUEST_COMPACT
 
 
-def sanitize_command_result(value: Any) -> Any:
-    """Return a JSON-safe value with command-public forbidden fields removed.
-
-    Command results share the same public forbidden-key superset as snapshots,
-    turns, and pending interactions so public JSON surfaces do not drift.
-    """
-    return sanitize_public_value(value)
-
-
 def _clean_mapping(value: Any) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return {str(k): v for k, v in value.items()}
-    return {}
-
-
-def _clean_public_mapping(value: Any) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    return sanitize_public_mapping(value)
+    return None if value is None else (
+        {str(k): v for k, v in value.items()} if isinstance(value, dict) else {}
+    )
 
 
 def _find_forbidden_fields(value: Any, path: str = "$") -> list[str]:
@@ -284,99 +215,54 @@ def error_value(
     """Return a neutral, sanitized error object."""
     return sanitize_public_mapping(
         {
-            "code": _string_value(code, STATUS_REJECTED),
-            "message": _string_value(message),
+            "code": _string_value(code, STATUS_REJECTED), "message": _string_value(message),
             "details": details or {},
         }
     )
 
 
-def instruction_text_error(code: str, message: str) -> dict[str, Any]:
-    return error_value(code, message, details={"field": "instruction.text"})
+def _field_error(
+    message: str, field_name: str, *, status: str = STATUS_INVALID_REQUEST, **details: Any,
+) -> dict[str, Any]:
+    return error_value(status, message, details={"field": field_name, **details})
 
 
-def _contains_bracketed_paste(text: str) -> bool:
-    return "\x1b[200~" in text or "\x1b[201~" in text
-
-
-def _contains_c1_control(text: str) -> bool:
-    return any(0x80 <= ord(char) <= 0x9F for char in text)
-
-
-def _is_raw_instruction_control(char: str) -> bool:
-    code = ord(char)
-    return (code < 32 and code not in {9, 10}) or code == 127
+def _domain_digest(domain: bytes, *parts: str) -> str:
+    return hashlib.sha256(
+        b"\x00".join((domain, *(part.encode("utf-8") for part in parts)))
+    ).hexdigest()
 
 
 def validate_instruction_text(text: Any) -> dict[str, Any] | None:
     """Validate instruction text and return an error dict, or None if valid."""
-    if text is None:
-        return instruction_text_error(STATUS_INVALID_REQUEST, "instruction.text is required")
-    if not isinstance(text, str):
-        return instruction_text_error(STATUS_INVALID_REQUEST, "instruction.text must be a string")
-    if not text:
-        return instruction_text_error(STATUS_INVALID_REQUEST, "instruction.text must not be empty")
+    basic_errors = (
+        (text is None, "instruction.text is required"),
+        (not isinstance(text, str), "instruction.text must be a string"),
+        (text == "", "instruction.text must not be empty"),
+    )
+    for invalid, message in basic_errors:
+        if invalid:
+            return _field_error(message, "instruction.text")
+    assert isinstance(text, str)
     if len(text) > MAX_INSTRUCTION_LENGTH:
-        return instruction_text_error(
-            STATUS_INVALID_REQUEST,
+        return _field_error(
             f"instruction.text exceeds maximum length of {MAX_INSTRUCTION_LENGTH}",
+            "instruction.text",
         )
-    if "\x00" in text:
-        return instruction_text_error(STATUS_INVALID_REQUEST, "instruction.text must not contain NUL")
-    if _contains_bracketed_paste(text):
-        return instruction_text_error(
-            STATUS_INVALID_REQUEST,
-            "instruction.text must not contain bracketed-paste sequences",
-        )
-    if "\x1b" in text:
-        return instruction_text_error(
-            STATUS_INVALID_REQUEST,
-            "instruction.text must not contain escape sequences",
-        )
-    if _contains_c1_control(text):
-        return instruction_text_error(
-            STATUS_INVALID_REQUEST,
-            "instruction.text must not contain C1 control characters",
-        )
-    # Reject C0 controls except LF and tab, plus DEL.
-    for char in text:
-        if _is_raw_instruction_control(char):
-            return instruction_text_error(
-                STATUS_INVALID_REQUEST,
-                "instruction.text must not contain raw control characters",
-            )
+    unsafe = (
+        ("\x00" in text, "instruction.text must not contain NUL"),
+        ("\x1b[200~" in text or "\x1b[201~" in text,
+         "instruction.text must not contain bracketed-paste sequences"),
+        ("\x1b" in text, "instruction.text must not contain escape sequences"),
+        (any(0x80 <= ord(char) <= 0x9F for char in text),
+         "instruction.text must not contain C1 control characters"),
+        (any((code := ord(char)) < 32 and code not in {9, 10} or code == 127 for char in text),
+         "instruction.text must not contain raw control characters"),
+    )
+    for invalid, message in unsafe:
+        if invalid:
+            return _field_error(message, "instruction.text")
     return None
-
-
-def normalize_instruction_text(text: Any) -> str:
-    """Return the Phase-1 whitespace-normalized instruction text.
-
-    Line boundaries remain significant, while runs of horizontal or other
-    intra-line whitespace are collapsed. The function is deliberately pure so
-    claim matching and the Phase-2 ledger cannot drift apart.
-
-    Herdr observations may retain terminal framing bytes at the outer edge of
-    otherwise exact input (for example a trailing U+0001). Submitted
-    instructions reject every such C0/C1 byte, so ignoring only edge controls
-    is collision-safe for ledger matching. Controls inside the instruction
-    remain significant and therefore fail closed.
-    """
-    raw = str(text or "")
-    start = 0
-    end = len(raw)
-    while start < end and (
-        _is_raw_instruction_control(raw[start])
-        or 0x80 <= ord(raw[start]) <= 0x9F
-    ):
-        start += 1
-    while end > start and (
-        _is_raw_instruction_control(raw[end - 1])
-        or 0x80 <= ord(raw[end - 1]) <= 0x9F
-    ):
-        end -= 1
-    return "\n".join(
-        " ".join(line.split()) for line in raw[start:end].splitlines()
-    ).strip()
 
 
 def instruction_fingerprint(text: Any) -> str:
@@ -387,13 +273,10 @@ def instruction_fingerprint(text: Any) -> str:
     ordinary text, but fingerprint the raw text in that edge case so submission
     bookkeeping can never reject an otherwise valid send.
     """
-    normalized = normalize_instruction_text(text)
+    raw = str(text or "").strip(_EDGE_INSTRUCTION_CONTROLS)
+    normalized = "\n".join(" ".join(line.split()) for line in raw.splitlines()).strip()
     fingerprint_text = normalized or str(text or "")
-    digest = hashlib.sha256(
-        _INSTRUCTION_FINGERPRINT_DOMAIN
-        + b"\x00"
-        + fingerprint_text.encode("utf-8")
-    ).hexdigest()
+    digest = _domain_digest(_INSTRUCTION_FINGERPRINT_DOMAIN, fingerprint_text)
     return f"twins1.{digest}"
 
 
@@ -403,72 +286,44 @@ def turn_submission_id(host_id: Any, request_id: Any) -> str:
     clean_request_id = str(request_id or "").strip()
     if not clean_host_id or not clean_request_id:
         raise ValueError("turn submission identity fields must be non-empty")
-    digest = hashlib.sha256(
-        _TURN_SUBMISSION_ID_DOMAIN
-        + b"\x00"
-        + clean_host_id.encode("utf-8")
-        + b"\x00"
-        + clean_request_id.encode("utf-8")
-    ).hexdigest()
+    digest = _domain_digest(_TURN_SUBMISSION_ID_DOMAIN, clean_host_id, clean_request_id)
     return f"twsub1.{digest}"
-
-
-def is_turn_submission_id(value: Any) -> bool:
-    """Return whether value is a supported opaque submission ID."""
-    return isinstance(value, str) and _TURN_SUBMISSION_ID_RE.fullmatch(value) is not None
 
 
 def _validate_target_shape(target: dict[str, Any] | None) -> dict[str, Any] | None:
     if target is None:
         return None
     if not isinstance(target, dict):
-        return error_value(STATUS_INVALID_REQUEST, "target must be an object", details={"field": "target"})
+        return _field_error("target must be an object", "target")
     extra = set(target.keys()) - TARGET_ALLOWED_FIELDS
     if extra:
-        return error_value(
-            STATUS_INVALID_REQUEST,
-            f"target contains disallowed fields: {sorted(extra)}",
-            details={"field": "target", "disallowed": sorted(extra)},
+        return _field_error(
+            f"target contains disallowed fields: {sorted(extra)}", "target",
+            disallowed=sorted(extra),
         )
     stable_key_present = "stable_key" in target
     stable_version_present = "stable_key_version" in target
     stable_key = target.get("stable_key")
     stable_version = target.get("stable_key_version")
-    if stable_key_present != stable_version_present:
-        return error_value(
-            STATUS_INVALID_REQUEST,
-            "target stable_key and stable_key_version must be supplied together",
-            details={"field": "target"},
-        )
-    if stable_key_present and (
-        not isinstance(stable_key, str)
-        or _STABLE_WORKER_KEY_RE.fullmatch(stable_key) is None
-        or type(stable_version) is not int
-        or stable_version != 1
-    ):
-        return error_value(
-            STATUS_INVALID_REQUEST,
-            "target stable worker identity is invalid or unsupported",
-            details={"field": "target"},
-        )
-    if _string_value(target.get("worker_fingerprint")) and not _target_has_stable_selector(
-        target
-    ):
-        return error_value(
-            STATUS_INVALID_REQUEST,
-            "target requires a stable selector beside worker_fingerprint",
-            details={
-                "field": "target",
-                "allowed": sorted(TARGET_STABLE_SELECTOR_FIELDS),
-            },
-        )
+    requirements = (
+        (stable_key_present != stable_version_present,
+         "target stable_key and stable_key_version must be supplied together", False),
+        (stable_key_present and (
+            not isinstance(stable_key, str) or _STABLE_WORKER_KEY_RE.fullmatch(stable_key) is None
+            or type(stable_version) is not int or stable_version != 1
+        ), "target stable worker identity is invalid or unsupported", False),
+        (_string_value(target.get("worker_fingerprint")) and not _target_has_stable_selector(target),
+         "target requires a stable selector beside worker_fingerprint", True),
+    )
+    for invalid, message, include_allowed in requirements:
+        if invalid:
+            details = {"allowed": sorted(TARGET_STABLE_SELECTOR_FIELDS)} if include_allowed else {}
+            return _field_error(message, "target", **details)
     return None
 
 
 def _target_has_stable_selector(target: dict[str, Any] | None) -> bool:
-    if not isinstance(target, dict):
-        return False
-    return any(
+    return isinstance(target, dict) and any(
         _string_value(target.get(field)) for field in TARGET_STABLE_SELECTOR_FIELDS
     )
 
@@ -485,17 +340,34 @@ def _validate_instruction_shape(instruction: dict[str, Any] | None) -> dict[str,
     if instruction is None:
         return None
     if not isinstance(instruction, dict):
-        return error_value(
-            STATUS_INVALID_REQUEST, "instruction must be an object", details={"field": "instruction"}
-        )
+        return _field_error("instruction must be an object", "instruction")
     extra = set(instruction.keys()) - INSTRUCTION_ALLOWED_FIELDS
     if extra:
-        return error_value(
-            STATUS_INVALID_REQUEST,
-            f"instruction contains disallowed fields: {sorted(extra)}",
-            details={"field": "instruction", "disallowed": sorted(extra)},
+        return _field_error(
+            f"instruction contains disallowed fields: {sorted(extra)}", "instruction",
+            disallowed=sorted(extra),
         )
     return validate_instruction_text(instruction.get("text"))
+
+
+def _request_header_error(
+    schema_version: Any,
+    dry_run: Any,
+    response_schema_version: Any,
+) -> dict[str, Any] | None:
+    if type(schema_version) is not int or schema_version != COMMAND_REQUEST_SCHEMA_VERSION:
+        return _field_error(
+            f"schema_version must be {COMMAND_REQUEST_SCHEMA_VERSION}", "schema_version"
+        )
+    if not isinstance(dry_run, bool):
+        return _field_error("dry_run must be a JSON boolean", "dry_run")
+    if type(response_schema_version) is not int or (
+        response_schema_version not in SUPPORTED_COMMAND_ENVELOPE_SCHEMA_VERSIONS
+    ):
+        return _field_error(
+            "response_schema_version must be 2 or 3", "response_schema_version"
+        )
+    return None
 
 
 @dataclass(frozen=True)
@@ -513,22 +385,15 @@ class CommandRequest:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "action", _string_value(self.action))
-        object.__setattr__(self, "schema_version", self.schema_version)
-        object.__setattr__(self, "dry_run", self.dry_run)
         object.__setattr__(self, "target", _clean_mapping(self.target))
         object.__setattr__(self, "instruction", _clean_mapping(self.instruction))
         object.__setattr__(self, "params", _clean_mapping(self.params))
-        object.__setattr__(self, "response_schema_version", self.response_schema_version)
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
-            "schema_version": self.schema_version,
-            "action": self.action,
-            "request_id": self.request_id,
-            "dry_run": self.dry_run,
-            "target": self.target,
-            "instruction": self.instruction,
-            "params": self.params,
+            "schema_version": self.schema_version, "action": self.action,
+            "request_id": self.request_id, "dry_run": self.dry_run,
+            "target": self.target, "instruction": self.instruction, "params": self.params,
         }
         if self.response_schema_version != COMMAND_ENVELOPE_SCHEMA_VERSION:
             payload["response_schema_version"] = self.response_schema_version
@@ -537,16 +402,12 @@ class CommandRequest:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CommandRequest":
         return cls(
-            action=data.get("action", ""),
+            action=data.get("action", ""), request_id=data.get("request_id"),
             schema_version=data.get("schema_version", COMMAND_REQUEST_SCHEMA_VERSION),
-            request_id=data.get("request_id"),
-            dry_run=data.get("dry_run", True),
-            target=data.get("target"),
-            instruction=data.get("instruction"),
-            params=data.get("params"),
+            dry_run=data.get("dry_run", True), target=data.get("target"),
+            instruction=data.get("instruction"), params=data.get("params"),
             response_schema_version=data.get(
-                "response_schema_version",
-                COMMAND_ENVELOPE_SCHEMA_VERSION,
+                "response_schema_version", COMMAND_ENVELOPE_SCHEMA_VERSION,
             ),
         )
 
@@ -565,6 +426,18 @@ class CanonicalMutation:
     fingerprint: str
 
 
+def _validated_mutation(request: CommandRequest, purpose: str) -> None:
+    if not isinstance(request, CommandRequest):
+        raise TypeError("request must be a CommandRequest")
+    if request.action not in {"send_instruction", "answer_decision"}:
+        raise ValueError(f"{purpose} require send_instruction or answer_decision")
+    if request.dry_run is not False:
+        raise ValueError(f"{purpose} require a non-dry-run request")
+    request_error = validate_request(request)
+    if request_error is not None:
+        raise ValueError(str(request_error.get("message") or "invalid command request"))
+
+
 def build_canonical_mutation(
     request: CommandRequest,
     *,
@@ -576,15 +449,7 @@ def build_canonical_mutation(
     fingerprints, connector origin metadata, and private binding data are
     intentionally outside this representation.
     """
-    if not isinstance(request, CommandRequest):
-        raise TypeError("request must be a CommandRequest")
-    if request.action not in {"send_instruction", "answer_decision"}:
-        raise ValueError("canonical mutations require send_instruction or answer_decision")
-    if request.dry_run is not False:
-        raise ValueError("canonical mutations require a non-dry-run request")
-    request_error = validate_request(request)
-    if request_error is not None:
-        raise ValueError(str(request_error.get("message") or "invalid command request"))
+    _validated_mutation(request, "canonical mutations")
     if not isinstance(public_worker_id, str) or not public_worker_id.strip():
         raise ValueError("public_worker_id must be a nonblank string")
 
@@ -621,10 +486,8 @@ def build_canonical_mutation(
         }
 
     return CanonicalMutation(
-        canonical_version=CANONICAL_MUTATION_VERSION,
-        action=request.action,
-        public_worker_id=public_worker_id,
-        canonical_json=stable_json_dumps(canonical_payload),
+        canonical_version=CANONICAL_MUTATION_VERSION, action=request.action,
+        public_worker_id=public_worker_id, canonical_json=stable_json_dumps(canonical_payload),
         fingerprint=stable_fingerprint(canonical_payload),
     )
 
@@ -663,100 +526,51 @@ def build_selector_proof(request: CommandRequest) -> str:
     untrusted input, carries no private binding or backend-routing data, and is
     never part of any public surface.
     """
-    if not isinstance(request, CommandRequest):
-        raise TypeError("request must be a CommandRequest")
-    if request.action not in {"send_instruction", "answer_decision"}:
-        raise ValueError("selector proofs require send_instruction or answer_decision")
-    if request.dry_run is not False:
-        raise ValueError("selector proofs require a non-dry-run request")
-    request_error = validate_request(request)
-    if request_error is not None:
-        raise ValueError(str(request_error.get("message") or "invalid command request"))
-
+    _validated_mutation(request, "selector proofs")
+    assert request.target is not None
     target = request.target
-    if target is None:
-        selector: dict[str, Any] = {"shape": "none"}
-    else:
-        # Mirror resolve_target's accepted value semantics exactly, so a stored
-        # proof and a live resolution can never disagree about what a selector
-        # says. A missing space_id is null and an empty one is "", because
-        # resolution treats those as different filters.
-        selector = {
-            "shape": "target",
-            "worker_id": _string_value(target.get("worker_id")),
-            "name": _string_value(target.get("name")),
-            "space_id": _optional_string(target.get("space_id")),
-            "stable_key": _string_value(target.get("stable_key")),
-            "stable_key_version": target.get("stable_key_version"),
-        }
+    selector = {
+        "shape": "target",
+        "worker_id": _string_value(target.get("worker_id")),
+        "name": _string_value(target.get("name")),
+        "space_id": _optional_string(target.get("space_id")),
+        "stable_key": _string_value(target.get("stable_key")),
+        "stable_key_version": target.get("stable_key_version"),
+    }
     payload = {
         "proof_version": SELECTOR_PROOF_VERSION,
         "action": request.action,
         "selector": selector,
     }
-    digest = hashlib.sha256(
-        _SELECTOR_PROOF_DOMAIN
-        + b"\x00"
-        + json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    digest = _domain_digest(_SELECTOR_PROOF_DOMAIN, stable_json_dumps(payload))
     return f"v{SELECTOR_PROOF_VERSION}:{digest}"
 
 
 def validate_request(request: CommandRequest) -> dict[str, Any] | None:
     """Validate a command request; return an error dict or None if valid."""
-    if (
-        isinstance(request.schema_version, bool)
-        or not isinstance(request.schema_version, int)
-        or request.schema_version != COMMAND_REQUEST_SCHEMA_VERSION
-    ):
-        return error_value(
-            STATUS_INVALID_REQUEST,
-            f"schema_version must be {COMMAND_REQUEST_SCHEMA_VERSION}",
-            details={"field": "schema_version"},
-        )
+    header_error = _request_header_error(
+        request.schema_version, request.dry_run, request.response_schema_version
+    )
+    if header_error is not None and header_error["details"]["field"] == "schema_version":
+        return header_error
 
     if not request.action:
-        return error_value(STATUS_INVALID_REQUEST, "action is required", details={"field": "action"})
-
-    if not isinstance(request.dry_run, bool):
-        return error_value(
-            STATUS_INVALID_REQUEST,
-            "dry_run must be a JSON boolean",
-            details={"field": "dry_run"},
-        )
-
-    if (
-        isinstance(request.response_schema_version, bool)
-        or not isinstance(request.response_schema_version, int)
-        or request.response_schema_version
-        not in SUPPORTED_COMMAND_ENVELOPE_SCHEMA_VERSIONS
-    ):
-        return error_value(
-            STATUS_INVALID_REQUEST,
-            "response_schema_version must be 2 or 3",
-            details={"field": "response_schema_version"},
-        )
+        return _field_error("action is required", "action")
+    if header_error is not None:
+        return header_error
 
     if request.action not in ALLOWED_ACTIONS:
-        return error_value(
-            STATUS_REJECTED,
-            f"unknown action {request.action!r}",
-            details={"field": "action", "allowed": sorted(ALLOWED_ACTIONS)},
+        return _field_error(
+            f"unknown action {request.action!r}", "action", status=STATUS_REJECTED,
+            allowed=sorted(ALLOWED_ACTIONS),
         )
     if (
         request.action in {"send_instruction", "answer_decision"}
         and request.dry_run is False
         and not is_valid_request_id(request.request_id)
     ):
-        return error_value(
-            STATUS_INVALID_REQUEST,
-            f"non-dry-run {request.action} requires a valid request_id",
-            details={"field": "request_id"},
+        return _field_error(
+            f"non-dry-run {request.action} requires a valid request_id", "request_id"
         )
 
     forbidden = _find_forbidden_fields(request.to_dict())
@@ -776,91 +590,59 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
         return instruction_err
 
     if request.action == "send_instruction":
-        if request.target is None:
-            return error_value(
-                STATUS_INVALID_REQUEST,
-                "send_instruction requires a target",
-                details={"field": "target"},
-            )
-        if not _target_has_stable_selector(request.target):
-            return error_value(
-                STATUS_INVALID_REQUEST,
-                "send_instruction requires at least one stable target selector",
-                details={
-                    "field": "target",
-                    "allowed": sorted(TARGET_STABLE_SELECTOR_FIELDS),
-                },
-            )
-        if request.instruction is None or not _string_value(request.instruction.get("text")):
-            return error_value(
-                STATUS_INVALID_REQUEST,
-                "send_instruction requires instruction.text",
-                details={"field": "instruction.text"},
-            )
+        requirements = (
+            (request.target is None, "send_instruction requires a target", "target"),
+            (not _target_has_stable_selector(request.target),
+             "send_instruction requires at least one stable target selector", "target"),
+            (request.instruction is None or not _string_value(request.instruction.get("text")),
+             "send_instruction requires instruction.text", "instruction.text"),
+        )
+        for invalid, message, field_name in requirements:
+            if invalid:
+                details = {"allowed": sorted(TARGET_STABLE_SELECTOR_FIELDS)} if (
+                    message.endswith("stable target selector")
+                ) else {}
+                return _field_error(message, field_name, **details)
 
     if request.action == "answer_decision":
-        if request.target is None or set(request.target) != {"worker_id"}:
-            return error_value(
-                STATUS_INVALID_REQUEST,
-                "answer_decision requires exactly target.worker_id",
-                details={"field": "target"},
-            )
-        worker_id = request.target.get("worker_id")
-        if not isinstance(worker_id, str) or not worker_id.strip():
-            return error_value(
-                STATUS_INVALID_REQUEST,
-                "answer_decision requires nonblank target.worker_id",
-                details={"field": "target.worker_id"},
-            )
-        if request.instruction is not None:
-            return error_value(
-                STATUS_INVALID_REQUEST,
-                "answer_decision does not accept an instruction",
-                details={"field": "instruction"},
-            )
-        if not isinstance(request.params, dict) or set(request.params) != ANSWER_DECISION_PARAM_FIELDS:
-            return error_value(
-                STATUS_INVALID_REQUEST,
-                "answer_decision params must contain exactly decision_ref and selection",
-                details={"field": "params"},
-            )
-        decision_ref = request.params.get("decision_ref")
-        if not isinstance(decision_ref, str) or not decision_ref.strip():
-            return error_value(
-                STATUS_INVALID_REQUEST,
-                "answer_decision requires nonblank params.decision_ref",
-                details={"field": "params.decision_ref"},
-            )
-        selection = request.params.get("selection")
+        target, params = request.target or {}, request.params or {}
+        worker_id, decision_ref = target.get("worker_id"), params.get("decision_ref")
+        requirements = (
+            (set(target) != {"worker_id"}, "answer_decision requires exactly target.worker_id", "target"),
+            (not isinstance(worker_id, str) or not worker_id.strip(),
+             "answer_decision requires nonblank target.worker_id", "target.worker_id"),
+            (request.instruction is not None, "answer_decision does not accept an instruction", "instruction"),
+            (set(params) != ANSWER_DECISION_PARAM_FIELDS,
+             "answer_decision params must contain exactly decision_ref and selection", "params"),
+            (not isinstance(decision_ref, str) or not decision_ref.strip(),
+             "answer_decision requires nonblank params.decision_ref", "params.decision_ref"),
+        )
+        for invalid, message, field_name in requirements:
+            if invalid:
+                return _field_error(message, field_name)
+        selection = params.get("selection")
         if not isinstance(selection, Mapping) or len(selection) != 1:
-            return error_value(
-                STATUS_INVALID_SELECTION,
-                "selection must contain exactly one selection form",
-                details={"field": "params.selection"},
+            return _field_error(
+                "selection must contain exactly one selection form", "params.selection",
+                status=STATUS_INVALID_SELECTION,
             )
         if set(selection) == {"option_refs"}:
             option_refs = selection.get("option_refs")
-            if not isinstance(option_refs, list) or not option_refs or any(
+            invalid = not isinstance(option_refs, list) or not option_refs or any(
                 not isinstance(ref, str) or not ref.strip() for ref in option_refs
-            ):
-                return error_value(
-                    STATUS_INVALID_SELECTION,
-                    "selection.option_refs must be a nonempty array of strings",
-                    details={"field": "params.selection.option_refs"},
-                )
-        elif set(selection) == {"text"}:
-            if validate_instruction_text(selection.get("text")) is not None:
-                return error_value(
-                    STATUS_INVALID_SELECTION,
-                    "selection.text must be nonempty safe text",
-                    details={"field": "params.selection.text"},
-                )
-        else:
-            return error_value(
-                STATUS_INVALID_SELECTION,
-                "selection must contain option_refs or text",
-                details={"field": "params.selection"},
             )
+            message = "selection.option_refs must be a nonempty array of strings"
+            field_name = "params.selection.option_refs"
+        elif set(selection) == {"text"}:
+            invalid = validate_instruction_text(selection.get("text")) is not None
+            message, field_name = "selection.text must be nonempty safe text", "params.selection.text"
+        else:
+            return _field_error(
+                "selection must contain option_refs or text", "params.selection",
+                status=STATUS_INVALID_SELECTION,
+            )
+        if invalid:
+            return _field_error(message, field_name, status=STATUS_INVALID_SELECTION)
 
     return None
 
@@ -870,17 +652,9 @@ def parse_command_request(payload: str) -> tuple[CommandRequest | None, dict[str
     try:
         data = json.loads(payload)
     except Exception as exc:  # noqa: BLE001
-        return None, error_value(
-            STATUS_INVALID_REQUEST,
-            f"invalid JSON: {exc}",
-            details={"field": "request"},
-        )
+        return None, _field_error(f"invalid JSON: {exc}", "request")
     if not isinstance(data, dict):
-        return None, error_value(
-            STATUS_INVALID_REQUEST,
-            "request must be a JSON object",
-            details={"field": "request"},
-        )
+        return None, _field_error("request must be a JSON object", "request")
     forbidden = _find_forbidden_fields(data)
     if forbidden:
         request = None
@@ -902,48 +676,16 @@ def parse_command_request(payload: str) -> tuple[CommandRequest | None, dict[str
             f"request contains unknown top-level fields: {unknown}",
             details={"fields": [f"$.{field}" for field in unknown]},
         )
-    if "schema_version" not in data:
-        return None, error_value(
-            STATUS_INVALID_REQUEST,
-            f"schema_version must be {COMMAND_REQUEST_SCHEMA_VERSION}",
-            details={"field": "schema_version"},
-        )
-    schema_version = data.get("schema_version")
-    if (
-        isinstance(schema_version, bool)
-        or not isinstance(schema_version, int)
-        or schema_version != COMMAND_REQUEST_SCHEMA_VERSION
-    ):
-        return None, error_value(
-            STATUS_INVALID_REQUEST,
-            f"schema_version must be {COMMAND_REQUEST_SCHEMA_VERSION}",
-            details={"field": "schema_version"},
-        )
-    if "dry_run" in data and not isinstance(data.get("dry_run"), bool):
-        return None, error_value(
-            STATUS_INVALID_REQUEST,
-            "dry_run must be a JSON boolean",
-            details={"field": "dry_run"},
-        )
-    if "response_schema_version" in data and (
-        isinstance(data.get("response_schema_version"), bool)
-        or not isinstance(data.get("response_schema_version"), int)
-        or data.get("response_schema_version")
-        not in SUPPORTED_COMMAND_ENVELOPE_SCHEMA_VERSIONS
-    ):
-        return None, error_value(
-            STATUS_INVALID_REQUEST,
-            "response_schema_version must be 2 or 3",
-            details={"field": "response_schema_version"},
-        )
+    header_error = _request_header_error(
+        data.get("schema_version"), data.get("dry_run", True),
+        data.get("response_schema_version", COMMAND_ENVELOPE_SCHEMA_VERSION),
+    )
+    if header_error is not None:
+        return None, header_error
     try:
         request = CommandRequest.from_dict(data)
     except Exception as exc:  # noqa: BLE001
-        return None, error_value(
-            STATUS_INVALID_REQUEST,
-            f"request shape error: {exc}",
-            details={"field": "request"},
-        )
+        return None, _field_error(f"request shape error: {exc}", "request")
     return request, None
 
 
@@ -963,34 +705,28 @@ class CommandEnvelope:
     schema_version: int = COMMAND_ENVELOPE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if not isinstance(self.ok, bool):
-            raise TypeError("ok must be a boolean")
+        type_requirements = (
+            (isinstance(self.ok, bool), "ok must be a boolean"),
+            (isinstance(self.action, str), "action must be a string"),
+            (self.request_id is None or isinstance(self.request_id, str),
+             "request_id must be a string or null"),
+            (isinstance(self.dry_run, bool), "dry_run must be a boolean"),
+            (self.result is None or isinstance(self.result, Mapping), "result must be an object or null"),
+            (self.error is None or isinstance(self.error, Mapping), "error must be an object or null"),
+            (isinstance(self.warnings, list) and all(isinstance(w, str) for w in self.warnings),
+             "warnings must be an array of strings"),
+        )
+        for valid, message in type_requirements:
+            if not valid:
+                raise TypeError(message)
         if not isinstance(self.status, str) or self.status not in VALID_STATUSES:
             raise ValueError("status must be a supported command status")
-        if not isinstance(self.action, str):
-            raise TypeError("action must be a string")
         if self.disposition not in VALID_DISPOSITIONS:
             raise ValueError("disposition must be a supported command disposition")
-        if self.request_id is not None and not isinstance(self.request_id, str):
-            raise TypeError("request_id must be a string or null")
-        if not isinstance(self.dry_run, bool):
-            raise TypeError("dry_run must be a boolean")
-        if self.result is not None and not isinstance(self.result, Mapping):
-            raise TypeError("result must be an object or null")
-        if self.error is not None and not isinstance(self.error, Mapping):
-            raise TypeError("error must be an object or null")
-        if not isinstance(self.warnings, list) or any(
-            not isinstance(warning, str) for warning in self.warnings
+        if type(self.schema_version) is not int or (
+            self.schema_version not in SUPPORTED_COMMAND_ENVELOPE_SCHEMA_VERSIONS
         ):
-            raise TypeError("warnings must be an array of strings")
-        if (
-            isinstance(self.schema_version, bool)
-            or not isinstance(self.schema_version, int)
-            or self.schema_version not in SUPPORTED_COMMAND_ENVELOPE_SCHEMA_VERSIONS
-        ):
-            raise ValueError(
-                "command envelope schema_version must be 2 or 3"
-            )
+            raise ValueError("command envelope schema_version must be 2 or 3")
 
         mutating = self.action in {
             "send_instruction",
@@ -1005,8 +741,8 @@ class CommandEnvelope:
         ):
             raise ValueError("receipt-bearing disposition requires a valid request_id")
 
-        clean_result = _clean_public_mapping(self.result)
-        clean_error = _clean_public_mapping(self.error)
+        clean_result = None if self.result is None else sanitize_public_mapping(self.result)
+        clean_error = None if self.error is None else sanitize_public_mapping(self.error)
         clean_warnings = [
             clean for warning in self.warnings if (clean := sanitize_public_text(warning))
         ]
@@ -1017,83 +753,49 @@ class CommandEnvelope:
         if self.ok and clean_error is not None:
             raise ValueError("successful command envelope must not include an error")
         if self.disposition == DISPOSITION_NO_RECEIPT:
-            if live_mutation:
-                valid_no_receipt_tuple = (
-                    not self.ok
-                    and self.status in LIVE_MUTATION_NO_RECEIPT_REJECTION_STATUSES
-                    and (
-                        self.status != STATUS_ANSWER_IN_PROGRESS
-                        or self.action == "answer_decision"
-                    )
-                )
-            elif mutating:
-                valid_no_receipt_tuple = (
+            valid_tuple = not mutating or (
+                live_mutation and not self.ok
+                and self.status in LIVE_MUTATION_NO_RECEIPT_REJECTION_STATUSES
+                and (self.status != STATUS_ANSWER_IN_PROGRESS or self.action == "answer_decision")
+            ) or (
+                not live_mutation and (
                     self.ok and self.status == STATUS_DRY_RUN
-                ) or (
-                    not self.ok
-                    and self.status
-                    in DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES
+                    or not self.ok and self.status in DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES
                 )
-            else:
-                valid_no_receipt_tuple = True
-            if not valid_no_receipt_tuple:
-                raise ValueError("no_receipt disposition has an inconsistent command tuple")
+            )
         elif self.disposition == DISPOSITION_IN_PROGRESS:
-            if (
-                not mutating
-                or self.dry_run
-                or self.ok
-                or self.status not in {STATUS_PENDING, STATUS_ANSWER_IN_PROGRESS}
-                or (
-                    self.status == STATUS_ANSWER_IN_PROGRESS
-                    and self.action != "answer_decision"
-                )
-            ):
-                raise ValueError("in_progress disposition has an inconsistent command tuple")
+            valid_tuple = (
+                live_mutation and not self.ok
+                and self.status in {STATUS_PENDING, STATUS_ANSWER_IN_PROGRESS}
+                and (self.status != STATUS_ANSWER_IN_PROGRESS or self.action == "answer_decision")
+            )
         elif self.disposition == DISPOSITION_TERMINAL_ACCEPTED:
-            if not mutating or self.dry_run or not self.ok or self.status != STATUS_ACCEPTED:
-                raise ValueError("terminal_accepted disposition has an inconsistent command tuple")
+            valid_tuple = live_mutation and self.ok and self.status == STATUS_ACCEPTED
         elif self.disposition == DISPOSITION_TERMINAL_REJECTED:
-            if (
-                not mutating
-                or self.dry_run
-                or self.ok
-                or self.status not in TERMINAL_MUTATION_REJECTION_STATUSES
-            ):
-                raise ValueError("terminal_rejected disposition has an inconsistent command tuple")
-        elif self.disposition == DISPOSITION_TERMINAL_UNCERTAIN:
-            if (
-                not mutating
-                or self.dry_run
-                or self.ok
-                or self.status != STATUS_REQUEST_STATE_UNCERTAIN
-            ):
-                raise ValueError("terminal_uncertain disposition has an inconsistent command tuple")
+            valid_tuple = (
+                live_mutation and not self.ok
+                and self.status in TERMINAL_MUTATION_REJECTION_STATUSES
+            )
+        else:
+            valid_tuple = (
+                live_mutation and not self.ok
+                and self.status == STATUS_REQUEST_STATE_UNCERTAIN
+            )
+        if not valid_tuple:
+            raise ValueError(f"{self.disposition} disposition has an inconsistent command tuple")
         if self.schema_version == COMMAND_ENVELOPE_V3_SCHEMA_VERSION:
-            submission_id = (
-                clean_result.get("submission_id")
-                if isinstance(clean_result, Mapping)
-                else None
-            )
-            turn_id = (
-                clean_result.get("turn_id")
-                if isinstance(clean_result, Mapping)
-                else None
-            )
+            submission_id = clean_result.get("submission_id") if clean_result else None
+            turn_id = clean_result.get("turn_id") if clean_result else None
             if (
                 self.action != "send_instruction"
                 or self.disposition != DISPOSITION_TERMINAL_ACCEPTED
-                or not is_turn_submission_id(submission_id)
-                or not isinstance(clean_result, Mapping)
+                or not isinstance(submission_id, str)
+                or _TURN_SUBMISSION_ID_RE.fullmatch(submission_id) is None
+                or clean_result is None
                 or "turn_id" not in clean_result
-                or not (
-                    turn_id is None
-                    or (isinstance(turn_id, str) and bool(turn_id))
-                )
+                or not (turn_id is None or isinstance(turn_id, str) and bool(turn_id))
             ):
-                raise ValueError(
-                    "schema-v3 envelopes require an accepted instruction submission"
-                )
+                raise ValueError("schema-v3 envelopes require an accepted instruction submission")
         if self.status == STATUS_ANSWER_IN_PROGRESS and not (
             self.action == "answer_decision"
             and live_mutation
@@ -1107,16 +809,10 @@ class CommandEnvelope:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": self.schema_version,
-            "action": self.action,
-            "request_id": self.request_id,
-            "ok": self.ok,
-            "dry_run": self.dry_run,
-            "status": self.status,
-            "disposition": self.disposition,
-            "result": self.result,
-            "error": self.error,
-            "warnings": self.warnings,
+            "schema_version": self.schema_version, "action": self.action,
+            "request_id": self.request_id, "ok": self.ok, "dry_run": self.dry_run,
+            "status": self.status, "disposition": self.disposition,
+            "result": self.result, "error": self.error, "warnings": self.warnings,
         }
 
     def to_json(self, indent: int | None = None) -> str:
@@ -1127,31 +823,12 @@ class CommandEnvelope:
         if not isinstance(data, dict):
             raise TypeError("command envelope must be an object")
         required_fields = {
-            "schema_version",
-            "action",
-            "request_id",
-            "ok",
-            "dry_run",
-            "status",
-            "disposition",
-            "result",
-            "error",
-            "warnings",
+            "schema_version", "action", "request_id", "ok", "dry_run", "status",
+            "disposition", "result", "error", "warnings",
         }
         if set(data) != required_fields:
             raise ValueError("command envelope must contain exactly the schema fields")
-        envelope = cls(
-            ok=data["ok"],
-            status=data["status"],
-            action=data["action"],
-            disposition=data["disposition"],
-            request_id=data["request_id"],
-            dry_run=data["dry_run"],
-            result=data["result"],
-            error=data["error"],
-            warnings=data["warnings"],
-            schema_version=data["schema_version"],
-        )
+        envelope = cls(**data)
         if envelope.to_dict() != data:
             raise ValueError("command envelope is not an exact public roundtrip")
         return envelope
@@ -1170,70 +847,42 @@ class CommandEnvelope:
         schema_version: int = COMMAND_ENVELOPE_SCHEMA_VERSION,
     ) -> "CommandEnvelope":
         return cls(
-            ok=ok,
-            status=status,
-            action=request.action,
-            disposition=disposition,
-            request_id=request.request_id,
-            dry_run=request.dry_run,
-            result=result,
-            error=error,
-            warnings=list(warnings or []),
-            schema_version=schema_version,
+            ok=ok, status=status, action=request.action, disposition=disposition,
+            request_id=request.request_id, dry_run=request.dry_run, result=result,
+            error=error, warnings=list(warnings or []), schema_version=schema_version,
         )
 
     @classmethod
     def from_error(cls, request: CommandRequest | None, error: dict[str, Any]) -> "CommandEnvelope":
         """Build a no-receipt rejection envelope from a partial or missing request."""
         if request is None:
-            return cls(
-                ok=False,
-                status=error.get("code", STATUS_INVALID_REQUEST),
-                action="",
-                request_id=None,
-                dry_run=True,
-                result=None,
-                error=error,
+            action, request_id, dry_run, default_status = "", None, True, STATUS_INVALID_REQUEST
+        else:
+            action = request.action
+            mutating = action in {"send_instruction", "answer_decision"}
+            valid_mutation_id = is_valid_request_id(request.request_id)
+            request_id = request.request_id if (
+                valid_mutation_id or not mutating and isinstance(request.request_id, str)
+            ) else None
+            dry_run = (
+                True if mutating and request.dry_run is False and not valid_mutation_id
+                else request.dry_run
             )
-        mutating = request.action in {
-            "send_instruction",
-            "answer_decision",
-        }
-        valid_mutation_id = is_valid_request_id(request.request_id)
-        request_id = (
-            request.request_id
-            if valid_mutation_id or (not mutating and isinstance(request.request_id, str))
-            else None
-        )
-        dry_run = request.dry_run
-        if mutating and dry_run is False and not valid_mutation_id:
-            # An invalid request was rejected before it became a live mutation.
-            # Do not emit a wire envelope that claims otherwise.
-            dry_run = True
+            default_status = STATUS_REJECTED
         return cls(
-            ok=False,
-            status=error.get("code", STATUS_REJECTED),
-            action=request.action,
-            request_id=request_id,
-            dry_run=dry_run,
-            result=None,
-            error=error,
+            ok=False, status=error.get("code", default_status), action=action,
+            request_id=request_id, dry_run=dry_run, error=error,
         )
 
 
-def worker_candidate(worker: Worker, *, include_backend_target: bool = False) -> dict[str, Any]:
+def worker_candidate(worker: Worker) -> dict[str, Any]:
     """Return a sanitized neutral candidate description for a worker."""
     candidate: dict[str, Any] = {
-        "worker_id": worker.id,
-        "name": worker.name,
-        "space_id": worker.space_id,
-        "status": worker.status,
-        "worker_fingerprint": worker.fingerprint,
+        "worker_id": worker.id, "name": worker.name, "space_id": worker.space_id,
+        "status": worker.status, "worker_fingerprint": worker.fingerprint,
     }
     if worker.summary:
         candidate["summary"] = worker.summary
-    if include_backend_target and worker.backend_target:
-        candidate["backend_target"] = dict(worker.backend_target)
     return candidate
 
 
@@ -1242,7 +891,6 @@ def resolve_target(
     workers: list[Worker],
     *,
     allow_disallowed_status: bool = False,
-    include_backend_target: bool = False,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str]:
     """Resolve a target dict against live workers.
 
@@ -1261,41 +909,30 @@ def resolve_target(
     stable_key = _string_value(target.get("stable_key"))
     stable_key_version = target.get("stable_key_version")
 
-    # First match by identity/name/space, excluding fingerprint.
-    identity_matches: list[Worker] = []
-    for worker in workers:
-        if worker_id and worker.id != worker_id:
-            continue
-        if name and worker.name != name:
-            continue
-        if space_id is not None and worker.space_id != space_id:
-            continue
-        if stable_key and (
-            worker.meta.get("stable_key") != stable_key
-            or worker.meta.get("stable_key_version") != stable_key_version
-        ):
-            continue
-        identity_matches.append(worker)
+    identity_matches = [worker for worker in workers if (
+        (not worker_id or worker.id == worker_id)
+        and (not name or worker.name == name)
+        and (space_id is None or worker.space_id == space_id)
+        and (not stable_key or (
+            worker.meta.get("stable_key") == stable_key
+            and worker.meta.get("stable_key_version") == stable_key_version
+        ))
+    )]
 
     # If a fingerprint was supplied, filter further. A non-empty identity match
     # that becomes empty due to fingerprint mismatch signals a stale target.
     if fingerprint is not None:
         fingerprint_matches = [w for w in identity_matches if w.fingerprint == fingerprint]
         if identity_matches and not fingerprint_matches:
-            if len(identity_matches) == 1:
-                return None, [worker_candidate(identity_matches[0])], STATUS_STALE_TARGET
-            # Multiple identity matches with no fingerprint match is ambiguous.
-            return None, [worker_candidate(w) for w in identity_matches], STATUS_AMBIGUOUS_TARGET
+            status = STATUS_STALE_TARGET if len(identity_matches) == 1 else STATUS_AMBIGUOUS_TARGET
+            return None, [worker_candidate(w) for w in identity_matches], status
         candidates = fingerprint_matches
     else:
         candidates = identity_matches
 
-    sanitized = [
-        worker_candidate(worker, include_backend_target=include_backend_target)
-        for worker in candidates
-    ]
+    sanitized = [worker_candidate(worker) for worker in candidates]
 
-    if len(candidates) == 0:
+    if not candidates:
         return None, [], STATUS_NOT_FOUND
     if len(candidates) > 1:
         return None, sanitized, STATUS_AMBIGUOUS_TARGET

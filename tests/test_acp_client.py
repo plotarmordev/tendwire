@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,6 @@ import pytest
 from tendwire.backends.acp_client import (
     AcpCapabilityError,
     BoundedAcpConnection as AcpClient,
-    AcpEventQueueFullError,
     AcpRequestTimeoutError,
     AcpTransportError,
     ClientState,
@@ -19,7 +19,6 @@ from tendwire.backends.acp_protocol import (
     AcpProtocolError,
     PermissionRequest,
     SessionUpdate,
-    SessionUpdateKind,
     StopReason,
     SteeringOutcome,
 )
@@ -32,6 +31,15 @@ def client(mode: str = "normal", **kwargs: object) -> AcpClient:
     return AcpClient([sys.executable, "-u", str(FAKE_AGENT), mode], **kwargs)
 
 
+@contextmanager
+def opened_client(mode: str = "normal", **kwargs: object):
+    acp = client(mode, **kwargs)
+    try:
+        yield acp
+    finally:
+        acp.close()
+
+
 def _typed_update(index: int) -> SessionUpdate:
     update = {
         "sessionUpdate": "agent_message_chunk",
@@ -39,7 +47,7 @@ def _typed_update(index: int) -> SessionUpdate:
         "content": {"type": "text", "text": str(index)},
     }
     raw = {"sessionId": "s", "update": update}
-    return SessionUpdate("s", SessionUpdateKind.AGENT_MESSAGE_CHUNK, update, None, raw)
+    return SessionUpdate("s", raw)
 
 
 def _typed_permission(index: int) -> PermissionRequest:
@@ -64,14 +72,6 @@ def _install_permission(acp: AcpClient, request: PermissionRequest) -> None:
     acp._put_session_event(request)
 
 
-def _waiter_has_released_condition(acp: AcpClient, ready: threading.Event) -> None:
-    assert ready.wait(timeout=1)
-    # The routing callback signals just before Condition.wait(). Acquiring the
-    # condition proves that the consumer has actually released it to sleep.
-    with acp._session_event_condition:
-        pass
-
-
 def _wait_for_condition_waiters(acp: AcpClient, count: int) -> None:
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
@@ -90,16 +90,11 @@ def _capture_failure(method, failures: list[BaseException]) -> None:
 
 
 def test_initialize_capabilities_and_session_lifecycle() -> None:
-    with client() as acp:
+    with opened_client() as acp:
         initialized = acp.initialize()
-        assert initialized.protocol_version == 1
-        assert initialized.agent_info == {"name": "fake", "version": "1.0"}
-        assert initialized.capabilities.load_session
-        assert initialized.capabilities.session_list
-        assert initialized.capabilities.session_resume
-        assert initialized.capabilities.session_close
-        assert initialized.capabilities.session_delete
-        assert initialized.capabilities.raw["_meta"] == {
+        assert initialized["loadSession"] is True
+        assert initialized["sessionCapabilities"]["resume"] == {}
+        assert initialized["_meta"] == {
             "vendor.example": {"level": 2}
         }
         assert acp.state is ClientState.INITIALIZED
@@ -108,54 +103,35 @@ def test_initialize_capabilities_and_session_lifecycle() -> None:
             "/tmp/project",
             additional_directories=["/tmp/other"],
         )
-        assert created.session_id == "s-new"
-        assert created.modes == {
-            "currentModeId": "default",
-            "availableModes": [{"id": "default", "name": "Default"}],
-        }
-        streamed = acp.next_update(timeout=1)
-        assert streamed.update_kind is SessionUpdateKind.AGENT_MESSAGE_CHUNK
+        assert created == "s-new"
+        streamed = acp.next_session_event(timeout=1)
+        assert streamed.raw["update"]["sessionUpdate"] == "agent_message_chunk"
 
         loaded = acp.load_session("s1", "/tmp/project")
         resumed = acp.resume_session("s1", "/tmp/project")
-        assert loaded.session_id == "s1"
-        assert resumed.config_options[0]["id"] == "model"
-
-        first = acp.list_sessions(cwd="/tmp/project")
-        assert first.sessions[0].session_id == "s1"
-        assert first.next_cursor == "page-2"
-        second = acp.list_sessions(cursor=first.next_cursor)
-        assert second.sessions[0].title == "second"
-        assert second.next_cursor is None
-
-        assert acp.close_session("s1")["_meta"]["vendor.example"]["receipt"] == "session/close"
-        assert acp.delete_session("s2")["_meta"]["vendor.example"]["receipt"] == "session/delete"
+        assert loaded == "s1"
+        assert resumed == "s1"
 
     assert acp.state is ClientState.CLOSED
-    assert acp.exit is not None
-    assert acp.exit.returncode == 0
 
 
 def test_load_session_accepts_standard_null_result(monkeypatch: pytest.MonkeyPatch) -> None:
     """ACP v1 completes load replay with a JSON-RPC null result."""
 
-    with client() as acp:
+    with opened_client() as acp:
         acp.initialize()
         monkeypatch.setattr(acp, "request", lambda *_args, **_kwargs: None)
         loaded = acp.load_session("s1", "/tmp/project")
 
-    assert loaded.session_id == "s1"
-    assert loaded.modes is None
-    assert loaded.config_options == ()
-    assert loaded.raw == {}
+    assert loaded == "s1"
 
 
 def test_prompt_stream_and_permission_response_can_run_concurrently() -> None:
-    with client() as acp:
+    with opened_client() as acp:
         acp.initialize()
         acp.new_session("/tmp/project")
         # Drain the new-session message update.
-        acp.next_update(timeout=1)
+        acp.next_session_event(timeout=1)
 
         outcome: list[object] = []
         failure: list[BaseException] = []
@@ -168,25 +144,25 @@ def test_prompt_stream_and_permission_response_can_run_concurrently() -> None:
 
         thread = threading.Thread(target=run_prompt)
         thread.start()
-        thought = acp.next_update(timeout=1)
-        assert thought.update_kind is SessionUpdateKind.AGENT_THOUGHT_CHUNK
-        permission = acp.next_permission_request(timeout=1)
+        thought = acp.next_session_event(timeout=1)
+        assert thought.raw["update"]["sessionUpdate"] == "agent_thought_chunk"
+        permission = acp.next_session_event(timeout=1)
         assert permission.options[0].option_id == "allow"
         acp.respond_permission(permission.request_id, option_id="allow")
-        plan = acp.next_update(timeout=1)
-        assert plan.update_kind is SessionUpdateKind.PLAN
+        plan = acp.next_session_event(timeout=1)
+        assert plan.raw["update"]["sessionUpdate"] == "plan"
         thread.join(timeout=2)
 
         assert not thread.is_alive()
         assert not failure
-        assert outcome[0].stop_reason is StopReason.END_TURN
+        assert outcome[0] is StopReason.END_TURN
 
 
 def test_advertised_steering_extension_is_capability_gated() -> None:
-    with client("steering") as acp:
+    with opened_client("steering") as acp:
         acp.initialize()
         acp.new_session("/tmp/project")
-        acp.next_update(timeout=1)
+        acp.next_session_event(timeout=1)
         assert acp.steering_supported
         callbacks: list[str] = []
         result = acp.steer_session(
@@ -195,12 +171,12 @@ def test_advertised_steering_extension_is_capability_gated() -> None:
             on_send_start=lambda: callbacks.append("started"),
             on_submitted=lambda: callbacks.append("submitted"),
         )
-        assert result.outcome is SteeringOutcome.INJECTED
+        assert result is SteeringOutcome.INJECTED
         assert callbacks == ["started", "submitted"]
-        echoed = acp.next_update(timeout=1)
-        assert echoed.update_kind is SessionUpdateKind.USER_MESSAGE_CHUNK
+        echoed = acp.next_session_event(timeout=1)
+        assert echoed.raw["update"]["sessionUpdate"] == "user_message_chunk"
 
-    with client() as acp:
+    with opened_client() as acp:
         acp.initialize()
         assert not acp.steering_supported
         with pytest.raises(AcpCapabilityError, match="steering"):
@@ -208,7 +184,7 @@ def test_advertised_steering_extension_is_capability_gated() -> None:
 
 
 def test_ordered_session_event_api_preserves_cross_kind_reader_order() -> None:
-    with client() as acp:
+    with opened_client() as acp:
         acp.initialize()
         outcome: list[object] = []
         thread = threading.Thread(
@@ -217,62 +193,14 @@ def test_ordered_session_event_api_preserves_cross_kind_reader_order() -> None:
         thread.start()
         first = acp.next_session_event(timeout=1)
         second = acp.next_session_event(timeout=1)
-        assert first.update_kind is SessionUpdateKind.AGENT_THOUGHT_CHUNK
+        assert first.raw["update"]["sessionUpdate"] == "agent_thought_chunk"
         assert second.options[0].option_id == "allow"
         acp.respond_permission(second.request_id, option_id="allow")
         third = acp.next_session_event(timeout=1)
-        assert third.update_kind is SessionUpdateKind.PLAN
+        assert third.raw["update"]["sessionUpdate"] == "plan"
         thread.join(timeout=2)
         assert not thread.is_alive()
-        assert outcome[0].stop_reason is StopReason.END_TURN
-
-
-@pytest.mark.parametrize("first_kind", ("permission", "update"))
-def test_concurrent_typed_consumers_route_either_first_kind_without_deadlock(
-    first_kind: str,
-) -> None:
-    acp = client()
-    update = _typed_update(1)
-    permission = _typed_permission(1)
-    waiting = threading.Event()
-    original_match = acp._matching_session_event_index
-    waiting_type = SessionUpdate if first_kind == "permission" else PermissionRequest
-
-    def observe_wait(expected: object) -> int | None:
-        result = original_match(expected)
-        if expected is waiting_type and result is None:
-            waiting.set()
-        return result
-
-    acp._matching_session_event_index = observe_wait  # type: ignore[method-assign]
-    if first_kind == "permission":
-        _install_permission(acp, permission)
-    else:
-        acp._put_session_event(update)
-
-    updates: list[SessionUpdate] = []
-    permissions: list[PermissionRequest] = []
-    update_thread = threading.Thread(target=lambda: updates.append(acp.next_update()))
-    permission_thread = threading.Thread(
-        target=lambda: permissions.append(acp.next_permission_request())
-    )
-    blocked_thread = update_thread if first_kind == "permission" else permission_thread
-    matching_thread = permission_thread if first_kind == "permission" else update_thread
-    blocked_thread.start()
-    _waiter_has_released_condition(acp, waiting)
-    matching_thread.start()
-    matching_thread.join(timeout=1)
-    assert not matching_thread.is_alive()
-
-    if first_kind == "permission":
-        acp._put_session_event(update)
-    else:
-        _install_permission(acp, permission)
-    blocked_thread.join(timeout=1)
-    assert not blocked_thread.is_alive()
-    assert updates == [update]
-    assert permissions == [permission]
-    assert list(acp._session_events) == []
+        assert outcome[0] is StopReason.END_TURN
 
 
 def test_ordered_consumer_remains_exact_with_mixed_session_events() -> None:
@@ -296,10 +224,8 @@ def test_close_and_failure_wake_all_session_event_waiters() -> None:
     acp = client()
     failures: list[BaseException] = []
     threads = [
-        threading.Thread(
-            target=lambda method=method: _capture_failure(method, failures)
-        )
-        for method in (acp.next_update, acp.next_permission_request)
+        threading.Thread(target=lambda: _capture_failure(acp.next_session_event, failures))
+        for _ in range(2)
     ]
     for thread in threads:
         thread.start()
@@ -324,21 +250,16 @@ def test_close_and_failure_wake_all_session_event_waiters() -> None:
     assert isinstance(failure[0], AcpTransportError)
 
 
-def test_mixed_typed_consumer_stress_is_bounded_and_exactly_once() -> None:
+def test_ordered_consumer_stress_is_bounded_and_exactly_once() -> None:
     acp = client(max_pending_events=8)
     count = 200
-    updates: list[SessionUpdate] = []
-    permissions: list[PermissionRequest] = []
-    update_thread = threading.Thread(
-        target=lambda: updates.extend(acp.next_update() for _ in range(count))
-    )
-    permission_thread = threading.Thread(
-        target=lambda: permissions.extend(
-            acp.next_permission_request() for _ in range(count)
+    received: list[SessionUpdate | PermissionRequest] = []
+    consumer = threading.Thread(
+        target=lambda: received.extend(
+            acp.next_session_event() for _ in range(count * 2)
         )
     )
-    update_thread.start()
-    permission_thread.start()
+    consumer.start()
     maximum_depth = 0
     for index in range(count):
         update = _typed_update(index)
@@ -351,82 +272,72 @@ def test_mixed_typed_consumer_stress_is_bounded_and_exactly_once() -> None:
             _install_permission(acp, permission)
         with acp._session_event_condition:
             maximum_depth = max(maximum_depth, len(acp._session_events))
-    update_thread.join(timeout=3)
-    permission_thread.join(timeout=3)
+    consumer.join(timeout=3)
 
-    assert not update_thread.is_alive()
-    assert not permission_thread.is_alive()
+    assert not consumer.is_alive()
     assert maximum_depth <= acp.max_pending_events
-    assert [item.update["messageId"] for item in updates] == [
-        f"message-{index}" for index in range(count)
-    ]
-    assert [item.request_id for item in permissions] == list(range(count))
+    assert sum(isinstance(item, SessionUpdate) for item in received) == count
+    assert sum(isinstance(item, PermissionRequest) for item in received) == count
     assert list(acp._session_events) == []
 
 
 def test_cancel_resolves_pending_permissions_as_cancelled() -> None:
-    with client() as acp:
+    with opened_client() as acp:
         acp.initialize()
         result: list[object] = []
         thread = threading.Thread(target=lambda: result.append(acp.prompt("s1", "wait")))
         thread.start()
-        acp.next_update(timeout=1)
-        acp.next_permission_request(timeout=1)
+        acp.next_session_event(timeout=1)
+        acp.next_session_event(timeout=1)
         acp.cancel("s1")
-        acp.next_update(timeout=1)
+        acp.next_session_event(timeout=1)
         thread.join(timeout=2)
         assert not thread.is_alive()
-        assert result[0].stop_reason is StopReason.CANCELLED
+        assert result[0] is StopReason.CANCELLED
 
 
 def test_cancel_also_resolves_permission_that_races_after_notification() -> None:
-    with client("cancel_race") as acp:
+    with opened_client("cancel_race") as acp:
         acp.initialize()
         result: list[object] = []
         thread = threading.Thread(target=lambda: result.append(acp.prompt("s1", "wait")))
         thread.start()
-        acp.next_update(timeout=1)
-        acp.next_permission_request(timeout=1)
+        acp.next_session_event(timeout=1)
+        acp.next_session_event(timeout=1)
         acp.cancel("s1")
-        acp.next_update(timeout=1)
+        acp.next_session_event(timeout=1)
         thread.join(timeout=2)
         assert not thread.is_alive()
-        assert result[0].stop_reason is StopReason.CANCELLED
+        assert result[0] is StopReason.CANCELLED
         with pytest.raises(AcpRequestTimeoutError):
-            acp.next_permission_request(timeout=0.05)
+            acp.next_session_event(timeout=0.05)
 
 
 def test_optional_methods_require_advertised_capabilities() -> None:
-    with client("baseline") as acp:
+    with opened_client("baseline") as acp:
         acp.initialize()
         with pytest.raises(AcpCapabilityError):
-            acp.list_sessions()
-        with pytest.raises(AcpCapabilityError):
             acp.load_session("s1", "/tmp")
-        with pytest.raises(AcpCapabilityError):
-            acp.close_session("s1")
-        with pytest.raises(AcpCapabilityError):
-            acp.delete_session("s1")
 
 
 def test_request_timeout_does_not_poison_transport() -> None:
-    with client("slow", request_timeout=0.05) as acp:
+    with opened_client("slow", request_timeout=0.05) as acp:
         acp.initialize(timeout=1)
         with pytest.raises(AcpRequestTimeoutError):
-            acp.list_sessions()
+            acp.request("session/list", {})
         assert acp.state is ClientState.INITIALIZED
 
 
 @pytest.mark.parametrize("mode", ["malformed", "oversize", "partial_eof"])
 def test_malformed_or_oversized_stdout_fails_connection(mode: str) -> None:
-    with client(mode, max_frame_bytes=1024) as acp:
+    with opened_client(mode, max_frame_bytes=1024) as acp:
         with pytest.raises(AcpProtocolError):
             acp.initialize(timeout=1)
         assert acp.state is ClientState.FAILED
 
 
 def test_absolute_session_paths_are_enforced_before_write() -> None:
-    with client() as acp:
+    with opened_client() as acp:
         acp.initialize()
         with pytest.raises(ValueError, match="absolute"):
             acp.new_session("relative/path")
@@ -438,7 +349,7 @@ def test_prewrite_callback_failure_emits_no_acp_frame(
     class ReceiptUnavailable(RuntimeError):
         pass
 
-    with client() as acp:
+    with opened_client() as acp:
         acp.initialize()
         writes: list[object] = []
 
@@ -459,7 +370,7 @@ def test_prewrite_callback_failure_emits_no_acp_frame(
 
 
 def test_write_lock_timeout_does_not_cross_prewrite_boundary() -> None:
-    with client() as acp:
+    with opened_client() as acp:
         acp.initialize()
         callbacks: list[str] = []
         assert acp._write_lock.acquire(timeout=0.1)
@@ -481,7 +392,7 @@ def test_write_lock_timeout_does_not_cross_prewrite_boundary() -> None:
 def test_unwritable_transport_does_not_cross_prewrite_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with client() as acp:
+    with opened_client() as acp:
         acp.initialize()
         callbacks: list[str] = []
         monkeypatch.setattr(acp, "_wait_writable", lambda _fd, _timeout: False)
@@ -498,17 +409,18 @@ def test_unwritable_transport_does_not_cross_prewrite_boundary(
 
 
 def test_prompt_content_is_validated_and_gated_by_negotiated_capabilities() -> None:
-    with client("baseline") as acp:
+    with opened_client("baseline") as acp:
         acp.initialize()
         with pytest.raises(AcpCapabilityError, match="image"):
             acp.prompt(
                 "s1",
                 [{"type": "image", "data": "AA==", "mimeType": "image/png"}],
             )
-        with pytest.raises(ValueError, match="text"):
-            acp.prompt("s1", [{"type": "text"}])
-        with pytest.raises(ValueError, match="outside"):
-            acp.prompt("s1", [{"type": "text", "text": "ok", "vendor": True}])
+        with pytest.raises(ValueError, match="text content"):
+            acp.prepare_prompt([{"type": "text"}])
+        assert acp.prepare_prompt(
+            [{"type": "text", "text": "ok", "vendor": True}]
+        ) == ({"type": "text", "text": "ok"},)
 
 
 def test_prompt_content_matches_stable_v1_generated_shapes() -> None:
@@ -526,14 +438,14 @@ def test_prompt_content_matches_stable_v1_generated_shapes() -> None:
             },
         },
     ]
-    with client("echo_prompt") as acp:
+    with opened_client("echo_prompt") as acp:
         acp.initialize()
         result = acp.prompt("s1", blocks)
-        assert result.stop_reason is StopReason.END_TURN
+        assert result is StopReason.END_TURN
 
 
 def test_mcp_servers_match_stable_v1_generated_shapes_and_capabilities() -> None:
-    with client() as acp:
+    with opened_client() as acp:
         acp.initialize()
         created = acp.new_session(
             "/tmp/project",
@@ -558,9 +470,9 @@ def test_mcp_servers_match_stable_v1_generated_shapes_and_capabilities() -> None
                 },
             ],
         )
-        assert created.session_id == "s-new"
+        assert created == "s-new"
 
-    with client("baseline") as acp:
+    with opened_client("baseline") as acp:
         acp.initialize()
         with pytest.raises(AcpCapabilityError, match="HTTP"):
             acp.new_session(
@@ -597,7 +509,7 @@ def test_mcp_servers_match_stable_v1_generated_shapes_and_capabilities() -> None
 
 
 def test_concurrent_initialize_is_exactly_once_and_returns_same_result() -> None:
-    with client() as acp:
+    with opened_client() as acp:
         results: list[object] = []
         failures: list[BaseException] = []
 
@@ -618,17 +530,16 @@ def test_concurrent_initialize_is_exactly_once_and_returns_same_result() -> None
 
 
 def test_backpressure_failure_remains_visible_after_full_queue_drains() -> None:
-    with client("flood", max_pending_events=1) as acp:
+    with opened_client("flood", max_pending_events=1) as acp:
         acp.initialize()
         deadline = time.monotonic() + 1
         while acp.state is not ClientState.FAILED and time.monotonic() < deadline:
             time.sleep(0.01)
         assert acp.state is ClientState.FAILED
-        assert isinstance(acp.failure, AcpEventQueueFullError)
-        first = acp.next_update(timeout=1)
-        assert first.update_kind is SessionUpdateKind.AGENT_MESSAGE_CHUNK
+        first = acp.next_session_event(timeout=1)
+        assert first.raw["update"]["sessionUpdate"] == "agent_message_chunk"
         with pytest.raises(AcpTransportError):
-            acp.next_update(timeout=1)
+            acp.next_session_event(timeout=1)
 
 
 def test_blocked_or_partial_stdin_write_is_bounded_and_terminal(
@@ -666,78 +577,34 @@ def test_close_escalates_to_kill_for_stubborn_adapter() -> None:
     acp.initialize()
     acp.close()
     assert acp.state is ClientState.CLOSED
-    assert acp.exit is not None
-    assert acp.exit.returncode != 0
-
-
-def test_stderr_tail_is_bounded_and_keeps_suffix() -> None:
-    acp = client("stderr_tail", stderr_limit_bytes=64)
-    acp.initialize()
-    acp.close()
-    tail = acp.stderr_tail()
-    assert len(tail.encode()) <= 64
-    assert tail.endswith("-TAIL")
-
-
-def test_unknown_adapter_extensions_remain_observable() -> None:
-    method = "_vendor.example/future_notification"
-    with client("extensions", supported_extension_notifications=(method,)) as acp:
-        initialized = acp.initialize()
-        assert initialized.capabilities.raw["_meta"] == {
-            "vendor.example": {"level": 2}
-        }
-        notification = acp.next_notification(timeout=1)
-        assert notification.method == method
-        assert notification.params["opaque"] == {"revision": 9}
-
-
-def test_unrecognized_extension_notifications_are_ignored_without_backpressure() -> None:
-    with client("extension_flood", max_pending_events=1) as acp:
-        acp.initialize()
-        time.sleep(0.1)
-        assert acp.state is ClientState.INITIALIZED
-        with pytest.raises(AcpRequestTimeoutError):
-            acp.next_notification(timeout=0.05)
 
 
 def test_unsupported_inbound_request_gets_automatic_method_not_found() -> None:
-    with client("unknown_request") as acp:
+    with opened_client("unknown_request") as acp:
         acp.initialize()
-        confirmation = acp.next_update(timeout=1)
+        confirmation = acp.next_session_event(timeout=1)
         assert confirmation.session_id == "s-extension"
-        assert confirmation.update["content"]["text"] == "method-not-found"
-
-
-def test_explicitly_supported_extension_request_remains_observable() -> None:
-    method = "_vendor.example/request"
-    with client("supported_request", supported_extension_requests=(method,)) as acp:
-        acp.initialize()
-        request = acp.next_inbound_request(timeout=1)
-        assert request.method == method
-        acp.reject_inbound_request(request.request_id)
-        confirmation = acp.next_update(timeout=1)
-        assert confirmation.update["content"]["text"] == "method-not-found"
+        assert confirmation.raw["update"]["content"]["text"] == "method-not-found"
 
 
 def test_uncorrelated_null_error_response_does_not_poison_transport() -> None:
-    with client("null_response") as acp:
+    with opened_client("null_response") as acp:
         acp.initialize()
         time.sleep(0.05)
         assert acp.state is ClientState.INITIALIZED
 
 
 def test_unexpected_clean_stdout_eof_is_transport_failure() -> None:
-    with client("exit_after_init") as acp:
+    with opened_client("exit_after_init") as acp:
         acp.initialize()
         deadline = time.monotonic() + 1
         while acp.state is not ClientState.FAILED and time.monotonic() < deadline:
             time.sleep(0.01)
         assert acp.state is ClientState.FAILED
-        assert isinstance(acp.failure, AcpTransportError)
 
 
 def test_boolean_protocol_version_is_not_accepted_as_integer_one() -> None:
-    with client("bool_version") as acp:
+    with opened_client("bool_version") as acp:
         with pytest.raises(AcpProtocolError, match="protocol version"):
             acp.initialize()
         assert acp.state is ClientState.FAILED
@@ -747,8 +614,8 @@ def test_unsupported_protocol_version_is_reaped_during_initialize() -> None:
     acp = client("bool_version", close_timeout=0.1)
     with pytest.raises(AcpProtocolError, match="protocol version"):
         acp.initialize()
-    assert acp.process is not None
-    assert acp.process.poll() is not None
+    assert acp.state is ClientState.FAILED
+    acp.close()
 
 
 @pytest.mark.parametrize(

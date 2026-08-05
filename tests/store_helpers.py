@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from tendwire.core.agent_events import AgentEvent, AppendAgentEventResult
-from tendwire.core.models import sanitize_public_mapping, stable_fingerprint
+from tendwire.core.models import Snapshot, Worker, WorkerBinding, sanitize_public_mapping, stable_fingerprint
 from tendwire.core.turns import PendingObservation, PendingObservedChoice
-from tendwire.store.sqlite import (
-    apply_turn_refresh,
+from tendwire.store.events import list_agent_events, record_agent_event
+from tendwire.store.projection import (
     attention_payload_from_store,
-    list_agent_events,
-    record_agent_event,
+    latest_snapshot,
+    save_snapshot,
+    upsert_worker_bindings as _upsert_worker_bindings,
 )
+from tendwire.store.schema import init_store
+from tendwire.store.turns import apply_turn_refresh
 
 
 def apply_test_turn_refresh(
@@ -39,6 +44,9 @@ def apply_test_backend_pending(
     host_id: str,
     worker_id: str,
     pending: Mapping[str, Any] | None,
+    *,
+    expected_binding: WorkerBinding | None = None,
+    observed_at: str | None = None,
 ) -> bool:
     if pending is None:
         observation = PendingObservation("read_succeeded_no_prompt")
@@ -78,6 +86,8 @@ def apply_test_backend_pending(
         worker_id,
         {},
         backend_pending_observation=observation,
+        expected_binding=expected_binding,
+        observed_at=observed_at,
     ).pending_changed
 
 
@@ -126,3 +136,48 @@ def read_public_test_agent_events(
         item.public_dict()
         for item in list_agent_events(db_path, host_id, visibility="public")
     )
+
+
+def upsert_test_worker_bindings(
+    db_path: Path,
+    bindings: list[WorkerBinding] | tuple[WorkerBinding, ...],
+) -> int:
+    """Persist test routes through the supported snapshot/binding transaction."""
+    init_store(db_path)
+    for binding in bindings:
+        snapshot = latest_snapshot(db_path, binding.host_id)
+        workers = list(snapshot.workers) if snapshot is not None else []
+        worker = next((item for item in workers if item.id == binding.worker_id), None)
+        if worker is None:
+            stable_key = "wsk1_" + hashlib.sha256(binding.worker_id.encode()).hexdigest()
+            worker = Worker(
+                id=binding.worker_id,
+                name=binding.worker_id,
+                fingerprint=binding.worker_fingerprint,
+                meta={"stable_key": stable_key, "stable_key_version": 1},
+            )
+            workers.append(worker)
+        elif not isinstance(worker.meta.get("stable_key"), str):
+            meta = dict(worker.meta)
+            meta.update(
+                {
+                    "stable_key": "wsk1_"
+                    + hashlib.sha256(binding.worker_id.encode()).hexdigest(),
+                    "stable_key_version": 1,
+                }
+            )
+            worker = replace(worker, meta=meta, fingerprint="")
+            workers = [worker if item.id == worker.id else item for item in workers]
+        save_snapshot(
+            db_path,
+            Snapshot(
+                host_id=binding.host_id,
+                updated_at=(snapshot.updated_at if snapshot is not None else binding.observed_at),
+                spaces=(() if snapshot is None else snapshot.spaces),
+                workers=workers,
+                attention=(() if snapshot is None else snapshot.attention),
+                backend_health=(() if snapshot is None else snapshot.backend_health),
+            ),
+        )
+        _upsert_worker_bindings(db_path, [binding])
+    return len(bindings)

@@ -12,31 +12,37 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import tendwire.store.sqlite as store_sqlite
 import tendwire.command_submission as command_submission
 from tendwire.backends.acp_permissions import AcpPermissionBroker
 from tendwire.backends.acp_protocol import (
     PermissionOption,
-    PermissionOptionKind,
     PermissionRequest,
-    SessionResult,
 )
 from tendwire.backends.acp_runtime import AcpWorkerSession, SessionOpenMode
 from tendwire.command_submission import submit_command
 from tendwire.config import Config
 from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
 from tendwire.daemon import TendwireDaemon
-from tendwire.store.sqlite import (
-    expire_worker_bindings,
-    get_command_request,
-    init_store,
-    list_worker_bindings,
+from tendwire.store.pending import (
+    claim_backend_pending_decision,
+    finish_backend_pending_decision_send,
     pending_payload_from_store,
-    save_snapshot,
-    upsert_worker_bindings,
+    start_backend_pending_decision_send,
 )
+from tendwire.store.projection import (
+    expire_worker_bindings,
+    list_worker_bindings,
+    save_snapshot,
+)
+from tendwire.store.receipts import get_command_request
+from tendwire.store.retention import RetentionPolicy, run_retention_cycle
+from tendwire.store.schema import init_store
 
 from tests.test_acp_runtime import FakeClient, FakeIngestor
+from .store_helpers import (
+    apply_test_backend_pending,
+    upsert_test_worker_bindings as upsert_worker_bindings,
+)
 
 
 def _config(tmp_path: Path) -> Config:
@@ -127,14 +133,12 @@ def _permission(session_id: str) -> PermissionRequest:
         PermissionOption(
             "private-allow-id",
             "Allow once",
-            PermissionOptionKind.ALLOW_ONCE,
-            {},
+            "allow_once",
         ),
         PermissionOption(
             "private-reject-id",
             "Reject",
-            PermissionOptionKind.REJECT_ONCE,
-            {},
+            "reject_once",
         ),
     )
     return PermissionRequest(
@@ -167,9 +171,41 @@ def _wait_pending(config: Any, worker_id: str) -> dict[str, Any]:
     raise AssertionError("permission overlay was not published")
 
 
+def _publish_test_choice(config: Config, worker_id: str, question: str) -> str:
+    assert config.db_path is not None
+    binding = list_worker_bindings(
+        config.db_path, config.host_id, backend="acp"
+    )[0]
+    assert apply_test_backend_pending(
+        config.db_path,
+        config.host_id,
+        worker_id,
+        {
+            "question": question,
+            "kind": "choice",
+            "choices": [{"label": "Allow"}, {"label": "Reject"}],
+        },
+        expected_binding=binding,
+    )
+    _wait_pending(config, worker_id)
+    with sqlite3.connect(config.db_path) as conn:
+        return str(
+            conn.execute(
+                """SELECT decision_ref FROM backend_pending
+                WHERE host_id=? AND worker_id=? AND state='open'""",
+                (config.host_id, worker_id),
+            ).fetchone()[0]
+        )
+
+
 def _setup(tmp_path: Path) -> tuple[Any, Worker, str, AcpPermissionBroker]:
     config = _config(tmp_path)
-    worker = Worker(id="w-1", name="Alpha", status="active")
+    worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="active",
+        meta={"stable_key": "wsk1_" + "a" * 64, "stable_key_version": 1},
+    )
     continuity = _binding(worker)
     _seed(config, [worker], [continuity])
     session_id = "private-session-id"
@@ -196,6 +232,315 @@ def _setup(tmp_path: Path) -> tuple[Any, Worker, str, AcpPermissionBroker]:
     )
 
 
+def test_expired_pending_claim_takeover_fences_old_token(
+    tmp_path: Path,
+) -> None:
+    config, worker, _session_id, _broker = _setup(tmp_path)
+    assert config.db_path is not None
+    decision_ref = _publish_test_choice(config, worker.id, "Choose once")
+    first = claim_backend_pending_decision(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        decision_ref,
+        {"text": "first"},
+        observed_at="2026-08-05T00:00:00Z",
+        claim_lease_seconds=10,
+    )
+    second = claim_backend_pending_decision(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        decision_ref,
+        {"text": "second"},
+        observed_at="2026-08-05T00:00:11Z",
+        claim_lease_seconds=10,
+    )
+    assert first.status == second.status == "claimed"
+    assert first.claim_token and second.claim_token
+    assert first.claim_token != second.claim_token
+    assert start_backend_pending_decision_send(
+        config.db_path,
+        config.host_id,
+        first.claim_token,
+        observed_at="2026-08-05T00:00:12Z",
+    ).status == "not_found"
+    assert start_backend_pending_decision_send(
+        config.db_path,
+        config.host_id,
+        second.claim_token,
+        observed_at="2026-08-05T00:00:12Z",
+    ).status == "started"
+
+
+def test_send_started_pending_claim_is_never_reclaimed_and_late_claim_is_fenced(
+    tmp_path: Path,
+) -> None:
+    config, worker, _session_id, _broker = _setup(tmp_path)
+    assert config.db_path is not None
+    decision_ref = _publish_test_choice(config, worker.id, "Choose once")
+    claim = claim_backend_pending_decision(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        decision_ref,
+        {"text": "first"},
+        observed_at="2026-08-05T00:00:00Z",
+        claim_lease_seconds=10,
+    )
+    assert claim.claim_token
+    assert start_backend_pending_decision_send(
+        config.db_path,
+        config.host_id,
+        claim.claim_token,
+        observed_at="2026-08-05T00:00:01Z",
+    ).status == "started"
+    assert claim_backend_pending_decision(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        decision_ref,
+        {"text": "second"},
+        observed_at="2026-08-05T00:00:20Z",
+    ).status == "already_claimed"
+
+    other_ref = _publish_test_choice(config, worker.id, "Another choice")
+    late = claim_backend_pending_decision(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        other_ref,
+        {"text": "late"},
+        observed_at="2026-08-05T00:01:00Z",
+        claim_lease_seconds=5,
+    )
+    assert late.claim_token
+    assert start_backend_pending_decision_send(
+        config.db_path,
+        config.host_id,
+        late.claim_token,
+        observed_at="2026-08-05T00:01:06Z",
+    ).status == "changed"
+
+
+def test_new_pending_revision_after_expired_claim_can_be_claimed(
+    tmp_path: Path,
+) -> None:
+    config, worker, _session_id, _broker = _setup(tmp_path)
+    assert config.db_path is not None
+    old_ref = _publish_test_choice(config, worker.id, "First revision")
+    old = claim_backend_pending_decision(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        old_ref,
+        {"text": "old"},
+        observed_at="2026-08-05T00:00:00Z",
+        claim_lease_seconds=5,
+    )
+    assert old.status == "claimed"
+    new_ref = _publish_test_choice(config, worker.id, "Second revision")
+    new = claim_backend_pending_decision(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        new_ref,
+        {"text": "new"},
+        observed_at="2026-08-05T00:00:06Z",
+        claim_lease_seconds=5,
+    )
+    assert new.status == "claimed"
+    assert new.claim_token and new.claim_token != old.claim_token
+
+
+def test_older_pending_open_cannot_supersede_newer_observation(
+    tmp_path: Path,
+) -> None:
+    config, worker, _session_id, _broker = _setup(tmp_path)
+    assert config.db_path is not None
+    binding = list_worker_bindings(
+        config.db_path, config.host_id, backend="acp"
+    )[0]
+    assert apply_test_backend_pending(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        {"question": "Newest question", "kind": "choice", "choices": []},
+        expected_binding=binding,
+        observed_at="2026-08-05T00:00:10Z",
+    )
+    before = pending_payload_from_store(config.db_path, config.host_id)
+    assert not apply_test_backend_pending(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        {"question": "Stale question", "kind": "choice", "choices": []},
+        expected_binding=binding,
+        observed_at="2026-08-05T00:00:09Z",
+    )
+    assert pending_payload_from_store(config.db_path, config.host_id) == before
+
+
+def test_older_pending_close_cannot_close_newer_observation(tmp_path: Path) -> None:
+    config, worker, _session_id, _broker = _setup(tmp_path)
+    assert config.db_path is not None
+    binding = list_worker_bindings(
+        config.db_path, config.host_id, backend="acp"
+    )[0]
+    assert apply_test_backend_pending(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        {"question": "Still current", "kind": "question", "choices": []},
+        expected_binding=binding,
+        observed_at="2026-08-05T00:00:10Z",
+    )
+    assert not apply_test_backend_pending(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        None,
+        expected_binding=binding,
+        observed_at="2026-08-05T00:00:09Z",
+    )
+    assert pending_payload_from_store(config.db_path, config.host_id)[
+        "pending_interactions"
+    ][0]["question"] == "Still current"
+
+
+def test_retention_deletes_settled_pending_claim_before_prompt(tmp_path: Path) -> None:
+    config, worker, _session_id, _broker = _setup(tmp_path)
+    assert config.db_path is not None
+    binding = list_worker_bindings(
+        config.db_path, config.host_id, backend="acp"
+    )[0]
+    assert apply_test_backend_pending(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        {"question": "Historical choice", "kind": "choice", "choices": []},
+        expected_binding=binding,
+        observed_at="2026-08-05T00:00:00Z",
+    )
+    with sqlite3.connect(config.db_path) as conn:
+        decision_ref = str(
+            conn.execute(
+                "SELECT decision_ref FROM backend_pending WHERE state='open'"
+            ).fetchone()[0]
+        )
+    claim = claim_backend_pending_decision(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        decision_ref,
+        {"text": "Allow"},
+        observed_at="2026-08-05T00:00:01Z",
+    )
+    assert claim.claim_token
+    assert start_backend_pending_decision_send(
+        config.db_path,
+        config.host_id,
+        claim.claim_token,
+        observed_at="2026-08-05T00:00:02Z",
+    ).status == "started"
+    assert finish_backend_pending_decision_send(
+        config.db_path,
+        config.host_id,
+        claim.claim_token,
+        accepted=True,
+        observed_at="2026-08-05T00:00:03Z",
+    )
+    result = run_retention_cycle(
+        config.db_path,
+        policy=RetentionPolicy(command_retention_days=1),
+        now="2026-08-07T00:00:04Z",
+    )
+    assert result["pending_claims"] == 1
+    assert result["pending_prompts"] == 1
+    with sqlite3.connect(config.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM backend_pending_claims").fetchone() == (0,)
+        assert conn.execute("SELECT COUNT(*) FROM backend_pending").fetchone() == (0,)
+        assert conn.execute("SELECT COUNT(*) FROM pending_interactions").fetchone() == (0,)
+
+
+def test_retention_preserves_send_started_claim_while_prompt_is_open(
+    tmp_path: Path,
+) -> None:
+    config, worker, _session_id, _broker = _setup(tmp_path)
+    assert config.db_path is not None
+    binding = list_worker_bindings(
+        config.db_path, config.host_id, backend="acp"
+    )[0]
+    assert apply_test_backend_pending(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        {"question": "Long-running send", "kind": "choice", "choices": []},
+        expected_binding=binding,
+        observed_at="2026-08-01T00:00:00Z",
+    )
+    with sqlite3.connect(config.db_path) as conn:
+        old_ref = str(
+            conn.execute(
+                "SELECT decision_ref FROM backend_pending WHERE state='open'"
+            ).fetchone()[0]
+        )
+    claim = claim_backend_pending_decision(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        old_ref,
+        {"text": "Allow"},
+        observed_at="2026-08-01T00:00:01Z",
+    )
+    assert claim.claim_token
+    assert start_backend_pending_decision_send(
+        config.db_path,
+        config.host_id,
+        claim.claim_token,
+        observed_at="2026-08-01T00:00:02Z",
+    ).status == "started"
+
+    retained = run_retention_cycle(
+        config.db_path,
+        policy=RetentionPolicy(command_retention_days=1),
+        now="2026-08-05T00:00:00Z",
+    )
+    assert retained["pending_claims"] == retained["pending_prompts"] == 0
+    assert claim_backend_pending_decision(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        old_ref,
+        {"text": "Again"},
+        observed_at="2026-08-05T00:00:01Z",
+    ).status == "already_claimed"
+
+    assert apply_test_backend_pending(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        {"question": "New revision", "kind": "choice", "choices": []},
+        expected_binding=binding,
+        observed_at="2026-08-05T00:00:02Z",
+    )
+    cleaned = run_retention_cycle(
+        config.db_path,
+        policy=RetentionPolicy(command_retention_days=1),
+        now="2026-08-07T00:00:03Z",
+    )
+    assert cleaned["pending_claims"] == 1
+    assert cleaned["pending_prompts"] == 1
+    with sqlite3.connect(config.db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM backend_pending_claims WHERE decision_ref=?",
+            (old_ref,),
+        ).fetchone() == (0,)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM backend_pending WHERE decision_ref=?", (old_ref,)
+        ).fetchone() == (0,)
+
+
 def test_permission_bridge_is_private_durable_and_frame_acknowledged(
     tmp_path: Path,
 ) -> None:
@@ -205,7 +550,7 @@ def test_permission_bridge_is_private_durable_and_frame_acknowledged(
         config.db_path, config.host_id, backend="acp"
     )[0]
     client = FakeClient()
-    client.restored_session_result = SessionResult(session_id, None, (), {})
+    client.restored_session_result = session_id
     runtime = AcpWorkerSession(
         client,
         config=config,
@@ -215,7 +560,7 @@ def test_permission_bridge_is_private_durable_and_frame_acknowledged(
         session_id=session_id,
         stream_generation="42",
         permission_callback=broker,
-        ingestor=FakeIngestor(session_id),
+        ingestor_factory=lambda *_args, **_kwargs: FakeIngestor(session_id),
         poll_timeout=0.01,
         stop_timeout=1,
     )

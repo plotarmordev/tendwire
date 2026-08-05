@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import errno
-import gc
-import io
+import base64
+import hashlib
 import json
 import os
 import signal
@@ -45,34 +45,412 @@ from tendwire.core.models import (
     SuggestedAction,
     Worker,
     WorkerBinding,
+    stable_fingerprint,
 )
 from tendwire.core.projector import project_from_raw
-from tendwire.core.turns import (
-    pending_payload_from_snapshot,
-    recompute_pending_content_fingerprint,
-)
 from tendwire.daemon import DaemonHooks, TendwireDaemon, run_daemon
 from tendwire.daemon_api import (
     DaemonAPIClient,
     DaemonUnavailable,
     DaemonProtocolError,
-    TendwireDaemonAPI,
+    TendwireDaemonAPI as _ProductionTendwireDaemonAPI,
     UnixSocketJSONServer,
     ensure_daemon_socket_not_active,
     MAX_RESPONSE_BYTES,
 )
-from tendwire.local_state import LocalStateError, LocalStateErrorCode, LocalStateKind
-from tendwire.store.sqlite import (
+
+
+def _connector_digest(value: Any) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(hashlib.sha256(encoded).digest()).rstrip(b"=").decode()
+
+
+def _working_connector_key(payload: dict[str, Any], host_id: str = "host-a") -> str:
+    turn, worker = payload["turn"], payload["worker"]
+    return "turn-final:working:twwork1." + _connector_digest([
+        "tendwire.working.v1",
+        [host_id, turn["turn_id"], turn["content_revision"], worker["route_generation"]],
+    ])
+
+
+def _decision_connector_identity(
+    payload: dict[str, Any], host_id: str = "host-a",
+) -> tuple[str, str]:
+    worker, decision = payload["worker"], payload["decision"]
+    decision_ref = "pending-" + hashlib.sha256(json.dumps(
+        [host_id, worker["worker_id"], decision["revision_digest"]],
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode()).hexdigest()[:24]
+    key = "turn-final:decision:twdecision1." + _connector_digest({
+        "domain": "tendwire.decision.v1", "host_id": host_id,
+        "decision_ref": decision_ref, "revision_digest": decision["revision_digest"],
+        "route_generation": worker["route_generation"],
+    })
+    return decision_ref, key
+from tendwire.local_state import LocalStateError, LocalStateErrorCode
+from tendwire.store.pending import pending_payload_from_store
+from tendwire.store.projection import (
     SnapshotObservationContext,
     attention_payload_from_store,
-    get_command_request,
-    init_store,
     latest_snapshot,
-    pending_payload_from_store,
     save_snapshot,
     upsert_worker_bindings,
 )
-from .store_helpers import apply_test_backend_pending, apply_test_turn_refresh
+from tendwire.store.receipts import get_command_request
+from tendwire.store.schema import init_store
+from .store_helpers import (
+    apply_test_backend_pending,
+    upsert_test_worker_bindings,
+)
+
+
+class TendwireDaemonAPI(_ProductionTendwireDaemonAPI):
+    """Test constructor that makes the always-injected store callbacks explicit."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        empty = lambda *_args, **_kwargs: {}
+        kwargs.setdefault("get_attention", empty)
+        kwargs.setdefault("get_turns", empty)
+        kwargs.setdefault("get_turn_delta", empty)
+        kwargs.setdefault("get_turn_content", empty)
+        kwargs.setdefault("get_pending", empty)
+        kwargs.setdefault("connector_call", empty)
+        super().__init__(*args, **kwargs)
+
+
+def _required_daemon_callbacks() -> dict[str, Any]:
+    empty = lambda *_args, **_kwargs: {}
+    return {
+        "get_snapshot": lambda: None,
+        "get_health": empty,
+        "submit_command": empty,
+        "get_attention": empty,
+        "get_turns": empty,
+        "get_turn_delta": empty,
+        "get_turn_content": empty,
+        "get_pending": empty,
+        "connector_call": empty,
+    }
+
+
+def test_daemon_api_requires_every_store_callback() -> None:
+    callbacks = _required_daemon_callbacks()
+    callbacks.pop("connector_call")
+    with pytest.raises(TypeError, match="connector_call"):
+        _ProductionTendwireDaemonAPI(**callbacks)
+
+
+def test_daemon_api_rejects_explicit_noncallable_callback_by_name() -> None:
+    callbacks = _required_daemon_callbacks()
+    callbacks["get_pending"] = None
+    with pytest.raises(TypeError, match="get_pending"):
+        _ProductionTendwireDaemonAPI(**callbacks)
+
+
+class _ConnectorMemoryConnection:
+    def __init__(self, request: bytes) -> None:
+        self.request = request
+        self.response = b""
+
+    def __enter__(self) -> "_ConnectorMemoryConnection":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def settimeout(self, _value: float) -> None:
+        return None
+
+    def recv(self, _size: int) -> bytes:
+        value, self.request = self.request, b""
+        return value
+
+    def sendall(self, value: bytes) -> None:
+        self.response += value
+
+    def shutdown(self, _how: int) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    "kind", ["working", "final_ready", "final_part", "retire", "decision"]
+)
+def test_connector_payload_survives_connection_framing_exactly(
+    tmp_path: Path, kind: str
+) -> None:
+    payload: dict[str, Any] = {
+        "schema_version": {"working": 1, "final_ready": 3, "final_part": 2, "retire": 1, "decision": 1}[kind],
+        "kind": kind,
+        "created_at": "2026-08-05T01:02:03.000000Z",
+        "worker": {
+            "worker_id": "worker-a",
+            "stable_key": "wsk1_" + "a" * 64,
+            "stable_key_version": 1,
+            "route_generation": "twroute1." + "A" * 43,
+        },
+        "route": {
+            "partition_key": "twpart1_" + "b" * 64,
+            "partition_sequence": 7,
+        },
+    }
+    if kind == "working":
+        text = "/home/smith/x /tmp/example token=example must remain exact"
+        payload["turn"] = {
+            "turn_id": "turn-a", "content_revision": "twrev1." + "C" * 43,
+            "replaces_key": None,
+            "text": {"assistant_stream_text": text, "char_length": len(text), "byte_length": len(text.encode())},
+        }
+    elif kind == "final_ready":
+        exact = "/home/smith/x /tmp/example token=example must remain exact"
+        descriptor = {"availability": "complete", "inline": exact, "char_length": len(exact), "byte_length": len(exact.encode()), "page_count": 0, "first_cursor": None}
+        payload["turn"] = {
+            "turn_id": "turn-a", "final_identity": "twfinal1." + "D" * 43,
+            "content_revision": "twrev1." + "C" * 43, "replaces_key": None,
+            "content": {"schema_version": 1, "content_revision": "twrev1." + "C" * 43, "known_incomplete": False, "fields": {"user_text": descriptor, "assistant_final_text": descriptor}},
+        }
+    elif kind == "final_part":
+        payload.update({
+            "turn": {"turn_id": "turn-a", "final_identity": "twfinal1." + "D" * 43, "content_revision": "twrev1." + "C" * 43},
+            "plan": {"plan_token": "twplan1." + "E" * 43, "generation": 1, "presentation_version": "v1", "ordinal": 0, "part_count": 1, "spans": [{"field": "assistant_final_text", "start_char": 0, "end_char": 1}]},
+            "lineage": {"recovered_from_plan_token": None, "predecessor_key": None, "replaces_key": None},
+        })
+    elif kind == "retire":
+        payload.update({
+            "turn": {"turn_id": "turn-a", "final_identity": "twfinal1." + "D" * 43, "content_revision": "twrev1." + "C" * 43},
+            "retire": {"target_key": "turn-final:twplan1." + "T" * 43 + ":000003", "target_kind": "final_part", "target_ordinal": 2, "predecessor_key": "turn-final:twplan1." + "E" * 43 + ":000004", "plan_token": "twplan1." + "E" * 43, "generation": 1, "reason": "excess_part"},
+        })
+    else:
+        payload["decision"] = {
+            "decision_ref": "", "revision_digest": "revision-a", "mode": "single",
+            "title": "/home/smith/x", "body": "/tmp/example token=example",
+            "choices": [{"ordinal": 0, "option_ref": "1", "label": "code token=example"}],
+        }
+        payload["decision"]["decision_ref"], decision_key = _decision_connector_identity(payload)
+    working_key = _working_connector_key(payload) if kind == "working" else ""
+    connector_result = {
+        "schema_version": 1,
+        "ok": True,
+        "status": "ok",
+        "host_id": "host-a",
+        "name": "turn-final",
+        "items": [{
+            "key": {
+                "working": working_key,
+                "final_ready": "turn-final:revision:twfinal1." + "D" * 43,
+                "final_part": "turn-final:twplan1." + "E" * 43 + ":000001",
+                "retire": "turn-final:twplan1." + "E" * 43 + ":000005",
+                "decision": decision_key if kind == "decision" else "",
+            }[kind],
+            "ref": "twref1." + "R" * 43,
+            "attempt": 1,
+            "leased_until": "2026-08-05T01:03:03.000000Z",
+            "available_at": "2026-08-05T01:02:03.000000Z",
+            "created_at": "2026-08-05T01:02:03.000000Z",
+            "payload": payload,
+        }],
+    }
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: None,  # type: ignore[arg-type]
+        get_health=lambda: {},
+        submit_command=lambda _params: {},
+        connector_call=lambda _method, _params: connector_result,
+    )
+    server = UnixSocketJSONServer(
+        tmp_path / "unused.sock",
+        api.dispatch,
+        request_workers=1,
+        max_in_flight_requests=1,
+    )
+    request = {"method": "connector.poll", "params": {"name": "turn-final"}}
+    connection = _ConnectorMemoryConnection(
+        json.dumps(request).encode("utf-8") + b"\n"
+    )
+    server._handle_connection(connection)  # type: ignore[arg-type]
+    response = json.loads(connection.response.split(b"\n", 1)[0])
+    assert response["result"] == connector_result
+    assert response["result"]["items"][0]["payload"] == payload
+    if kind == "retire":
+        swapped = json.loads(json.dumps(connector_result))
+        swapped["items"][0]["payload"]["retire"]["target_ordinal"] = 999
+    else:
+        swapped = json.loads(json.dumps(connector_result))
+        swapped["items"][0]["key"] = {
+            "working": "turn-final:working:twwork1." + "Z" * 43,
+            "final_ready": "turn-final:revision:twfinal1." + "Z" * 43,
+            "final_part": "turn-final:twplan1." + "E" * 43 + ":000002",
+            "decision": "turn-final:decision:twdecision1." + "Z" * 43,
+        }[kind]
+    invalid_api = TendwireDaemonAPI(
+        get_snapshot=lambda: None,  # type: ignore[arg-type]
+        get_health=lambda: {}, submit_command=lambda _params: {},
+        connector_call=lambda _method, _params: swapped,
+    )
+    invalid = invalid_api.dispatch(request)
+    assert invalid["ok"] is False
+    assert invalid["error"]["code"] == "internal_error"
+    if kind in {"working", "final_ready", "final_part"}:
+        fields = ("replaces_key", "predecessor_key") if kind == "final_part" else ("replaces_key",)
+        for field in fields:
+            for replacement in (
+                "turn-final:decision:twdecision1." + "Z" * 43,
+                "turn-final:retire:twretire1." + "Z" * 43,
+            ):
+                bad_lineage = json.loads(json.dumps(connector_result))
+                container = "lineage" if kind == "final_part" else "turn"
+                bad_lineage["items"][0]["payload"][container][field] = replacement
+                lineage_api = TendwireDaemonAPI(
+                    get_snapshot=lambda: None,  # type: ignore[arg-type]
+                    get_health=lambda: {}, submit_command=lambda _params: {},
+                    connector_call=lambda _method, _params: bad_lineage,
+                )
+                assert lineage_api.dispatch(request)["ok"] is False
+    if kind == "retire":
+        for field, malformed in (
+            ("target_ordinal", None), ("target_ordinal", True),
+            ("generation", None), ("generation", 0), ("generation", "1"),
+        ):
+            bad_retire = json.loads(json.dumps(connector_result))
+            bad_retire["items"][0]["payload"]["retire"][field] = malformed
+            retire_api = TendwireDaemonAPI(
+                get_snapshot=lambda: None,  # type: ignore[arg-type]
+                get_health=lambda: {}, submit_command=lambda _params: {},
+                connector_call=lambda _method, _params: bad_retire,
+            )
+            rejected = retire_api.dispatch(request)
+            assert rejected["ok"] is False
+            assert rejected["error"]["code"] == "internal_error"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda result: result.update({"unexpected": "field"}),
+        lambda result: result["items"][0]["payload"].update(
+            {"private_binding": {"chat_id": 42}}
+        ),
+        lambda result: result["items"][0]["payload"]["turn"]["text"].update(
+            {"chatId": 42}
+        ),
+        lambda result: result["items"][0]["payload"]["worker"].update(
+            {"provider_token": "private"}
+        ),
+        lambda result: result["items"][0]["payload"]["route"].update(
+            {"private_binding_json": "private"}
+        ),
+        lambda result: result["items"][0].update({"attempt": float("nan")}),
+    ],
+)
+def test_connector_exact_response_rejects_unvalidated_or_private_data(
+    tmp_path: Path, mutation: Any
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "kind": "working",
+        "created_at": "2026-08-05T01:02:03.000000Z",
+        "worker": {"worker_id": "worker-a", "stable_key": "wsk1_" + "a" * 64, "stable_key_version": 1, "route_generation": "twroute1." + "A" * 43},
+        "route": {"partition_key": "twpart1_" + "b" * 64, "partition_sequence": 1},
+        "turn": {"turn_id": "turn-a", "content_revision": "twrev1." + "C" * 43, "replaces_key": None, "text": {"assistant_stream_text": "ok", "char_length": 2, "byte_length": 2}},
+    }
+    result = {"schema_version": 1, "ok": True, "status": "ok", "host_id": "host-a", "name": "turn-final", "items": [{"key": "turn-final:working:twwork1." + "W" * 43, "ref": "twref1." + "R" * 43, "attempt": 1, "leased_until": "2026-08-05T01:03:03.000000Z", "available_at": "2026-08-05T01:02:03.000000Z", "created_at": "2026-08-05T01:02:03.000000Z", "payload": payload}]}
+    result["items"][0]["key"] = _working_connector_key(payload)
+    mutation(result)
+    api = TendwireDaemonAPI(get_snapshot=lambda: None, get_health=lambda: {}, submit_command=lambda _params: {}, connector_call=lambda _method, _params: result)  # type: ignore[arg-type]
+    response = api.dispatch({"method": "connector.poll", "params": {"name": "turn-final"}})
+    assert response["ok"] is False
+    assert response["error"]["code"] == "internal_error"
+
+
+def test_generic_connector_payload_and_requeued_status_survive_exact_framing(
+    tmp_path: Path,
+) -> None:
+    generic_result = {
+        "schema_version": 1,
+        "ok": True,
+        "status": "ok",
+        "host_id": "host-a",
+        "name": "notice",
+        "items": [{
+            "key": "notice-key",
+            "ref": "twref1." + "R" * 43,
+            "attempt": 1,
+            "leased_until": "2026-08-05T01:03:03.000000Z",
+            "available_at": "2026-08-05T01:02:03.000000Z",
+            "payload": {"schema_version": 1, "event_type": "notice", "body": "exact"},
+        }],
+    }
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: None,  # type: ignore[arg-type]
+        get_health=lambda: {},
+        submit_command=lambda _params: {},
+        connector_call=lambda _method, _params: generic_result,
+    )
+    response = api.dispatch({"method": "connector.poll", "params": {"name": "notice"}})
+    assert response["ok"] is True
+    assert response["result"] == generic_result
+
+    requeued = {
+        "schema_version": 1,
+        "ok": True,
+        "status": "requeued",
+        "host_id": "host-a",
+        "name": "turn-final",
+        "key": "turn-final:decision:twdecision1." + "D" * 43,
+        "retry_generation": 2,
+        "prior_attempt_count": 1,
+        "warning": "provider_acceptance_may_have_occurred",
+    }
+    retry_api = TendwireDaemonAPI(
+        get_snapshot=lambda: None,  # type: ignore[arg-type]
+        get_health=lambda: {},
+        submit_command=lambda _params: {},
+        connector_call=lambda _method, _params: requeued,
+    )
+    retry_response = retry_api.dispatch(
+        {"method": "connector.retry", "params": {"name": "turn-final"}}
+    )
+    assert retry_response["ok"] is True
+    assert retry_response["result"] == requeued
+
+
+@pytest.mark.parametrize("private_key", ["chatId", "provider_token", "private_binding_json"])
+def test_generic_connector_payload_rejects_nested_private_keys(
+    private_key: str,
+) -> None:
+    generic_result = {
+        "schema_version": 1,
+        "ok": True,
+        "status": "ok",
+        "host_id": "host-a",
+        "name": "notice",
+        "items": [
+            {
+                "key": "notice-key",
+                "ref": "twref1." + "R" * 43,
+                "attempt": 1,
+                "leased_until": "2026-08-05T01:03:03.000000Z",
+                "available_at": "2026-08-05T01:02:03.000000Z",
+                "payload": {
+                    "schema_version": 1,
+                    "event_type": "notice",
+                    "body": "exact",
+                    "nested": {private_key: "private"},
+                },
+            }
+        ],
+    }
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: None,  # type: ignore[arg-type]
+        get_health=lambda: {},
+        submit_command=lambda _params: {},
+        connector_call=lambda _method, _params: generic_result,
+    )
+    response = api.dispatch(
+        {"method": "connector.poll", "params": {"name": "notice"}}
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "internal_error"
 
 
 _PUBLIC_JSON_FORBIDDEN_KEYS = {
@@ -274,15 +652,7 @@ def test_daemon_api_required_methods_are_public_safe() -> None:
         assert "sentinel-private" not in encoded
         _assert_no_public_json_forbidden(response)
     default_pending = api.dispatch({"method": "pending.list"})["result"]
-    assert default_pending == pending_payload_from_snapshot(snapshot)
-    assert default_pending["pending_health"] == {
-        "status": "healthy",
-        "counts": {"fresh": 0, "stale": 0, "total": 0},
-    }
-    assert (
-        default_pending["content_fingerprint"]
-        == recompute_pending_content_fingerprint(default_pending)
-    )
+    assert default_pending == {}
 
     command_response = api.dispatch(
         {
@@ -439,9 +809,8 @@ def test_daemon_connector_pending_projection_is_recursively_public_safe() -> Non
         }
     )
 
-    assert response["result"]["items"] == [
-        {"choice_id": "choice-" + ("e" * 24)}
-    ]
+    assert response["ok"] is False
+    assert response["error"]["code"] == "internal_error"
     assert "sentinel-private" not in json.dumps(response, sort_keys=True)
     _assert_no_public_json_forbidden(response)
 
@@ -454,19 +823,24 @@ def test_daemon_pending_matches_shared_durable_projection_and_fingerprint(
     config = Config(host_id=snapshot.host_id, db_path=db_path)
     init_store(db_path)
     save_snapshot(db_path, snapshot)
-    baseline = pending_payload_from_snapshot(snapshot)
+    baseline = pending_payload_from_store(db_path, snapshot.host_id)
     assert baseline["pending_health"] == {
         "status": "healthy",
         "counts": {"fresh": 0, "stale": 0, "total": 0},
     }
-    degraded = dict(baseline)
-    degraded["pending_health"] = {
-        "status": "degraded",
-        "counts": {"fresh": 0, "stale": 1, "total": 1},
-    }
-    assert (
-        recompute_pending_content_fingerprint(degraded)
-        != baseline["content_fingerprint"]
+    upsert_test_worker_bindings(
+        db_path,
+        [
+            WorkerBinding(
+                host_id=snapshot.host_id,
+                worker_id="worker-1",
+                worker_fingerprint=snapshot.workers[0].fingerprint,
+                backend="herdr",
+                target_kind="agent_id",
+                target_value="private",
+                private_fingerprint="pending-parity-private",
+            )
+        ],
     )
     apply_test_backend_pending(
         db_path,
@@ -559,7 +933,7 @@ def test_daemon_pending_matches_shared_durable_projection_and_fingerprint(
         "malformed-nested-meta",
     ],
 )
-def test_malformed_durable_snapshot_is_fixed_unavailable_for_daemon_and_cli(
+def test_pending_projection_is_independent_of_malformed_snapshot_payload(
     tmp_path: Path,
     capsys,
     stored_payload: str,
@@ -572,12 +946,14 @@ def test_malformed_durable_snapshot_is_fixed_unavailable_for_daemon_and_cli(
         conn.execute(
             """
             INSERT INTO snapshots (
-                host_id, created_at, content_fingerprint, payload
-            ) VALUES (?, ?, ?, ?)
+                host_id, observed_at, authority_fingerprint,
+                content_fingerprint, payload_json
+            ) VALUES (?, ?, ?, ?, ?)
             """,
             (
                 host_id,
                 "2026-01-01T00:00:00+00:00",
+                "test-authority",
                 "sentinel-private-fingerprint",
                 stored_payload,
             ),
@@ -592,23 +968,33 @@ def test_malformed_durable_snapshot_is_fixed_unavailable_for_daemon_and_cli(
             str(tmp_path / "missing.sock"),
             "pending",
             "--json",
-            "--db-path",
-            str(db_path),
         ]
     )
     cli_payload = json.loads(capsys.readouterr().out)
     expected = {
         "schema_version": 1,
         "host_id": host_id,
-        "ok": False,
-        "status": "store_unavailable",
+        "ok": True,
+        "status": "ok",
         "pending_interactions": [],
         "backend_health": [],
         "pending_health": {
-            "status": "store_unavailable",
+            "status": "healthy",
             "counts": {"fresh": 0, "stale": 0, "total": 0},
         },
     }
+    expected["content_fingerprint"] = stable_fingerprint(
+        {
+            key: expected[key]
+            for key in (
+                "schema_version",
+                "host_id",
+                "pending_interactions",
+                "backend_health",
+                "pending_health",
+            )
+        }
+    )
 
     assert cli_code == 1
     assert daemon_payload == expected
@@ -622,14 +1008,9 @@ def test_malformed_durable_snapshot_is_fixed_unavailable_for_daemon_and_cli(
     _assert_no_public_json_forbidden(cli_payload)
 
 
-def test_pending_store_projection_reads_snapshot_and_overlay_atomically(
+def test_pending_store_projection_uses_durable_binding_not_snapshot_churn(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from contextlib import contextmanager
-
-    import tendwire.store.sqlite as sqlite_store
-
     db_path = tmp_path / "pending-atomic.db"
     config = Config(host_id="atomic-pending", db_path=db_path)
     snapshot_a = project_from_raw(
@@ -656,6 +1037,20 @@ def test_pending_store_projection_reads_snapshot_and_overlay_atomically(
     )
     init_store(db_path)
     save_snapshot(db_path, snapshot_a)
+    upsert_test_worker_bindings(
+        db_path,
+        [
+            WorkerBinding(
+                host_id=config.host_id,
+                worker_id="worker-1",
+                worker_fingerprint=snapshot_a.workers[0].fingerprint,
+                backend="herdr",
+                target_kind="agent_id",
+                target_value="private",
+                private_fingerprint="pending-atomic-private",
+            )
+        ],
+    )
     apply_test_backend_pending(
         db_path,
         config.host_id,
@@ -663,65 +1058,29 @@ def test_pending_store_projection_reads_snapshot_and_overlay_atomically(
         {"question": "Backend A?", "kind": "question", "meta": {"source": "backend"}},
     )
 
-    allow_writer = threading.Event()
-    writer_done = threading.Event()
-    writer_errors: list[BaseException] = []
-    reader_thread_id = threading.get_ident()
-    original_connect = sqlite_store._connect
-
-    @contextmanager
-    def traced_connect(*args: Any, **kwargs: Any) -> Any:
-        with original_connect(*args, **kwargs) as conn:
-            if threading.get_ident() == reader_thread_id:
-                def trace(statement: str) -> None:
-                    normalized = " ".join(statement.lower().split())
-                    if normalized.startswith(
-                        "select worker_id, payload_json, choice_routes_json"
-                    ):
-                        allow_writer.set()
-                        writer_done.wait(timeout=5)
-
-                conn.set_trace_callback(trace)
-            yield conn
-
-    def publish_new_view() -> None:
-        try:
-            assert allow_writer.wait(timeout=5)
-            save_snapshot(db_path, snapshot_b)
-            apply_test_backend_pending(
-                db_path,
-                config.host_id,
-                "worker-1",
-                {
-                    "question": "Backend B?",
-                    "kind": "question",
-                    "meta": {"source": "backend"},
-                },
-            )
-        except BaseException as exc:
-            writer_errors.append(exc)
-        finally:
-            writer_done.set()
-
-    monkeypatch.setattr(sqlite_store, "_connect", traced_connect)
-    writer = threading.Thread(target=publish_new_view)
-    writer.start()
     first = pending_payload_from_store(db_path, config.host_id)
-    writer.join(timeout=5)
-
-    assert not writer.is_alive()
-    assert writer_errors == []
     assert first["pending_interactions"][0]["question"] == "Backend A?"
     assert (
         first["pending_interactions"][0]["worker_fingerprint"]
         == snapshot_a.workers[0].fingerprint
     )
 
+    save_snapshot(db_path, snapshot_b)
+    apply_test_backend_pending(
+        db_path,
+        config.host_id,
+        "worker-1",
+        {
+            "question": "Backend B?",
+            "kind": "question",
+            "meta": {"source": "backend"},
+        },
+    )
     second = pending_payload_from_store(db_path, config.host_id)
     assert second["pending_interactions"][0]["question"] == "Backend B?"
     assert (
         second["pending_interactions"][0]["worker_fingerprint"]
-        == snapshot_b.workers[0].fingerprint
+        == snapshot_a.workers[0].fingerprint
     )
     assert TendwireDaemon(config).get_pending() == second
 
@@ -909,7 +1268,7 @@ def test_daemon_turn_list_is_store_projection_only(
             "turns": [],
         }
 
-    monkeypatch.setattr("tendwire.store.sqlite.turns_payload_from_store", project)
+    monkeypatch.setattr("tendwire.store.turns.turns_payload_from_store", project)
     daemon = TendwireDaemon(config)
 
     for _ in range(3):
@@ -1012,7 +1371,7 @@ def test_daemon_api_protocol_errors_do_not_echo_private_request_names() -> None:
     _assert_no_public_json_forbidden(safe_id)
 
 
-def test_daemon_api_attention_list_uses_store_lifecycle_payload(tmp_path: Path) -> None:
+def test_daemon_api_attention_list_uses_current_store_projection(tmp_path: Path) -> None:
     db_path = tmp_path / "attention-api.db"
     config = Config(host_id="daemon-host", db_path=db_path)
     observed_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -1093,11 +1452,8 @@ def test_daemon_api_attention_list_uses_store_lifecycle_payload(tmp_path: Path) 
     assert response["ok"] is True
     assert payload["host_id"] == "daemon-host"
     assert len(payload["attention"]) == 1
-    assert payload["attention"][0]["lifecycle_status"] == "open"
-    assert payload["attention"][0]["first_seen_at"] == observed_at.isoformat()
-    assert payload["attention"][0]["last_seen_at"] == escalated_at.isoformat()
-    assert payload["attention"][0]["signal_count"] == 2
     assert payload["attention"][0]["severity"] == "critical"
+    assert payload["attention"][0]["status"] == "failed"
     assert not {
         "family_key",
         "generation",
@@ -1116,8 +1472,6 @@ def _blocked_worker(status: str) -> list[dict[str, Any]]:
     return [{"id": "worker-1", "name": "Worker One", "status": status}]
 
 
-# Complete observations are the sole absence authority. Resolution requires
-# two distinct misses and 120 seconds elapsed from the first accepted miss.
 _HEALTHY_BACKEND = [
     {
         "name": "herdr",
@@ -1146,7 +1500,7 @@ def _complete_observation(observed_at: datetime) -> SnapshotObservationContext:
 
 
 
-def test_attention_positive_after_two_early_complete_misses_does_not_re_notify(
+def test_attention_projection_replaces_prior_snapshot_without_outbox(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "attention-flap.db"
@@ -1163,7 +1517,7 @@ def test_attention_positive_after_two_early_complete_misses_does_not_re_notify(
         ),
         observation=_complete_observation(base),
     )
-    assert _attention_outbox_count(db_path, "flap-host") == 1
+    assert _attention_outbox_count(db_path, "flap-host") == 0
 
     for offset in (30, 90):
         observed_at = base + timedelta(seconds=offset)
@@ -1178,8 +1532,7 @@ def test_attention_positive_after_two_early_complete_misses_does_not_re_notify(
             observation=_complete_observation(observed_at),
         )
     payload = attention_payload_from_store(db_path, "flap-host")
-    assert len(payload["attention"]) == 1
-    assert payload["attention"][0]["lifecycle_status"] == "open"
+    assert payload["attention"] == []
 
     recurrence_at = base + timedelta(seconds=100)
     save_snapshot(
@@ -1192,21 +1545,11 @@ def test_attention_positive_after_two_early_complete_misses_does_not_re_notify(
         ),
         observation=_complete_observation(recurrence_at),
     )
-    assert _attention_outbox_count(db_path, "flap-host") == 1
+    assert _attention_outbox_count(db_path, "flap-host") == 0
     assert len(attention_payload_from_store(db_path, "flap-host")["attention"]) == 1
-    with sqlite3.connect(str(db_path)) as conn:
-        generation, missing_count = conn.execute(
-            """
-            SELECT generation, missing_observation_count
-            FROM attention_lifecycles
-            WHERE host_id = ?
-            """,
-            ("flap-host",),
-        ).fetchone()
-    assert (generation, missing_count) == (1, 0)
 
 
-def test_attention_recurrence_after_two_complete_misses_re_notifies(tmp_path: Path) -> None:
+def test_attention_recurrence_is_projection_only_and_never_enqueues(tmp_path: Path) -> None:
     db_path = tmp_path / "attention-genuine-reopen.db"
     config = Config(host_id="reopen-host", db_path=db_path)
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -1221,7 +1564,7 @@ def test_attention_recurrence_after_two_complete_misses_re_notifies(tmp_path: Pa
         ),
         observation=_complete_observation(base),
     )
-    assert _attention_outbox_count(db_path, "reopen-host") == 1
+    assert _attention_outbox_count(db_path, "reopen-host") == 0
 
     first_miss_at = base + timedelta(seconds=10)
     save_snapshot(
@@ -1234,7 +1577,7 @@ def test_attention_recurrence_after_two_complete_misses_re_notifies(tmp_path: Pa
         ),
         observation=_complete_observation(first_miss_at),
     )
-    assert len(attention_payload_from_store(db_path, "reopen-host")["attention"]) == 1
+    assert attention_payload_from_store(db_path, "reopen-host")["attention"] == []
 
     second_miss_at = first_miss_at + timedelta(seconds=120)
     save_snapshot(
@@ -1260,674 +1603,68 @@ def test_attention_recurrence_after_two_complete_misses_re_notifies(tmp_path: Pa
         ),
         observation=_complete_observation(recurrence_at),
     )
-    assert _attention_outbox_count(db_path, "reopen-host") == 2
+    assert _attention_outbox_count(db_path, "reopen-host") == 0
     assert len(attention_payload_from_store(db_path, "reopen-host")["attention"]) == 1
-    with sqlite3.connect(str(db_path)) as conn:
-        generation = conn.execute(
-            "SELECT generation FROM attention_lifecycles WHERE host_id = ?",
-            ("reopen-host",),
-        ).fetchone()[0]
-    assert generation == 2
 
 
-def test_daemon_health_exposes_public_operational_status_without_private_values(tmp_path: Path) -> None:
-    db_path = tmp_path / "health.db"
-    config = Config(
-        host_id="health-host",
-        db_path=db_path,
-        reconcile_interval_seconds=2,
-        event_retention_days=3,
-        max_workers=8,
-        max_outbox_attempts=4,
-        connector_claim_ttl_seconds=33,
-        connector_max_claim_ttl_seconds=222,
-        connector_ack_ttl_seconds=111,
-        acknowledged_final_retention_days=40,
-        acknowledged_final_retention_count=500,
-        snapshot_retention_days=9,
-        snapshot_retention_count=70,
-        snapshot_maintenance_batch_size=6,
-        store_maintenance_cadence_seconds=44,
-        pending_stale_grace_seconds=31,
-        command_retry_horizon_seconds=120,
-        command_receipt_retention_seconds=691_200,
-        command_receipt_retention_count=77,
-    )
-    snapshot = project_from_raw(
-        config,
-        workers=[
-            {
-                "id": "worker-1",
-                "name": "Worker One",
-                "backend_target": {"pane_id": "sentinel-private-pane"},
-            }
-        ],
-        backend_health=[
-            {
-                "name": "herdr",
-                "status": "healthy",
-                "outcome": "healthy_non_empty",
-                "observed_at": "2026-01-01T00:00:00+00:00",
-                "counts": {"workers": 1},
-            }
-        ],
-    )
-    save_snapshot(db_path, snapshot)
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute(
-            """
-            INSERT INTO connector_outbox (
-                host_id, connector, delivery_key, status, payload_json,
-                private_state_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "health-host",
-                "attention",
-                "job-1",
-                "queued",
-                '{"safe":"kept"}',
-                '{"token":"sentinel-private-token"}',
-                "9999-01-01T00:00:00+00:00",
-                "9999-01-01T00:00:00+00:00",
-            ),
-        )
-
-    daemon = TendwireDaemon(config)
-    health = daemon.get_health()
-    encoded = json.dumps(health)
-
-    assert health["status"] == "ok"
-    assert health["acp"]["required"] is True
-    assert health["acp"]["healthy"] is True
-    assert health["daemon"]["started_at"]
-    assert health["store"]["counts"]["snapshots"] == 1
-    assert health["store"]["outbox"]["pending"] == 1
-    assert health["store"]["final_retention"] == {
-        "acknowledged": 0,
-        "unresolved": 0,
-        "queued": 0,
-        "leased": 0,
-        "deferred": 0,
-        "retry": 0,
-        "dead_letter": 0,
-        "awaiting_ack": 0,
-        "eligible": 0,
-        "acknowledged_final_retention_days": 40,
-        "acknowledged_final_retention_count": 500,
-        "storage_pressure": False,
-    }
-    assert health["store"]["command_requests"] == {
-        "total": 0,
-        "states": {
-            "reserved": 0,
-            "send_started": 0,
-            "accepted": 0,
-            "rejected": 0,
-            "uncertain": 0,
-        },
-        "stale_active": 0,
-        "eligible": 0,
-        "retry_horizon_seconds": 120,
-        "retention_seconds": 691_200,
-        "retention_count": 77,
-        "storage_pressure": False,
-    }
-    assert health["store"]["maintenance"] == {
-        "last_completed_at": None,
-        "status": "never",
-        "snapshot_count": 1,
-        "snapshot_retention_days": 9,
-        "snapshot_retention_count": 70,
-        "maintenance_batch_size": 6,
-        "maintenance_cadence_seconds": 44,
-        "backlog": False,
-    }
-    assert health["limits"] == {
-        "reconcile_interval_seconds": 2,
-        "event_retention_days": 3,
-        "max_workers": 8,
-        "max_outbox_attempts": 4,
-        "outbox_claim_ttl_seconds": 33,
-        "outbox_max_claim_ttl_seconds": 222,
-        "outbox_ack_ttl_seconds": 111,
-        "acknowledged_final_retention_days": 40,
-        "acknowledged_final_retention_count": 500,
-        "command_retry_horizon_seconds": 120,
-        "command_receipt_retention_seconds": 691_200,
-        "command_receipt_retention_count": 77,
-        "snapshot_retention_days": 9,
-        "snapshot_retention_count": 70,
-        "snapshot_maintenance_batch_size": 6,
-        "store_maintenance_cadence_seconds": 44,
-    }
-    assert health["pending_ingestion"] == {
-        "status": "healthy",
-        "counts": {"fresh": 0, "stale": 0, "total": 0},
-        "bounds": {"stale_grace_seconds": 31.0},
-    }
-    assert health["backend"]["reconcile_enabled"] is True
-    assert "health.db" not in encoded
-    assert str(tmp_path) not in encoded
-    assert "sentinel-private" not in encoded
-    _assert_no_public_json_forbidden(health)
-
-
-def test_daemon_health_accepts_valid_command_request_aggregate(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from tendwire.store import sqlite as store_sqlite
-
-    db_path = tmp_path / "valid-command-health.db"
-    config = Config(
-        host_id="command-health-host",
-        db_path=db_path,
-        command_retry_horizon_seconds=120,
-        command_receipt_retention_seconds=691_200,
-        command_receipt_retention_count=7,
-    )
-    init_store(db_path)
+def test_daemon_health_uses_current_concern_owned_store_counts(tmp_path: Path) -> None:
+    db_path = tmp_path / "current-health.db"
+    config = Config(host_id="health-host", db_path=db_path)
     save_snapshot(db_path, project_from_raw(config, workers=[]))
-    real_status = store_sqlite.store_status
-    expected = {
-        "total": 15,
-        "states": {
-            "reserved": 1,
-            "send_started": 2,
-            "accepted": 3,
-            "rejected": 4,
-            "uncertain": 5,
-        },
-        "stale_active": 0,
-        "eligible": 0,
-        "retry_horizon_seconds": 120,
-        "retention_seconds": 691_200,
-        "retention_count": 7,
-        "storage_pressure": False,
-    }
 
-    def valid_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        payload = real_status(*args, **kwargs)
-        payload["command_requests"] = expected
-        return payload
-
-    monkeypatch.setattr(store_sqlite, "store_status", valid_status)
     health = TendwireDaemon(config).get_health()
 
     assert health["status"] == "ok"
     assert health["store"]["status"] == "healthy"
-    assert health["store"]["command_requests"] == expected
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        "retry_policy",
-        "retention_policy",
-        "count_policy",
-        "state_type",
-        "total",
-        "stale_active",
-        "eligible",
-        "pressure",
-        "shape",
-    ],
-)
-def test_daemon_health_rejects_invalid_command_request_aggregate(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    case: str,
-) -> None:
-    from tendwire.store import sqlite as store_sqlite
-
-    db_path = tmp_path / f"invalid-command-health-{case}.db"
-    config = Config(
-        host_id="command-health-host",
-        db_path=db_path,
-        command_retry_horizon_seconds=120,
-        command_receipt_retention_seconds=691_200,
-        command_receipt_retention_count=7,
-    )
-    init_store(db_path)
-    save_snapshot(db_path, project_from_raw(config, workers=[]))
-    real_status = store_sqlite.store_status
-
-    def invalid_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        payload = real_status(*args, **kwargs)
-        aggregate = payload["command_requests"]
-        if case == "retry_policy":
-            aggregate["retry_horizon_seconds"] = 121
-        elif case == "retention_policy":
-            aggregate["retention_seconds"] = 691_201
-        elif case == "count_policy":
-            aggregate["retention_count"] = 8
-        elif case == "state_type":
-            aggregate["states"]["reserved"] = True
-        elif case == "total":
-            aggregate["total"] = 1
-        elif case == "stale_active":
-            aggregate["states"]["reserved"] = 1
-            aggregate["total"] = 1
-            aggregate["stale_active"] = 1
-            aggregate["storage_pressure"] = True
-        elif case == "eligible":
-            aggregate["eligible"] = 1
-            aggregate["storage_pressure"] = True
-        elif case == "pressure":
-            aggregate["storage_pressure"] = True
-        else:
-            del aggregate["eligible"]
-        return payload
-
-    monkeypatch.setattr(store_sqlite, "store_status", invalid_status)
-    health = TendwireDaemon(config).get_health()
-
-    assert health["status"] == "degraded"
-    assert health["store"]["status"] == "unavailable"
-    assert health["store"]["command_requests"] == {
-        "total": 0,
-        "states": {
-            "reserved": 0,
-            "send_started": 0,
-            "accepted": 0,
-            "rejected": 0,
-            "uncertain": 0,
-        },
-        "stale_active": 0,
-        "eligible": 0,
-        "retry_horizon_seconds": 120,
-        "retention_seconds": 691_200,
-        "retention_count": 7,
-        "storage_pressure": False,
+    assert health["store"]["counts"] == {
+        "turns": 0,
+        "agent_events": 0,
+        "outbox": 0,
+    }
+    assert health["store"]["maintenance"] is None
+    assert set(health["limits"]) == {
+        "reconcile_interval_seconds",
+        "event_retention_days",
+        "max_outbox_attempts",
     }
 
 
-def test_daemon_health_degrades_on_command_request_storage_pressure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_daemon_health_rejects_malformed_current_store_shape_without_leaking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from tendwire.store import sqlite as store_sqlite
+    from tendwire.store import db as store_db
 
-    db_path = tmp_path / "command-pressure.db"
-    config = Config(
-        host_id="command-pressure-host",
-        db_path=db_path,
-        command_retry_horizon_seconds=120,
-        command_receipt_retention_seconds=691_200,
-        command_receipt_retention_count=2,
-    )
-    init_store(db_path)
+    db_path = tmp_path / "malformed-current-health.db"
+    config = Config(host_id="health-host", db_path=db_path)
     save_snapshot(db_path, project_from_raw(config, workers=[]))
-    real_status = store_sqlite.store_status
+    private_marker = "sentinel-private-store-diagnostic"
 
-    def pressured_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        payload = real_status(*args, **kwargs)
-        payload["command_requests"] = {
-            "total": 4,
-            "states": {
-                "reserved": 1,
-                "send_started": 0,
-                "accepted": 0,
-                "rejected": 0,
-                "uncertain": 3,
-            },
-            "stale_active": 0,
-            "eligible": 1,
-            "retry_horizon_seconds": 120,
-            "retention_seconds": 691_200,
-            "retention_count": 2,
-            "storage_pressure": True,
-        }
-        return payload
-
-    monkeypatch.setattr(store_sqlite, "store_status", pressured_status)
-    health = TendwireDaemon(config).get_health()
-
-    assert health["status"] == "degraded"
-    assert health["store"]["status"] == "degraded"
-    assert health["store"]["command_requests"]["eligible"] == 1
-    assert health["store"]["command_requests"]["storage_pressure"] is True
-
-
-def test_daemon_health_command_request_aggregate_never_exposes_row_data(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from tendwire.store import sqlite as store_sqlite
-
-    db_path = tmp_path / "private-command-health.db"
-    config = Config(host_id="command-health-host", db_path=db_path)
-    init_store(db_path)
-    save_snapshot(db_path, project_from_raw(config, workers=[]))
-    real_status = store_sqlite.store_status
-    private_fields = {
-        "id": "sentinel-private-id",
-        "request_id": "sentinel-private-request",
-        "action": "sentinel-private-action",
-        "canonical_request_json": "sentinel-private-canonical-json",
-        "canonical_fingerprint": "sentinel-private-canonical-fingerprint",
-        "result": "sentinel-private-result",
-        "worker": "sentinel-private-worker",
-        "binding": "sentinel-private-binding",
-    }
-
-    def private_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        payload = real_status(*args, **kwargs)
-        payload["command_requests"].update(private_fields)
-        return payload
-
-    monkeypatch.setattr(store_sqlite, "store_status", private_status)
-    health = TendwireDaemon(config).get_health()
-    command_requests = health["store"]["command_requests"]
-    encoded = json.dumps(health, sort_keys=True)
-
-    assert health["status"] == "degraded"
-    assert health["store"]["status"] == "unavailable"
-    assert set(command_requests) == {
-        "total",
-        "states",
-        "stale_active",
-        "eligible",
-        "retry_horizon_seconds",
-        "retention_seconds",
-        "retention_count",
-        "storage_pressure",
-    }
-    assert not set(private_fields).intersection(command_requests)
-    assert "sentinel-private" not in encoded
-    _assert_no_public_json_forbidden(health)
-
-
-def test_daemon_health_pending_aggregate_is_fail_closed_and_public_safe(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from tendwire.store import sqlite as store_sqlite
-
-    db_path = tmp_path / "pending-health.db"
-    config = Config(
-        host_id="health-host",
-        db_path=db_path,
-        pending_stale_grace_seconds=19,
-    )
-    init_store(db_path)
-    save_snapshot(db_path, project_from_raw(config, workers=[]))
-
-    def degraded_health(_db_path: Path, _host_id: str) -> dict[str, Any]:
-        return {
-            "status": "degraded",
-            "counts": {"fresh": 4, "stale": 2, "total": 6},
-            "pane_id": "sentinel-private-pane",
-            "source_path": str(tmp_path / "sentinel-private-source"),
-            "tool_id": "sentinel-private-tool",
-            "error": "sentinel-private-error",
-        }
-
-    monkeypatch.setattr(store_sqlite, "backend_pending_health", degraded_health)
-
-    health = TendwireDaemon(config).get_health()
-    encoded = json.dumps(health, sort_keys=True)
-
-    assert health["status"] == "degraded"
-    assert health["store"]["status"] == "healthy"
-    assert health["pending_ingestion"] == {
-        "status": "degraded",
-        "counts": {"fresh": 4, "stale": 2, "total": 6},
-        "bounds": {"stale_grace_seconds": 19.0},
-    }
-    assert "sentinel-private" not in encoded
-    assert str(tmp_path) not in encoded
-    _assert_no_public_json_forbidden(health)
     monkeypatch.setattr(
-        store_sqlite,
-        "backend_pending_health",
-        lambda *_args: {
-            "status": "healthy",
-            "counts": {"fresh": 1, "stale": 1, "total": 2},
-        },
-    )
-    fail_closed = TendwireDaemon(config).get_health()
-    assert fail_closed["pending_ingestion"] == {
-        "status": "store_unavailable",
-        "counts": {"fresh": 0, "stale": 0, "total": 0},
-        "bounds": {"stale_grace_seconds": 19.0},
-    }
-    monkeypatch.setattr(
-        store_sqlite,
-        "backend_pending_health",
-        lambda *_args: {
-            "status": "healthy",
-            "counts": {"fresh": 1, "stale": 0, "total": 1},
-        },
-    )
-    recovered = TendwireDaemon(config).get_health()
-    assert recovered["status"] == "ok"
-    assert recovered["pending_ingestion"] == {
-        "status": "healthy",
-        "counts": {"fresh": 1, "stale": 0, "total": 1},
-        "bounds": {"stale_grace_seconds": 19.0},
-    }
-
-
-def test_daemon_health_degrades_on_public_safe_final_storage_pressure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from tendwire.store import sqlite as store_sqlite
-
-    db_path = tmp_path / "final-pressure.db"
-    config = Config(
-        host_id="pressure-host",
-        db_path=db_path,
-        acknowledged_final_retention_days=30,
-        acknowledged_final_retention_count=2,
-    )
-    init_store(db_path)
-    save_snapshot(db_path, project_from_raw(config, workers=[]))
-
-    def pressured_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        payload = {
-            "schema_version": 1,
+        store_db,
+        "store_status",
+        lambda *_args, **_kwargs: {
             "ok": True,
             "status": "ok",
             "host_id": config.host_id,
+            "store_schema_version": 30,
             "counts": {
-                "snapshots": 1,
-                "events": 0,
-                "spaces": 0,
-                "workers": 0,
                 "turns": 0,
-                "pending_interactions": 0,
-                "attention_items": 0,
-                "commands": 0,
-                "command_receipts": 0,
-                "backend_health": 0,
+                "agent_events": 0,
+                "connector_outbox": 0,
+                "diagnostic": private_marker,
             },
-            "outbox": {
-                "pending": 0,
-                "leased": 0,
-                "completed": 0,
-                "by_status": {},
-                "due": 0,
-                "oldest_due_at": None,
-                "overdue_awaiting_ack": 0,
-                "drain_target_seconds": 30,
-                "starved": False,
-            },
-            "maintenance": {
-                "last_completed_at": None,
-                "status": "never",
-                "snapshot_count": 1,
-                "snapshot_retention_days": config.snapshot_retention_days,
-                "snapshot_retention_count": config.snapshot_retention_count,
-                "maintenance_batch_size": config.snapshot_maintenance_batch_size,
-                "maintenance_cadence_seconds": config.store_maintenance_cadence_seconds,
-                "backlog": False,
-            },
-            "final_retention": {
-                "acknowledged": 4,
-                "unresolved": 3,
-                "queued": 1,
-                "leased": 0,
-                "deferred": 0,
-                "retry": 0,
-                "dead_letter": 1,
-                "awaiting_ack": 1,
-                "eligible": 2,
-                "acknowledged_final_retention_days": 30,
-                "acknowledged_final_retention_count": 2,
-                "storage_pressure": True,
-                "row_id": 987,
-                "private_state_json": "sentinel-private-state",
-                "source_path": str(tmp_path / "sentinel-private-source"),
-            },
-            "command_requests": {
-                "total": 0,
-                "states": {
-                    "reserved": 0,
-                    "send_started": 0,
-                    "accepted": 0,
-                    "rejected": 0,
-                    "uncertain": 0,
-                },
-                "stale_active": 0,
-                "eligible": 0,
-                "retry_horizon_seconds": config.command_retry_horizon_seconds,
-                "retention_seconds": config.command_receipt_retention_seconds,
-                "retention_count": config.command_receipt_retention_count,
-                "storage_pressure": False,
-            },
-        }
-        return payload
-
-    monkeypatch.setattr(store_sqlite, "store_status", pressured_status)
+        },
+    )
 
     health = TendwireDaemon(config).get_health()
-    encoded = json.dumps(health, sort_keys=True)
-
     assert health["status"] == "degraded"
-    assert health["store"]["status"] == "degraded"
-    assert health["store"]["final_retention"] == {
-        "acknowledged": 4,
-        "unresolved": 3,
-        "queued": 1,
-        "leased": 0,
-        "deferred": 0,
-        "retry": 0,
-        "dead_letter": 1,
-        "awaiting_ack": 1,
-        "eligible": 2,
-        "acknowledged_final_retention_days": 30,
-        "acknowledged_final_retention_count": 2,
-        "storage_pressure": True,
+    assert health["store"] == {
+        "status": "unavailable",
+        "schema_version": None,
+        "counts": {"turns": 0, "agent_events": 0, "outbox": 0},
+        "maintenance": None,
     }
-    assert "sentinel-private" not in encoded
-    assert str(tmp_path) not in encoded
-    assert "row_id" not in encoded
-    _assert_no_public_json_forbidden(health)
-
-
-def test_daemon_health_degrades_on_valid_snapshot_maintenance_backlog(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from tendwire.store import sqlite as store_sqlite
-
-    db_path = tmp_path / "snapshot-pressure.db"
-    config = Config(host_id="snapshot-pressure-host", db_path=db_path)
-    init_store(db_path)
-    save_snapshot(db_path, project_from_raw(config, workers=[]))
-    real_status = store_sqlite.store_status
-
-    def backlogged_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        payload = real_status(*args, **kwargs)
-        payload["maintenance"]["backlog"] = True
-        return payload
-
-    monkeypatch.setattr(store_sqlite, "store_status", backlogged_status)
-    health = TendwireDaemon(config).get_health()
-
-    assert health["status"] == "degraded"
-    assert health["store"]["status"] == "degraded"
-    assert health["store"]["maintenance"]["backlog"] is True
-
-
-def test_daemon_health_rejects_cross_host_store_aggregate(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from tendwire.store import sqlite as store_sqlite
-
-    db_path = tmp_path / "cross-host-health.db"
-    config = Config(host_id="expected-host", db_path=db_path)
-    init_store(db_path)
-    save_snapshot(db_path, project_from_raw(config, workers=[]))
-    real_status = store_sqlite.store_status
-
-    def cross_host_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        payload = real_status(*args, **kwargs)
-        payload["host_id"] = "foreign-host"
-        payload["counts"]["snapshots"] = 999
-        return payload
-
-    monkeypatch.setattr(store_sqlite, "store_status", cross_host_status)
-    health = TendwireDaemon(config).get_health()
-
-    assert health["status"] == "degraded"
-    assert health["store"]["status"] == "unavailable"
-    assert set(health["store"]["counts"].values()) == {0}
-    assert health["store"]["maintenance"]["snapshot_count"] == 0
-
-
-def test_daemon_health_rejects_malformed_aggregate_fields_without_leaking(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from tendwire.store import sqlite as store_sqlite
-
-    db_path = tmp_path / "malformed-health.db"
-    config = Config(host_id="malformed-host", db_path=db_path)
-    init_store(db_path)
-    save_snapshot(db_path, project_from_raw(config, workers=[]))
-    private_marker = "XYZZY-private-health-marker"
-    real_status = store_sqlite.store_status
-
-    def malformed_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        payload = real_status(*args, **kwargs)
-        payload["counts"]["diagnostic"] = private_marker
-        payload["outbox"] = {
-            "pending": -1,
-            "leased": 0,
-            "by_status": {},
-            "diagnostic": private_marker,
-        }
-        payload["maintenance"]["last_completed_at"] = private_marker
-        payload["final_retention"]["unresolved"] = 0
-        payload["final_retention"]["queued"] = 1
-        return payload
-
-    monkeypatch.setattr(store_sqlite, "store_status", malformed_status)
-    health = TendwireDaemon(config).get_health()
-    encoded = json.dumps(health, sort_keys=True)
-
-    assert health["status"] == "degraded"
-    assert health["store"]["status"] == "unavailable"
-    assert set(health["store"]["counts"].values()) == {0}
-    assert health["store"]["outbox"] == {
-        "pending": 0,
-        "leased": 0,
-        "completed": 0,
-        "by_status": {},
-        "due": 0,
-        "oldest_due_at": None,
-        "overdue_awaiting_ack": 0,
-        "drain_target_seconds": 30,
-        "starved": False,
-    }
-    assert health["store"]["maintenance"]["last_completed_at"] is None
-    assert health["store"]["final_retention"]["queued"] == 0
-    assert private_marker not in encoded
+    assert private_marker not in json.dumps(health)
 
 
 _UNIX_SOCKET_TEST = pytest.mark.skipif(
@@ -2035,50 +1772,34 @@ def test_snapshot_maintenance_wires_agent_event_retention_without_socket(
         db_path=db_path,
         event_retention_days=9,
         snapshot_maintenance_batch_size=13,
+        acknowledged_final_retention_days=36_500,
+        command_receipt_retention_seconds=691_200,
     )
     init_store(db_path)
     captured: dict[str, Any] = {}
 
-    def maintenance(path: Path, **kwargs: Any) -> dict[str, Any]:
-        captured.update({"path": path, **kwargs})
-        return {
-            "schema_version": 1,
-            "ok": True,
-            "status": "ok",
-            "due": False,
-            "snapshot": {
-                "examined": 0,
-                "deleted": 0,
-                "remaining_candidates": False,
-            },
-            "agent_events": {
-                "examined": 5,
-                "deleted": 4,
-                "remaining_candidates": True,
-            },
-        }
+    def maintenance(path: Path, *, policy: Any) -> dict[str, Any]:
+        captured.update({"path": path, "policy": policy})
+        return {"agent_events": 4, "snapshots": 0, "checkpoint": {}}
 
     monkeypatch.setattr(
-        "tendwire.store.sqlite.maybe_run_automatic_store_maintenance",
+        "tendwire.store.retention.run_retention_cycle",
         maintenance,
     )
     daemon = TendwireDaemon(config)
     daemon._after_snapshot_saved()
 
     assert captured["path"] == db_path
-    assert captured["agent_event_host_id"] == "daemon-host"
-    assert captured["agent_event_retention_days"] == 9
+    assert captured["policy"].event_retention_days == 9
     assert captured["policy"].batch_size == 13
+    assert captured["policy"].targetable_retention_days == 36_500
+    assert captured["policy"].route_content_retention_days == 36_500
+    assert captured["policy"].command_retention_days == 8
     assert daemon._automatic_maintenance_status == {
         "ok": True,
         "status": "ok",
-        "due": False,
-        "examined": 0,
-        "deleted": 0,
-        "remaining_candidates": False,
-        "agent_events_examined": 5,
-        "agent_events_deleted": 4,
-        "agent_events_remaining_candidates": True,
+        "due": True,
+        "result": {"agent_events": 4, "snapshots": 0, "checkpoint": {}},
     }
 
 
@@ -2094,75 +1815,24 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         data_dir=data_dir,
         db_path=db_path,
         snapshot_retention_days=21,
-        snapshot_retention_count=123,
         snapshot_maintenance_batch_size=17,
         store_maintenance_cadence_seconds=91,
         acknowledged_final_retention_days=33,
-        acknowledged_final_retention_count=456,
-        command_retry_horizon_seconds=120,
         command_receipt_retention_seconds=691_200,
-        command_receipt_retention_count=77,
     )
-    calls: list[
-        tuple[Path, Any, str | None, int | None, int, int, int, int, int, int]
-    ] = []
+    calls: list[tuple[Path, Any]] = []
 
     def initialize(path: Path) -> None:
         init_store(path)
         snapshot = _public_snapshot()
         save_snapshot(db_path, snapshot)
 
-    def maintenance(
-        path: Path,
-        *,
-        policy: Any,
-        agent_event_host_id: str | None = None,
-        agent_event_retention_days: int | None = None,
-        acknowledged_final_retention_days: int = 30,
-        acknowledged_final_retention_count: int = 4096,
-        command_retry_horizon_seconds: int = 604_800,
-        command_receipt_retention_seconds: int = 2_592_000,
-        command_receipt_retention_count: int = 4096,
-        cadence_seconds: int = 3600,
-        now: str | None = None,
-    ) -> dict[str, Any]:
-        assert now is None
-        calls.append(
-            (
-                path,
-                policy,
-                agent_event_host_id,
-                agent_event_retention_days,
-                acknowledged_final_retention_days,
-                acknowledged_final_retention_count,
-                command_retry_horizon_seconds,
-                command_receipt_retention_seconds,
-                command_receipt_retention_count,
-                cadence_seconds,
-            )
-        )
-        return {
-            "schema_version": 1,
-            "ok": True,
-            "status": "not_due",
-            "due": False,
-            "last_completed_at": "2026-01-01T00:00:00Z",
-            "next_due_at": "2026-01-01T00:01:31Z",
-            "snapshot": {
-                "examined": 0,
-                "deleted": 0,
-                "remaining_candidates": False,
-            },
-            "agent_events": {
-                "examined": 2,
-                "deleted": 1,
-                "remaining_candidates": True,
-            },
-            "batch_size": policy.batch_size,
-        }
+    def maintenance(path: Path, *, policy: Any) -> dict[str, Any]:
+        calls.append((path, policy))
+        return {"agent_events": 1, "snapshots": 0, "checkpoint": {}}
 
     monkeypatch.setattr(
-        "tendwire.store.sqlite.maybe_run_automatic_store_maintenance",
+        "tendwire.store.retention.run_retention_cycle",
         maintenance,
     )
     daemon = TendwireDaemon(
@@ -2180,54 +1850,20 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         daemon.stop()
 
     assert len(calls) == 1
-    (
-        path,
-        policy,
-        agent_host,
-        agent_days,
-        final_days,
-        final_count,
-        retry_horizon,
-        retention_seconds,
-        retention_count,
-        cadence,
-    ) = calls[0]
+    path, policy = calls[0]
     assert path == db_path
     assert (
-        policy.retention_days,
-        policy.retention_count,
+        policy.snapshot_retention_days,
         policy.batch_size,
-        agent_host,
-        agent_days,
-        final_days,
-        final_count,
-        retry_horizon,
-        retention_seconds,
-        retention_count,
-        cadence,
     ) == (
         21,
-        123,
         17,
-        "daemon-host",
-        config.event_retention_days,
-        33,
-        456,
-        120,
-        691_200,
-        77,
-        91,
     )
-    assert health["store"]["maintenance"]["last_check"] == {
+    assert health["store"]["maintenance"] == {
         "ok": True,
-        "status": "not_due",
-        "due": False,
-        "examined": 0,
-        "deleted": 0,
-        "remaining_candidates": False,
-        "agent_events_examined": 2,
-        "agent_events_deleted": 1,
-        "agent_events_remaining_candidates": True,
+        "status": "ok",
+        "due": True,
+        "result": {"agent_events": 1, "snapshots": 0, "checkpoint": {}},
     }
 
 
@@ -2252,7 +1888,7 @@ def test_cli_snapshot_persists_when_automatic_maintenance_fails(
         raise RuntimeError(f"sentinel-private failure at {tmp_path}/secret.db")
 
     monkeypatch.setattr(
-        "tendwire.store.sqlite.maybe_run_automatic_store_maintenance",
+        "tendwire.store.retention.run_retention_cycle",
         maintenance_failure,
     )
     daemon = TendwireDaemon(
@@ -2272,7 +1908,7 @@ def test_cli_snapshot_persists_when_automatic_maintenance_fails(
     assert persisted.content_fingerprint == _public_snapshot().content_fingerprint
     assert health["status"] == "degraded"
     assert health["store"]["status"] == "degraded"
-    assert health["store"]["maintenance"]["last_check"] == {
+    assert health["store"]["maintenance"] == {
         "ok": False,
         "status": "failed",
         "due": False,
@@ -2423,43 +2059,6 @@ def test_daemon_rejects_identity_defect_before_socket_or_hook_work(
         protected_target,
         socket_path,
     )
-
-
-def test_one_shot_cli_repairs_existing_database_without_initializing_identity(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    data_dir = tmp_path / "one-shot-state"
-    db_path = data_dir / "one-shot.db"
-    init_store(db_path)
-    os.chmod(data_dir, 0o755)
-    os.chmod(db_path, 0o644)
-    identity_paths = (
-        data_dir / "installation.key",
-        data_dir / "installation.key.sha256",
-        data_dir / "installation.key.initialized",
-    )
-    monkeypatch.setenv("TENDWIRE_DATA_DIR", str(data_dir))
-    monkeypatch.delenv("TENDWIRE_DB_PATH", raising=False)
-
-    exit_code = main(
-        [
-            "--host-id",
-            "one-shot-host",
-            "store",
-            "status",
-            "--db-path",
-            str(db_path),
-        ]
-    )
-    payload = json.loads(capsys.readouterr().out)
-
-    assert exit_code == 0
-    assert payload["ok"] is True
-    assert _socket_mode(data_dir) == 0o700
-    assert _socket_mode(db_path) == 0o600
-    assert all(not path.exists() for path in identity_paths)
 
 
 @_UNIX_SOCKET_TEST
@@ -2637,10 +2236,7 @@ def test_post_bind_pin_failure_rolls_back_exact_bound_endpoint(
 
     def fail_post_bind_pin(parent_fd: int, leaf: str) -> Any:
         if os.path.lexists(socket_path):
-            raise LocalStateError(
-                LocalStateErrorCode.OPERATION_FAILED,
-                "secure local-state operation failed",
-            )
+            raise LocalStateError(LocalStateErrorCode.OPERATION_FAILED)
         return original_pin(parent_fd, leaf)
 
     monkeypatch.setattr(daemon_api_module, "pin_owned_socket_at", fail_post_bind_pin)
@@ -2672,10 +2268,7 @@ def test_post_bind_pin_failure_never_unlinks_replacement_identity(
             return original_pin(parent_fd, leaf)
         socket_path.unlink()
         replacement_listener = _bind_unix_listener(socket_path)
-        raise LocalStateError(
-            LocalStateErrorCode.OPERATION_FAILED,
-            "secure local-state operation failed",
-        )
+        raise LocalStateError(LocalStateErrorCode.OPERATION_FAILED)
 
     monkeypatch.setattr(
         daemon_api_module,
@@ -2723,10 +2316,7 @@ def test_startup_cleanup_failure_preserves_primary_error_and_pending_identity(
         nonlocal unlink_calls
         unlink_calls += 1
         if unlink_calls == 1:
-            raise LocalStateError(
-                LocalStateErrorCode.OPERATION_FAILED,
-                "secure local-state operation failed",
-            )
+            raise LocalStateError(LocalStateErrorCode.OPERATION_FAILED)
         original_unlink(parent_fd, leaf, expected)
 
     monkeypatch.setattr(
@@ -3984,8 +3574,8 @@ def test_daemon_command_submit_rejects_blank_request_id_before_mutation(
     assert response["result"]["status"] == STATUS_INVALID_REQUEST
     assert calls == []
     with sqlite3.connect(str(db_path)) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM agent_events").fetchone()[0] == 0
 
 def test_cli_snapshot_requires_daemon_when_configured_socket_is_absent(
     tmp_path: Path,
@@ -4016,27 +3606,6 @@ def test_cli_snapshot_requires_daemon_when_configured_socket_is_absent(
     assert payload["ok"] is False
     assert payload["status"] == "daemon_unavailable"
     assert not (data_dir / "tendwire.db").exists()
-
-
-def test_cli_command_falls_back_when_configured_socket_is_stale(
-    tmp_path: Path,
-    capsys,
-    monkeypatch,
-) -> None:
-    socket_path = tmp_path / "stale.sock"
-    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    stale.bind(str(socket_path))
-    stale.close()
-
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"schema_version": 1, "action": "noop"})))
-
-    code = main(["--socket-path", str(socket_path), "command", "--json"])
-    captured = capsys.readouterr()
-    payload = json.loads(captured.out)
-
-    assert code == 0
-    assert payload["ok"] is True
-    assert payload["status"] == "noop"
 
 
 def _current_socket_group() -> tuple[str, int]:
@@ -4558,289 +4127,3 @@ def test_socket_startup_lock_retries_interrupted_nonblocking_flock(
         server.close()
 
     assert not os.path.lexists(socket_path)
-
-
-@_UNIX_SOCKET_TEST
-def test_isolated_daemon_survives_deterministic_real_wal_retirement_without_resources(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "private-daemon-race.db"
-    socket_path = tmp_path / "private-daemon-race.sock"
-    config = Config(
-        host_id="daemon-race-host",
-        data_dir=tmp_path,
-        db_path=db_path,
-        socket_path=socket_path,
-        acknowledged_final_retention_days=36500,
-    )
-    worker = Worker(id="worker-race", name="Worker Race", status="active")
-    snapshot = Snapshot(
-        host_id=config.host_id,
-        updated_at="2026-01-01T00:00:00+00:00",
-        workers=[worker],
-        backend_health=[
-            BackendHealth(
-                name="herdr",
-                status="healthy",
-                outcome="healthy_non_empty",
-                observed_at="2026-01-01T00:00:00+00:00",
-            )
-        ],
-    )
-    init_store(db_path)
-    save_snapshot(db_path, snapshot)
-    upsert_worker_bindings(
-        db_path,
-        [
-            WorkerBinding(
-                host_id=config.host_id,
-                worker_id=worker.id,
-                worker_fingerprint=worker.fingerprint,
-                backend="herdr",
-                target_kind="agent_id",
-                target_value="private-race-agent",
-                turn_target_kind="pane_id",
-                turn_target_value="private-race-pane",
-                sendable=True,
-                reason=None,
-                observed_at="2026-01-01T00:00:00+00:00",
-                private_fingerprint="private-race-binding",
-            )
-        ],
-    )
-    assert apply_test_turn_refresh(
-        db_path,
-        config.host_id,
-        worker.id,
-        {
-            "source_turn_id": "source-turn-race",
-            "assistant_final_text": "durable race final",
-            "complete": True,
-            "has_open_turn": False,
-        },
-        observed_at="2026-01-01T00:01:00+00:00",
-    ) == 1
-    setup_connection = sqlite3.connect(str(db_path))
-    try:
-        assert setup_connection.execute(
-            "PRAGMA journal_mode=WAL"
-        ).fetchone()[0] == "wal"
-        setup_connection.execute(
-            "CREATE TABLE IF NOT EXISTS daemon_race_churn "
-            "(cycle INTEGER PRIMARY KEY, value TEXT NOT NULL)"
-        )
-        setup_connection.commit()
-        assert setup_connection.execute(
-            "PRAGMA wal_checkpoint(TRUNCATE)"
-        ).fetchone()[0] == 0
-    finally:
-        setup_connection.close()
-
-    cycle_count = 4
-    wal_path = Path(f"{db_path}-wal")
-    shm_path = Path(f"{db_path}-shm")
-    ready = threading.Barrier(2, timeout=10)
-    captured = threading.Barrier(2, timeout=10)
-    retired = threading.Barrier(2, timeout=10)
-    consumed = threading.Barrier(2, timeout=10)
-    race_enabled = threading.Event()
-    phase_calls: list[tuple[str, LocalStateKind]] = []
-    writer_errors: list[BaseException] = []
-
-    def phase_hook(phase: str, kind: LocalStateKind) -> None:
-        if (
-            phase == "captured"
-            and kind is LocalStateKind.DATABASE_WAL
-            and race_enabled.is_set()
-        ):
-            race_enabled.clear()
-            phase_calls.append((phase, kind))
-            captured.wait()
-            retired.wait()
-
-    monkeypatch.setattr(
-        "tendwire.local_state._sqlite_family_test_phase",
-        phase_hook,
-    )
-
-    def churn_wal() -> None:
-        try:
-            for cycle in range(cycle_count):
-                connection = sqlite3.connect(str(db_path), timeout=5)
-                try:
-                    assert connection.execute(
-                        "PRAGMA journal_mode=WAL"
-                    ).fetchone()[0] == "wal"
-                    connection.execute(
-                        "INSERT INTO daemon_race_churn (cycle, value) VALUES (?, ?)",
-                        (cycle, f"value-{cycle}"),
-                    )
-                    connection.commit()
-                    if not os.path.lexists(wal_path):
-                        raise AssertionError("WAL was not live before capture")
-                    ready.wait()
-                    captured.wait()
-                    assert connection.execute(
-                        "PRAGMA wal_checkpoint(TRUNCATE)"
-                    ).fetchone()[0] == 0
-                finally:
-                    connection.close()
-                wal_path.unlink(missing_ok=True)
-                shm_path.unlink(missing_ok=True)
-                assert not os.path.lexists(wal_path)
-                assert not os.path.lexists(shm_path)
-                retired.wait()
-                consumed.wait()
-        except BaseException as exc:  # noqa: BLE001
-            writer_errors.append(exc)
-            for barrier in (ready, captured, retired, consumed):
-                try:
-                    barrier.abort()
-                except threading.BrokenBarrierError:
-                    pass
-
-    def direct_child_processes() -> set[int]:
-        children: set[int] = set()
-        for task in (Path("/proc/self/task")).iterdir():
-            try:
-                values = (task / "children").read_text(encoding="ascii").split()
-            except FileNotFoundError:
-                continue
-            children.update(int(value) for value in values)
-        return children
-
-    def fd_targets() -> dict[str, tuple[str, int, int, int]]:
-        targets: dict[str, tuple[str, int, int, int]] = {}
-        for fd in os.listdir("/proc/self/fd"):
-            try:
-                target = os.readlink(f"/proc/self/fd/{fd}")
-                fd_stat = os.fstat(int(fd))
-            except (FileNotFoundError, OSError):
-                continue
-            targets[fd] = (
-                target,
-                int(fd_stat.st_dev),
-                int(fd_stat.st_ino),
-                stat.S_IFMT(fd_stat.st_mode),
-            )
-        return targets
-
-    # Earlier SQLite fixtures may leave unreachable cyclic connections pending
-    # collection. Stabilize the process-wide descriptor baseline before this
-    # test attributes later changes to the daemon under test.
-    gc.collect()
-    baseline_fds = fd_targets()
-    baseline_threads = {id(thread) for thread in threading.enumerate()}
-    baseline_children = direct_child_processes()
-    main_identity = (db_path.stat().st_dev, db_path.stat().st_ino)
-    daemon = TendwireDaemon(config)
-    server_thread: threading.Thread | None = None
-    writer_thread = threading.Thread(target=churn_wal)
-    writer_started = False
-    requests_completed = False
-    responses: list[dict[str, Any]] = []
-    try:
-        daemon.start()
-        assert daemon.server is not None
-        api = daemon.server.dispatcher.__self__
-        assert isinstance(api, TendwireDaemonAPI)
-        for callback_name, method_name in (
-            ("_get_snapshot", "get_snapshot"),
-            ("_get_turns", "get_turns"),
-            ("_get_health", "get_health"),
-            ("_get_pending", "get_pending"),
-        ):
-            callback = getattr(api, callback_name)
-            assert callback.__self__ is daemon
-            assert callback.__func__ is getattr(TendwireDaemon, method_name)
-        server_thread = threading.Thread(target=daemon.serve_forever)
-        server_thread.start()
-        writer_thread.start()
-        writer_started = True
-        client = DaemonAPIClient(socket_path, timeout_seconds=5)
-        for _cycle in range(cycle_count):
-            ready.wait()
-            race_enabled.set()
-            snapshot_response = client.request("snapshot.get")
-            turn_response = client.request(
-                "turn.list",
-                {
-                    "schema_version": 2,
-                    "limit": 10,
-                    "cursor": None,
-                    "since": None,
-                },
-            )
-            health_response = client.request("health.get")
-            responses.extend(
-                (snapshot_response, turn_response, health_response)
-            )
-            assert snapshot_response["ok"] is True, (
-                snapshot_response,
-                writer_errors,
-            )
-            assert snapshot_response["result"]["host_id"] == config.host_id
-            assert turn_response["ok"] is True, turn_response
-            assert turn_response["result"]["schema_version"] == 2
-            assert any(
-                turn.get("assistant_final_text") == "durable race final"
-                for turn in turn_response["result"]["turns"]
-            )
-            assert health_response["ok"] is True, health_response
-            assert health_response["result"]["status"] == "ok"
-            assert health_response["result"]["store"]["status"] == "healthy"
-            consumed.wait()
-        requests_completed = True
-    finally:
-        race_enabled.clear()
-        if not requests_completed:
-            for barrier in (ready, captured, retired, consumed):
-                try:
-                    barrier.abort()
-                except threading.BrokenBarrierError:
-                    pass
-        daemon.stop()
-        if writer_started:
-            writer_thread.join(timeout=10)
-        if server_thread is not None:
-            server_thread.join(timeout=10)
-
-    assert not writer_thread.is_alive()
-    assert server_thread is not None and not server_thread.is_alive()
-    assert writer_errors == []
-    assert phase_calls == [
-        ("captured", LocalStateKind.DATABASE_WAL)
-    ] * cycle_count
-    assert len(responses) == cycle_count * 3
-    assert (db_path.stat().st_dev, db_path.stat().st_ino) == main_identity
-    assert not os.path.lexists(socket_path)
-    current_fds = fd_targets()
-    changed_fds = {
-        fd: (baseline_fds.get(fd), current_fds.get(fd))
-        for fd in set(baseline_fds) | set(current_fds)
-        if baseline_fds.get(fd) != current_fds.get(fd)
-    }
-    assert current_fds == baseline_fds, changed_fds
-    assert {id(thread) for thread in threading.enumerate()} == baseline_threads
-    assert direct_child_processes() == baseline_children
-    for response in responses:
-        _assert_no_public_json_forbidden(response)
-        serialized = json.dumps(response, sort_keys=True)
-        for private_value in (
-            str(tmp_path),
-            str(db_path),
-            db_path.name,
-            str(socket_path),
-            socket_path.name,
-            "private-race-agent",
-            "private-race-pane",
-            "private-race-binding",
-            "-wal",
-            "-shm",
-            "-journal",
-            '"uid"',
-            '"gid"',
-            '"inode"',
-        ):
-            assert private_value not in serialized

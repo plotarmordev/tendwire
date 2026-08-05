@@ -18,15 +18,10 @@ from tendwire.backends.acp_client import (
 )
 from tendwire.backends.acp_protocol import (
     PermissionOption,
-    PermissionOptionKind,
     PermissionRequest,
-    PromptResult,
-    SessionResult,
     SessionUpdate,
-    SessionUpdateKind,
     StopReason,
     SteeringOutcome,
-    SteeringResult,
 )
 from tendwire.backends.acp_runtime import (
     AcpWorkerSession as AcpRuntime,
@@ -39,14 +34,13 @@ from tendwire.backends.acp_runtime import (
 )
 from tendwire.config import Config
 from tendwire.core.models import Snapshot, Worker, WorkerBinding, utc_timestamp
-from tendwire.store.sqlite import (
-    expire_stale_worker_bindings,
+from tendwire.store.events import list_agent_events
+from tendwire.store.projection import (
     expire_worker_bindings,
-    list_agent_events,
     list_worker_bindings,
     save_snapshot,
-    upsert_worker_bindings,
 )
+from .store_helpers import upsert_test_worker_bindings as upsert_worker_bindings
 
 
 _END = object()
@@ -62,18 +56,15 @@ class FakeClient:
         self.permissions = self.events
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
         self.permission_responses: list[tuple[object, str | None, bool]] = []
-        self.prompt_result: object = PromptResult(StopReason.END_TURN, {})
+        self.prompt_result: object = StopReason.END_TURN
         self.prompt_failure: BaseException | None = None
         self.initialize_failure: BaseException | None = None
-        self.new_session_result: SessionResult | None = None
-        self.restored_session_result: SessionResult | None = None
+        self.new_session_result: str | None = None
+        self.restored_session_result: str | None = None
         self.closed = False
         self.close_calls = 0
         self.steering_supported = False
-        self.steering_result = SteeringResult(
-            SteeringOutcome.INJECTED,
-            {"outcome": "injected"},
-        )
+        self.steering_result = SteeringOutcome.INJECTED
 
     def initialize(self, **kwargs: Any) -> object:
         self.calls.append(("initialize", (), kwargs))
@@ -81,27 +72,21 @@ class FakeClient:
             raise self.initialize_failure
         return object()
 
-    def new_session(self, cwd: Path, **kwargs: Any) -> SessionResult:
+    def new_session(self, cwd: Path, **kwargs: Any) -> str:
         self.calls.append(("new", (cwd,), kwargs))
-        return self.new_session_result or SessionResult(
-            "session-private", None, (), {}
-        )
+        return self.new_session_result or "session-private"
 
     def load_session(
         self, session_id: str, cwd: Path, **kwargs: Any
-    ) -> SessionResult:
+    ) -> str:
         self.calls.append(("load", (session_id, cwd), kwargs))
-        return self.restored_session_result or SessionResult(
-            session_id, None, (), {}
-        )
+        return self.restored_session_result or session_id
 
     def resume_session(
         self, session_id: str, cwd: Path, **kwargs: Any
-    ) -> SessionResult:
+    ) -> str:
         self.calls.append(("resume", (session_id, cwd), kwargs))
-        return self.restored_session_result or SessionResult(
-            session_id, None, (), {}
-        )
+        return self.restored_session_result or session_id
 
     def prompt(self, session_id: str, prompt: object, **kwargs: Any) -> object:
         self.calls.append(("prompt", (session_id, prompt), kwargs))
@@ -129,26 +114,6 @@ class FakeClient:
 
     def cancel(self, session_id: str) -> None:
         self.calls.append(("cancel", (session_id,), {}))
-
-    def next_update(self, *, timeout: float) -> SessionUpdate:
-        try:
-            value = self.updates.get(timeout=timeout)
-        except queue.Empty as exc:
-            raise AcpRequestTimeoutError("idle") from exc
-        if value is _END:
-            raise EOFError("closed")
-        assert isinstance(value, SessionUpdate)
-        return value
-
-    def next_permission_request(self, *, timeout: float) -> PermissionRequest:
-        try:
-            value = self.permissions.get(timeout=timeout)
-        except queue.Empty as exc:
-            raise AcpRequestTimeoutError("idle") from exc
-        if value is _END:
-            raise EOFError("closed")
-        assert isinstance(value, PermissionRequest)
-        return value
 
     def next_session_event(
         self,
@@ -187,7 +152,6 @@ class FakeIngestor:
         self.permissions: list[tuple[object, str | None]] = []
         self.completions = 0
         self.completion_reasons: list[StopReason] = []
-        self.load_resets = 0
         self.update_failure: BaseException | None = None
         self.permission_failure: BaseException | None = None
         self.completion_failure: BaseException | None = None
@@ -242,9 +206,6 @@ class FakeIngestor:
     def append_prompt(self, prompt: object, *, producer_turn_id: str) -> object:
         self.appended.append((prompt, producer_turn_id))
         return self.update_result
-
-    def reset_after_load(self) -> None:
-        self.load_resets += 1
 
     def mark_prompt_complete(
         self,
@@ -322,7 +283,7 @@ def runtime(
         cwd=tmp_path,
         stream_generation="generation-private-secret",
         session_binding_callback=binding_callback(db_path),
-        ingestor=ingestor or FakeIngestor(),  # type: ignore[arg-type]
+        ingestor_factory=lambda *_args, **_kwargs: ingestor or FakeIngestor(),
         poll_timeout=0.01,
         stop_timeout=0.5,
         **kwargs,
@@ -362,13 +323,7 @@ def update(session_id: str = "session-private") -> SessionUpdate:
             "content": {"type": "text", "text": "answer"},
         },
     }
-    return SessionUpdate(
-        session_id,
-        SessionUpdateKind.AGENT_MESSAGE_CHUNK,
-        raw["update"],
-        None,
-        raw,
-    )
+    return SessionUpdate(session_id, raw)
 
 
 def permission(
@@ -378,20 +333,21 @@ def permission(
         PermissionOption(
             "allow-once",
             "Allow once",
-            PermissionOptionKind.ALLOW_ONCE,
-            {"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
+            "allow_once",
         ),
         PermissionOption(
             "reject-once",
             "Reject once",
-            PermissionOptionKind.REJECT_ONCE,
-            {"optionId": "reject-once", "name": "Reject once", "kind": "reject_once"},
+            "reject_once",
         ),
     )
     raw = {
         "sessionId": session_id,
         "toolCall": {"toolCallId": "tool-private"},
-        "options": [dict(option.raw) for option in options],
+        "options": [
+            {"optionId": option.option_id, "name": option.name, "kind": option.kind}
+            for option in options
+        ],
     }
     return PermissionRequest(
         request_id,
@@ -431,7 +387,6 @@ def test_start_negotiates_opens_one_session_and_binds_factory(tmp_path: Path) ->
         binding=continuity,
         cwd=tmp_path,
         stream_generation="generation-private-secret",
-        client_capabilities={"fs": {"readTextFile": True}},
         session_binding_callback=binding_callback(db_path),
         ingestor_factory=factory,  # type: ignore[arg-type]
         poll_timeout=0.01,
@@ -439,7 +394,6 @@ def test_start_negotiates_opens_one_session_and_binds_factory(tmp_path: Path) ->
     ).start()
     try:
         assert [call[0] for call in client.calls[:2]] == ["initialize", "new"]
-        assert client.calls[0][2]["client_capabilities"] == {}
         assert captured["session_id"] == "session-private"
         assert captured["binding"] is not None
         assert captured["stream_generation"] == "generation-private-secret"
@@ -455,38 +409,6 @@ def test_start_negotiates_opens_one_session_and_binds_factory(tmp_path: Path) ->
     )
     assert len(retired) == 1
     assert retired[0].reason == "acp_runtime_stopped"
-
-
-@pytest.mark.parametrize(
-    "claims",
-    [
-        {"fs": {"readTextFile": True, "writeTextFile": True}},
-        {"terminal": True},
-        {"elicitation": {"form": {}, "url": {}}},
-        {"session": {"configOptions": {"boolean": {}}}},
-        {"_meta": {"example.test/capability": True}},
-    ],
-)
-def test_runtime_strips_client_capabilities_it_cannot_serve(
-    tmp_path: Path,
-    claims: dict[str, object],
-) -> None:
-    client = FakeClient()
-    service = runtime(tmp_path, client, client_capabilities=claims).start()
-    try:
-        assert client.calls[0][2]["client_capabilities"] == {}
-    finally:
-        service.stop()
-
-
-def test_runtime_rejects_unknown_extension_capability_claims(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="unsupported client capabilities"):
-        runtime(
-            tmp_path,
-            FakeClient(),
-            client_capabilities={"example.test/custom": {}},
-        )
-
 
 @pytest.mark.parametrize(
     ("mode", "method"),
@@ -510,14 +432,13 @@ def test_load_and_resume_use_requested_session(
         cwd=tmp_path,
         session_mode=mode,
         session_id="existing-private",
-        ingestor=ingestor,  # type: ignore[arg-type]
+        ingestor_factory=lambda *_args, **_kwargs: ingestor,
         poll_timeout=0.01,
         stop_timeout=0.5,
     ).start()
     try:
         assert client.calls[1][0] == method
         assert client.calls[1][1][0] == "existing-private"
-        assert ingestor.load_resets == (1 if mode is SessionOpenMode.LOAD else 0)
     finally:
         service.stop()
     assert list_worker_bindings(db_path, "host-a", backend="acp") == []
@@ -531,18 +452,263 @@ def test_load_and_resume_use_requested_session(
     assert retired[0].reason == "acp_runtime_stopped"
 
 
+def test_derived_binding_release_retries_after_store_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "events.db"
+    existing = binding("existing-private")
+    upsert_worker_bindings(db_path, [existing])
+    service = AcpRuntime(
+        FakeClient(),  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=existing,
+        cwd=tmp_path,
+        session_mode=SessionOpenMode.LOAD,
+        session_id="existing-private",
+    )
+    attempts = 0
+
+    def fail_once(*args: object, **kwargs: object) -> int:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("injected expiry failure")
+        return expire_worker_bindings(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        "tendwire.backends.acp_runtime.expire_worker_bindings",
+        fail_once,
+    )
+    with pytest.raises(sqlite3.OperationalError, match="injected expiry failure"):
+        service._release_derived_bindings(reason="acp_runtime_failed")
+
+    assert service._provisional_bindings == {
+        (
+            existing.worker_id,
+            existing.worker_fingerprint,
+            existing.private_fingerprint,
+        ): existing,
+    }
+    assert list_worker_bindings(db_path, "host-a", backend="acp") == [existing]
+
+    service._release_derived_bindings(reason="acp_runtime_stopped")
+    assert service._provisional_bindings == {}
+    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
+
+
+def test_callback_cleanup_retains_every_new_binding_until_expiry_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "events.db"
+    continuity = continuity_binding()
+    upsert_worker_bindings(db_path, [continuity])
+    service = AcpRuntime(
+        FakeClient(),  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=continuity,
+        cwd=tmp_path,
+        session_binding_callback=binding_callback(db_path),
+    )
+    existing = {
+        item.private_fingerprint
+        for item in service._authority_acp_bindings(continuity)
+    }
+    created = replace(
+        continuity,
+        backend="acp",
+        turn_target_kind="acp_session_id",
+        turn_target_value="persisted-before-callback-failure",
+        private_fingerprint="",
+    )
+    upsert_worker_bindings(db_path, [created])
+    persisted = list_worker_bindings(db_path, "host-a", backend="acp")[0]
+    attempts = 0
+
+    def fail_once(*args: object, **kwargs: object) -> int:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("injected callback cleanup failure")
+        return expire_worker_bindings(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        "tendwire.backends.acp_runtime.expire_worker_bindings",
+        fail_once,
+    )
+    with pytest.raises(sqlite3.OperationalError, match="callback cleanup failure"):
+        service._expire_new_acp_bindings(continuity, existing)
+
+    assert service._provisional_bindings == {
+        (
+            persisted.worker_id,
+            persisted.worker_fingerprint,
+            persisted.private_fingerprint,
+        ): persisted,
+    }
+    service._release_derived_bindings(reason="acp_runtime_failed")
+    assert service._provisional_bindings == {}
+    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
+
+
+def test_callback_cleanup_is_scoped_to_one_exact_worker_authority(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "events.db"
+    continuity = continuity_binding()
+    other_continuity = replace(
+        continuity,
+        worker_id="other-worker",
+        target_value="other-pane",
+        turn_target_value="other-pane",
+        private_fingerprint="other-continuity",
+    )
+    upsert_worker_bindings(db_path, [continuity])
+    save_snapshot(
+        db_path,
+        Snapshot(
+            host_id="host-a",
+            updated_at="2026-08-05T12:00:00+00:00",
+            workers=(
+                Worker(
+                    id=continuity.worker_id,
+                    name="own worker",
+                    fingerprint=continuity.worker_fingerprint,
+                    meta={
+                        "stable_key": "wsk1_" + "a" * 64,
+                        "stable_key_version": 1,
+                    },
+                ),
+                Worker(
+                    id=other_continuity.worker_id,
+                    name="other worker",
+                    fingerprint=other_continuity.worker_fingerprint,
+                    meta={
+                        "stable_key": "wsk1_" + "b" * 64,
+                        "stable_key_version": 1,
+                    },
+                ),
+            ),
+        ),
+    )
+    upsert_worker_bindings(db_path, [other_continuity])
+    service = AcpRuntime(
+        FakeClient(),  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=continuity,
+        cwd=tmp_path,
+        session_binding_callback=binding_callback(db_path),
+    )
+    own = replace(
+        continuity,
+        backend="acp",
+        turn_target_kind="acp_session_id",
+        turn_target_value="own-session",
+        private_fingerprint="shared-explicit-fingerprint",
+    )
+    other = replace(
+        other_continuity,
+        backend="acp",
+        turn_target_kind="acp_session_id",
+        turn_target_value="other-session",
+        private_fingerprint="shared-explicit-fingerprint",
+    )
+    upsert_worker_bindings(db_path, [own, other])
+
+    service._expire_new_acp_bindings(continuity, set())
+
+    assert list_worker_bindings(db_path, "host-a", backend="acp") == [other]
+
+
+def test_release_retains_binding_refreshed_after_expiry_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "events.db"
+    existing = binding("existing-private")
+    upsert_worker_bindings(db_path, [existing])
+    service = AcpRuntime(
+        FakeClient(),  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=existing,
+        cwd=tmp_path,
+        session_mode=SessionOpenMode.LOAD,
+        session_id="existing-private",
+    )
+    refreshed = replace(
+        existing,
+        observed_at="2099-01-01T00:00:00+00:00",
+    )
+    refreshed_once = False
+
+    def refresh_then_expire(*args: object, **kwargs: object) -> int:
+        nonlocal refreshed_once
+        if not refreshed_once:
+            refreshed_once = True
+            upsert_worker_bindings(db_path, [refreshed])
+        return expire_worker_bindings(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        "tendwire.backends.acp_runtime.expire_worker_bindings",
+        refresh_then_expire,
+    )
+    with pytest.raises(AcpRuntimeBindingError, match="changed during cleanup"):
+        service._release_derived_bindings(reason="acp_runtime_failed")
+
+    assert tuple(service._provisional_bindings.values()) == (refreshed,)
+    service._release_derived_bindings(reason="acp_runtime_stopped")
+    assert service._provisional_bindings == {}
+    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
+
+
+def test_stop_prefers_original_failure_when_binding_cleanup_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "events.db"
+    existing = binding("existing-private")
+    upsert_worker_bindings(db_path, [existing])
+    service = AcpRuntime(
+        FakeClient(),  # type: ignore[arg-type]
+        config=Config(host_id="host-a", db_path=db_path),
+        binding=existing,
+        cwd=tmp_path,
+        session_mode=SessionOpenMode.LOAD,
+        session_id="existing-private",
+    )
+    original = RuntimeError("original runtime failure")
+    with service._state_lock:
+        service._failure = original
+        service._state = RuntimeState.FAILED
+
+    def fail_cleanup(*_args: object, **_kwargs: object) -> int:
+        raise sqlite3.OperationalError("secondary cleanup failure")
+
+    monkeypatch.setattr(
+        "tendwire.backends.acp_runtime.expire_worker_bindings",
+        fail_cleanup,
+    )
+    with pytest.raises(RuntimeError, match="original runtime failure"):
+        service.stop()
+
+    assert service._failure is original
+    assert service._provisional_bindings
+    monkeypatch.setattr(
+        "tendwire.backends.acp_runtime.expire_worker_bindings",
+        expire_worker_bindings,
+    )
+    service._release_derived_bindings(reason="acp_runtime_stopped")
+    assert service._provisional_bindings == {}
+
+
 @pytest.mark.parametrize("mode", [SessionOpenMode.LOAD, SessionOpenMode.RESUME])
 def test_load_and_resume_reject_agent_session_mismatch_and_close(
     tmp_path: Path,
     mode: SessionOpenMode,
 ) -> None:
     client = FakeClient()
-    client.restored_session_result = SessionResult(
-        "attacker-session-private",
-        None,
-        (),
-        {},
-    )
+    client.restored_session_result = "attacker-session-private"
     db_path = tmp_path / "events.db"
     existing = binding("existing-private")
     upsert_worker_bindings(db_path, [existing])
@@ -604,7 +770,7 @@ def test_load_and_resume_reject_non_acp_binding_before_transport(
 def test_new_accepts_unpredictable_agent_generated_session_id(tmp_path: Path) -> None:
     client = FakeClient()
     generated = "agent-generated-unpredictable-7f94"
-    client.new_session_result = SessionResult(generated, None, (), {})
+    client.new_session_result = generated
     db_path = tmp_path / "events.db"
     continuity = continuity_binding()
     upsert_worker_bindings(db_path, [continuity])
@@ -620,7 +786,7 @@ def test_new_accepts_unpredictable_agent_generated_session_id(tmp_path: Path) ->
         binding=continuity,
         cwd=tmp_path,
         session_binding_callback=establish,
-        ingestor=FakeIngestor(generated),  # type: ignore[arg-type]
+        ingestor_factory=lambda *_args, **_kwargs: FakeIngestor(generated),
         poll_timeout=0.01,
         stop_timeout=0.5,
     ).start()
@@ -644,7 +810,7 @@ def test_new_acp_binding_survives_herdr_refresh_and_normal_stop(
         binding=continuity,
         cwd=tmp_path,
         session_binding_callback=binding_callback(db_path),
-        ingestor=FakeIngestor(),  # type: ignore[arg-type]
+        ingestor_factory=lambda *_args, **_kwargs: FakeIngestor(),
         poll_timeout=0.01,
         stop_timeout=0.5,
     ).start()
@@ -652,11 +818,12 @@ def test_new_acp_binding_survives_herdr_refresh_and_normal_stop(
     derived = list_worker_bindings(db_path, "host-a", backend="acp")
     assert len(derived) == 1
     assert derived[0].turn_target_value == "session-private"
-    expire_stale_worker_bindings(
+    expire_worker_bindings(
         db_path,
         "host-a",
         backend="herdr",
-        current_private_fingerprints=[continuity.private_fingerprint],
+        private_fingerprints=["unrelated-private-binding"],
+        reason="stale_observation",
     )
     assert list_worker_bindings(db_path, "host-a", backend="acp") == derived
     service.stop()
@@ -694,7 +861,7 @@ def test_new_session_binding_accepts_concurrent_herdr_lease_refresh(
         binding=continuity,
         cwd=tmp_path,
         session_binding_callback=bind_after_refresh,
-        ingestor=FakeIngestor(),  # type: ignore[arg-type]
+        ingestor_factory=lambda *_args, **_kwargs: FakeIngestor(),
         poll_timeout=0.01,
         stop_timeout=0.5,
     ).start()
@@ -820,7 +987,7 @@ def test_prompt_rechecks_binding_before_remote_send(tmp_path: Path) -> None:
         binding=continuity,
         cwd=tmp_path,
         session_binding_callback=binding_callback(db_path),
-        ingestor=ingestor,  # type: ignore[arg-type]
+        ingestor_factory=lambda *_args, **_kwargs: ingestor,
         poll_timeout=0.01,
         stop_timeout=0.5,
     ).start()
@@ -1225,7 +1392,7 @@ def test_prompt_finalizes_only_after_valid_response_and_update_drain(
         client.updates.put(update())
         result = service.prompt("question", producer_turn_id="producer-private")
 
-        assert result.stop_reason is StopReason.END_TURN
+        assert result is StopReason.END_TURN
         assert ingestor.started == ["producer-private"]
         assert len(ingestor.updates) == 1
         assert ingestor.completions == 1
@@ -1299,7 +1466,7 @@ def test_submit_steering_records_input_at_transport_boundary(tmp_path: Path) -> 
             acknowledgement_timeout=0.25,
             on_send_start=lambda: callbacks.append("started"),
         )
-        assert result.outcome is SteeringOutcome.INJECTED
+        assert result is SteeringOutcome.INJECTED
         assert callbacks == ["started"]
         assert len(ingestor.appended) == 1
         assert ingestor.appended[0][1] == "producer-steer"
@@ -1318,7 +1485,7 @@ def test_submit_steering_retries_definite_non_application_once(tmp_path: Path) -
 
         def steer_session(
             self, session_id: str, prompt: object, **kwargs: Any
-        ) -> SteeringResult:
+        ) -> SteeringOutcome:
             self.calls.append(("steer", (session_id, prompt), kwargs))
             self.steering_attempts += 1
             on_send_start = kwargs.get("on_send_start")
@@ -1329,7 +1496,7 @@ def test_submit_steering_retries_definite_non_application_once(tmp_path: Path) -
                 if self.steering_attempts == 1
                 else SteeringOutcome.INJECTED
             )
-            return SteeringResult(outcome, {"outcome": outcome.value})
+            return outcome
 
     client = FailOnceSteeringClient()
     ingestor = FakeIngestor()
@@ -1342,7 +1509,7 @@ def test_submit_steering_retries_definite_non_application_once(tmp_path: Path) -
             acknowledgement_timeout=0.25,
             on_send_start=lambda: callbacks.append("started"),
         )
-        assert result.outcome is SteeringOutcome.INJECTED
+        assert result is SteeringOutcome.INJECTED
         assert callbacks == ["started"]
         assert len(ingestor.appended) == 1
         assert ingestor.appended[0][1] == "producer-steer-retry"
@@ -1358,10 +1525,7 @@ def test_submit_steering_returns_second_definite_failure_without_third_attempt(
 ) -> None:
     client = FakeClient()
     client.steering_supported = True
-    client.steering_result = SteeringResult(
-        SteeringOutcome.FAILED,
-        {"outcome": SteeringOutcome.FAILED.value},
-    )
+    client.steering_result = SteeringOutcome.FAILED
     ingestor = FakeIngestor()
     service = runtime(tmp_path, client, ingestor).start()
     try:
@@ -1372,7 +1536,7 @@ def test_submit_steering_returns_second_definite_failure_without_third_attempt(
             acknowledgement_timeout=0.25,
             on_send_start=lambda: callbacks.append("started"),
         )
-        assert result.outcome is SteeringOutcome.FAILED
+        assert result is SteeringOutcome.FAILED
         assert callbacks == ["started"]
         assert len(ingestor.appended) == 1
         assert [call[0] for call in client.calls].count("steer") == 2
@@ -1439,7 +1603,7 @@ def test_prompt_finality_waits_for_permission_resolution(tmp_path: Path) -> None
         ingestor,
         permission_callback=decide,
     ).start()
-    result: list[PromptResult] = []
+    result: list[StopReason] = []
     failure: list[BaseException] = []
 
     def run_prompt() -> None:
@@ -1522,7 +1686,7 @@ def test_cross_kind_ingestion_cannot_overtake_an_active_update(
         service.stop()
 
 
-def test_load_drains_replay_larger_than_client_queue_before_response(
+def test_load_drains_and_discards_setup_replay_before_live_ingestion(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "load.db"
@@ -1546,8 +1710,8 @@ def test_load_drains_replay_larger_than_client_queue_before_response(
         stop_timeout=2,
     ).start()
     try:
-        assert service.status().updates_ingested == 64
-        assert len(list_agent_events(db_path, "host-a")) == 64
+        assert service.status().updates_ingested == 0
+        assert list_agent_events(db_path, "host-a") == ()
         with sqlite3.connect(db_path) as conn:
             assert conn.execute("SELECT COUNT(*) FROM connector_outbox").fetchone()[0] == 0
     finally:
@@ -1560,12 +1724,12 @@ def test_runtime_carries_every_prompt_stop_reason_to_completion(
     stop_reason: StopReason,
 ) -> None:
     client = FakeClient()
-    client.prompt_result = PromptResult(stop_reason, {"stopReason": stop_reason.value})
+    client.prompt_result = stop_reason
     ingestor = FakeIngestor()
     service = runtime(tmp_path, client, ingestor).start()
     try:
         result = service.prompt("no echo", producer_turn_id="turn-a")
-        assert result.stop_reason is stop_reason
+        assert result is stop_reason
         assert ingestor.started == ["turn-a"]
         assert ingestor.completion_reasons == [stop_reason]
     finally:
@@ -1686,12 +1850,12 @@ def test_prompt_transport_failure_materializes_one_cancelled_final_projection(
             ("host-a",),
         ).fetchall()
         revisions = conn.execute(
-            "SELECT final_state, assistant_final_text "
+            "SELECT known_incomplete, assistant_final_text "
             "FROM turn_content_revisions WHERE host_id = ? AND is_current = 1",
             ("host-a",),
         ).fetchall()
     assert len(turns) == 1
-    assert revisions == [("complete", "[ACP prompt cancelled]")]
+    assert revisions == [(0, "[ACP prompt cancelled]")]
 
 
 def test_invalid_prompt_response_cancels_and_finalizes_open_turn(

@@ -1067,7 +1067,7 @@ edit    herdres_connector/source_sync.py     # remove JSON-ingress/receipt-worki
 edit    herdres_connector/ingress_identity.py  # trim retained key/identity code to 80--100 SLOC
 edit    herdres_connector/managed_bots.py    # ephemeral receiver/policy typing only
 edit    herdres_connector/tendwire_client.py
-keep    herdres_connector/telegram_delivery.py  # H8 uses existing bounded methods
+edit    herdres_connector/telegram_delivery.py  # bounded markup ambiguity marker only
 delete  herdres_connector/ingress_lanes.py
 delete  herdres_connector/ingress_requests.py
 edit/delete only the H8 tests and docs declared by the approved H8 design

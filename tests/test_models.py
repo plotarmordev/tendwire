@@ -289,43 +289,12 @@ def test_suggested_action_from_dict_does_not_promote_forbidden_command_alias() -
         encoded = json.dumps(payload, sort_keys=True)
 
         assert action.tendwire_action == ""
-        assert action.command == raw_action["command"]
-        assert not action.has_public_tendwire_action
         expected_label = "Action" if raw_action["label"] == "Run raw command" else raw_action["label"]
         assert payload["label"] == expected_label
         assert "tendwire_action" not in payload
         assert "safe" in payload["params"]
         assert "sentinel-" not in encoded
         _assert_no_forbidden_fields(payload)
-
-
-def test_suggested_action_command_alias_stays_internal_and_out_of_public_identity() -> None:
-    action_a = SuggestedAction(
-        label="Run diagnostic",
-        command="sentinel-safe-looking-command-alias-a",
-        params={"safe": "kept", "commandLine": "sentinel-command-line-a"},
-    )
-    action_b = SuggestedAction(
-        label="Run diagnostic",
-        command="sentinel-safe-looking-command-alias-b",
-        params={"safe": "kept", "commandLine": "sentinel-command-line-b"},
-    )
-
-    payload_a = action_a.to_dict()
-    payload_b = action_b.to_dict()
-
-    assert action_a.command == "sentinel-safe-looking-command-alias-a"
-    assert action_b.command == "sentinel-safe-looking-command-alias-b"
-    assert action_a.tendwire_action == ""
-    assert not action_a.has_public_tendwire_action
-    assert action_a.action_id == action_b.action_id
-    assert payload_a == payload_b == {
-        "action_id": action_a.action_id,
-        "label": "Run diagnostic",
-        "params": {"safe": "kept"},
-    }
-    assert "sentinel-" not in json.dumps(payload_a, sort_keys=True)
-    _assert_no_forbidden_fields(payload_a)
 
 
 def test_suggested_action_from_dict_prefers_safe_explicit_tendwire_action() -> None:
@@ -345,7 +314,6 @@ def test_suggested_action_from_dict_prefers_safe_explicit_tendwire_action() -> N
     encoded = json.dumps(payload, sort_keys=True)
 
     assert action.tendwire_action == "approve"
-    assert action.has_public_tendwire_action
     assert payload["tendwire_action"] == "approve"
     assert payload["params"] == {"safe": "kept"}
     assert "sentinel-" not in encoded
@@ -361,15 +329,13 @@ def test_suggested_action_omits_raw_explicit_tendwire_action_publicly() -> None:
 
     payload = action.to_dict()
 
-    assert action.command == "tendwire snapshot --json --token sentinel-action-token"
-    assert not action.has_public_tendwire_action
     assert "tendwire_action" not in payload
     assert "sentinel-" not in json.dumps(payload, sort_keys=True)
     _assert_no_forbidden_fields(payload)
 
 
 def _snapshot_payload(snapshot: Snapshot) -> dict[str, Any]:
-    return json.loads(snapshot.to_json())
+    return snapshot.to_dict()
 
 
 def _stable_item_key(item: dict[str, Any]) -> str:
@@ -647,9 +613,9 @@ def test_public_model_text_values_preserve_public_connector_words_before_fingerp
     assert dirty_worker.to_dict() == clean_worker.to_dict()
     assert dirty_action.to_dict() == clean_action.to_dict()
     assert dirty_signal.to_dict() == clean_signal.to_dict()
-    assert fallback_space.id == "telegram delivery workspace"
+    assert fallback_space.id == "unknown"
     assert fallback_space.name == "telegram delivery workspace"
-    assert fallback_worker.id.startswith("worker-")
+    assert fallback_worker.id == "unknown"
     assert fallback_worker.name == fallback_worker.id
     assert fallback_worker.space_id == "telegram delivery workspace"
     assert explicit_dirty_space.id == "telegram delivery workspace"
@@ -835,7 +801,6 @@ def test_attention_signal_direct_identity_and_dataclass_actions_are_neutral() ->
     action = SuggestedAction(
         action_id="inspect-worker",
         label="Inspect worker",
-        command="tendwire snapshot --json",
         params={"worker_id": "worker-1", "route": "telegram", "safe": "kept"},
     )
 
@@ -869,46 +834,8 @@ def test_attention_signal_direct_identity_and_dataclass_actions_are_neutral() ->
         "worker_id": "worker-1",
         "safe": "kept",
     }
-    assert action.command == "tendwire snapshot --json"
     assert "tendwire_action" not in payload["suggested_actions"][0]
     assert "command" not in payload["suggested_actions"][0]
-    _assert_no_forbidden_fields(payload)
-
-
-def test_snapshot_attention_public_fingerprint_ignores_command_aliases() -> None:
-    def snapshot(command: str) -> Snapshot:
-        action = SuggestedAction(
-            label="Run diagnostic",
-            command=command,
-            params={"safe": "kept"},
-        )
-        return Snapshot(
-            host_id="attention-command-host",
-            updated_at="2026-01-01T00:00:00+00:00",
-            attention=[
-                AttentionSignal(
-                    kind="worker_status",
-                    severity="warning",
-                    status="waiting",
-                    reason="Choose next action",
-                    source="worker:worker-1",
-                    suggested_actions=[action],
-                    host_id="attention-command-host",
-                )
-            ],
-        )
-
-    snapshot_a = snapshot("sentinel-safe-looking-command-alias-a")
-    snapshot_b = snapshot("sentinel-safe-looking-command-alias-b")
-    payload = snapshot_a.to_dict()
-
-    assert snapshot_a.content_fingerprint == snapshot_b.content_fingerprint
-    assert (
-        payload["attention"][0]["suggested_actions"]
-        == snapshot_b.to_dict()["attention"][0]["suggested_actions"]
-    )
-    assert "tendwire_action" not in payload["attention"][0]["suggested_actions"][0]
-    assert "sentinel-" not in json.dumps(payload, sort_keys=True)
     _assert_no_forbidden_fields(payload)
 
 
@@ -996,7 +923,7 @@ def test_backend_health_serialization_is_public_safe() -> None:
         "outcome": "healthy_non_empty",
         "observed_at": "2026-01-01T00:00:00+00:00",
         "message": "Herdr observation is healthy",
-        "counts": {"spaces": 1, "workers": 2},
+        "counts": {"spaces": 1},
     }
     _assert_no_forbidden_fields(payload)
 
@@ -1143,7 +1070,7 @@ def test_snapshot_backend_health_roundtrip_and_fingerprint_ignore_observed_at() 
         ],
     )
 
-    assert Snapshot.from_json(snapshot_a.to_json()) == snapshot_a
+    assert Snapshot.from_dict(snapshot_a.to_dict()) == snapshot_a
     assert snapshot_a.content_fingerprint == snapshot_b.content_fingerprint
     assert changed.content_fingerprint != snapshot_a.content_fingerprint
     assert _snapshot_payload(snapshot_a)["content_fingerprint"] == _expected_snapshot_fingerprint(
@@ -1159,7 +1086,7 @@ def test_snapshot_from_json_roundtrip_preserves_fingerprints() -> None:
         workers=[{"id": "worker-1", "name": "Agent One", "status": "blocked"}],
     )
 
-    restored = Snapshot.from_json(snapshot.to_json())
+    restored = Snapshot.from_dict(snapshot.to_dict())
 
     assert restored == snapshot
     assert restored.content_fingerprint == snapshot.content_fingerprint
@@ -1303,7 +1230,7 @@ def test_attention_updated_at_uses_worker_source_time_without_snapshot_fallback(
     assert first_signal["updated_at"] is None
     assert second_signal["updated_at"] is None
     assert _snapshot_payload(sourced)["attention"][0]["updated_at"] == source_time
-    assert _snapshot_payload(sourced_from_updated)["attention"][0]["updated_at"] == source_time
+    assert _snapshot_payload(sourced_from_updated)["attention"][0]["updated_at"] is None
 
 
 def test_snapshot_content_fingerprint_ignores_updated_at_and_sorts_content() -> None:

@@ -25,22 +25,21 @@ from ..config import Config
 from ..core.models import (
     BackendHealth,
     Space,
+    WORKER_BINDING_ACTIVE_EXPIRES_AT,
     Worker,
     WorkerBinding,
     normalize_status,
-    separate_duplicate_worker_bindings,
     utc_timestamp,
     worker_binding_private_fingerprint,
 )
 from ..core.commands import turn_submission_id
 from ..core.models import stable_fingerprint
-from ..store.sqlite import (
+from ..store.events import list_agent_events
+from ..store.pending import pending_payload_from_store
+from ..store.projection import (
     expire_worker_bindings,
     latest_snapshot,
-    list_agent_events,
     list_worker_bindings,
-    pending_payload_from_store,
-    record_agent_event,
     save_snapshot,
     upsert_worker_bindings,
 )
@@ -55,7 +54,6 @@ from .acp_client import BoundedAcpConnection
 from .acp_permissions import AcpPermissionBroker
 from .acp_runtime import (
     AcpWorkerSession,
-    PermissionCallback,
     RuntimeState,
     SessionOpenMode,
 )
@@ -65,10 +63,6 @@ from .herdr_socket import HerdrSocketClient
 
 class AcpCoordinatorError(RuntimeError):
     """The private Herdr ACP endpoint contract or supervisor failed."""
-
-
-class AcpPermissionBridgeUnavailable(AcpCoordinatorError):
-    """Production ACP cannot authorize tools without a durable user decision."""
 
 
 class AcpConsoleInputGap(AcpCoordinatorError):
@@ -102,14 +96,7 @@ class HerdrAcpEndpoint:
     generation: str
     session_mode: SessionOpenMode
     session_id: str | None
-    console: HerdrAcpConsoleEndpoint | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class HerdrAcpStatus:
-    generation: str
-    lifecycle: str
-    console_lifecycle: str
+    console: HerdrAcpConsoleEndpoint
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,14 +110,16 @@ class _SessionSlot:
     continuity: WorkerBinding
     generation: str
     runtime: AcpWorkerSession
+    console: HerdrAcpConsoleEndpoint
+    console_executor: ThreadPoolExecutor
     permission_broker: AcpPermissionBroker | None = None
-    console: HerdrAcpConsoleEndpoint | None = None
     console_input_sequence: int = 0
     console_event_sequence: int = 0
-    console_cursor_loaded: bool = False
-    console_local_turns: set[str] | None = None
-    console_executor: ThreadPoolExecutor | None = None
-    console_submissions: dict[int, Future[Any]] | None = None
+    # Unknown until one empty-output exchange observes Herdr's retained pane
+    # queue for this freshly minted generation.
+    console_retained_output_bytes: int | None = None
+    console_local_turns: set[str] = field(default_factory=set)
+    console_submissions: dict[int, Future[Any]] = field(default_factory=dict)
     console_failures: int = 0
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     retired: bool = False
@@ -232,16 +221,7 @@ class AcpSupervisor:
         session_factory: WorkerSessionFactory = AcpWorkerSession,
         connection_factory: ConnectionFactory = BoundedAcpConnection,
         reconcile_interval: float | None = None,
-        permission_callback: PermissionCallback | None = None,
-        require_permission_bridge: bool = False,
-        durable_permission_bridge: bool = False,
     ) -> None:
-        if config.db_path is None:
-            raise ValueError("ACP coordinator requires a sqlite db path")
-        if durable_permission_bridge and permission_callback is not None:
-            raise ValueError(
-                "durable ACP permission bridge cannot use an embedding callback"
-            )
         self.config = config
         self._daemon_stop = stop_event
         self._endpoint_client_factory = (
@@ -252,9 +232,6 @@ class AcpSupervisor:
             self._discovery_client_factory = _default_endpoint_client_factory
         self._session_factory = session_factory
         self._connection_factory = connection_factory
-        self._permission_callback = permission_callback
-        self._require_permission_bridge = bool(require_permission_bridge)
-        self._durable_permission_bridge = bool(durable_permission_bridge)
         resolved_reconcile_interval = float(
             config.reconcile_interval_seconds
             if reconcile_interval is None
@@ -271,19 +248,15 @@ class AcpSupervisor:
         self._reconcile_lock = threading.RLock()
         self._stop = threading.Event()
         self._slots: dict[str, _SessionSlot] = {}
-        self._retired_slots: list[_SessionSlot] = []
+        # Retirement removes routing authority immediately, but shutdown must
+        # still account for bridge and executor work that already started.
+        self._retired_slots: dict[int, _SessionSlot] = {}
         self._thread: threading.Thread | None = None
-        self._console_thread: threading.Thread | None = None
         self._state = RuntimeState.NEW
         self._failure_type: str | None = None
         self._required_degraded = False
-        self._console_degraded = False
         self._console_failure_type: str | None = None
-        self._console_failed_workers: set[str] = set()
         self._console_failed_claims: dict[str, str] = {}
-        # Exact ACP ownership survives runtime retirement so an outage remains
-        # distinguishable from a worker that Herdr has actually removed.
-        self._published_acp_claims: dict[str, str] = {}
         self._last_discovery_at: str | None = None
         self._worker_count = 0
 
@@ -293,16 +266,6 @@ class AcpSupervisor:
                 return self
             if self._state is not RuntimeState.NEW:
                 raise AcpCoordinatorError("ACP coordinator cannot be restarted")
-            if (
-                self._require_permission_bridge
-                and self._permission_callback is None
-                and not self._durable_permission_bridge
-            ):
-                self._state = RuntimeState.FAILED
-                self._failure_type = "AcpPermissionBridgeUnavailable"
-                raise AcpPermissionBridgeUnavailable(
-                    "durable ACP permission decisions are not configured"
-                )
             self._state = RuntimeState.STARTING
         try:
             # ACP adapter processes cannot survive this coordinator process.
@@ -328,13 +291,6 @@ class AcpSupervisor:
             )
             self._thread = thread
             thread.start()
-            console_thread = threading.Thread(
-                target=self._run_console_bridge,
-                name="tendwire-acp-console-bridge",
-                daemon=True,
-            )
-            self._console_thread = console_thread
-            console_thread.start()
         return self
 
     def stop(self, *, timeout: float | None = None) -> None:
@@ -349,7 +305,7 @@ class AcpSupervisor:
             if self._state is RuntimeState.STOPPED:
                 return
             self._state = RuntimeState.STOPPING
-            slots = tuple(self._slots.values()) + tuple(self._retired_slots)
+            slots = tuple(self._slots.values())
         self._stop.set()
         # A durable permission answer keeps the generation fence until the
         # complete JSON-RPC response frame is written.  Wake any broker waiters
@@ -377,20 +333,16 @@ class AcpSupervisor:
             self._stop_all(timeout=max(0.001, deadline - time.monotonic()))
         finally:
             self._reconcile_lock.release()
+        with self._lock:
+            slots = tuple(self._retired_slots.values())
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
-        console_thread = self._console_thread
-        if console_thread is not None and console_thread is not threading.current_thread():
-            console_thread.join(timeout=max(0.0, deadline - time.monotonic()))
-        unfinished = bool(
-            (thread is not None and thread.is_alive())
-            or (console_thread is not None and console_thread.is_alive())
-        )
+        unfinished = bool(thread is not None and thread.is_alive())
         for slot in slots:
             with slot.lock:
                 bridge_thread = slot.console_bridge_thread
-                futures = tuple((slot.console_submissions or {}).values())
+                futures = tuple(slot.console_submissions.values())
                 executor = slot.console_executor
             if bridge_thread is not None and bridge_thread is not threading.current_thread():
                 bridge_thread.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -405,7 +357,7 @@ class AcpSupervisor:
                     pass
                 slot_unfinished = slot_unfinished or not future.done()
             unfinished = unfinished or slot_unfinished
-            if not slot_unfinished and executor is not None:
+            if not slot_unfinished:
                 # The executor was already asked to shut down by retirement;
                 # once every task is terminal this join is immediate and
                 # ensures no non-daemon worker survives a successful stop.
@@ -416,25 +368,6 @@ class AcpSupervisor:
                 self._failure_type = "AcpRuntimeStopTimeout"
             elif self._state is not RuntimeState.FAILED:
                 self._state = RuntimeState.STOPPED
-
-    def join(self, timeout: float | None = None) -> bool:
-        deadline = None if timeout is None else time.monotonic() + timeout
-        threads = (self._thread, self._console_thread)
-        for thread in threads:
-            if thread is None or thread is threading.current_thread():
-                continue
-            remaining = (
-                None
-                if deadline is None
-                else max(0.0, deadline - time.monotonic())
-            )
-            thread.join(timeout=remaining)
-        return all(
-            thread is None
-            or thread is threading.current_thread()
-            or not thread.is_alive()
-            for thread in threads
-        )
 
     def status(self) -> dict[str, Any]:
         counters = {
@@ -453,7 +386,7 @@ class AcpSupervisor:
             slots = tuple(self._slots.values())
             failure_type = self._failure_type
             required_degraded = self._required_degraded
-            console_degraded = self._console_degraded
+            console_degraded = bool(self._console_failed_claims)
             console_failure_type = self._console_failure_type
         failure_type = failure_type or console_failure_type
         healthy = (
@@ -533,7 +466,7 @@ class AcpSupervisor:
             if self._state is not RuntimeState.RUNNING:
                 raise AcpCoordinatorError("ACP coordinator is not running")
             slot = self._slots.get(worker.id)
-            console_failed = worker.id in self._console_failed_workers
+            console_failed = worker.id in self._console_failed_claims
         if slot is None:
             raise AcpCoordinatorError("ACP worker route is unavailable")
         if console_failed:
@@ -552,31 +485,26 @@ class AcpSupervisor:
         return slot
 
     def _run(self) -> None:
-        while not self._stop.wait(self._reconcile_interval):
+        next_reconcile = time.monotonic() + self._reconcile_interval
+        while not self._stop.wait(_CONSOLE_BRIDGE_INTERVAL_SECONDS):
             if self._daemon_stop.is_set():
                 return
+            self._bridge_console_slots()
+            if time.monotonic() < next_reconcile:
+                continue
             try:
                 self._reconcile(strict=False)
             except Exception as exc:  # noqa: BLE001
                 with self._lock:
                     self._failure_type = type(exc).__name__
-
-    def _run_console_bridge(self) -> None:
-        while not self._stop.wait(_CONSOLE_BRIDGE_INTERVAL_SECONDS):
-            if self._daemon_stop.is_set():
-                return
-            self._bridge_console_slots()
+            next_reconcile = time.monotonic() + self._reconcile_interval
 
     def _bridge_console_slots(self) -> None:
         """Dispatch independent visible pane bridges without head-of-line blocking."""
+        self._reap_retired_slots()
         with self._lock:
-            self._retired_slots = [
-                slot for slot in self._retired_slots if _slot_has_live_work(slot)
-            ]
             slots = tuple(self._slots.values())
         for slot in slots:
-            if slot.console is None:
-                continue
             with slot.lock:
                 if slot.retired:
                     continue
@@ -592,6 +520,25 @@ class AcpSupervisor:
                 slot.console_bridge_thread = thread
                 thread.start()
 
+    def _reap_retired_slots(self) -> None:
+        """Release terminal retired work without losing shutdown accounting."""
+
+        with self._lock:
+            retired = tuple(self._retired_slots.items())
+        for slot_id, slot in retired:
+            with slot.lock:
+                bridge = slot.console_bridge_thread
+                futures = tuple(slot.console_submissions.values())
+                executor = slot.console_executor
+            if (bridge is not None and bridge.is_alive()) or any(
+                not future.done() for future in futures
+            ):
+                continue
+            executor.shutdown(wait=True, cancel_futures=True)
+            with self._lock:
+                if self._retired_slots.get(slot_id) is slot:
+                    self._retired_slots.pop(slot_id, None)
+
     def _bridge_console_slot_supervised(self, slot: _SessionSlot) -> None:
         worker_id = slot.continuity.worker_id
         try:
@@ -606,10 +553,8 @@ class AcpSupervisor:
                 # exact slot currently published for this worker.
                 if self._slots.get(worker_id) is not slot:
                     return
-                self._console_failed_workers.discard(worker_id)
                 self._console_failed_claims.pop(worker_id, None)
-                self._console_degraded = bool(self._console_failed_workers)
-                if not self._console_degraded:
+                if not self._console_failed_claims:
                     self._console_failure_type = None
         except Exception as exc:
             with slot.lock:
@@ -620,14 +565,9 @@ class AcpSupervisor:
             # Console availability is supervised independently of the ACP
             # runtime. A later pass replays inputs and idempotent outputs.
             with self._lock:
-                self._console_failed_workers.add(worker_id)
                 self._console_failed_claims[worker_id] = (
                     slot.continuity.worker_fingerprint
                 )
-                self._published_acp_claims[worker_id] = (
-                    slot.continuity.worker_fingerprint
-                )
-                self._console_degraded = True
                 self._console_failure_type = type(exc).__name__
             if failure_count >= 3:
                 try:
@@ -636,7 +576,6 @@ class AcpSupervisor:
                         self._retire_worker(
                             worker_id,
                             expected=slot,
-                            preserve_console_failure=True,
                         )
                         current, _ambiguities = self._continuity_bindings()
                         continuity = current.get(worker_id)
@@ -655,40 +594,14 @@ class AcpSupervisor:
             if slot.retired:
                 return
             console = slot.console
-        if console is None or self.config.db_path is None:
-            return
         binding = getattr(slot.runtime, "_binding", None)
         if not isinstance(binding, WorkerBinding):
             raise AcpCoordinatorError("ACP console session binding is unavailable")
         with slot.lock:
-            cursor_loaded = slot.console_cursor_loaded
-        if not cursor_loaded:
-            persisted_cursor = _load_console_event_cursor(
-                Path(self.config.db_path),
-                self.config.host_id,
-                slot.continuity.worker_id,
-                binding.turn_target_value,
-            )
-            loaded_cursor = (
-                persisted_cursor
-                if persisted_cursor is not None
-                else _initial_console_event_cursor(
-                    Path(self.config.db_path),
-                    self.config.host_id,
-                    slot.continuity.worker_id,
-                    binding.turn_target_value,
-                )
-            )
-            with slot.lock:
-                if slot.retired:
-                    return
-                slot.console_event_sequence = loaded_cursor
-                slot.console_cursor_loaded = True
-        with slot.lock:
             event_sequence = slot.console_event_sequence
             input_sequence = slot.console_input_sequence
-            submissions = slot.console_submissions or {}
-            slot.console_submissions = submissions
+            retained_output_bytes = slot.console_retained_output_bytes
+            submissions = slot.console_submissions
         events = list_agent_events(
             Path(self.config.db_path),
             self.config.host_id,
@@ -705,46 +618,45 @@ class AcpSupervisor:
         with slot.lock:
             if slot.retired:
                 return
-            local_turns = set(slot.console_local_turns or ())
+            local_turns = set(slot.console_local_turns)
         output: list[dict[str, str]] = []
         completed_submissions: list[int] = []
+        output_budget = max(
+            0,
+            _CONSOLE_OUTPUT_QUEUE_BUDGET_BYTES - (retained_output_bytes or 0),
+        )
         for sequence, future in tuple(submissions.items()):
             if not future.done():
                 continue
-            completed_submissions.append(sequence)
+            item: dict[str, str] | None = None
             try:
                 outcome = future.result()
-                durable_outcome = str(outcome)
             except Exception:
-                # Keep the durable payload deterministic across a retry of the
-                # same request id; exception types can differ across a crash.
-                durable_outcome = "error"
-            _record_console_submission_outcome(
-                Path(self.config.db_path),
-                self.config.host_id,
-                slot.continuity.worker_id,
-                binding.turn_target_value,
-                generation=console.generation,
-                input_sequence=sequence,
-                outcome=durable_outcome,
-            )
-            # A terminal command receipt now exists (accepted or rejected), so
-            # the next exchange may acknowledge this one Herdr queue item.
-            record_agent_event(
-                Path(self.config.db_path),
-                self.config.host_id,
-                kind="extension",
-                source="tendwire-console",
-                worker_id=slot.continuity.worker_id,
-                payload={
-                    "extension": "tendwire.acp.console_input_cursor",
-                    "generation": console.generation,
-                    "input_sequence": sequence,
-                },
-                source_session_id=binding.turn_target_value,
-                source_event_id=f"input:{console.generation}:{sequence}",
-                visibility="private",
-            )
+                item = _bounded_console_output(
+                    f"console-input:{slot.generation}:{sequence}",
+                    "error",
+                    "instruction failed",
+                )
+            else:
+                status = (
+                    {
+                        "permission": "permission selection accepted",
+                        "cancelled": "active turn cancellation requested",
+                    }.get(outcome)
+                    if isinstance(outcome, str)
+                    else None
+                )
+                if status is not None:
+                    item = _bounded_console_output(
+                        f"console-input:{slot.generation}:{sequence}",
+                        "status",
+                        status,
+                    )
+            if item is not None:
+                if _console_output_wire_bytes([*output, item]) > output_budget:
+                    continue
+                output.append(item)
+            completed_submissions.append(sequence)
             input_sequence = max(input_sequence, sequence)
         pending = _console_pending_decision(
             Path(self.config.db_path),
@@ -753,18 +665,18 @@ class AcpSupervisor:
         )
         if pending is not None:
             decision_ref, _options, prompt = pending
-            output.append(
-                _bounded_console_output(
-                    "permission:" + stable_fingerprint(
-                        {
-                            "worker_id": slot.continuity.worker_id,
-                            "decision_ref": decision_ref,
-                        }
-                    ),
-                    "status",
-                    prompt,
-                )
+            item = _bounded_console_output(
+                "permission:" + stable_fingerprint(
+                    {
+                        "worker_id": slot.continuity.worker_id,
+                        "decision_ref": decision_ref,
+                    }
+                ),
+                "status",
+                prompt,
             )
+            if _console_output_wire_bytes([*output, item]) <= output_budget:
+                output.append(item)
         consumed_local_turns: set[str] = set()
         processed_event_sequence = event_sequence
         for stored in events:
@@ -780,179 +692,56 @@ class AcpSupervisor:
                 continue
             stream, text = rendered
             item = _bounded_console_output(event.event_id, stream, text)
-            if not _console_output_fits(output, item, budget=_CONSOLE_OUTPUT_QUEUE_BUDGET_BYTES):
+            if _console_output_wire_bytes([*output, item]) > output_budget:
                 break
             output.append(item)
             processed_event_sequence = stored.sequence
+        probing_retained_output = retained_output_bytes is None
         client = self._endpoint_client_factory(self.config)
-        gap_error: AcpConsoleInputGap | None = None
         inputs: tuple[tuple[int, str], ...] = ()
         try:
-            connect = getattr(client, "connect", None)
-            if callable(connect):
-                connect()
-            # Probe the retained Herdr output queue before publishing.  Herdr
-            # echoes that queue in its response, so publishing blind can create
-            # a response larger than its 2 MiB control-frame limit.
             result = client.agent_acp_console_exchange(
                 slot.continuity.target_value,
                 generation=console.generation,
                 lease=console.lease,
                 after_input_sequence=input_sequence,
-                output=(),
+                output=[] if probing_retained_output else output,
                 timeout=self.config.herdr_timeout_seconds,
             )
+            retained_output_bytes = _console_output_wire_bytes(result["outputs"])
             inputs = _parse_console_exchange(result, input_sequence)
-            retained_bytes = _console_exchange_output_bytes(result)
-            publish = _fit_console_output_batch(
-                output,
-                budget=max(0, _CONSOLE_OUTPUT_QUEUE_BUDGET_BYTES - retained_bytes),
-            )
-            if len(publish) < len(output):
-                # Only ACP events after this prefix must be replayed. Synthetic
-                # permission output is first and idempotent, so a full queue may
-                # delay it without advancing any ACP event cursor.
-                published_ids = {item["event_id"] for item in publish}
-                processed_event_sequence = event_sequence
-                consumed_local_turns.clear()
-                for stored in events:
-                    event = stored.event
-                    if event.kind == "user_message" and event.source_turn_id in local_turns:
-                        if event.source_turn_id is not None:
-                            consumed_local_turns.add(event.source_turn_id)
-                        processed_event_sequence = stored.sequence
-                        continue
-                    rendered = _console_event_output(event.kind, event.payload)
-                    if rendered is None:
-                        processed_event_sequence = stored.sequence
-                        continue
-                    if event.event_id not in published_ids:
-                        break
-                    processed_event_sequence = stored.sequence
-            if publish:
-                result = client.agent_acp_console_exchange(
-                    slot.continuity.target_value,
-                    generation=console.generation,
-                    lease=console.lease,
-                    after_input_sequence=input_sequence,
-                    output=publish,
-                    timeout=self.config.herdr_timeout_seconds,
-                )
-                inputs = _parse_console_exchange(result, input_sequence)
         except AcpConsoleInputGap as exc:
-            gap_error = exc
+            # Historical pane input is out of scope. Move to Herdr's retained
+            # tail; the next bridge cadence begins with fresh input.
+            input_sequence = max(input_sequence, exc.recovery_after_sequence)
+            processed_event_sequence = event_sequence
+            consumed_local_turns.clear()
         finally:
-            close = getattr(client, "close", None)
-            if callable(close):
-                close()
-        if gap_error is not None:
-            if self.config.acp_console_input_policy == "live_only":
-                # The operator explicitly chose live traffic over recovery of
-                # a partially discarded backlog. Persist the tail watermark
-                # before acknowledging it, then make one fresh exchange so an
-                # input arriving after the probe is still delivered.
-                input_sequence = max(
-                    input_sequence,
-                    gap_error.recovery_after_sequence,
-                )
-                record_agent_event(
-                    Path(self.config.db_path),
-                    self.config.host_id,
-                    kind="extension",
-                    source="tendwire-console",
-                    worker_id=slot.continuity.worker_id,
-                    payload={
-                        "extension": "tendwire.acp.console_input_cursor",
-                        "generation": console.generation,
-                        "input_sequence": input_sequence,
-                        "recovery": "live_only",
-                    },
-                    source_session_id=binding.turn_target_value,
-                    source_event_id=(
-                        f"input-live-baseline:{console.generation}:{input_sequence}"
-                    ),
-                    visibility="private",
-                )
-                client = self._endpoint_client_factory(self.config)
-                try:
-                    connect = getattr(client, "connect", None)
-                    if callable(connect):
-                        connect()
-                    result = client.agent_acp_console_exchange(
-                        slot.continuity.target_value,
-                        generation=console.generation,
-                        lease=console.lease,
-                        after_input_sequence=input_sequence,
-                        output=(),
-                        timeout=self.config.herdr_timeout_seconds,
-                    )
-                    inputs = _parse_console_exchange(result, input_sequence)
-                finally:
-                    close = getattr(client, "close", None)
-                    if callable(close):
-                        close()
-                gap_error = None
-        if gap_error is not None:
-            gap_output = [{
-                "event_id": f"console-gap:{console.generation}:{input_sequence}",
-                "stream": "error",
-                "text": "console input backlog overflowed; restart the pane console before retrying",
-            }]
-            client = self._endpoint_client_factory(self.config)
-            try:
-                connect = getattr(client, "connect", None)
-                if callable(connect):
-                    connect()
-                client.agent_acp_console_exchange(
-                    slot.continuity.target_value,
-                    generation=console.generation,
-                    lease=console.lease,
-                    after_input_sequence=input_sequence,
-                    output=gap_output,
-                    timeout=self.config.herdr_timeout_seconds,
-                )
-            finally:
-                close = getattr(client, "close", None)
-                if callable(close):
-                    close()
-            raise gap_error
+            client.close()
+        if probing_retained_output:
+            # The first pass is an empty-output probe; no locally rendered
+            # event or submission outcome was accepted by Herdr yet.
+            processed_event_sequence = event_sequence
+            completed_submissions.clear()
+            consumed_local_turns.clear()
         with slot.lock:
             if slot.retired:
                 return
             slot.console_input_sequence = input_sequence
+            slot.console_retained_output_bytes = retained_output_bytes
             for sequence in completed_submissions:
                 submissions.pop(sequence, None)
         if processed_event_sequence > event_sequence:
-            # Herdr deduplicates output event_id values, so replaying a page
-            # after a crash between exchange and this cursor update is safe.
-            next_event_sequence = processed_event_sequence
-            record_agent_event(
-                Path(self.config.db_path),
-                self.config.host_id,
-                kind="extension",
-                source="tendwire-console",
-                worker_id=slot.continuity.worker_id,
-                payload={
-                    "extension": "tendwire.acp.console_cursor",
-                    "sequence": next_event_sequence,
-                },
-                source_session_id=binding.turn_target_value,
-                source_event_id=f"cursor:{next_event_sequence}",
-                visibility="private",
-            )
             with slot.lock:
                 if slot.retired:
                     return
-                slot.console_event_sequence = next_event_sequence
-                if slot.console_local_turns is not None:
-                    slot.console_local_turns.difference_update(consumed_local_turns)
+                slot.console_event_sequence = processed_event_sequence
+                slot.console_local_turns.difference_update(consumed_local_turns)
         for sequence, text in inputs[:1]:
             with slot.lock:
                 if slot.retired or sequence in submissions:
                     continue
                 executor = slot.console_executor
-                if executor is None:
-                    raise AcpCoordinatorError("ACP console submission worker is unavailable")
                 submissions[sequence] = executor.submit(
                     self._submit_console_input, slot, sequence, text
                 )
@@ -1050,11 +839,7 @@ class AcpSupervisor:
                         raise AcpCoordinatorError(
                             "ACP console input generation is stale"
                         )
-                    local_turns = slot.console_local_turns
-                    if local_turns is None:
-                        local_turns = set()
-                        slot.console_local_turns = local_turns
-                    local_turns.add(local_turn_id)
+                    slot.console_local_turns.add(local_turn_id)
         try:
             result = submit_command(
                 self.config,
@@ -1065,14 +850,12 @@ class AcpSupervisor:
         except Exception:
             if local_turn_id is not None:
                 with slot.lock:
-                    if slot.console_local_turns is not None:
-                        slot.console_local_turns.discard(local_turn_id)
+                    slot.console_local_turns.discard(local_turn_id)
             raise
         if result.status not in {"accepted", "duplicate_request"}:
             if local_turn_id is not None:
                 with slot.lock:
-                    if slot.console_local_turns is not None:
-                        slot.console_local_turns.discard(local_turn_id)
+                    slot.console_local_turns.discard(local_turn_id)
             raise AcpCoordinatorError("ACP console input was not accepted")
         if request["action"] == "answer_decision":
             return "permission"
@@ -1080,8 +863,7 @@ class AcpSupervisor:
             # A duplicate receipt does not start a new ACP turn, so there is no
             # corresponding user event left to suppress in this process.
             with slot.lock:
-                if slot.console_local_turns is not None:
-                    slot.console_local_turns.discard(local_turn_id)
+                slot.console_local_turns.discard(local_turn_id)
         return "instruction"
 
     def _require_reconcile_state(self, *, allow_starting: bool) -> None:
@@ -1140,9 +922,10 @@ class AcpSupervisor:
                     self._stop_all()
 
     def _reconcile_locked(self, *, strict: bool) -> None:
+        discovery_omissions = 0
         if self._discovery_client_factory is not None:
             try:
-                self._discover_continuity()
+                discovery_omissions = self._discover_continuity()
             except Exception as exc:
                 with self._lock:
                     self._required_degraded = True
@@ -1153,10 +936,9 @@ class AcpSupervisor:
         current, ambiguities = self._continuity_bindings()
         with self._lock:
             failed_claims = tuple(self._console_failed_claims.items())
-            published_claims = tuple(self._published_acp_claims.items())
         exact_authorities = (
             self._herdr_authority_claims()
-            if failed_claims or published_claims
+            if failed_claims
             else set()
         )
         with self._lock:
@@ -1169,21 +951,8 @@ class AcpSupervisor:
                 and self._console_failed_claims.get(worker_id) == fingerprint
             ]
             for worker_id in disappeared_failures:
-                self._console_failed_workers.discard(worker_id)
-                failed_fingerprint = self._console_failed_claims.pop(worker_id, None)
-                if self._published_acp_claims.get(worker_id) == failed_fingerprint:
-                    self._published_acp_claims.pop(worker_id, None)
-            disappeared_published = [
-                worker_id
-                for worker_id, fingerprint in published_claims
-                if (worker_id, fingerprint) not in exact_authorities
-                and worker_id not in self._slots
-                and self._published_acp_claims.get(worker_id) == fingerprint
-            ]
-            for worker_id in disappeared_published:
-                self._published_acp_claims.pop(worker_id, None)
-            self._console_degraded = bool(self._console_failed_workers)
-            if not self._console_degraded:
+                self._console_failed_claims.pop(worker_id, None)
+            if not self._console_failed_claims:
                 self._console_failure_type = None
         for worker_id in stale:
             self._retire_worker(worker_id)
@@ -1191,6 +960,10 @@ class AcpSupervisor:
             AcpCoordinatorError("worker has ambiguous Herdr authority")
             for _ in range(ambiguities)
         ]
+        if discovery_omissions:
+            failures.append(
+                AcpCoordinatorError("one or more Herdr pane routes were omitted")
+            )
         for worker_id, continuity in current.items():
             self._require_reconcile_state(allow_starting=True)
             try:
@@ -1207,41 +980,35 @@ class AcpSupervisor:
         if strict and failures:
             raise AcpCoordinatorError("one or more ACP workers failed to attach")
 
-    def _discover_continuity(self) -> None:
+    def _discover_continuity(self) -> int:
         """Refresh the one Herdr lifecycle projection consumed by ACP routing."""
 
         client = self._discovery_client_factory(self.config)
         try:
-            connect = getattr(client, "connect", None)
-            if callable(connect):
-                connect()
             workspaces = client.workspace_list(timeout=self.config.herdr_timeout_seconds)
             panes = client.pane_list(timeout=self.config.herdr_timeout_seconds)
             agents = client.agent_list(timeout=self.config.herdr_timeout_seconds)
         finally:
-            close = getattr(client, "close", None)
-            if callable(close):
-                close()
+            client.close()
 
         observed_at = utc_timestamp()
         spaces = _discovered_spaces(workspaces)
-        prior_bindings = list_worker_bindings(
-            Path(self.config.db_path),
-            self.config.host_id,
-            backend="herdr",
-        )
-        workers, bindings = _discovered_workers(
+        workers, bindings, omissions = _discovered_workers(
             self.config,
             panes,
             agents,
             observed_at,
-            prior_bindings=prior_bindings,
         )
         health = BackendHealth(
             name="herdr",
-            status="healthy",
-            outcome="healthy_non_empty" if spaces or workers else "empty_healthy",
+            status="degraded" if omissions else "healthy",
+            outcome=(
+                "continuity_unavailable"
+                if omissions
+                else "healthy_non_empty" if spaces or workers else "empty_healthy"
+            ),
             observed_at=observed_at,
+            message=(f"{omissions} Herdr panes omitted" if omissions else ""),
             counts={"spaces": len(spaces), "workers": len(workers)},
         )
         snapshot = project_from_observations(
@@ -1250,7 +1017,7 @@ class AcpSupervisor:
             workers=workers,
             backend_health=[health],
         )
-        from ..store.sqlite import SnapshotObservationContext
+        from ..store.projection import SnapshotObservationContext
 
         save_snapshot(
             Path(self.config.db_path),
@@ -1267,6 +1034,7 @@ class AcpSupervisor:
         with self._lock:
             self._last_discovery_at = observed_at
             self._worker_count = len(workers)
+        return omissions
 
     def _reconcile_worker(self, worker_id: str, *, strict: bool) -> None:
         with self._reconcile_lock:
@@ -1277,10 +1045,7 @@ class AcpSupervisor:
                 if continuity is None:
                     with self._lock:
                         failed_fingerprint = self._console_failed_claims.get(worker_id)
-                        published_fingerprint = self._published_acp_claims.get(
-                            worker_id
-                        )
-                    claimed_fingerprint = failed_fingerprint or published_fingerprint
+                    claimed_fingerprint = failed_fingerprint
                     authority_remains = True
                     if claimed_fingerprint is not None:
                         try:
@@ -1294,13 +1059,8 @@ class AcpSupervisor:
                             authority_remains = True
                     with self._lock:
                         if worker_id not in self._slots and not authority_remains:
-                            self._console_failed_workers.discard(worker_id)
                             self._console_failed_claims.pop(worker_id, None)
-                            self._published_acp_claims.pop(worker_id, None)
-                            self._console_degraded = bool(
-                                self._console_failed_workers
-                            )
-                            if not self._console_degraded:
+                            if not self._console_failed_claims:
                                 self._console_failure_type = None
                     if strict:
                         raise AcpCoordinatorError(
@@ -1333,8 +1093,7 @@ class AcpSupervisor:
         try:
             runtime.start()
         except Exception:
-            if permission_broker is not None:
-                permission_broker.close()
+            permission_broker.close()
             try:
                 runtime.stop(timeout=self.config.acp_shutdown_timeout_seconds)
             except Exception:
@@ -1343,90 +1102,56 @@ class AcpSupervisor:
         try:
             self._require_reconcile_state(allow_starting=True)
         except Exception:
-            if permission_broker is not None:
-                permission_broker.close()
+            permission_broker.close()
             self._stop_runtime(runtime)
             raise
         runtime_binding = getattr(runtime, "_binding", None)
         console_cursor = 0
-        console_input_cursor = 0
-        console_cursor_loaded = False
-        if (
-            endpoint.console is not None
-            and isinstance(runtime_binding, WorkerBinding)
-            and runtime_binding.turn_target_value
-        ):
-            console_cursor = _prepare_console_event_cursor(
+        if isinstance(runtime_binding, WorkerBinding) and runtime_binding.turn_target_value:
+            console_cursor = _latest_console_event_sequence(
                 Path(self.config.db_path),
                 self.config.host_id,
                 continuity.worker_id,
                 runtime_binding.turn_target_value,
-                session_mode=endpoint.session_mode,
-                generation=endpoint.console.generation,
-            )
-            console_cursor_loaded = True
-            console_input_cursor = _load_console_input_cursor(
-                Path(self.config.db_path),
-                self.config.host_id,
-                continuity.worker_id,
-                runtime_binding.turn_target_value,
-                endpoint.console.generation,
             )
         slot = _SessionSlot(
             continuity,
             endpoint.generation,
             runtime,
-            permission_broker,
             console=endpoint.console,
-            console_input_sequence=console_input_cursor,
-            console_event_sequence=console_cursor,
-            console_cursor_loaded=console_cursor_loaded,
-            console_local_turns=set(),
             console_executor=ThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix=f"tendwire-acp-console-{continuity.worker_id}",
             ),
-            console_submissions={},
+            permission_broker=permission_broker,
+            console_event_sequence=console_cursor,
         )
         with self._lock:
             displaced = self._slots.get(continuity.worker_id)
             self._slots[continuity.worker_id] = slot
-            self._published_acp_claims[continuity.worker_id] = (
-                continuity.worker_fingerprint
-            )
         if displaced is not None:
             self._stop_runtime(displaced.runtime)
 
     def _resolve_endpoint(self, continuity: WorkerBinding) -> HerdrAcpEndpoint:
         client = self._endpoint_client_factory(self.config)
         try:
-            connect = getattr(client, "connect", None)
-            if callable(connect):
-                connect()
             result = client.agent_acp_endpoint(
                 continuity.target_value,
                 timeout=self.config.herdr_timeout_seconds,
             )
         finally:
-            close = getattr(client, "close", None)
-            if callable(close):
-                close()
+            client.close()
         return _parse_endpoint(self.config, continuity, result)
 
-    def _resolve_status(self, continuity: WorkerBinding) -> HerdrAcpStatus:
+    def _resolve_status(self, continuity: WorkerBinding) -> tuple[str, str, str]:
         client = self._endpoint_client_factory(self.config)
         try:
-            connect = getattr(client, "connect", None)
-            if callable(connect):
-                connect()
             result = client.agent_acp_status(
                 continuity.target_value,
                 timeout=self.config.herdr_timeout_seconds,
             )
         finally:
-            close = getattr(client, "close", None)
-            if callable(close):
-                close()
+            client.close()
         return _parse_status(continuity, result)
 
     def _require_attached_generation(self, slot: _SessionSlot) -> None:
@@ -1435,11 +1160,7 @@ class AcpSupervisor:
         except Exception:
             self._retire_worker(slot.continuity.worker_id, expected=slot)
             raise
-        if (
-            status.lifecycle != "acp_owned_attached"
-            or status.console_lifecycle != "attached"
-            or status.generation != slot.generation
-        ):
+        if status != (slot.generation, "acp_owned_attached", "attached"):
             self._retire_worker(slot.continuity.worker_id, expected=slot)
             raise AcpCoordinatorError("ACP worker generation lease is not current")
 
@@ -1533,7 +1254,7 @@ class AcpSupervisor:
         self,
         continuity: WorkerBinding,
         endpoint: HerdrAcpEndpoint,
-    ) -> tuple[AcpWorkerSession, AcpPermissionBroker | None]:
+    ) -> tuple[AcpWorkerSession, AcpPermissionBroker]:
         client = self._connection_factory(
             endpoint.command,
             cwd=endpoint.cwd,
@@ -1550,16 +1271,12 @@ class AcpSupervisor:
             binding = _derived_binding(continuity, endpoint.session_id)
             upsert_worker_bindings(Path(self.config.db_path), [binding])
             callback = None
-        permission_broker = (
-            AcpPermissionBroker(
-                self.config,
-                worker_id=continuity.worker_id,
-                worker_fingerprint=continuity.worker_fingerprint,
-                generation=endpoint.generation,
-                timeout=float(self.config.submission_hard_ttl_seconds),
-            )
-            if self._durable_permission_bridge
-            else None
+        permission_broker = AcpPermissionBroker(
+            self.config,
+            worker_id=continuity.worker_id,
+            worker_fingerprint=continuity.worker_fingerprint,
+            generation=endpoint.generation,
+            timeout=float(self.config.submission_hard_ttl_seconds),
         )
         try:
             runtime = self._session_factory(
@@ -1576,14 +1293,13 @@ class AcpSupervisor:
                 # generation would make synthetic notification identities
                 # collide after a Tendwire restart.
                 session_binding_callback=callback,
-                permission_callback=(permission_broker or self._permission_callback),
+                permission_callback=permission_broker,
                 poll_timeout=min(0.25, self.config.acp_request_timeout_seconds),
                 stop_timeout=self.config.acp_shutdown_timeout_seconds,
             )
             return runtime, permission_broker
         except Exception:
-            if permission_broker is not None:
-                permission_broker.close()
+            permission_broker.close()
             try:
                 client.close()
             except Exception:
@@ -1610,7 +1326,6 @@ class AcpSupervisor:
         worker_id: str,
         *,
         expected: _SessionSlot | None = None,
-        preserve_console_failure: bool = False,
     ) -> None:
         with self._reconcile_lock:
             with self._lock:
@@ -1618,27 +1333,20 @@ class AcpSupervisor:
                 if slot is None or (expected is not None and slot is not expected):
                     return
                 self._slots.pop(worker_id, None)
-                self._retired_slots.append(slot)
+                self._retired_slots[id(slot)] = slot
                 # A visible-console failure is an exact sticky ownership
                 # claim. Retirement, ambiguity, and failed reminting must not
                 # erase endpoint ownership while Herdr still publishes that
                 # identity. Only a successful current console pass or the
                 # positive-disappearance path in reconciliation may remove it.
-                if (
-                    not preserve_console_failure
-                    and worker_id not in self._console_failed_claims
-                ):
-                    self._console_failed_workers.discard(worker_id)
-                    self._console_degraded = bool(self._console_failed_workers)
-                    if not self._console_degraded:
-                        self._console_failure_type = None
+                if not self._console_failed_claims:
+                    self._console_failure_type = None
             with slot.lock:
                 slot.retired = True
                 executor = slot.console_executor
             if slot.permission_broker is not None:
                 slot.permission_broker.close()
-            if executor is not None:
-                executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=False, cancel_futures=True)
             self._stop_runtime(slot.runtime)
 
     def _stop_runtime(
@@ -1668,16 +1376,17 @@ class AcpSupervisor:
 
         expire_worker_bindings(
             Path(self.config.db_path),
-            self.config.host_id,
-            backend="acp",
-            now=utc_timestamp(),
-            reason="acp_coordinator_restarted",
+        self.config.host_id,
+        backend="acp",
+        observed_before=WORKER_BINDING_ACTIVE_EXPIRES_AT,
+        reason="acp_coordinator_restarted",
         )
 
     def _stop_all(self, *, timeout: float | None = None) -> None:
         with self._lock:
             slots = tuple(self._slots.values())
             self._slots.clear()
+            self._retired_slots.update((id(slot), slot) for slot in slots)
         if not slots:
             return
         total = (
@@ -1695,22 +1404,11 @@ class AcpSupervisor:
                 executor = slot.console_executor
             if slot.permission_broker is not None:
                 slot.permission_broker.close()
-            if executor is not None:
-                executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=False, cancel_futures=True)
             self._stop_runtime(
                 slot.runtime,
                 timeout=max(0.001, deadline - time.monotonic()),
             )
-
-
-def _slot_has_live_work(slot: _SessionSlot) -> bool:
-    with slot.lock:
-        thread = slot.console_bridge_thread
-        futures = tuple((slot.console_submissions or {}).values())
-    return bool(
-        (thread is not None and thread.is_alive())
-        or any(not future.done() for future in futures)
-    )
 
 
 def _default_endpoint_client_factory(config: Config) -> HerdrSocketClient:
@@ -1745,52 +1443,29 @@ def _expire_derived_binding(
     *,
     reason: str,
 ) -> None:
-    if config.db_path is None:  # pragma: no cover - coordinator invariant
-        return
     expire_worker_bindings(
         Path(config.db_path),
         binding.host_id,
         backend="acp",
+        worker_id=binding.worker_id,
         private_fingerprints=[binding.private_fingerprint],
-        now=binding.observed_at,
+        observed_before=binding.observed_at,
         reason=reason,
     )
 
 
 def _same_continuity(left: WorkerBinding, right: WorkerBinding) -> bool:
     """Compare authority identity while ignoring observation lease refreshes."""
-    return (
-        left.host_id,
-        left.worker_id,
-        left.worker_fingerprint,
-        left.backend,
-        left.target_kind,
-        left.target_value,
-        left.private_fingerprint,
-        left.sendable,
-    ) == (
-        right.host_id,
-        right.worker_id,
-        right.worker_fingerprint,
-        right.backend,
-        right.target_kind,
-        right.target_value,
-        right.private_fingerprint,
-        right.sendable,
-    )
-
-
-def _field(item: Mapping[str, Any], name: str) -> Any:
-    expected = name.replace("_", "").lower()
-    for key, value in item.items():
-        if str(key).replace("_", "").replace("-", "").lower() == expected:
-            return value
-    return None
+    return replace(
+        left,
+        observed_at=right.observed_at,
+        expires_at=right.expires_at,
+    ) == right
 
 
 def _text(item: Mapping[str, Any], *names: str) -> str | None:
     for name in names:
-        value = _field(item, name)
+        value = item.get(name)
         if isinstance(value, (str, int)) and not isinstance(value, bool):
             text = str(value).strip()
             if text:
@@ -1798,28 +1473,23 @@ def _text(item: Mapping[str, Any], *names: str) -> str | None:
     return None
 
 
-def _items(payload: Any, *names: str) -> list[dict[str, Any]]:
+def _items(payload: Any, name: str) -> list[dict[str, Any]]:
     if isinstance(payload, list):
         values = payload
     elif isinstance(payload, Mapping):
-        values = []
-        for name in (*names, "data", "payload"):
-            candidate = _field(payload, name)
-            if isinstance(candidate, list):
-                values = candidate
-                break
-            if isinstance(candidate, Mapping):
-                nested = _items(candidate, *names)
-                if nested:
-                    return nested
+        values = payload.get(name, [])
     else:
         return []
-    return [dict(value) for value in values if isinstance(value, Mapping)]
+    return (
+        [dict(value) for value in values if isinstance(value, Mapping)]
+        if isinstance(values, list)
+        else []
+    )
 
 
 def _discovered_spaces(payload: Any) -> list[Space]:
     spaces: list[Space] = []
-    for item in _items(payload, "workspaces", "spaces", "items", "result"):
+    for item in _items(payload, "workspaces"):
         space_id = _text(item, "workspace_id", "space_id", "id", "name")
         if space_id is None:
             continue
@@ -1849,70 +1519,24 @@ def _agent_match(
     return (matches[0], False) if len(matches) == 1 else (None, len(matches) > 1)
 
 
-def _assign_prior_worker_ids(
-    rows: list[dict[str, Any]],
-    prior_bindings: Sequence[WorkerBinding],
-) -> None:
-    private_counts = Counter(str(row["private_fingerprint"]) for row in rows)
-    target_key_counts = Counter(
-        (str(row["target_kind"]), str(row["target_value"])) for row in rows
-    )
-    stored_by_private: dict[str, list[WorkerBinding]] = {}
-    stored_by_target: dict[tuple[str, str], list[WorkerBinding]] = {}
-    for binding in prior_bindings:
-        if (
-            binding.backend != "herdr"
-            or not binding.worker_id
-            or binding.reason in {"duplicate_backend_target", "ambiguous_pane_match"}
-        ):
-            continue
-        stored_by_private.setdefault(binding.private_fingerprint, []).append(binding)
-        stored_by_target.setdefault(
-            (binding.target_kind, binding.target_value), []
-        ).append(binding)
-    for row in rows:
-        prior: WorkerBinding | None = None
-        private_fingerprint = str(row["private_fingerprint"])
-        private_candidates = stored_by_private.get(private_fingerprint, [])
-        if private_counts[private_fingerprint] == 1 and len(private_candidates) == 1:
-            prior = private_candidates[0]
-        target_key = (str(row["target_kind"]), str(row["target_value"]))
-        target_candidates = stored_by_target.get(target_key, [])
-        if prior is None and target_key_counts[target_key] == 1 and len(target_candidates) == 1:
-            prior = target_candidates[0]
-        row["desired_id"] = prior.worker_id if prior is not None else row["base_id"]
-
-
 def _materialize_discovered_workers(
     config: Config,
     rows: list[dict[str, Any]],
     observed_at: str,
 ) -> tuple[list[Worker], list[WorkerBinding]]:
-    target_counts = Counter(str(row["target_value"]) for row in rows)
-    id_counts = Counter(str(row["desired_id"]) for row in rows)
     workers: list[Worker] = []
     bindings: list[WorkerBinding] = []
-    duplicate_indexes: dict[str, int] = {}
-    for row in sorted(rows, key=lambda value: str(value["private_fingerprint"])):
-        base_id = str(row["desired_id"])
-        worker_id = base_id
-        if id_counts[base_id] > 1:
-            duplicate_indexes[base_id] = duplicate_indexes.get(base_id, 0) + 1
-            worker_id = f"{base_id}-{duplicate_indexes[base_id]}"
+    for row in rows:
+        worker_id = str(row["desired_id"])
         pane = row["pane"]
         agent = row["agent"]
-        meta: dict[str, Any] = {}
+        meta = {
+            "stable_key": row["stable_key"],
+            "stable_key_version": STABLE_KEY_VERSION,
+        }
         label = _text(pane, "label")
         if label:
             meta["label"] = label
-        stable_key = row["stable_key"]
-        if stable_key is not None:
-            meta["stable_key"] = stable_key
-            meta["stable_key_version"] = STABLE_KEY_VERSION
-        reason = row["reason"]
-        sendable = reason is None and target_counts[str(row["target_value"])] == 1
-        if not sendable and reason is None:
-            reason = "duplicate_backend_target"
         worker = Worker(
             id=worker_id,
             name=(
@@ -1930,8 +1554,8 @@ def _materialize_discovered_workers(
             backend_target={
                 "kind": row["target_kind"],
                 "value": row["target_value"],
-                "sendable": sendable,
-                "reason": reason,
+                "sendable": True,
+                "reason": None,
             },
         )
         workers.append(worker)
@@ -1943,23 +1567,14 @@ def _materialize_discovered_workers(
                 backend="herdr",
                 target_kind=str(row["target_kind"]),
                 target_value=str(row["target_value"]),
-                sendable=sendable,
-                reason=reason,
+                sendable=True,
+                reason=None,
                 observed_at=observed_at,
                 expires_at=None,
                 private_fingerprint=str(row["private_fingerprint"]),
             )
         )
-    separated = separate_duplicate_worker_bindings(bindings)
-    final_workers: list[Worker] = []
-    final_bindings: list[WorkerBinding] = []
-    for worker, binding in zip(workers, separated, strict=True):
-        if worker.backend_target != binding.backend_target():
-            worker = replace(worker, backend_target=binding.backend_target())
-            binding = replace(binding, worker_fingerprint=worker.fingerprint)
-        final_workers.append(worker)
-        final_bindings.append(binding)
-    return final_workers, final_bindings
+    return workers, bindings
 
 
 def _discovered_workers(
@@ -1967,21 +1582,25 @@ def _discovered_workers(
     pane_payload: Any,
     agent_payload: Any,
     observed_at: str,
-    *,
-    prior_bindings: Sequence[WorkerBinding] = (),
-) -> tuple[list[Worker], list[WorkerBinding]]:
-    panes = _items(pane_payload, "panes", "items", "result")
-    agents = _items(agent_payload, "agents", "workers", "items", "result")
+) -> tuple[list[Worker], list[WorkerBinding], int]:
+    panes = _items(pane_payload, "panes")
+    agents = _items(agent_payload, "agents")
     rows: list[dict[str, Any]] = []
-    needs_stable_key = False
+    candidate_count = 0
     for pane in panes:
         agent, ambiguous_agent = _agent_match(pane, agents)
-        if agent is None and not ambiguous_agent and not _text(pane, "agent", "name", "label"):
+        if agent is None and not ambiguous_agent and not _text(
+            pane, "agent", "name", "label"
+        ):
+            continue
+        candidate_count += 1
+        if ambiguous_agent:
             continue
         workspace_id = _text(pane, "workspace_id")
         pane_id = _text(pane, "pane_id")
         identity = canonical_herdr_pane_identity(workspace_id, pane_id)
-        needs_stable_key = needs_stable_key or identity is not None
+        if identity is None:
+            continue
         target_kind = ""
         target_value = ""
         for kind, value in (
@@ -2018,32 +1637,32 @@ def _discovered_workers(
                 "private_fingerprint": private_fingerprint,
                 "target_kind": target_kind,
                 "target_value": target_value,
-                "reason": (
-                    "ambiguous_pane_match"
-                    if ambiguous_agent
-                    else ("invalid_pane_identity" if identity is None else None)
-                ),
             }
         )
 
-    installation_key = (
-        load_or_create_installation_key(config.data_dir) if needs_stable_key else None
-    )
+    installation_key = load_or_create_installation_key(config.data_dir) if rows else None
     for row in rows:
         identity = row["identity"]
-        if installation_key is not None and identity is not None:
-            workspace_id, pane_id = identity
-            row["stable_key"] = stable_worker_key(
-                installation_key,
-                backend="herdr",
-                host_id=config.host_id,
-                workspace_id=workspace_id,
-                pane_id=pane_id,
-            )
-        else:
-            row["stable_key"] = None
-    _assign_prior_worker_ids(rows, prior_bindings)
-    return _materialize_discovered_workers(config, rows, observed_at)
+        assert installation_key is not None and identity is not None
+        workspace_id, pane_id = identity
+        row["stable_key"] = stable_worker_key(
+            installation_key, backend="herdr", host_id=config.host_id,
+            workspace_id=workspace_id, pane_id=pane_id,
+        )
+        row["desired_id"] = "worker-" + stable_fingerprint(
+            {"stable_key": row["stable_key"]}
+        )
+    private_counts = Counter(str(row["private_fingerprint"]) for row in rows)
+    target_counts = Counter(str(row["target_value"]) for row in rows)
+    stable_counts = Counter(str(row["stable_key"]) for row in rows)
+    unique = [
+        row for row in rows
+        if private_counts[str(row["private_fingerprint"])] == 1
+        and target_counts[str(row["target_value"])] == 1
+        and stable_counts[str(row["stable_key"])] == 1
+    ]
+    workers, bindings = _materialize_discovered_workers(config, unique, observed_at)
+    return workers, bindings, candidate_count - len(unique)
 
 
 def _nonempty_text(value: Any, field: str) -> str:
@@ -2086,6 +1705,55 @@ def _require_target_identity(
         raise AcpCoordinatorError(f"Herdr ACP {response} target changed")
 
 
+def _parse_endpoint_identity(
+    continuity: WorkerBinding,
+    value: Mapping[str, Any],
+    *,
+    response: str,
+) -> tuple[int, SessionOpenMode, str | None, Path]:
+    worker = value.get("worker")
+    adapter = value.get("adapter")
+    session = value.get("session")
+    if not all(isinstance(item, Mapping) for item in (worker, adapter, session)):
+        raise AcpCoordinatorError(f"Herdr ACP {response} nested shape is invalid")
+    assert isinstance(worker, Mapping)
+    assert isinstance(adapter, Mapping)
+    assert isinstance(session, Mapping)
+    worker_fields = {
+        "terminal_id", "workspace_id", "tab_id", "pane_id",
+        "name", "agent", "generation",
+    }
+    if set(worker) != worker_fields:
+        raise AcpCoordinatorError(f"Herdr ACP {response} worker identity shape is invalid")
+    generation = worker.get("generation")
+    if type(generation) is not int or not 0 <= generation <= (1 << 64) - 1:
+        raise AcpCoordinatorError(f"Herdr ACP {response} generation is invalid")
+    for field in worker_fields - {"generation"}:
+        _nonempty_text(worker.get(field), field)
+    _require_target_identity(continuity, worker, response=response)
+    if set(adapter) != {"name", "version"}:
+        raise AcpCoordinatorError(f"Herdr ACP {response} adapter identity shape is invalid")
+    _nonempty_text(adapter.get("name"), "adapter name")
+    _nonempty_text(adapter.get("version"), "adapter version")
+    if set(session) not in ({"mode"}, {"id", "mode"}):
+        raise AcpCoordinatorError(f"Herdr ACP {response} session shape is invalid")
+    try:
+        mode = SessionOpenMode(session.get("mode"))
+    except (TypeError, ValueError) as exc:
+        raise AcpCoordinatorError(f"Herdr ACP {response} session mode is invalid") from exc
+    session_id_value = session.get("id")
+    if mode is SessionOpenMode.NEW:
+        if "id" in session and session_id_value is not None:
+            raise AcpCoordinatorError(f"new Herdr ACP {response} already has a session")
+        session_id = None
+    else:
+        session_id = _nonempty_text(session_id_value, "session id")
+    cwd = Path(_nonempty_text(value.get("cwd"), "cwd"))
+    if not cwd.is_absolute():
+        raise AcpCoordinatorError(f"Herdr ACP {response} cwd must be absolute")
+    return generation, mode, session_id, cwd
+
+
 def _parse_endpoint(
     config: Config,
     continuity: WorkerBinding,
@@ -2111,18 +1779,14 @@ def _parse_endpoint(
     endpoint = value.get("endpoint")
     console = value.get("console")
     worker = value.get("worker")
-    adapter = value.get("adapter")
-    session = value.get("session")
     if not all(
         isinstance(item, Mapping)
-        for item in (endpoint, console, worker, adapter, session)
+        for item in (endpoint, console, worker, value.get("adapter"), value.get("session"))
     ):
         raise AcpCoordinatorError("Herdr ACP endpoint nested shape is invalid")
     assert isinstance(endpoint, Mapping)
     assert isinstance(console, Mapping)
     assert isinstance(worker, Mapping)
-    assert isinstance(adapter, Mapping)
-    assert isinstance(session, Mapping)
     if set(endpoint) != {"transport", "command", "args", "protocol_version"}:
         raise AcpCoordinatorError("Herdr ACP launch specification is invalid")
     if (
@@ -2134,13 +1798,9 @@ def _parse_endpoint(
     command = _nonempty_text(endpoint.get("command"), "command")
     if command != "herdr" or Path(config.herdr_bin).name != "herdr":
         raise AcpCoordinatorError("Herdr ACP endpoint executable is not configured Herdr")
-    raw_generation = worker.get("generation")
-    if (
-        type(raw_generation) is not int
-        or raw_generation < 0
-        or raw_generation > (1 << 64) - 1
-    ):
-        raise AcpCoordinatorError("Herdr ACP endpoint generation is invalid")
+    raw_generation, mode, session_id, cwd = _parse_endpoint_identity(
+        continuity, value, response="endpoint"
+    )
     generation = str(raw_generation)
     if set(console) != {"generation", "lease"}:
         raise AcpCoordinatorError("Herdr ACP console endpoint shape is invalid")
@@ -2164,40 +1824,6 @@ def _parse_endpoint(
     if _nonempty_text(args[4], "argument generation") != generation:
         raise AcpCoordinatorError("Herdr ACP endpoint generation is inconsistent")
     _nonempty_text(args[6], "ticket")
-    if set(worker) != {
-        "terminal_id",
-        "workspace_id",
-        "tab_id",
-        "pane_id",
-        "name",
-        "agent",
-        "generation",
-    }:
-        raise AcpCoordinatorError("Herdr ACP worker identity shape is invalid")
-    _require_target_identity(continuity, worker, response="endpoint")
-    for field in ("terminal_id", "workspace_id", "tab_id", "name", "agent"):
-        _nonempty_text(worker.get(field), field)
-    _nonempty_text(worker.get("pane_id"), "pane_id")
-    if set(adapter) != {"name", "version"}:
-        raise AcpCoordinatorError("Herdr ACP adapter identity shape is invalid")
-    _nonempty_text(adapter.get("name"), "adapter name")
-    _nonempty_text(adapter.get("version"), "adapter version")
-    if set(session) not in ({"mode"}, {"id", "mode"}):
-        raise AcpCoordinatorError("Herdr ACP session shape is invalid")
-    try:
-        mode = SessionOpenMode(session.get("mode"))
-    except (TypeError, ValueError) as exc:
-        raise AcpCoordinatorError("Herdr ACP session mode is invalid") from exc
-    session_id_value = session.get("id")
-    if mode is SessionOpenMode.NEW:
-        if "id" in session and session_id_value is not None:
-            raise AcpCoordinatorError("new Herdr ACP endpoint already has a session")
-        session_id = None
-    else:
-        session_id = _nonempty_text(session_id_value, "session id")
-    cwd = Path(_nonempty_text(value.get("cwd"), "cwd"))
-    if not cwd.is_absolute():
-        raise AcpCoordinatorError("Herdr ACP cwd must be absolute")
     return HerdrAcpEndpoint(
         command=(
             config.herdr_bin,
@@ -2214,7 +1840,7 @@ def _parse_endpoint(
 def _parse_status(
     continuity: WorkerBinding,
     value: Any,
-) -> HerdrAcpStatus:
+) -> tuple[str, str, str]:
     """Validate Herdr's non-ticketing ACP generation/lease status."""
     if not isinstance(value, Mapping) or set(value) != {
         "type",
@@ -2235,62 +1861,10 @@ def _parse_status(
         raise AcpCoordinatorError("Herdr ACP status lifecycle is invalid")
     if console_lifecycle not in {"starting", "attached", "missing"}:
         raise AcpCoordinatorError("Herdr ACP console lifecycle is invalid")
-    worker = value.get("worker")
-    adapter = value.get("adapter")
-    session = value.get("session")
-    if not all(isinstance(item, Mapping) for item in (worker, adapter, session)):
-        raise AcpCoordinatorError("Herdr ACP status nested shape is invalid")
-    assert isinstance(worker, Mapping)
-    assert isinstance(adapter, Mapping)
-    assert isinstance(session, Mapping)
-    if set(worker) != {
-        "terminal_id",
-        "workspace_id",
-        "tab_id",
-        "pane_id",
-        "name",
-        "agent",
-        "generation",
-    }:
-        raise AcpCoordinatorError("Herdr ACP status worker shape is invalid")
-    raw_generation = worker.get("generation")
-    if (
-        type(raw_generation) is not int
-        or raw_generation < 0
-        or raw_generation > (1 << 64) - 1
-    ):
-        raise AcpCoordinatorError("Herdr ACP status generation is invalid")
-    for field in (
-        "terminal_id",
-        "workspace_id",
-        "tab_id",
-        "pane_id",
-        "name",
-        "agent",
-    ):
-        _nonempty_text(worker.get(field), field)
-    _require_target_identity(continuity, worker, response="status")
-    if set(adapter) != {"name", "version"}:
-        raise AcpCoordinatorError("Herdr ACP status adapter shape is invalid")
-    _nonempty_text(adapter.get("name"), "adapter name")
-    _nonempty_text(adapter.get("version"), "adapter version")
-    if set(session) not in ({"mode"}, {"id", "mode"}):
-        raise AcpCoordinatorError("Herdr ACP status session shape is invalid")
-    try:
-        mode = SessionOpenMode(session.get("mode"))
-    except (TypeError, ValueError) as exc:
-        raise AcpCoordinatorError("Herdr ACP status session mode is invalid") from exc
-    if mode is SessionOpenMode.NEW:
-        if "id" in session and session.get("id") is not None:
-            raise AcpCoordinatorError("new Herdr ACP status already has a session")
-    else:
-        _nonempty_text(session.get("id"), "session id")
-    cwd = Path(_nonempty_text(value.get("cwd"), "cwd"))
-    if not cwd.is_absolute():
-        raise AcpCoordinatorError("Herdr ACP status cwd must be absolute")
-    return HerdrAcpStatus(
-        str(raw_generation), str(lifecycle), str(console_lifecycle)
+    raw_generation, _mode, _session_id, _cwd = _parse_endpoint_identity(
+        continuity, value, response="status"
     )
+    return str(raw_generation), str(lifecycle), str(console_lifecycle)
 
 
 def _parse_console_exchange(
@@ -2308,28 +1882,20 @@ def _parse_console_exchange(
         raise AcpCoordinatorError("Herdr ACP console exchange shape is invalid")
     if value.get("type") != "agent_acp_console_exchange":
         raise AcpCoordinatorError("Herdr ACP console exchange type is invalid")
-    raw_inputs = value.get("inputs")
-    raw_outputs = value.get("outputs")
+    raw_inputs, raw_outputs = value.get("inputs"), value.get("outputs")
     if not isinstance(raw_inputs, list) or not isinstance(raw_outputs, list):
         raise AcpCoordinatorError("Herdr ACP console exchange lists are invalid")
-    input_floor = value.get("input_floor_sequence")
-    output_floor = value.get("output_floor_sequence")
-    next_input = value.get("next_input_sequence")
-    next_output = value.get("next_output_sequence")
+    input_floor, output_floor, next_input, next_output = (
+        value.get(name) for name in (
+            "input_floor_sequence", "output_floor_sequence",
+            "next_input_sequence", "next_output_sequence",
+        )
+    )
     if (
-        type(after_sequence) is not int
-        or after_sequence < 0
-        or after_sequence > (1 << 64) - 1
-        or type(input_floor) is not int
-        or type(output_floor) is not int
-        or input_floor < 0
-        or output_floor < 0
-        or type(next_input) is not int
-        or type(next_output) is not int
+        any(type(number) is not int or not 0 <= number <= (1 << 64) - 1
+            for number in (after_sequence, input_floor, output_floor, next_input, next_output))
         or next_input < input_floor
         or next_output < output_floor
-        or next_input > (1 << 64) - 1
-        or next_output > (1 << 64) - 1
     ):
         raise AcpCoordinatorError("Herdr ACP console exchange floors are invalid")
     if input_floor > after_sequence + 1:
@@ -2367,44 +1933,6 @@ def _parse_console_exchange(
         raise AcpCoordinatorError(
             "Herdr ACP console next input sequence is invalid"
         )
-    output_expected = output_floor
-    allowed_streams = {
-        "user",
-        "assistant",
-        "thought",
-        "tool",
-        "plan",
-        "status",
-        "error",
-        "turn_end",
-    }
-    for item in raw_outputs:
-        if not isinstance(item, Mapping) or set(item) != {
-            "sequence",
-            "event_id",
-            "stream",
-            "text",
-        }:
-            raise AcpCoordinatorError("Herdr ACP console output shape is invalid")
-        sequence = item.get("sequence")
-        event_id = item.get("event_id")
-        stream = item.get("stream")
-        text = item.get("text")
-        if (
-            type(sequence) is not int
-            or sequence != output_expected
-            or not isinstance(event_id, str)
-            or not event_id
-            or len(event_id) > 512
-            or stream not in allowed_streams
-            or not isinstance(text, str)
-        ):
-            raise AcpCoordinatorError("Herdr ACP console output item is invalid")
-        output_expected += 1
-    if next_output != output_expected:
-        raise AcpCoordinatorError(
-            "Herdr ACP console next output sequence is invalid"
-        )
     return tuple(parsed)
 
 
@@ -2429,29 +1957,7 @@ def _console_event_output(
             return None
         title = str(snapshot.get("title") or snapshot.get("kind") or "tool")
         status = str(snapshot.get("status") or "updated")
-        details = [f"{title} [{status}]"]
-        content = snapshot.get("content")
-        if isinstance(content, list):
-            for item in content:
-                if not isinstance(item, Mapping):
-                    continue
-                if item.get("type") == "content":
-                    block = item.get("content")
-                    if (
-                        isinstance(block, Mapping)
-                        and block.get("type") == "text"
-                        and isinstance(block.get("text"), str)
-                    ):
-                        details.append(str(block["text"]))
-                elif item.get("type") == "diff" and isinstance(item.get("path"), str):
-                    details.append(f"diff {item['path']}")
-                    if isinstance(item.get("oldText"), str):
-                        details.append("- " + str(item["oldText"]))
-                    if isinstance(item.get("newText"), str):
-                        details.append("+ " + str(item["newText"]))
-        # Herdr also enforces a bounded console item. Bound before transport so
-        # a single verbose tool result cannot starve all later events.
-        return "tool", "\n".join(details)[: 256 * 1024]
+        return "tool", f"{title} [{status}]"
     if kind == "plan":
         entries = payload.get("entries")
         if not isinstance(entries, list):
@@ -2462,28 +1968,11 @@ def _console_event_output(
             if isinstance(item, Mapping) and str(item.get("content") or "").strip()
         ]
         return ("plan", "\n".join(lines)) if lines else None
-    if kind == "usage":
-        return "status", "usage " + json.dumps(
-            dict(payload), sort_keys=True, separators=(",", ":")
-        )
-    if kind == "session_info" and payload.get("title"):
-        return "status", f"session {payload['title']}"
     if (
         kind == "extension"
         and payload.get("extension") == "tendwire.acp.prompt_completion"
     ):
         return "status", f"turn {str(payload.get('outcome') or 'complete')}"
-    if (
-        kind == "extension"
-        and payload.get("extension") == "tendwire.acp.console_submission_outcome"
-    ):
-        outcome = payload.get("outcome")
-        if outcome == "permission":
-            return "status", "permission selection accepted"
-        if outcome == "cancelled":
-            return "status", "active turn cancellation requested"
-        if outcome == "error":
-            return "error", "instruction failed"
     return None
 
 
@@ -2507,196 +1996,19 @@ def _console_output_wire_bytes(output: list[dict[str, str]]) -> int:
     )
 
 
-def _console_output_fits(
-    output: list[dict[str, str]], item: dict[str, str], *, budget: int
-) -> bool:
-    return _console_output_wire_bytes([*output, item]) <= budget
-
-
-def _fit_console_output_batch(
-    output: list[dict[str, str]], *, budget: int
-) -> list[dict[str, str]]:
-    fitted: list[dict[str, str]] = []
-    for item in output:
-        if not _console_output_fits(fitted, item, budget=budget):
-            break
-        fitted.append(item)
-    return fitted
-
-
-def _console_exchange_output_bytes(value: Any) -> int:
-    assert isinstance(value, Mapping)
-    outputs = value.get("outputs")
-    assert isinstance(outputs, list)
-    return len(
-        json.dumps(outputs, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    )
-
-
-def _load_console_event_cursor(
-    db_path: Path,
-    host_id: str,
-    worker_id: str,
-    session_id: str,
-) -> int | None:
+def _latest_console_event_sequence(
+    db_path: Path, host_id: str, worker_id: str, session_id: str
+) -> int:
     after = 0
-    cursor = 0
-    found = False
     while True:
         page = list_agent_events(
-            db_path,
-            host_id,
-            worker_id=worker_id,
-            source="tendwire-console",
-            session_id=session_id,
-            after_sequence=after,
-            limit=1000,
+            db_path, host_id, worker_id=worker_id, source="acp",
+            session_id=session_id, after_sequence=after, limit=1000,
         )
-        if not page:
-            return cursor if found else None
         for stored in page:
             after = max(after, stored.sequence)
-            payload = stored.event.payload
-            value = payload.get("sequence")
-            if (
-                payload.get("extension") == "tendwire.acp.console_cursor"
-                and type(value) is int
-                and value >= 0
-            ):
-                found = True
-                cursor = max(cursor, value)
         if len(page) < 1000:
-            return cursor if found else None
-
-
-def _initial_console_event_cursor(
-    db_path: Path,
-    host_id: str,
-    worker_id: str,
-    session_id: str,
-) -> int:
-    persisted = _load_console_event_cursor(
-        db_path, host_id, worker_id, session_id
-    )
-    if persisted is not None:
-        return persisted
-    return 0
-
-
-def _record_console_event_cursor(
-    db_path: Path,
-    host_id: str,
-    worker_id: str,
-    session_id: str,
-    sequence: int,
-    *,
-    source_event_id: str,
-) -> None:
-    record_agent_event(
-        db_path,
-        host_id,
-        kind="extension",
-        source="tendwire-console",
-        worker_id=worker_id,
-        payload={"extension": "tendwire.acp.console_cursor", "sequence": sequence},
-        source_session_id=session_id,
-        source_event_id=source_event_id,
-        visibility="private",
-    )
-
-
-def _prepare_console_event_cursor(
-    db_path: Path,
-    host_id: str,
-    worker_id: str,
-    session_id: str,
-    *,
-    session_mode: SessionOpenMode,
-    generation: int,
-) -> int:
-    persisted = _load_console_event_cursor(db_path, host_id, worker_id, session_id)
-    if persisted is not None:
-        return persisted
-    # A missing checkpoint is never evidence that any stored ACP update was
-    # displayed. Replay from zero for NEW setup updates as well as LOAD/RESUME;
-    # Herdr's stable event ids make the conservative replay idempotent.
-    baseline = 0
-    _record_console_event_cursor(
-        db_path,
-        host_id,
-        worker_id,
-        session_id,
-        baseline,
-        source_event_id=f"baseline:{generation}:{baseline}",
-    )
-    return baseline
-
-
-def _record_console_submission_outcome(
-    db_path: Path,
-    host_id: str,
-    worker_id: str,
-    session_id: str,
-    *,
-    generation: int,
-    input_sequence: int,
-    outcome: str,
-) -> None:
-    record_agent_event(
-        db_path,
-        host_id,
-        kind="extension",
-        source="acp",
-        worker_id=worker_id,
-        payload={
-            "schema_version": 1,
-            "extension": "tendwire.acp.console_submission_outcome",
-            "generation": generation,
-            "input_sequence": input_sequence,
-            "outcome": outcome,
-        },
-        source_session_id=session_id,
-        source_event_id=f"console-outcome:{generation}:{input_sequence}",
-        visibility="private",
-    )
-
-
-def _load_console_input_cursor(
-    db_path: Path,
-    host_id: str,
-    worker_id: str,
-    _session_id: str,
-    generation: int,
-) -> int:
-    # Herdr owns the visible input queue at the worker generation, not at an
-    # adapter session. A NEW adapter session can be reminted after a bridge
-    # failure while Herdr retains the same console generation and sequence.
-    # Recovering only from the reminted session would reset this cursor to zero
-    # and turn every retained input into a permanent false gap.
-    after = 0
-    cursor = 0
-    while True:
-        page = list_agent_events(
-            db_path,
-            host_id,
-            worker_id=worker_id,
-            source="tendwire-console",
-            after_sequence=after,
-            limit=1000,
-        )
-        if not page:
-            return cursor
-        for stored in page:
-            after = max(after, stored.sequence)
-            payload = stored.event.payload
-            if (
-                payload.get("extension") == "tendwire.acp.console_input_cursor"
-                and payload.get("generation") == generation
-                and type(payload.get("input_sequence")) is int
-            ):
-                cursor = max(cursor, int(payload["input_sequence"]))
-        if len(page) < 1000:
-            return cursor
+            return after
 
 
 def _console_pending_decision(
@@ -2772,6 +2084,4 @@ def production_acp_supervisor_factory(
     return AcpSupervisor(
         config,
         stop_event,
-        require_permission_bridge=True,
-        durable_permission_bridge=True,
     )

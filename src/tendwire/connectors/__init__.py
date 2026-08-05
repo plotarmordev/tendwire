@@ -1,5 +1,13 @@
 """Neutral Tendwire connector delivery boundary."""
 
-from .outbox import ConnectorOutboxAPI
+from typing import Any
+
+
+def __getattr__(name: str) -> Any:
+    if name != "ConnectorOutboxAPI":
+        raise AttributeError(name)
+    from .outbox import ConnectorOutboxAPI
+
+    return ConnectorOutboxAPI
 
 __all__ = ["ConnectorOutboxAPI"]

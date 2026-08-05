@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import json
 
+import pytest
+
 from tendwire.cli import main
 
 
@@ -18,10 +20,27 @@ def test_invalid_command_is_rejected_locally(monkeypatch, capsys) -> None:
     assert payload["ok"] is False
 
 
-def test_noop_remains_pure(monkeypatch, capsys) -> None:
-    code, payload = _run(monkeypatch, capsys, {"schema_version": 1, "action": "noop"})
-    assert code == 0
-    assert payload["status"] == "noop"
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"schema_version": 1, "action": "noop"},
+        {
+            "schema_version": 1,
+            "action": "send_instruction",
+            "dry_run": True,
+            "target": {"worker_id": "worker"},
+            "instruction": {"text": "hello"},
+        },
+    ],
+)
+def test_valid_command_always_uses_authoritative_daemon(
+    monkeypatch, capsys, tmp_path, payload
+) -> None:
+    monkeypatch.setenv("TENDWIRE_DATA_DIR", str(tmp_path))
+    code, response = _run(monkeypatch, capsys, payload)
+    assert code == 1
+    assert response["status"] == "backend_unavailable"
+    assert not (tmp_path / "tendwire.db").exists()
 
 
 def test_live_mutation_never_falls_back_from_daemon(monkeypatch, capsys, tmp_path) -> None:

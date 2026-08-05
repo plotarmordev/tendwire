@@ -22,23 +22,20 @@ from tendwire.backends.acp_coordinator import (
     _SessionSlot as _RuntimeSlot,
     _CONSOLE_BRIDGE_INTERVAL_SECONDS,
     _derived_binding,
+    _expire_derived_binding,
     _console_event_output,
     _bounded_console_output,
     _console_output_wire_bytes,
-    _fit_console_output_batch,
     _console_permission_selection,
-    _load_console_event_cursor,
-    _load_console_input_cursor,
+    _latest_console_event_sequence,
     _parse_console_exchange,
     _parse_endpoint,
     _parse_status,
-    _prepare_console_event_cursor,
-    _record_console_submission_outcome,
     production_acp_supervisor_factory as production_acp_runtime_factory,
 )
 from tendwire.backends.acp_runtime import RuntimeState, SessionOpenMode
 from tendwire.backends.herdr_protocol import HerdrErrorResponse
-from tendwire.command_submission import submit_acp_command, submit_command
+from tendwire.command_submission import submit_command
 from tendwire.config import Config
 from tendwire.core.models import (
     BackendHealth,
@@ -47,15 +44,15 @@ from tendwire.core.models import (
     WorkerBinding,
 )
 from tendwire.daemon import DaemonHooks, TendwireDaemon
-from tendwire.store.sqlite import (
-    get_command_request,
-    init_store,
-    list_agent_events,
+from tendwire.store.events import list_agent_events, record_agent_event
+from tendwire.store.projection import (
+    latest_snapshot,
     list_worker_bindings,
-    record_agent_event,
     save_snapshot,
-    upsert_worker_bindings,
 )
+from tendwire.store.receipts import get_command_request
+from tendwire.store.schema import init_store
+from .store_helpers import upsert_test_worker_bindings as upsert_worker_bindings
 
 
 def _config(tmp_path: Path) -> Config:
@@ -80,6 +77,20 @@ def _binding() -> WorkerBinding:
         sendable=True,
         private_fingerprint="herdr-private-binding",
     )
+
+
+@pytest.fixture
+def console_executor_factory():
+    executors: list[ThreadPoolExecutor] = []
+
+    def create() -> ThreadPoolExecutor:
+        executor = ThreadPoolExecutor(max_workers=1)
+        executors.append(executor)
+        return executor
+
+    yield create
+    for executor in executors:
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def _endpoint(*, generation: int = 42, lifecycle: str = "acp_owned_ready") -> dict[str, Any]:
@@ -188,35 +199,11 @@ def test_console_exchange_requires_floor_and_next_sequence_contract() -> None:
     with pytest.raises(AcpCoordinatorError, match="incomplete"):
         _parse_console_exchange(incomplete, 2)
 
-    output = dict(
-        result,
-        outputs=[
-            {
-                "sequence": 7,
-                "event_id": "event-7",
-                "stream": "assistant",
-                "text": "done",
-            }
-        ],
-        output_floor_sequence=7,
-        next_output_sequence=8,
-    )
-    assert _parse_console_exchange(output, 2) == ((3, "continue"),)
-    malformed_output = dict(output, outputs=[{"sequence": 7, "text": "done"}])
-    with pytest.raises(AcpCoordinatorError, match="output shape"):
-        _parse_console_exchange(malformed_output, 2)
-    wrong_output_next = dict(output, next_output_sequence=9)
-    with pytest.raises(AcpCoordinatorError, match="next output"):
-        _parse_console_exchange(wrong_output_next, 2)
-
-
 def test_live_only_console_policy_skips_lost_backlog_to_current_tail(
     tmp_path: Path,
+    console_executor_factory,
 ) -> None:
-    config = replace(
-        _config(tmp_path),
-        acp_console_input_policy="live_only",
-    )
+    config = _config(tmp_path)
     assert config.db_path is not None
     init_store(config.db_path)
     exchanges: list[int] = []
@@ -243,7 +230,14 @@ def test_live_only_console_policy_skips_lost_backlog_to_current_tail(
                     if after_input_sequence == 0
                     else []
                 ),
-                "outputs": [],
+                "outputs": [
+                    {
+                        "sequence": 1,
+                        "event_id": "already-retained",
+                        "stream": "status",
+                        "text": "existing pane output",
+                    }
+                ],
                 "input_floor_sequence": 3,
                 "output_floor_sequence": 1,
                 "next_input_sequence": 5,
@@ -271,20 +265,23 @@ def test_live_only_console_policy_skips_lost_backlog_to_current_tail(
         generation="42",
         runtime=SimpleNamespace(_binding=binding),
         console=HerdrAcpConsoleEndpoint(42, "coordinator-lease"),
-        console_cursor_loaded=True,
+        console_executor=console_executor_factory(),
     )
 
     coordinator._bridge_console_slot(slot)
 
-    assert exchanges == [0, 4]
+    assert exchanges == [0]
     assert slot.console_input_sequence == 4
-    assert _load_console_input_cursor(
-        config.db_path,
-        config.host_id,
-        "worker-1",
-        "session-a",
-        42,
-    ) == 4
+    assert slot.console_retained_output_bytes == _console_output_wire_bytes(
+        [
+            {
+                "sequence": 1,
+                "event_id": "already-retained",
+                "stream": "status",
+                "text": "existing pane output",
+            }
+        ]
+    )
 
 
 def test_console_event_projection_covers_messages_thought_tools_and_plan() -> None:
@@ -299,29 +296,6 @@ def test_console_event_projection_covers_messages_thought_tools_and_plan() -> No
     assert _console_event_output(
         "tool_call_update", {"snapshot": {"title": "pytest", "status": "completed"}}
     ) == ("tool", "pytest [completed]")
-    assert _console_event_output(
-        "tool_call_update",
-        {
-            "snapshot": {
-                "title": "Edit source",
-                "status": "completed",
-                "rawInput": {"secret": "not rendered"},
-                "rawOutput": "not rendered",
-                "content": [
-                    {"type": "content", "content": {"type": "text", "text": "done"}},
-                    {
-                        "type": "diff",
-                        "path": "/workspace/source.py",
-                        "oldText": "old",
-                        "newText": "new",
-                    },
-                ],
-            }
-        },
-    ) == (
-        "tool",
-        "Edit source [completed]\ndone\ndiff /workspace/source.py\n- old\n+ new",
-    )
     assert _console_event_output(
         "plan", {"entries": [{"content": "verify", "status": "in_progress"}]}
     ) == ("plan", "[in_progress] verify")
@@ -340,148 +314,101 @@ def test_console_permission_selection_is_explicit_and_fail_closed() -> None:
     assert _console_permission_selection("do something else", options) is None
 
 
-def test_console_cursors_survive_restart_crash_boundaries(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    assert config.db_path is not None
-    init_store(config.db_path)
-    record_agent_event(
-        config.db_path,
-        config.host_id,
-        kind="extension",
-        source="tendwire-console",
-        worker_id="worker-1",
-        payload={"extension": "tendwire.acp.console_cursor", "sequence": 41},
-        source_session_id="session-a",
-        source_event_id="cursor:41",
-        visibility="private",
-    )
-    record_agent_event(
-        config.db_path,
-        config.host_id,
-        kind="extension",
-        source="tendwire-console",
-        worker_id="worker-1",
-        payload={
-            "extension": "tendwire.acp.console_input_cursor",
-            "generation": 42,
-            "input_sequence": 7,
-        },
-        source_session_id="session-a",
-        source_event_id="input:42:7",
-        visibility="private",
-    )
-    assert _load_console_event_cursor(
-        config.db_path, config.host_id, "worker-1", "session-a"
-    ) == 41
-    assert _load_console_input_cursor(
-        config.db_path, config.host_id, "worker-1", "session-a", 42
-    ) == 7
-    # The visible Herdr input queue survives an ACP adapter remint. Its cursor
-    # is owned by worker generation 42, so a replacement session must recover
-    # the already acknowledged input rather than reporting a false gap.
-    assert _load_console_input_cursor(
-        config.db_path, config.host_id, "worker-1", "session-b", 42
-    ) == 7
-    assert _load_console_input_cursor(
-        config.db_path, config.host_id, "worker-1", "session-a", 43
-    ) == 0
-
-
-def test_missing_checkpoint_replays_from_zero_including_new_session_start_updates(
-    tmp_path: Path,
-) -> None:
-    config = _config(tmp_path)
-    assert config.db_path is not None
-    init_store(config.db_path)
-    record_agent_event(
-        config.db_path,
-        config.host_id,
-        kind="agent_message",
-        source="acp",
-        worker_id="worker-1",
-        payload={"text_delta": "stored before coordinator checkpoint"},
-        source_session_id="session-resume",
-        source_event_id="agent-before-crash",
-        visibility="private",
-    )
-    assert _prepare_console_event_cursor(
-        config.db_path,
-        config.host_id,
-        "worker-1",
-        "session-resume",
-        session_mode=SessionOpenMode.RESUME,
-        generation=42,
-    ) == 0
-    assert _load_console_event_cursor(
-        config.db_path, config.host_id, "worker-1", "session-resume"
-    ) == 0
-
-    record_agent_event(
-        config.db_path,
-        config.host_id,
-        kind="agent_message",
-        source="acp",
-        worker_id="worker-1",
-        payload={"text_delta": "setup replay"},
-        source_session_id="session-new",
-        source_event_id="agent-during-setup",
-        visibility="private",
-    )
-    baseline = _prepare_console_event_cursor(
-        config.db_path,
-        config.host_id,
-        "worker-1",
-        "session-new",
-        session_mode=SessionOpenMode.NEW,
-        generation=43,
-    )
-    assert baseline == 0
-    assert _load_console_event_cursor(
-        config.db_path, config.host_id, "worker-1", "session-new"
-    ) == baseline
-
-
-def test_console_failure_outcome_is_durable_before_input_ack(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    assert config.db_path is not None
-    init_store(config.db_path)
-    _record_console_submission_outcome(
-        config.db_path,
-        config.host_id,
-        "worker-1",
-        "session-a",
-        generation=42,
-        input_sequence=7,
-        outcome="error",
-    )
-    # Simulate a crash before the following input-cursor write. The error is
-    # replayable even though Herdr input 7 was not acknowledged yet.
-    assert _load_console_input_cursor(
-        config.db_path, config.host_id, "worker-1", "session-a", 42
-    ) == 0
-    stored = list_agent_events(
-        config.db_path,
-        config.host_id,
-        worker_id="worker-1",
-        source="acp",
-        session_id="session-a",
-    )
-    assert len(stored) == 1
-    assert _console_event_output(stored[0].event.kind, stored[0].event.payload) == (
-        "error",
-        "instruction failed",
-    )
-
-
 def test_console_output_batch_is_utf8_bounded_and_replay_deterministic() -> None:
     first = _bounded_console_output("event-a", "tool", "😀" * 100_000)
     second = _bounded_console_output("event-b", "assistant", "β" * 100_000)
     assert first["text"].encode("utf-8").decode("utf-8") == first["text"]
     assert "[console output truncated]" in first["text"]
     budget = _console_output_wire_bytes([first])
-    assert _fit_console_output_batch([first, second], budget=budget) == [first]
-    assert _fit_console_output_batch([first, second], budget=budget) == [first]
     assert _console_output_wire_bytes([first]) <= budget
+
+
+def test_new_console_slot_starts_at_live_tail_and_delivers_only_fresh_events(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    for source_id, text in (("old-1", "old one"), ("old-2", "old two")):
+        record_agent_event(
+            config.db_path,
+            config.host_id,
+            kind="agent_message",
+            source="acp",
+            worker_id="worker-1",
+            payload={"text_delta": text},
+            source_session_id="session-a",
+            source_event_id=source_id,
+            visibility="private",
+        )
+    baseline = _latest_console_event_sequence(
+        config.db_path, config.host_id, "worker-1", "session-a"
+    )
+    record_agent_event(
+        config.db_path,
+        config.host_id,
+        kind="agent_message",
+        source="acp",
+        worker_id="worker-1",
+        payload={"text_delta": "fresh"},
+        source_session_id="session-a",
+        source_event_id="fresh-1",
+        visibility="private",
+    )
+
+    class EndpointClient:
+        published: list[dict[str, Any]] = []
+        next_output = 1
+
+        def agent_acp_console_exchange(self, _target: str, **params: Any) -> dict[str, Any]:
+            for item in params["output"]:
+                self.published.append({"sequence": self.next_output, **dict(item)})
+                self.next_output += 1
+            return {
+                "type": "agent_acp_console_exchange",
+                "inputs": [],
+                "outputs": list(self.published),
+                "input_floor_sequence": 1,
+                "output_floor_sequence": 1,
+                "next_input_sequence": 1,
+                "next_output_sequence": self.next_output,
+            }
+
+        def close(self) -> None:
+            return None
+
+    runtime = SimpleNamespace(
+        _binding=replace(
+            _binding(),
+            backend="acp",
+            turn_target_kind="acp_session_id",
+            turn_target_value="session-a",
+        )
+    )
+    slot = _RuntimeSlot(
+        continuity=_binding(),
+        generation="42",
+        runtime=runtime,
+        console=HerdrAcpConsoleEndpoint(42, "coordinator-lease"),
+        console_event_sequence=baseline,
+        console_executor=ThreadPoolExecutor(max_workers=1),
+        console_submissions={},
+        console_local_turns=set(),
+    )
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        reconcile_interval=60.0,
+    )
+    try:
+        coordinator._bridge_console_slot(slot)
+        assert EndpointClient.published == []
+        coordinator._bridge_console_slot(slot)
+        assert [item["text"] for item in EndpointClient.published] == ["fresh"]
+    finally:
+        assert slot.console_executor is not None
+        slot.console_executor.shutdown(wait=True, cancel_futures=True)
 
 
 def test_console_bridge_byte_batches_and_advances_only_published_prefix(
@@ -556,8 +483,8 @@ def test_console_bridge_byte_batches_and_advances_only_published_prefix(
         generation="42",
         runtime=runtime,
         console=HerdrAcpConsoleEndpoint(42, "coordinator-lease"),
-        console_cursor_loaded=True,
         console_executor=executor,
+        console_retained_output_bytes=0,
         console_submissions={},
         console_local_turns=set(),
     )
@@ -573,12 +500,13 @@ def test_console_bridge_byte_batches_and_advances_only_published_prefix(
         # Once the pane drains, the exact unacknowledged suffix is published.
         EndpointClient.retained.clear()
         coordinator._bridge_console_slot(slot)
+        coordinator._bridge_console_slot(slot)
         assert slot.console_event_sequence > first_cursor
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
 
-def test_console_bridge_polls_independently_of_slow_reconcile_interval(
+def test_supervisor_polls_console_independently_of_slow_reconcile_interval(
     tmp_path: Path,
 ) -> None:
     coordinator = AcpRuntimeCoordinator(
@@ -593,13 +521,16 @@ def test_console_bridge_polls_independently_of_slow_reconcile_interval(
 
     coordinator._bridge_console_slots = tick  # type: ignore[method-assign]
     started = time.monotonic()
-    coordinator._run_console_bridge()
+    coordinator._run()
     assert len(ticks) == 3
     assert 0.25 <= _CONSOLE_BRIDGE_INTERVAL_SECONDS <= 0.5
     assert ticks[-1] - started < 3.5 * _CONSOLE_BRIDGE_INTERVAL_SECONDS
 
 
-def test_console_bridge_dispatches_slow_workers_independently(tmp_path: Path) -> None:
+def test_console_bridge_dispatches_slow_workers_independently(
+    tmp_path: Path,
+    console_executor_factory,
+) -> None:
     coordinator = AcpRuntimeCoordinator(
         _config(tmp_path), threading.Event(), reconcile_interval=60.0
     )
@@ -612,12 +543,14 @@ def test_console_bridge_dispatches_slow_workers_independently(tmp_path: Path) ->
         "42",
         SimpleNamespace(),
         console=HerdrAcpConsoleEndpoint(42, "slow-lease"),
+        console_executor=console_executor_factory(),
     )
     fast_slot = _RuntimeSlot(
         replace(_binding(), worker_id="worker-2"),
         "43",
         SimpleNamespace(),
         console=HerdrAcpConsoleEndpoint(43, "fast-lease"),
+        console_executor=console_executor_factory(),
     )
     coordinator._slots = {"worker-1": slow_slot, "worker-2": fast_slot}
 
@@ -641,7 +574,10 @@ def test_console_bridge_dispatches_slow_workers_independently(tmp_path: Path) ->
                 thread.join(timeout=1.0)
 
 
-def test_console_failure_remains_degraded_after_slot_disappears(tmp_path: Path) -> None:
+def test_console_failure_remains_degraded_after_slot_disappears(
+    tmp_path: Path,
+    console_executor_factory,
+) -> None:
     coordinator = AcpRuntimeCoordinator(
         _config(tmp_path),
         threading.Event(),
@@ -653,6 +589,7 @@ def test_console_failure_remains_degraded_after_slot_disappears(tmp_path: Path) 
         "42",
         SimpleNamespace(),
         console=HerdrAcpConsoleEndpoint(42, "console-lease"),
+        console_executor=console_executor_factory(),
     )
 
     def fail(_slot: _RuntimeSlot) -> None:
@@ -670,6 +607,7 @@ def test_console_failure_remains_degraded_after_slot_disappears(tmp_path: Path) 
 
 def test_first_console_failure_immediately_fences_prompt_route_until_success(
     tmp_path: Path,
+    console_executor_factory,
 ) -> None:
     coordinator = AcpRuntimeCoordinator(
         _config(tmp_path),
@@ -686,6 +624,7 @@ def test_first_console_failure_immediately_fences_prompt_route_until_success(
         "42",
         runtime,
         console=HerdrAcpConsoleEndpoint(42, "console-lease"),
+        console_executor=console_executor_factory(),
     )
     coordinator._slots["worker-1"] = slot
     worker = Worker(
@@ -757,6 +696,7 @@ def test_first_console_failure_immediately_fences_prompt_route_until_success(
 
 def test_superseded_console_success_cannot_clear_replacement_fence(
     tmp_path: Path,
+    console_executor_factory,
 ) -> None:
     coordinator = AcpRuntimeCoordinator(
         _config(tmp_path),
@@ -773,36 +713,50 @@ def test_superseded_console_success_cannot_clear_replacement_fence(
         "42",
         runtime,
         console=HerdrAcpConsoleEndpoint(42, "old-lease"),
+        console_executor=console_executor_factory(),
     )
     replacement = _RuntimeSlot(
         _binding(),
         "43",
         runtime,
         console=HerdrAcpConsoleEndpoint(43, "replacement-lease"),
+        console_executor=console_executor_factory(),
     )
     coordinator._slots["worker-1"] = replacement
-    coordinator._console_failed_workers.add("worker-1")
-    coordinator._console_degraded = True
+    coordinator._console_failed_claims["worker-1"] = "worker-fingerprint"
     coordinator._bridge_console_slot = lambda _slot: None  # type: ignore[method-assign]
 
     coordinator._bridge_console_slot_supervised(old)
-    assert "worker-1" in coordinator._console_failed_workers
+    assert "worker-1" in coordinator._console_failed_claims
     assert coordinator.status()["healthy"] is False
 
     coordinator._bridge_console_slot_supervised(replacement)
-    assert "worker-1" not in coordinator._console_failed_workers
+    assert "worker-1" not in coordinator._console_failed_claims
     assert coordinator.status()["healthy"] is True
 
 
 def test_console_submission_rejects_a_retired_generation_before_store_access(
     tmp_path: Path,
+    console_executor_factory,
 ) -> None:
     coordinator = AcpRuntimeCoordinator(
         _config(tmp_path), threading.Event(), reconcile_interval=60.0
     )
     coordinator._state = RuntimeState.RUNNING
-    stale = _RuntimeSlot(_binding(), "42", SimpleNamespace())
-    replacement = _RuntimeSlot(_binding(), "43", SimpleNamespace())
+    stale = _RuntimeSlot(
+        _binding(),
+        "42",
+        SimpleNamespace(),
+        HerdrAcpConsoleEndpoint(42, "stale-lease"),
+        console_executor_factory(),
+    )
+    replacement = _RuntimeSlot(
+        _binding(),
+        "43",
+        SimpleNamespace(),
+        HerdrAcpConsoleEndpoint(43, "replacement-lease"),
+        console_executor_factory(),
+    )
     coordinator._slots["worker-1"] = replacement
     with pytest.raises(AcpCoordinatorError, match="generation is stale"):
         coordinator._submit_console_input(stale, 1, "must not cross sessions")
@@ -811,6 +765,7 @@ def test_console_submission_rejects_a_retired_generation_before_store_access(
 def test_console_local_turn_is_suppressed_before_acp_submission_emits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    console_executor_factory,
 ) -> None:
     config = _config(tmp_path)
     assert config.db_path is not None
@@ -845,6 +800,8 @@ def test_console_local_turn_is_suppressed_before_acp_submission_emits(
         continuity,
         "42",
         runtime,
+        console=HerdrAcpConsoleEndpoint(42, "coordinator-lease"),
+        console_executor=console_executor_factory(),
         console_local_turns=set(),
     )
     coordinator = AcpRuntimeCoordinator(
@@ -879,6 +836,7 @@ def test_stop_reports_failed_while_console_submission_thread_is_still_running(
         _binding(),
         "42",
         runtime,
+        console=HerdrAcpConsoleEndpoint(42, "coordinator-lease"),
         console_executor=executor,
         console_submissions={1: future},
     )
@@ -891,6 +849,144 @@ def test_stop_reports_failed_while_console_submission_thread_is_still_running(
     finally:
         release.set()
         future.result(timeout=1.0)
+
+
+def test_stop_accounts_for_submission_work_after_slot_retirement(tmp_path: Path) -> None:
+    coordinator = AcpRuntimeCoordinator(
+        _config(tmp_path), threading.Event(), reconcile_interval=60.0
+    )
+    coordinator._state = RuntimeState.RUNNING
+    entered = threading.Event()
+    release = threading.Event()
+    executor = ThreadPoolExecutor(max_workers=1)
+
+    def block() -> None:
+        entered.set()
+        assert release.wait(2.0)
+
+    future = executor.submit(block)
+    assert entered.wait(1.0)
+    slot = _RuntimeSlot(
+        _binding(),
+        "42",
+        SimpleNamespace(stop=lambda *, timeout: None),
+        console=HerdrAcpConsoleEndpoint(42, "coordinator-lease"),
+        console_executor=executor,
+        console_submissions={1: future},
+    )
+    coordinator._slots["worker-1"] = slot
+    coordinator._retire_worker("worker-1")
+    try:
+        coordinator.stop(timeout=0.05)
+        assert coordinator.status()["state"] == "failed"
+        assert coordinator.status()["failure_type"] == "AcpRuntimeStopTimeout"
+    finally:
+        release.set()
+        future.result(timeout=1.0)
+
+
+def test_terminal_retired_work_is_reaped_but_active_work_remains_accounted(
+    tmp_path: Path,
+) -> None:
+    coordinator = AcpRuntimeCoordinator(
+        _config(tmp_path), threading.Event(), reconcile_interval=60.0
+    )
+    coordinator._state = RuntimeState.RUNNING
+    release = threading.Event()
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(lambda: release.wait(2.0))
+    slot = _RuntimeSlot(
+        _binding(),
+        "42",
+        SimpleNamespace(stop=lambda *, timeout: None),
+        console=HerdrAcpConsoleEndpoint(42, "coordinator-lease"),
+        console_executor=executor,
+        console_submissions={1: future},
+    )
+    coordinator._slots["worker-1"] = slot
+    coordinator._retire_worker("worker-1")
+
+    coordinator._reap_retired_slots()
+    assert coordinator._retired_slots == {id(slot): slot}
+    release.set()
+    future.result(timeout=1.0)
+    coordinator._reap_retired_slots()
+    assert coordinator._retired_slots == {}
+    with pytest.raises(RuntimeError, match="shutdown"):
+        executor.submit(lambda: None)
+
+
+def test_console_submission_error_is_visible_before_input_ack(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    exchanges: list[dict[str, Any]] = []
+
+    class EndpointClient:
+        def agent_acp_console_exchange(self, _target: str, **params: Any) -> Any:
+            exchanges.append(params)
+            retained = [
+                {"sequence": index, **dict(item)}
+                for index, item in enumerate(params["output"], start=1)
+            ]
+            return {
+                "type": "agent_acp_console_exchange",
+                "inputs": [],
+                "outputs": retained,
+                "input_floor_sequence": 1,
+                "output_floor_sequence": 1,
+                "next_input_sequence": params["after_input_sequence"] + 1,
+                "next_output_sequence": len(retained) + 1,
+            }
+
+        def close(self) -> None:
+            return None
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    failed = executor.submit(
+        lambda: (_ for _ in ()).throw(RuntimeError("private command detail"))
+    )
+    with pytest.raises(RuntimeError):
+        failed.result(timeout=1.0)
+    slot = _RuntimeSlot(
+        _binding(),
+        "42",
+        SimpleNamespace(
+            _binding=replace(
+                _binding(),
+                backend="acp",
+                turn_target_kind="acp_session_id",
+                turn_target_value="session-a",
+            )
+        ),
+        console=HerdrAcpConsoleEndpoint(42, "coordinator-lease"),
+        console_executor=executor,
+        console_retained_output_bytes=0,
+        console_submissions={1: failed},
+    )
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        reconcile_interval=60.0,
+    )
+    try:
+        coordinator._bridge_console_slot(slot)
+        assert exchanges[0]["after_input_sequence"] == 1
+        assert exchanges[0]["output"] == [
+            {
+                "event_id": "console-input:42:1",
+                "stream": "error",
+                "text": "instruction failed",
+            }
+        ]
+        assert "private command detail" not in json.dumps(exchanges)
+        assert slot.console_input_sequence == 1
+        assert slot.console_submissions == {}
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def test_console_input_submission_worker_does_not_block_event_exchange(
@@ -949,7 +1045,6 @@ def test_console_input_submission_worker_does_not_block_event_exchange(
         generation="42",
         runtime=runtime,
         console=HerdrAcpConsoleEndpoint(42, "coordinator-lease"),
-        console_cursor_loaded=True,
         console_executor=executor,
         console_submissions={},
         console_local_turns=set(),
@@ -1009,6 +1104,10 @@ class _Route:
     def supports_steering(self) -> bool:
         return False
 
+    @contextmanager
+    def prepare(self):
+        yield self
+
     def prompt(
         self,
         text: str,
@@ -1062,11 +1161,11 @@ class _SteeringRoute(_Route):
         producer_turn_id: str,
         timeout: float,
         on_send_start: Any = None,
-    ) -> object:
+    ) -> str:
         self.steering_calls.append((text, producer_turn_id, timeout))
         if callable(on_send_start):
             on_send_start()
-        return SimpleNamespace(outcome=self.outcome)
+        return self.outcome
 
 
 def _seed(config: Config) -> Worker:
@@ -1097,8 +1196,26 @@ def _seed(config: Config) -> Worker:
             ],
         ),
     )
-    upsert_worker_bindings(config.db_path, [_binding()])
-    return worker
+    continuity = _binding()
+    acp_route = replace(
+        continuity,
+        backend="acp",
+        target_kind="acp_session_id",
+        target_value="session-private",
+        turn_target_kind="acp_session_id",
+        turn_target_value="session-private",
+        private_fingerprint="acp-private-binding",
+    )
+    upsert_worker_bindings(config.db_path, [continuity, acp_route])
+    stored = latest_snapshot(config.db_path, config.host_id)
+    assert stored is not None
+    enriched = save_snapshot(
+        config.db_path,
+        stored,
+        worker_bindings=[acp_route],
+        binding_backend="acp",
+    )
+    return enriched.workers[0]
 
 
 def _request(request_id: str = "request-1") -> dict[str, Any]:
@@ -1267,6 +1384,7 @@ def test_acp_generation_preflight_failure_is_retryable_before_receipt(
 
 def test_production_route_checks_generation_before_reserving_receipt(
     tmp_path: Path,
+    console_executor_factory,
 ) -> None:
     config = _config(tmp_path)
     worker = _seed(config)
@@ -1284,6 +1402,8 @@ def test_production_route_checks_generation_before_reserving_receipt(
         _binding(),
         "42",
         runtime,
+        console=HerdrAcpConsoleEndpoint(42, "coordinator-lease"),
+        console_executor=console_executor_factory(),
     )
     coordinator._require_attached_generation = (  # type: ignore[method-assign]
         lambda _slot: (_ for _ in ()).throw(
@@ -1327,7 +1447,7 @@ def test_acp_failure_before_transport_boundary_is_immediately_retryable(
     )
     assert receipt is not None
     assert receipt["state"] == "reserved"
-    assert receipt["send_started_at"] is None
+    assert receipt["binding_fingerprint"] is None
 
     good_route = _Route()
     second = submit_command(
@@ -1348,7 +1468,7 @@ def test_acp_failure_before_transport_boundary_is_immediately_retryable(
 
 def test_route_authority_failure_is_safe_before_receipt_reservation(tmp_path: Path) -> None:
     config = _config(tmp_path)
-    _seed(config)
+    worker = _seed(config)
 
     class VanishedRoute:
         @property
@@ -1358,12 +1478,11 @@ def test_route_authority_failure_is_safe_before_receipt_reservation(tmp_path: Pa
         def prompt(self, *_args: Any, **_kwargs: Any) -> None:
             raise AssertionError("a route without authority must not send")
 
-    required = submit_acp_command(
+    required = submit_command(
         config,
         _request("route-race-required"),
-        prompt_router=lambda _worker: VanishedRoute(),
+        acp_prompt_router=lambda routed: VanishedRoute() if routed == worker else None,
     )
-    assert required is not None
     assert required.status == "backend_unavailable"
     assert get_command_request(
         config.db_path,
@@ -1528,9 +1647,6 @@ def test_reconnect_remints_endpoint_instead_of_replaying_attach_ticket(tmp_path:
     ).start()
     try:
         assert minted == ["one-shot-private-ticket-1"]
-        assert coordinator._published_acp_claims == {
-            "worker-1": "worker-fingerprint"
-        }
         coordinator._reconcile_worker("worker-1", strict=True)
         worker = Worker(
             id="worker-1",
@@ -1749,7 +1865,6 @@ def test_stop_closes_permission_waiter_before_generation_fence_deadline(
         endpoint_client_factory=lambda _config: EndpointClient(),
         connection_factory=lambda *_args, **_kwargs: object(),
         session_factory=Runtime,
-        durable_permission_bridge=True,
         reconcile_interval=60.0,
     ).start()
     slot = coordinator._slots["worker-1"]
@@ -1910,7 +2025,10 @@ def test_coordinator_start_revokes_orphaned_process_binding(tmp_path: Path) -> N
     config = _config(tmp_path)
     assert config.db_path is not None
     init_store(config.db_path)
-    orphaned = _derived_binding(_binding(), "orphaned-session")
+    orphaned = replace(
+        _derived_binding(_binding(), "orphaned-session"),
+        observed_at="2099-01-01T00:00:00+00:00",
+    )
     upsert_worker_bindings(config.db_path, [orphaned])
 
     coordinator = AcpRuntimeCoordinator(
@@ -1926,6 +2044,30 @@ def test_coordinator_start_revokes_orphaned_process_binding(tmp_path: Path) -> N
         ) == []
     finally:
         coordinator.stop()
+
+
+def test_coordinator_fallback_revokes_future_observed_binding_now(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    derived = replace(
+        _derived_binding(_binding(), "future-session"),
+        observed_at="2099-01-01T00:00:00+00:00",
+    )
+    upsert_worker_bindings(config.db_path, [derived])
+
+    _expire_derived_binding(config, derived, reason="acp_runtime_retired")
+
+    assert list_worker_bindings(config.db_path, config.host_id, backend="acp") == []
+    retired = list_worker_bindings(
+        config.db_path,
+        config.host_id,
+        backend="acp",
+        include_expired=True,
+    )
+    assert len(retired) == 1
+    assert retired[0].reason == "acp_runtime_retired"
 
 
 def test_production_coordinator_installs_durable_permission_bridge(
@@ -1957,7 +2099,6 @@ def test_production_coordinator_installs_durable_permission_bridge(
     coordinator.start()
     try:
         assert coordinator.status()["state"] == "running"
-        assert coordinator._durable_permission_bridge is True
     finally:
         coordinator.stop()
 
@@ -1969,53 +2110,6 @@ def test_coordinator_rejects_disabled_reconciliation(tmp_path: Path) -> None:
             threading.Event(),
             reconcile_interval=0,
         )
-
-
-def test_coordinator_forwards_explicit_permission_bridge(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    assert config.db_path is not None
-    init_store(config.db_path)
-    upsert_worker_bindings(config.db_path, [_binding()])
-    seen: list[Any] = []
-
-    class EndpointClient:
-        def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
-            return _endpoint()
-
-        def close(self) -> None:
-            return None
-
-    class Runtime:
-        def __init__(self, _client: Any, **kwargs: Any) -> None:
-            seen.append(kwargs["permission_callback"])
-            self._binding = kwargs["binding"]
-
-        def start(self) -> None:
-            return None
-
-        def stop(self, *, timeout: float) -> None:
-            return None
-
-        def status(self) -> Any:
-            return SimpleNamespace(healthy=True, failure_type=None)
-
-    def permission_bridge(_request: Any) -> str | None:
-        return None
-
-    coordinator = AcpRuntimeCoordinator(
-        config,
-        threading.Event(),
-        endpoint_client_factory=lambda _config: EndpointClient(),
-        connection_factory=lambda *_args, **_kwargs: object(),
-        session_factory=Runtime,
-        permission_callback=permission_bridge,
-        require_permission_bridge=True,
-        reconcile_interval=60.0,
-    ).start()
-    try:
-        assert seen == [permission_bridge]
-    finally:
-        coordinator.stop()
 
 
 def test_required_zero_workers_is_idle_healthy_then_new_unowned_worker_degrades(

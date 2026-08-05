@@ -28,8 +28,12 @@ RequestId: TypeAlias = str | int | None
 
 _MIN_REQUEST_NUMBER = -(2**63)
 _MAX_REQUEST_NUMBER = 2**63 - 1
-
-
+_SESSION_UPDATE_KINDS = frozenset({
+    "user_message_chunk", "agent_message_chunk", "agent_thought_chunk",
+    "tool_call", "tool_call_update", "plan", "available_commands_update",
+    "current_mode_update", "config_option_update", "session_info_update",
+    "usage_update",
+})
 class AcpProtocolError(Exception):
     """Base class for ACP framing and envelope errors."""
 
@@ -60,26 +64,6 @@ class AcpRemoteError(AcpProtocolError):
         super().__init__(f"ACP error {code}: {message}")
 
 
-class MessageKind(str, Enum):
-    REQUEST = "request"
-    RESPONSE = "response"
-    NOTIFICATION = "notification"
-
-
-class SessionUpdateKind(str, Enum):
-    USER_MESSAGE_CHUNK = "user_message_chunk"
-    AGENT_MESSAGE_CHUNK = "agent_message_chunk"
-    AGENT_THOUGHT_CHUNK = "agent_thought_chunk"
-    TOOL_CALL = "tool_call"
-    TOOL_CALL_UPDATE = "tool_call_update"
-    PLAN = "plan"
-    AVAILABLE_COMMANDS_UPDATE = "available_commands_update"
-    CURRENT_MODE_UPDATE = "current_mode_update"
-    CONFIG_OPTION_UPDATE = "config_option_update"
-    SESSION_INFO_UPDATE = "session_info_update"
-    USAGE_UPDATE = "usage_update"
-
-
 class StopReason(str, Enum):
     END_TURN = "end_turn"
     MAX_TOKENS = "max_tokens"
@@ -96,43 +80,22 @@ class SteeringOutcome(str, Enum):
     FAILED = "failed"
 
 
-class PermissionOptionKind(str, Enum):
-    ALLOW_ONCE = "allow_once"
-    ALLOW_ALWAYS = "allow_always"
-    REJECT_ONCE = "reject_once"
-    REJECT_ALWAYS = "reject_always"
-
-
 @dataclass(frozen=True, slots=True)
 class JsonRpcRequest:
     request_id: RequestId
     method: str
     params: Mapping[str, Any]
 
-    @property
-    def kind(self) -> MessageKind:
-        return MessageKind.REQUEST
-
-
 @dataclass(frozen=True, slots=True)
 class JsonRpcNotification:
     method: str
     params: Mapping[str, Any]
-
-    @property
-    def kind(self) -> MessageKind:
-        return MessageKind.NOTIFICATION
-
 
 @dataclass(frozen=True, slots=True)
 class JsonRpcResponse:
     request_id: RequestId | None
     result: Any = None
     error: Mapping[str, Any] | None = None
-
-    @property
-    def kind(self) -> MessageKind:
-        return MessageKind.RESPONSE
 
     def result_or_raise(self) -> Any:
         if self.error is None:
@@ -149,131 +112,8 @@ JsonRpcMessage: TypeAlias = JsonRpcRequest | JsonRpcNotification | JsonRpcRespon
 
 
 @dataclass(frozen=True, slots=True)
-class AgentCapabilities:
-    """Captured ACP capabilities with convenient stable-v1 feature checks."""
-
-    raw: Mapping[str, Any]
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any] | None) -> "AgentCapabilities":
-        return cls(_freeze_mapping(value or {}))
-
-    @property
-    def load_session(self) -> bool:
-        return self.raw.get("loadSession") is True
-
-    @property
-    def session_list(self) -> bool:
-        return _is_capability_object(self._session_capabilities().get("list"))
-
-    @property
-    def session_resume(self) -> bool:
-        return _is_capability_object(self._session_capabilities().get("resume"))
-
-    @property
-    def session_close(self) -> bool:
-        return _is_capability_object(self._session_capabilities().get("close"))
-
-    @property
-    def session_delete(self) -> bool:
-        return _is_capability_object(self._session_capabilities().get("delete"))
-
-    @property
-    def additional_directories(self) -> bool:
-        return _is_capability_object(
-            self._session_capabilities().get("additionalDirectories")
-        )
-
-    @property
-    def prompt_image(self) -> bool:
-        return self._prompt_capabilities().get("image") is True
-
-    @property
-    def prompt_audio(self) -> bool:
-        return self._prompt_capabilities().get("audio") is True
-
-    @property
-    def prompt_embedded_context(self) -> bool:
-        return self._prompt_capabilities().get("embeddedContext") is True
-
-    @property
-    def mcp_http(self) -> bool:
-        return self._mcp_capabilities().get("http") is True
-
-    @property
-    def mcp_sse(self) -> bool:
-        return self._mcp_capabilities().get("sse") is True
-
-    @property
-    def auth_logout(self) -> bool:
-        auth = self.raw.get("auth")
-        return isinstance(auth, Mapping) and _is_capability_object(auth.get("logout"))
-
-    def _session_capabilities(self) -> Mapping[str, Any]:
-        value = self.raw.get("sessionCapabilities")
-        return value if isinstance(value, Mapping) else {}
-
-    def _prompt_capabilities(self) -> Mapping[str, Any]:
-        value = self.raw.get("promptCapabilities")
-        return value if isinstance(value, Mapping) else {}
-
-    def _mcp_capabilities(self) -> Mapping[str, Any]:
-        value = self.raw.get("mcpCapabilities")
-        return value if isinstance(value, Mapping) else {}
-
-
-@dataclass(frozen=True, slots=True)
-class InitializeResult:
-    protocol_version: int
-    capabilities: AgentCapabilities
-    agent_info: Mapping[str, Any] | None
-    auth_methods: tuple[Mapping[str, Any], ...]
-    raw: Mapping[str, Any]
-
-
-@dataclass(frozen=True, slots=True)
-class SessionResult:
-    session_id: str
-    modes: Mapping[str, Any] | None
-    config_options: tuple[Mapping[str, Any], ...]
-    raw: Mapping[str, Any]
-
-
-@dataclass(frozen=True, slots=True)
-class SessionInfo:
-    session_id: str
-    cwd: str
-    additional_directories: tuple[str, ...]
-    title: str | None
-    updated_at: str | None
-    raw: Mapping[str, Any]
-
-
-@dataclass(frozen=True, slots=True)
-class SessionPage:
-    sessions: tuple[SessionInfo, ...]
-    next_cursor: str | None
-    raw: Mapping[str, Any]
-
-
-@dataclass(frozen=True, slots=True)
-class PromptResult:
-    stop_reason: StopReason
-    raw: Mapping[str, Any]
-
-
-@dataclass(frozen=True, slots=True)
-class SteeringResult:
-    outcome: SteeringOutcome
-    raw: Mapping[str, Any]
-
-
-@dataclass(frozen=True, slots=True)
 class SessionUpdate:
     session_id: str
-    update_kind: SessionUpdateKind | str
-    update: Mapping[str, Any]
-    meta: Mapping[str, Any] | None
     raw: Mapping[str, Any]
 
 
@@ -281,8 +121,7 @@ class SessionUpdate:
 class PermissionOption:
     option_id: str
     name: str
-    kind: PermissionOptionKind | str
-    raw: Mapping[str, Any]
+    kind: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,11 +138,6 @@ def _freeze_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     # A shallow immutable copy is intentional: arbitrary extension payloads are
     # retained verbatim and callers should treat all raw values as read-only.
     return MappingProxyType(dict(value))
-
-
-def _is_capability_object(value: Any) -> bool:
-    # ACP advertises optional capabilities with an object (often simply {}).
-    return isinstance(value, Mapping)
 
 
 def _valid_request_id(value: Any) -> bool:
@@ -454,81 +288,21 @@ def encode_message(
     return payload
 
 
-def request_envelope(
-    request_id: RequestId,
-    method: str,
-    params: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    value = {
-        "jsonrpc": JSONRPC_VERSION,
-        "id": request_id,
-        "method": method,
-        "params": dict(params or {}),
-    }
-    validate_envelope(value)
-    return value
-
-
-def notification_envelope(
-    method: str,
-    params: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    value = {
-        "jsonrpc": JSONRPC_VERSION,
-        "method": method,
-        "params": dict(params or {}),
-    }
-    validate_envelope(value)
-    return value
-
-
-def result_envelope(request_id: RequestId, result: Any) -> dict[str, Any]:
-    value = {"jsonrpc": JSONRPC_VERSION, "id": request_id, "result": result}
-    validate_envelope(value)
-    return value
-
-
-def error_envelope(
-    request_id: RequestId | None,
-    code: int,
-    message: str,
-    *,
-    data: Any = None,
-) -> dict[str, Any]:
-    error: dict[str, Any] = {"code": code, "message": message}
-    if data is not None:
-        error["data"] = data
-    value = {"jsonrpc": JSONRPC_VERSION, "id": request_id, "error": error}
-    validate_envelope(value)
-    return value
-
-
 def parse_session_update(params: Mapping[str, Any]) -> SessionUpdate:
     session_id = _required_string(params, "sessionId")
     update = params.get("update")
     if not isinstance(update, Mapping):
         raise AcpEnvelopeError("session/update params.update must be an object")
     kind_value = _required_string(update, "sessionUpdate")
-    try:
-        kind: SessionUpdateKind | str = SessionUpdateKind(kind_value)
-    except ValueError:
-        # ACP extensions and future stable revisions remain observable.
-        kind = kind_value
-    else:
+    if kind_value in _SESSION_UPDATE_KINDS:
         try:
             UpstreamSessionNotification.model_validate(dict(params))
         except ValidationError as exc:
             raise AcpEnvelopeError(
                 "session/update params do not match the upstream ACP schema"
             ) from exc
-    meta = params.get("_meta")
-    if meta is not None and not isinstance(meta, Mapping):
-        meta = None
     return SessionUpdate(
         session_id=session_id,
-        update_kind=kind,
-        update=_freeze_mapping(update),
-        meta=_freeze_mapping(meta) if isinstance(meta, Mapping) else None,
         raw=_freeze_mapping(params),
     )
 
@@ -538,72 +312,32 @@ def parse_permission_request(request: JsonRpcRequest) -> PermissionRequest:
         raise AcpEnvelopeError("request is not session/request_permission")
     params = request.params
     try:
-        UpstreamRequestPermissionRequest.model_validate(dict(params))
+        validated = UpstreamRequestPermissionRequest.model_validate(dict(params))
     except ValidationError as exc:
-        errors = exc.errors(include_url=False, include_input=False)
-        if any(
-            tuple(error.get("loc", ()))[-1:] == ("kind",)
-            for error in errors
-        ):
-            raise AcpEnvelopeError(
-                "permission option kind is not valid ACP v1"
-            ) from exc
-        locations = ", ".join(
-            ".".join(_upstream_alias(part) for part in error.get("loc", ()))
-            for error in errors
-        )
-        suffix = f" ({locations})" if locations else ""
-        raise AcpEnvelopeError(
-            f"permission request does not match the upstream ACP schema{suffix}"
-        ) from exc
-    session_id = _required_string(params, "sessionId")
-    tool_call = params.get("toolCall")
-    if not isinstance(tool_call, Mapping):
-        raise AcpEnvelopeError("permission request toolCall must be an object")
-    _required_string(tool_call, "toolCallId")
-    raw_options = params.get("options")
-    if not isinstance(raw_options, list):
-        raise AcpEnvelopeError("permission request options must be an array")
-    options: list[PermissionOption] = []
-    seen_option_ids: set[str] = set()
-    for raw in raw_options:
-        if not isinstance(raw, Mapping):
-            raise AcpEnvelopeError("permission option must be an object")
-        option_id = _required_string(raw, "optionId")
-        if option_id in seen_option_ids:
-            raise AcpEnvelopeError("permission option IDs must be unique")
-        seen_option_ids.add(option_id)
-        name = _required_string(raw, "name")
-        kind_value = _required_string(raw, "kind")
-        try:
-            kind: PermissionOptionKind | str = PermissionOptionKind(kind_value)
-        except ValueError as exc:
+        fields = {error.get("loc", ())[-1] for error in exc.errors() if error.get("loc")}
+        if "kind" in fields:
             raise AcpEnvelopeError("permission option kind is not valid ACP v1") from exc
-        options.append(
-            PermissionOption(
-                option_id=option_id,
-                name=name,
-                kind=kind,
-                raw=_freeze_mapping(raw),
-            )
-        )
-    meta = params.get("_meta")
+        if fields & {"tool_call_id", "toolCallId"}:
+            raise AcpEnvelopeError("permission request is missing toolCallId") from exc
+        raise AcpEnvelopeError(
+            "permission request does not match the upstream ACP schema"
+        ) from exc
+    raw = validated.model_dump(by_alias=True, exclude_none=True)
+    options = raw["options"]
+    option_ids = [option["optionId"] for option in options]
+    if len(option_ids) != len(set(option_ids)):
+        raise AcpEnvelopeError("permission option IDs must be unique")
     return PermissionRequest(
         request_id=request.request_id,
-        session_id=session_id,
-        tool_call=_freeze_mapping(tool_call),
-        options=tuple(options),
-        meta=_freeze_mapping(meta) if isinstance(meta, Mapping) else None,
+        session_id=raw["sessionId"],
+        tool_call=_freeze_mapping(raw["toolCall"]),
+        options=tuple(
+            PermissionOption(option["optionId"], option["name"], option["kind"])
+            for option in options
+        ),
+        meta=_freeze_mapping(raw["_meta"]) if "_meta" in raw else None,
         raw=_freeze_mapping(params),
     )
-
-
-def _upstream_alias(value: object) -> str:
-    """Render safe validation locations using ACP wire aliases."""
-
-    text = str(value)
-    head, *tail = text.split("_")
-    return head + "".join(part[:1].upper() + part[1:] for part in tail)
 
 
 def _required_string(value: Mapping[str, Any], key: str) -> str:

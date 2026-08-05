@@ -15,10 +15,9 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Config
-from ..core.agent_events import AgentEvent, agent_event
+from ..core.agent_events import AgentEvent, AppendBoundAgentEventResult, agent_event
 from ..core.models import WorkerBinding, stable_fingerprint
-from ..store.sqlite import (
-    AppendBoundAgentEventResult,
+from ..store.turns import (
     AppendProjectedAgentEventResult,
     TurnRefreshApplyResult,
     append_agent_event_and_apply_turn_for_binding,
@@ -59,8 +58,6 @@ class AcpSessionIngestor:
         projector: AcpEventProjector | None = None,
         persist_event: PersistEvent = append_agent_event_and_apply_turn_for_binding,
     ) -> None:
-        if config.db_path is None:
-            raise ValueError("ACP ingestion requires a sqlite db path")
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("ACP session and stream generation are required")
         if not isinstance(stream_generation, str) or not stream_generation.strip():
@@ -84,6 +81,9 @@ class AcpSessionIngestor:
         self._source_turn_id: str | None = None
         self._turn_complete = False
         self._local_prompt_recorded = False
+        self._turn_messages: dict[str, dict[int, str]] = {
+            "user_message": {}, "agent_message": {},
+        }
 
     @property
     def source_turn_id(self) -> str | None:
@@ -101,7 +101,7 @@ class AcpSessionIngestor:
         self._turn_ordinal += 1
         self.projector.reset_turn(self.session_id)
         # An authoritative producer turn ID retains identity across ACP
-        # transport recreation.  The fallback exists only for unsolicited or
+        # transport recreation.  Synthetic identity exists only for unsolicited or
         # historical inbound streams; outgoing prompts require producer
         # identity before any durable or remote side effect.
         identity = (
@@ -120,6 +120,7 @@ class AcpSessionIngestor:
         self._source_turn_id = f"acpt_{stable_fingerprint(identity)}"
         self._turn_complete = False
         self._local_prompt_recorded = False
+        self._turn_messages = {"user_message": {}, "agent_message": {}}
         return self._source_turn_id
 
     def ingest_update(
@@ -127,8 +128,6 @@ class AcpSessionIngestor:
         notification: Mapping[str, Any],
         *,
         source_event_id: str | None = None,
-        replay: bool = False,
-        setup_replay: bool = False,
     ) -> AcpIngestionResult:
         """Normalize, journal, and conditionally project ``session/update``."""
 
@@ -145,13 +144,12 @@ class AcpSessionIngestor:
         if (
             update_kind == "user_message_chunk"
             and self._local_prompt_recorded
-            and not replay
         ):
             # ACP agents commonly echo the prompt as a user-message update.
             # begin_prompt() already journaled the complete producer-owned
             # input, so accepting the echo would duplicate both the journal
-            # and the compatibility turn. Load replay has no local producer
-            # record and must continue to retain historical user messages.
+            # and the durable public turn. Load replay has no local producer
+            # record and must not be duplicated.
             return AcpIngestionResult("user_message", ignored_reason="prompt_echo")
         thought_rejection = _thought_rejection_reason(
             notification,
@@ -167,7 +165,6 @@ class AcpSessionIngestor:
             canonical = self.projector.normalize_session_update(
                 notification,
                 source_event_id=source_event_id,
-                replay=replay,
             )
         except BaseException:
             self._restore_speculation(checkpoint, prior_turn_state)
@@ -179,8 +176,6 @@ class AcpSessionIngestor:
             canonical,
             checkpoint=checkpoint,
             prior_turn_state=prior_turn_state,
-            project_turn=not setup_replay,
-            replay_namespace="load" if setup_replay else None,
         )
 
     def begin_prompt(
@@ -190,61 +185,7 @@ class AcpSessionIngestor:
         producer_turn_id: str | None = None,
     ) -> AcpIngestionResult:
         """Durably record outgoing prompt content before transport send."""
-
-        if not isinstance(producer_turn_id, str) or not producer_turn_id.strip():
-            raise ValueError("producer_turn_id must be non-empty text")
-        blocks = [dict(block) for block in prompt]
-        if not blocks:
-            raise ValueError("prompt must contain at least one content block")
-        checkpoint = self.projector.checkpoint_session(self.session_id)
-        prior_turn_state = self._turn_state()
-        source_turn_id = self.start_turn(producer_turn_id=producer_turn_id)
-        text = "\n".join(
-            str(block.get("text"))
-            for block in blocks
-            if block.get("type") == "text" and isinstance(block.get("text"), str)
-        )
-        source_event_id = f"prompt-input:{source_turn_id}"
-        try:
-            canonical = self.projector.normalize_session_update(
-                {
-                    "method": "session/update",
-                    "params": {
-                        "sessionId": self.session_id,
-                        "update": {
-                            "sessionUpdate": "user_message_chunk",
-                            "messageId": source_event_id,
-                            "content": {"type": "text", "text": text},
-                        },
-                    },
-                },
-                source_event_id=source_event_id,
-                replay=False,
-            )
-            if canonical is None:  # pragma: no cover - fresh turn invariant
-                raise RuntimeError("outgoing ACP prompt was unexpectedly duplicated")
-            payload = canonical.get("payload")
-            if not isinstance(payload, Mapping):  # pragma: no cover - projector invariant
-                raise RuntimeError("outgoing ACP prompt projection is invalid")
-            canonical = {
-                **canonical,
-                "payload": {
-                    **payload,
-                    "prompt_content": deepcopy(blocks),
-                    "outgoing": True,
-                },
-            }
-        except BaseException:
-            self._restore_speculation(checkpoint, prior_turn_state)
-            raise
-        result = self._accept(
-            canonical,
-            checkpoint=checkpoint,
-            prior_turn_state=prior_turn_state,
-        )
-        if result.event is not None and result.event.status != "binding_changed":
-            self._local_prompt_recorded = True
-        return result
+        return self._record_prompt(prompt, producer_turn_id, steering=False)
 
     def can_append_prompt(self) -> bool:
         """Return whether a steering input can join the current logical turn."""
@@ -258,82 +199,71 @@ class AcpSessionIngestor:
         producer_turn_id: str,
     ) -> AcpIngestionResult:
         """Durably append one steering input to the current ACP turn."""
+        return self._record_prompt(prompt, producer_turn_id, steering=True)
 
+    def _record_prompt(
+        self,
+        prompt: Sequence[Mapping[str, Any]],
+        producer_turn_id: str | None,
+        *,
+        steering: bool,
+    ) -> AcpIngestionResult:
         if not isinstance(producer_turn_id, str) or not producer_turn_id.strip():
             raise ValueError("producer_turn_id must be non-empty text")
-        if not self.can_append_prompt():
+        if steering and not self.can_append_prompt():
             raise RuntimeError("ACP steering requires an active turn")
         blocks = [dict(block) for block in prompt]
         if not blocks:
             raise ValueError("prompt must contain at least one content block")
         checkpoint = self.projector.checkpoint_session(self.session_id)
         prior_turn_state = self._turn_state()
+        producer = producer_turn_id.strip()
+        if steering:
+            source_event_id = "steer-input:" + stable_fingerprint(
+                {"producer_turn": producer}
+            )
+        else:
+            source_event_id = f"prompt-input:{self.start_turn(producer_turn_id=producer)}"
         text = "\n".join(
-            str(block.get("text"))
+            str(block["text"])
             for block in blocks
             if block.get("type") == "text" and isinstance(block.get("text"), str)
         )
-        producer = producer_turn_id.strip()
-        source_event_id = "steer-input:" + stable_fingerprint(
-            {"producer_turn": producer}
-        )
         try:
             canonical = self.projector.normalize_session_update(
-                {
-                    "method": "session/update",
-                    "params": {
-                        "sessionId": self.session_id,
-                        "update": {
-                            "sessionUpdate": "user_message_chunk",
-                            "messageId": source_event_id,
-                            "content": {"type": "text", "text": text},
-                        },
-                    },
-                },
+                {"sessionId": self.session_id, "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "messageId": source_event_id,
+                    "content": {"type": "text", "text": text},
+                }},
                 source_event_id=source_event_id,
-                replay=False,
             )
             if canonical is None:
-                raise RuntimeError("outgoing ACP steering input was duplicated")
+                raise RuntimeError("outgoing ACP input was unexpectedly duplicated")
             payload = canonical.get("payload")
             if not isinstance(payload, Mapping):
-                raise RuntimeError("outgoing ACP steering projection is invalid")
-            canonical = {
-                **canonical,
-                "payload": {
-                    **payload,
-                    "prompt_content": deepcopy(blocks),
-                    "outgoing": True,
-                    "steering": True,
-                },
-            }
+                raise RuntimeError("outgoing ACP prompt projection is invalid")
+            canonical = {**canonical, "payload": {
+                **payload,
+                "prompt_content": deepcopy(blocks),
+                "outgoing": True,
+                **({"steering": True} if steering else {}),
+            }}
         except BaseException:
             self._restore_speculation(checkpoint, prior_turn_state)
             raise
         result = self._accept(
-            canonical,
-            checkpoint=checkpoint,
-            prior_turn_state=prior_turn_state,
+            canonical, checkpoint=checkpoint, prior_turn_state=prior_turn_state
         )
         if result.event is not None and result.event.status != "binding_changed":
             self._local_prompt_recorded = True
         return result
-
-    def reset_after_load(self) -> None:
-        """Drop replay turn assembly before accepting a new active prompt."""
-
-        self.projector.reset_turn(self.session_id)
-        self._source_turn_id = None
-        self._turn_complete = False
-        self._local_prompt_recorded = False
 
     def ingest_permission_request(
         self,
         request: Mapping[str, Any],
         *,
         source_event_id: str | None = None,
-        replay: bool = False,
-        setup_replay: bool = False,
     ) -> AcpIngestionResult:
         """Journal a permission request as a private tool lifecycle update."""
 
@@ -354,7 +284,6 @@ class AcpSessionIngestor:
             canonical = self.projector.normalize_permission_request(
                 request,
                 source_event_id=source_event_id,
-                replay=replay,
             )
         except BaseException:
             self._restore_speculation(checkpoint, prior_turn_state)
@@ -366,8 +295,6 @@ class AcpSessionIngestor:
             canonical,
             checkpoint=checkpoint,
             prior_turn_state=prior_turn_state,
-            project_turn=not setup_replay,
-            replay_namespace="load" if setup_replay else None,
         )
 
     def mark_prompt_complete(
@@ -387,7 +314,7 @@ class AcpSessionIngestor:
                 normalized_reason = StopReason(stop_reason)
             except ValueError as exc:
                 raise ValueError("unsupported ACP prompt stop reason") from exc
-            content = self.projector.mark_turn_complete(self.session_id)
+            content = self._turn_content(complete=True)
             content["source_turn_id"] = self._source_turn_id
             content["assistant_final_text"] = _final_text_for_stop_reason(
                 str(content.get("assistant_final_text") or ""),
@@ -445,9 +372,9 @@ class AcpSessionIngestor:
         canonical: Mapping[str, Any],
         *,
         checkpoint: AcpProjectionCheckpoint,
-        prior_turn_state: tuple[int, str | None, bool, bool],
-        project_turn: bool = True,
-        replay_namespace: str | None = None,
+        prior_turn_state: tuple[
+            int, str | None, bool, bool, dict[str, dict[int, str]]
+        ],
     ) -> AcpIngestionResult:
         kind = str(canonical.get("kind") or "")
         if kind == "thought" and self.config.acp_thought_policy == "disabled":
@@ -464,17 +391,7 @@ class AcpSessionIngestor:
             source_id = (
                 str(explicit_event_id)
                 if explicit_event_id is not None and str(explicit_event_id)
-                else (
-                    _replay_source_event_id(
-                        replay_namespace,
-                        session_id=self.session_id,
-                        sequence=sequence,
-                        kind=kind,
-                        payload=payload,
-                    )
-                    if replay_namespace is not None
-                    else f"stream:{self.stream_generation}:{sequence}"
-                )
+                else f"stream:{self.stream_generation}:{sequence}"
             )
             event = agent_event(
                 kind=kind,
@@ -492,11 +409,13 @@ class AcpSessionIngestor:
                 visibility="private",
             )
             projection: Mapping[str, Any] | None = None
-            if (
-                kind in {"user_message", "agent_message"}
-                and project_turn
-            ):
-                content = self.projector.project_turn_content(self.session_id)
+            if kind in {"user_message", "agent_message"}:
+                message_index = payload.get("message_index")
+                assembled_text = payload.get("assembled_text")
+                if type(message_index) is not int or not isinstance(assembled_text, str):
+                    raise ValueError("canonical ACP message projection is invalid")
+                self._turn_messages[kind][message_index] = assembled_text
+                content = self._turn_content()
                 if self._source_turn_id is not None:
                     content["source_turn_id"] = self._source_turn_id
                 projection = content
@@ -532,18 +451,30 @@ class AcpSessionIngestor:
             ),
         )
 
-    def _turn_state(self) -> tuple[int, str | None, bool, bool]:
+    def _turn_content(self, *, complete: bool = False) -> dict[str, Any]:
+        user = "\n\n".join(self._turn_messages["user_message"].values())
+        assistant = "\n\n".join(self._turn_messages["agent_message"].values())
+        return {
+            "user_text": user,
+            "assistant_stream_text": "" if complete else assistant,
+            "assistant_final_text": assistant if complete else "",
+            "complete": complete,
+            "has_open_turn": bool(user or assistant) and not complete,
+        }
+
+    def _turn_state(self) -> tuple[int, str | None, bool, bool, dict[str, dict[int, str]]]:
         return (
             self._turn_ordinal,
             self._source_turn_id,
             self._turn_complete,
             self._local_prompt_recorded,
+            deepcopy(self._turn_messages),
         )
 
     def _restore_speculation(
         self,
         checkpoint: AcpProjectionCheckpoint,
-        prior_turn_state: tuple[int, str | None, bool, bool],
+        prior_turn_state: tuple[int, str | None, bool, bool, dict[str, dict[int, str]]],
     ) -> None:
         self.projector.restore_session(checkpoint)
         (
@@ -551,6 +482,7 @@ class AcpSessionIngestor:
             self._source_turn_id,
             self._turn_complete,
             self._local_prompt_recorded,
+            self._turn_messages,
         ) = prior_turn_state
 
 
@@ -575,25 +507,6 @@ def _final_text_for_stop_reason(text: str, stop_reason: StopReason) -> str:
     if notice is None:
         return text
     return f"{text}\n\n{notice}" if text else notice
-
-
-def _replay_source_event_id(
-    namespace: str,
-    *,
-    session_id: str,
-    sequence: int,
-    kind: str,
-    payload: Mapping[str, Any],
-) -> str:
-    fingerprint = stable_fingerprint(
-        {
-            "session": session_id,
-            "sequence": sequence,
-            "kind": kind,
-            "payload": payload,
-        }
-    )
-    return f"{namespace}:{fingerprint}"
 
 
 def _source_message_id(kind: str, payload: Mapping[str, Any]) -> str | None:
@@ -621,9 +534,6 @@ _TURN_SCOPED_UPDATES = frozenset(
     }
 )
 _TRUSTED_THOUGHT_SUMMARY_KEY = "tendwire.dev/thought_kind"
-_LEGACY_THOUGHT_CLASSIFICATION_KEYS = frozenset(
-    {"thought_kind", "thoughtKind", "reasoning_kind", "reasoningKind"}
-)
 
 
 def _params(value: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -670,25 +580,14 @@ def _thought_classification(value: Mapping[str, Any]) -> str | None:
     if trusted != "summary":
         return "unclassified" if trusted is None else "unknown"
 
-    # The exact update-level marker is a Tendwire adapter convention, not an
-    # ACP classification guarantee. Contradictory legacy or content metadata
-    # therefore fails closed even when the trusted marker says "summary".
-    for container in (update, update.get("content")):
-        if not isinstance(container, Mapping):
-            continue
-        meta = container.get("_meta")
-        if not isinstance(meta, Mapping):
-            continue
-        marker = meta.get(_TRUSTED_THOUGHT_SUMMARY_KEY)
-        if marker is not None and marker != "summary":
-            return "conflicting"
-        if any(key in meta for key in _LEGACY_THOUGHT_CLASSIFICATION_KEYS):
-            return "conflicting"
-        legacy_namespace = meta.get("tendwire")
-        if isinstance(legacy_namespace, Mapping) and any(
-            key in legacy_namespace for key in _LEGACY_THOUGHT_CLASSIFICATION_KEYS
-        ):
-            return "conflicting"
+    # Summary classification is a Tendwire adapter convention rather than an
+    # ACP guarantee, so accept only the one exact marker and no competing
+    # metadata surface.
+    if set(update_meta) != {_TRUSTED_THOUGHT_SUMMARY_KEY}:
+        return "conflicting"
+    content = update.get("content")
+    if isinstance(content, Mapping) and content.get("_meta") is not None:
+        return "conflicting"
     return "summary"
 
 

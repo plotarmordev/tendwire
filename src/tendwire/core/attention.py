@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .models import AttentionSignal, Snapshot, Worker, normalize_status, sanitize_public_mapping, stable_fingerprint
+from .models import AttentionSignal, Snapshot, Worker, normalize_status
 
 
 _HUMAN_NEEDED_META_KEYS = frozenset(
@@ -160,28 +160,6 @@ def attention_from_snapshot(snapshot: Snapshot) -> list[AttentionSignal]:
         signals.extend(attention_for_worker(worker, host_id=snapshot.host_id))
 
     return sorted(signals, key=lambda signal: (signal.id, signal.fingerprint))
-
-
-def attention_payload_from_snapshot(snapshot: Snapshot) -> dict[str, Any]:
-    """Return the public attention.list payload computed from a snapshot."""
-    payload = sanitize_public_mapping(
-        {
-            "schema_version": snapshot.schema_version,
-            "host_id": snapshot.host_id,
-            "updated_at": snapshot.updated_at,
-            "attention": [signal.to_dict() for signal in snapshot.attention],
-            "backend_health": [health.to_dict() for health in snapshot.backend_health],
-        }
-    )
-    payload["content_fingerprint"] = stable_fingerprint(
-        {
-            "schema_version": payload["schema_version"],
-            "host_id": payload["host_id"],
-            "attention": payload["attention"],
-            "backend_health": payload["backend_health"],
-        }
-    )
-    return sanitize_public_mapping(payload)
 
 
 def update_snapshot_attention(snapshot: Snapshot) -> Snapshot:

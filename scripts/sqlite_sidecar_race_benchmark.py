@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hermetic installed-candidate evidence for SQLite sidecar race recovery.
+"""Hermetic installed-candidate evidence for the SQLite store and daemon.
 
 The public invocation builds a versioned wheel from this checkout, installs it in
 an isolated virtual environment, and re-executes the measured phases with that
@@ -34,14 +34,12 @@ import tomllib
 import venv
 import zipfile
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from time import perf_counter_ns, process_time_ns
 from typing import Any
 
 REPORT_SCHEMA_VERSION = 1
-DEFAULT_ITERATIONS = 128
-DEFAULT_DAEMON_CYCLES = 64
 DEFAULT_REQUESTS = 64
 DEFAULT_TIMEOUT_SECONDS = 120.0
 HOST_LATENCY_BUDGET_NS = 350_000_000
@@ -363,13 +361,11 @@ def _verify_candidate(python: Path, version: str, checkout: Path) -> None:
 
 
 def _argument_values(namespace: argparse.Namespace) -> None:
-    for name in ("iterations", "daemon_wal_cycles", "requests_per_method"):
+    for name in ("requests_per_method",):
         if int(getattr(namespace, name)) <= 0:
             raise _ArgumentError("positive_count_required")
     if namespace.herdres_sync_passes != 3:
         raise _ArgumentError("three_sync_passes_required")
-    if namespace.daemon_wal_cycles != namespace.requests_per_method:
-        raise _ArgumentError("daemon_request_counts_must_match")
     if not 1.0 <= namespace.phase_timeout_seconds <= 600.0:
         raise _ArgumentError("timeout_out_of_range")
     if not namespace.json:
@@ -379,9 +375,7 @@ def _argument_values(namespace: argparse.Namespace) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run hermetic SQLite sidecar race evidence.")
-    parser.add_argument("--iterations", type=int, default=DEFAULT_ITERATIONS)
-    parser.add_argument("--daemon-wal-cycles", type=int, default=DEFAULT_DAEMON_CYCLES)
+    parser = argparse.ArgumentParser(description="Run hermetic SQLite daemon/store evidence.")
     parser.add_argument("--requests-per-method", type=int, default=DEFAULT_REQUESTS)
     parser.add_argument("--herdres-sync-passes", type=int, default=3)
     parser.add_argument("--phase-timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
@@ -401,209 +395,29 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--artifact-digest", help=argparse.SUPPRESS)
     parser.add_argument("--source-revision", help=argparse.SUPPRESS)
     parser.add_argument("--source-tree-digest", help=argparse.SUPPRESS)
-    parser.add_argument("--inject-failure", choices=("churn", "daemon", "herdres"), help=argparse.SUPPRESS)
+    parser.add_argument("--inject-failure", choices=("daemon", "herdres"), help=argparse.SUPPRESS)
     return parser
 
 
-def _abort_barriers(barriers: tuple[threading.Barrier, ...]) -> None:
-    for barrier in barriers:
-        try:
-            barrier.abort()
-        except threading.BrokenBarrierError:
-            pass
-
-
-def _family_phase(db_path: Path, iterations: int, timeout: float, *, journal: bool) -> dict[str, Any]:
-    from tendwire import local_state
-    from tendwire.local_state import LocalStateKind, PermissionState
-
-    kind = LocalStateKind.DATABASE_JOURNAL if journal else LocalStateKind.DATABASE_WAL
-    target_path = Path(f"{db_path}-journal" if journal else f"{db_path}-wal")
-    companion_path = None if journal else Path(f"{db_path}-shm")
-    ready = threading.Barrier(2, timeout=timeout)
-    captured = threading.Barrier(2, timeout=timeout)
-    retired = threading.Barrier(2, timeout=timeout)
-    consumed = threading.Barrier(2, timeout=timeout)
-    barriers = (ready, captured, retired, consumed)
-    enabled = threading.Event()
-    failures: list[BaseException] = []
-    phase_counts: Counter[str] = Counter()
-    terminal_counts: Counter[str] = Counter()
-    managed = Counter()
-    optional_disappearances = Counter()
-    original_hook = local_state._sqlite_family_test_phase
-
-    def hook(phase: str, current_kind: Any) -> None:
-        phase_counts[f"{phase}:{current_kind.value}"] += 1
-        if phase == "captured" and current_kind is kind and enabled.is_set():
-            enabled.clear()
-            captured.wait()
-            retired.wait()
-
-    local_state._sqlite_family_test_phase = hook
-
-    def writer() -> None:
-        try:
-            for cycle in range(iterations):
-                connection = sqlite3.connect(str(db_path), timeout=5)
-                managed["opens"] += 1
-                try:
-                    if journal:
-                        connection.execute("PRAGMA journal_mode=DELETE")
-                        connection.execute("BEGIN IMMEDIATE")
-                        connection.execute(
-                            "UPDATE sidecar_evidence SET value = ? WHERE slot = 1",
-                            (-(cycle + 1),),
-                        )
-                        managed["transactions"] += 1
-                    else:
-                        connection.execute("PRAGMA journal_mode=WAL")
-                        connection.execute(
-                            "UPDATE sidecar_evidence SET value = ? WHERE slot = 1",
-                            (cycle + 1,),
-                        )
-                        connection.commit()
-                        managed["transactions"] += 1
-                    if not os.path.lexists(target_path):
-                        raise RuntimeError("sidecar_not_created")
-                    if companion_path is not None and not os.path.lexists(companion_path):
-                        raise RuntimeError("shm_not_created")
-                    ready.wait()
-                    captured.wait()
-                    if journal:
-                        connection.rollback()
-                        managed["rollbacks"] += 1
-                    else:
-                        row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-                        if row is None or int(row[0]) != 0:
-                            raise RuntimeError("checkpoint_failed")
-                        managed["checkpoints"] += 1
-                finally:
-                    connection.close()
-                    managed["closes"] += 1
-                target_path.unlink(missing_ok=True)
-                if companion_path is not None:
-                    companion_path.unlink(missing_ok=True)
-                if os.path.lexists(target_path) or (
-                    companion_path is not None and os.path.lexists(companion_path)
-                ):
-                    raise RuntimeError("sidecar_retirement_failed")
-                optional_disappearances["journal" if journal else "wal"] += 1
-                if companion_path is not None:
-                    optional_disappearances["shm"] += 1
-                retired.wait()
-                consumed.wait()
-        except BaseException as exc:
-            failures.append(exc)
-            _abort_barriers(barriers)
-
-    worker = threading.Thread(
-        target=writer,
-        name="tendwire-sidecar-journal-writer" if journal else "tendwire-sidecar-wal-writer",
-    )
-    worker.start()
-    resource_peak = _resource_counts()
-    results_seen = 0
-    try:
-        for _ in range(iterations):
-            ready.wait()
-            _merge_resource_peak(resource_peak, _resource_counts())
-            enabled.set()
-            results = local_state.prepare_sqlite_family(db_path)
-            results_seen += 1
-            for result in results:
-                terminal_counts[result.state.value] += 1
-            selected = next(result for result in results if result.kind is kind)
-            if selected.state is not PermissionState.ABSENT:
-                raise RuntimeError("retired_sidecar_not_absent")
-            consumed.wait()
-    except BaseException:
-        _abort_barriers(barriers)
-        raise
-    finally:
-        local_state._sqlite_family_test_phase = original_hook
-        worker.join(timeout=timeout)
-    if worker.is_alive() or failures:
-        raise RuntimeError("family_worker_failed")
-    expected_disappearances = {"journal": iterations} if journal else {"wal": iterations, "shm": iterations}
-    if dict(optional_disappearances) != expected_disappearances:
-        raise RuntimeError("disappearance_count_mismatch")
-    return {
-        "mode": "rollback_journal" if journal else "wal",
-        "iterations": iterations,
-        "preparations": results_seen,
-        "write_transactions": managed["transactions"],
-        "checkpoints": managed["checkpoints"],
-        "rollbacks": managed["rollbacks"],
-        "managed_connection_opens": managed["opens"],
-        "managed_connection_closes": managed["closes"],
-        "member_phase_observations": sum(phase_counts.values()),
-        "target_captures": phase_counts[f"captured:{kind.value}"],
-        "optional_disappearances": dict(optional_disappearances),
-        "terminal_outcomes": {
-            "present": terminal_counts["private"] + terminal_counts["repaired"] + terminal_counts["created"],
-            "absent": terminal_counts["absent"],
-            "invalid": 0,
-        },
-        "typed_codes": {
-            "missing_entry": 0,
-            "entry_changed": 0,
-            "wrong_type": 0,
-            "wrong_owner": 0,
-            "operation_failed": 0,
-        },
-        "maximum_attempts_per_member": 3,
-        "resource_peak_counts": resource_peak,
-    }
-
-
-def _run_churn_phase(root: Path, iterations: int, timeout: float) -> tuple[dict[str, Any], Path]:
-    db_path = root / "isolated.db"
-    connection = sqlite3.connect(str(db_path))
-    try:
-        connection.execute("CREATE TABLE sidecar_evidence (slot INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
-        connection.execute("INSERT INTO sidecar_evidence (slot, value) VALUES (1, 0)")
-        connection.commit()
-    finally:
-        connection.close()
-    wal = _family_phase(db_path, iterations, timeout, journal=False)
-    journal = _family_phase(db_path, iterations, timeout, journal=True)
-    return {
-        "family_iterations": iterations * 2,
-        "wal": wal,
-        "rollback_journal": journal,
-        "bounded_family_preparations": wal["preparations"] + journal["preparations"],
-        "optional_disappearances": sum(wal["optional_disappearances"].values())
-        + sum(journal["optional_disappearances"].values()),
-        "unexpected_exceptions": 0,
-        "maximum_attempts_per_member": max(
-            wal["maximum_attempts_per_member"], journal["maximum_attempts_per_member"]
-        ),
-    }, db_path
-
-
-class _NoopScheduler:
+class _NoopACPSupervisor:
     def __init__(self) -> None:
         self.started = False
         self.stopped = False
-        self.refreshes = 0
 
     def start(self) -> None:
         self.started = True
 
-    def request_refresh(self) -> None:
-        self.refreshes += 1
-
-    def stop(self, *, flush_timeout_seconds: float | None = None) -> None:
-        del flush_timeout_seconds
+    def stop(self, *, timeout: float | None = None) -> None:
+        del timeout
         self.stopped = True
 
-    def operational_status(self) -> dict[str, Any]:
+    def join(self, *, timeout: float | None = None) -> None:
+        del timeout
+
+    def status(self) -> dict[str, Any]:
         return {
-            "status": "healthy",
-            "queue_depth": 0,
-            "active": 0,
-            "queue_capacity": 1,
+            "state": "running" if self.started and not self.stopped else "stopped",
+            "healthy": self.started and not self.stopped,
         }
 
 
@@ -621,10 +435,20 @@ def _write_herdr_trap(path: Path, marker: Path) -> None:
 
 def _seed_daemon_store(db_path: Path) -> None:
     from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
-    from tendwire.store import sqlite as store
+    from tendwire.store.projection import save_snapshot, upsert_worker_bindings
+    from tendwire.store.schema import init_store
+    from tendwire.store.turns import apply_turn_refresh
 
-    store.init_store(db_path)
-    worker = Worker(id=FIXTURE_WORKER, name="Generated Evidence Worker", status="active")
+    init_store(db_path)
+    worker = Worker(
+        id=FIXTURE_WORKER,
+        name="Generated Evidence Worker",
+        status="active",
+        meta={
+            "stable_key": "wsk1_" + hashlib.sha256(FIXTURE_WORKER.encode()).hexdigest(),
+            "stable_key_version": 1,
+        },
+    )
     snapshot = Snapshot(
         host_id=FIXTURE_HOST,
         updated_at=FIXTURE_TIMESTAMP,
@@ -652,10 +476,10 @@ def _seed_daemon_store(db_path: Path) -> None:
         observed_at=FIXTURE_TIMESTAMP,
         private_fingerprint="generated-sidecar-private-binding",
     )
-    store.save_snapshot(db_path, snapshot)
-    if store.upsert_worker_bindings(db_path, [binding]) != 1:
+    save_snapshot(db_path, snapshot)
+    if upsert_worker_bindings(db_path, [binding]) != 1:
         raise RuntimeError("binding_seed_failed")
-    applied = store.apply_turn_refresh(
+    applied = apply_turn_refresh(
         db_path,
         FIXTURE_HOST,
         FIXTURE_WORKER,
@@ -675,17 +499,13 @@ def _seed_daemon_store(db_path: Path) -> None:
 def _run_daemon_phase(
     root: Path,
     db_path: Path,
-    cycles: int,
     requests: int,
     timeout: float,
     herdr_trap: Path,
-) -> tuple[dict[str, Any], Any, Path]:
-    from tendwire import local_state
+) -> tuple[dict[str, Any], Path]:
     from tendwire.config import Config
     from tendwire.daemon import DaemonHooks, TendwireDaemon
     from tendwire.daemon_api import DaemonAPIClient, TendwireDaemonAPI
-    from tendwire.local_state import LocalStateKind
-    from tendwire.store import sqlite as store
 
     _seed_daemon_store(db_path)
     socket_path = root / "isolated.sock"
@@ -695,68 +515,15 @@ def _run_daemon_phase(
         data_dir=root,
         db_path=db_path,
         socket_path=socket_path,
-        herdr_backend="cli",
-        reconcile_interval_seconds=0.0,
-        turn_refresh_interval_seconds=3600.0,
-        turn_refresh_workers=1,
         herdr_timeout_seconds=5.0,
     )
-    scheduler = _NoopScheduler()
+    supervisor = _NoopACPSupervisor()
     daemon = TendwireDaemon(
         config,
         hooks=DaemonHooks(
-            observe_initial_snapshot=lambda _config: store.latest_snapshot(db_path, FIXTURE_HOST),
-            turn_scheduler_factory=lambda _config: scheduler,
+            acp_supervisor_factory=lambda _config, _stop_event: supervisor,
         ),
     )
-    ready = threading.Barrier(2, timeout=timeout)
-    captured = threading.Barrier(2, timeout=timeout)
-    retired = threading.Barrier(2, timeout=timeout)
-    consumed = threading.Barrier(2, timeout=timeout)
-    barriers = (ready, captured, retired, consumed)
-    enabled = threading.Event()
-    failures: list[BaseException] = []
-    capture_count = 0
-    managed = Counter()
-    original_hook = local_state._sqlite_family_test_phase
-
-    def hook(phase: str, kind: Any) -> None:
-        nonlocal capture_count
-        if phase == "captured" and kind is LocalStateKind.DATABASE_WAL and enabled.is_set():
-            enabled.clear()
-            capture_count += 1
-            captured.wait()
-            retired.wait()
-
-    def writer() -> None:
-        try:
-            for cycle in range(cycles):
-                connection = sqlite3.connect(str(db_path), timeout=5)
-                managed["opens"] += 1
-                try:
-                    connection.execute("PRAGMA journal_mode=WAL")
-                    connection.execute(
-                        "UPDATE sidecar_evidence SET value = ? WHERE slot = 1",
-                        (10_000 + cycle,),
-                    )
-                    connection.commit()
-                    managed["transactions"] += 1
-                    ready.wait()
-                    captured.wait()
-                    row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-                    if row is None or int(row[0]) != 0:
-                        raise RuntimeError("daemon_checkpoint_failed")
-                    managed["checkpoints"] += 1
-                finally:
-                    connection.close()
-                    managed["closes"] += 1
-                Path(f"{db_path}-wal").unlink(missing_ok=True)
-                Path(f"{db_path}-shm").unlink(missing_ok=True)
-                retired.wait()
-                consumed.wait()
-        except BaseException as exc:
-            failures.append(exc)
-            _abort_barriers(barriers)
 
     latencies = {"snapshot_get": [], "turn_list": [], "health_get": []}
     sizes = {"snapshot_get": [], "turn_list": [], "health_get": []}
@@ -764,8 +531,6 @@ def _run_daemon_phase(
     api_failures = Counter()
     production_callbacks = False
     server_thread: threading.Thread | None = None
-    writer_thread = threading.Thread(target=writer, name="tendwire-sidecar-daemon-writer")
-    local_state._sqlite_family_test_phase = hook
     resource_peak = _resource_counts()
     try:
         daemon.start()
@@ -787,12 +552,9 @@ def _run_daemon_phase(
             raise RuntimeError("production_callbacks_unbound")
         server_thread = threading.Thread(target=daemon.serve_forever, name="tendwire-sidecar-daemon")
         server_thread.start()
-        writer_thread.start()
         client = DaemonAPIClient(socket_path, timeout_seconds=min(10.0, timeout))
-        for _cycle in range(requests):
-            ready.wait()
+        for _request in range(requests):
             _merge_resource_peak(resource_peak, _resource_counts())
-            enabled.set()
             operations = (
                 (
                     "turn_list",
@@ -831,18 +593,11 @@ def _run_daemon_phase(
                     successes[label] += 1
                 else:
                     api_failures[label] += 1
-            consumed.wait()
-    except BaseException:
-        _abort_barriers(barriers)
-        raise
     finally:
-        enabled.clear()
-        local_state._sqlite_family_test_phase = original_hook
         daemon.stop()
-        writer_thread.join(timeout=timeout)
         if server_thread is not None:
             server_thread.join(timeout=timeout)
-    if failures or writer_thread.is_alive() or server_thread is None or server_thread.is_alive():
+    if server_thread is None or server_thread.is_alive():
         raise RuntimeError("daemon_worker_cleanup_failed")
     integrity = sqlite3.connect(str(db_path))
     try:
@@ -858,12 +613,6 @@ def _run_daemon_phase(
         integrity.close()
     return (
         {
-            "wal_cycles": cycles,
-            "write_transactions": managed["transactions"],
-            "checkpoints": managed["checkpoints"],
-            "sidecar_captures": capture_count,
-            "managed_connection_opens": managed["opens"],
-            "managed_connection_closes": managed["closes"],
             "requests_per_method": requests,
             "api_successes": dict(successes),
             "api_failures": dict(api_failures),
@@ -875,11 +624,10 @@ def _run_daemon_phase(
             "revision_rows": revision_rows,
             "duplicate_revision_groups": duplicate_revisions,
             "socket_removed_after_shutdown": not os.path.lexists(socket_path),
-            "scheduler_refreshes": scheduler.refreshes,
-            "scheduler_stopped": scheduler.stopped,
+            "supervisor_started": supervisor.started,
+            "supervisor_stopped": supervisor.stopped,
             "resource_peak_counts": resource_peak,
         },
-        daemon,
         socket_path,
     )
 
@@ -938,7 +686,7 @@ def _run_herdres_phase(
     herdres_root: Path,
 ) -> dict[str, Any]:
     from tendwire.core.models import BackendHealth, Snapshot
-    from tendwire.store import sqlite as store_module
+    from tendwire.store.projection import save_snapshot
 
     empty_snapshot = Snapshot(
         host_id=FIXTURE_HOST,
@@ -953,7 +701,7 @@ def _run_herdres_phase(
             )
         ],
     )
-    store_module.save_snapshot(db_path, empty_snapshot)
+    save_snapshot(db_path, empty_snapshot)
     # Clear only the benchmark daemon's documented cache so the production callback
     # re-reads the newly durable settling snapshot; no public schema is bypassed.
     daemon._snapshot_cache = None
@@ -1162,23 +910,11 @@ def _candidate_run(args: argparse.Namespace) -> dict[str, Any]:
         "generated-sidecar-private-binding",
         "generated-sidecar-source-turn",
     ]
-    churn_started = perf_counter_ns()
-    churn, db_path = _run_churn_phase(root, args.iterations, args.phase_timeout_seconds)
-    for family in ("wal", "rollback_journal"):
-        family_peak = churn[family]["resource_peak_counts"]
-        peak_fd_count = max(peak_fd_count, family_peak["fds"])
-        peak_thread_count = max(peak_thread_count, family_peak["threads"])
-        peak_child_count = max(peak_child_count, family_peak["direct_children"])
-    churn_ns = perf_counter_ns() - churn_started
-    if args.inject_failure == "churn":
-        raise RuntimeError("injected_churn_failure")
-    peak_fd_count = max(peak_fd_count, len(_fd_snapshot()))
-    peak_thread_count = max(peak_thread_count, len(_thread_snapshot()))
+    db_path = root / "isolated.db"
     daemon_started = perf_counter_ns()
-    daemon_metrics, daemon, socket_path = _run_daemon_phase(
+    daemon_metrics, socket_path = _run_daemon_phase(
         root,
         db_path,
-        args.daemon_wal_cycles,
         args.requests_per_method,
         args.phase_timeout_seconds,
         herdr_trap,
@@ -1196,28 +932,20 @@ def _candidate_run(args: argparse.Namespace) -> dict[str, Any]:
     # Herdres uses a fresh lifecycle after the daemon phase proved full cleanup.
     from tendwire.config import Config
     from tendwire.daemon import DaemonHooks, TendwireDaemon
-    from tendwire.store import sqlite as store_module
 
-    herdres_scheduler = _NoopScheduler()
+    herdres_supervisor = _NoopACPSupervisor()
     herdres_config = Config(
         host_id=FIXTURE_HOST,
         herdr_bin=str(herdr_trap),
         data_dir=root,
         db_path=db_path,
         socket_path=socket_path,
-        herdr_backend="cli",
-        reconcile_interval_seconds=0.0,
-        turn_refresh_interval_seconds=3600.0,
-        turn_refresh_workers=1,
         herdr_timeout_seconds=5.0,
     )
     daemon = TendwireDaemon(
         herdres_config,
         hooks=DaemonHooks(
-            observe_initial_snapshot=lambda _config: store_module.latest_snapshot(
-                db_path, FIXTURE_HOST
-            ),
-            turn_scheduler_factory=lambda _config: herdres_scheduler,
+            acp_supervisor_factory=lambda _config, _stop_event: herdres_supervisor,
         ),
     )
     daemon.start()
@@ -1263,17 +991,16 @@ def _candidate_run(args: argparse.Namespace) -> dict[str, Any]:
         "installed_candidate_imported": True,
         "mutable_source_not_imported": True,
         "private_temporary_directory": stat.S_IMODE(root.stat().st_mode) == 0o700,
-        "fixed_family_counts_completed": churn["family_iterations"] == args.iterations * 2,
-        "bounded_family_attempts": churn["maximum_attempts_per_member"] <= 3,
-        "optional_disappearances_observed": churn["optional_disappearances"] == args.iterations * 3,
-        "no_unexpected_churn_exceptions": churn["unexpected_exceptions"] == 0,
-        "daemon_cycle_count_exact": daemon_metrics["wal_cycles"] == args.daemon_wal_cycles,
         "api_request_counts_exact": all(
             daemon_metrics["api_successes"].get(label, 0) == args.requests_per_method
             for label in ("snapshot_get", "turn_list", "health_get")
         ),
         "api_failures_zero": sum(daemon_metrics["api_failures"].values()) == 0,
         "production_callbacks_bound": daemon_metrics["production_callbacks"],
+        "daemon_supervisor_lifecycle": daemon_metrics["supervisor_started"]
+        and daemon_metrics["supervisor_stopped"],
+        "herdres_supervisor_lifecycle": herdres_supervisor.started
+        and herdres_supervisor.stopped,
         "sqlite_integrity_ok": daemon_metrics["integrity_ok"],
         "duplicate_revisions_zero": daemon_metrics["duplicate_revision_groups"] == 0,
         "two_noop_syncs_exact": herdres_metrics["noop_passes"] == 2,
@@ -1285,14 +1012,6 @@ def _candidate_run(args: argparse.Namespace) -> dict[str, Any]:
         and herdres_metrics["command_sequence_exact"],
         "direct_herdr_calls_zero": trap_calls == 0,
         "external_network_calls_zero": herdres_metrics["external_network_attempts"] == 0,
-        "managed_connections_balanced": (
-            churn["wal"]["managed_connection_opens"]
-            == churn["wal"]["managed_connection_closes"]
-            and churn["rollback_journal"]["managed_connection_opens"]
-            == churn["rollback_journal"]["managed_connection_closes"]
-            and daemon_metrics["managed_connection_opens"]
-            == daemon_metrics["managed_connection_closes"]
-        ),
         "live_fd_peak_observed": peak_fd_count > len(baseline_fds),
         "live_thread_peak_observed": peak_thread_count > len(baseline_threads),
         "live_direct_child_peak_observed": peak_child_count > len(baseline_children),
@@ -1306,12 +1025,9 @@ def _candidate_run(args: argparse.Namespace) -> dict[str, Any]:
         "ok": False,
         "status": "validating",
         "parameters": {
-            "iterations_per_family": args.iterations,
-            "daemon_wal_cycles": args.daemon_wal_cycles,
             "requests_per_method": args.requests_per_method,
             "herdres_sync_passes": args.herdres_sync_passes,
             "phase_timeout_seconds": args.phase_timeout_seconds,
-            "maximum_attempts_per_member": 3,
         },
         "candidate": {
             "version": args.candidate_version,
@@ -1328,13 +1044,11 @@ def _candidate_run(args: argparse.Namespace) -> dict[str, Any]:
             "platform": platform.system().lower(),
             "architecture": platform.machine(),
         },
-        "churn": churn,
         "daemon": daemon_metrics,
         "herdres": herdres_metrics,
         "timing_ns": {
             "wall": wall_ns,
             "process_cpu": cpu_ns,
-            "churn_wall": churn_ns,
             "daemon_wall": daemon_ns,
             "herdres_wall": herdres_ns,
             **usage_delta,
@@ -1406,10 +1120,6 @@ def _public_run(args: argparse.Namespace) -> dict[str, Any]:
             source_tree_digest,
             "--herdres-root",
             str(args.herdres_root.resolve()),
-            "--iterations",
-            str(args.iterations),
-            "--daemon-wal-cycles",
-            str(args.daemon_wal_cycles),
             "--requests-per-method",
             str(args.requests_per_method),
             "--herdres-sync-passes",

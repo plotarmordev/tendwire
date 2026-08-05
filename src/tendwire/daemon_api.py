@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any
 
 from ._version import __version__
-from .core.attention import attention_payload_from_snapshot
 from .core.commands import CommandEnvelope, error_value
 from .core.models import (
     Snapshot,
@@ -31,8 +30,12 @@ from .core.turns import (
     TURN_DELTA_MAX_LIMIT,
     TURN_LIST_DEFAULT_LIMIT,
     TURN_LIST_MAX_LIMIT,
-    pending_payload_from_snapshot,
-    turns_payload_from_snapshot,
+)
+from .connectors.protocol import (
+    valid_canonical_utc as _valid_utc,
+    valid_delivery_key,
+    valid_generic_payload,
+    valid_turn_final_delivery,
 )
 from .local_state import (
     EntryIdentity,
@@ -63,105 +66,335 @@ _SOCKET_STARTUP_LOCK_TIMEOUT_SECONDS = 1.0
 _SOCKET_STARTUP_LOCK_RETRY_SECONDS = 0.01
 _SERVER_LISTEN_BACKLOG = 32
 _CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
-_REQUEST_ID_FORBIDDEN_SEGMENTS = frozenset(
+_REVISION_RE = re.compile(r"twrev1\.[A-Za-z0-9_-]{43}")
+_FINAL_RE = re.compile(r"twfinal1\.[A-Za-z0-9_-]{43}")
+_PLAN_RE = re.compile(r"twplan1\.[A-Za-z0-9_-]{1,256}")
+_REF_RE = re.compile(r"twref1\.[A-Za-z0-9_-]{43}")
+_CONNECTOR_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_CONNECTOR_NAME_FORBIDDEN = (
+    "backend_target", "pane_id", "session_id", "terminal_id", "chat_id", "topic_id",
+    "message_id", "bot_token", "shell", "argv", "environment", "stdout", "stderr",
+)
+_RESTORE_PLAN_RE = re.compile(r"twplan1\.[A-Za-z0-9_-]+")
+_RESTORE_FINAL_RE = re.compile(r"twfinal1\.[A-Za-z0-9_-]+")
+_RESTORE_REVISION_RE = re.compile(r"twrev1\.[A-Za-z0-9_-]+")
+_RESTORE_DELIVERY_RE = re.compile(r"turn-final:revision:twfinal1\.[A-Za-z0-9_-]+")
+_RESTORE_PATTERNS = {
+    "plan_token": _RESTORE_PLAN_RE, "failed_plan_token": _RESTORE_PLAN_RE,
+    "recovered_plan_token": _RESTORE_PLAN_RE, "replaces_plan_token": _RESTORE_PLAN_RE,
+    "recovers_plan_token": _RESTORE_PLAN_RE, "final_identity": _RESTORE_FINAL_RE,
+    "content_revision": _RESTORE_REVISION_RE, "key": _RESTORE_DELIVERY_RE,
+}
+
+
+class _ExactConnectorResponse(dict[str, Any]):
+    """Marker for a connector result already validated at its strict edge."""
+
+
+_CONNECTOR_PRIVATE_KEYS = frozenset(
     {
-        "telegram",
-        "chat",
-        "chats",
-        "topic",
-        "topics",
-        "message",
-        "messages",
-        "thread",
-        "threads",
-        "token",
-        "tokens",
-        "auth",
-        "authorization",
-        "bearer",
-        "cookie",
-        "cookies",
-        "credential",
-        "credentials",
-        "delivery",
-        "deliveries",
-        "route",
-        "routes",
-        "connector",
-        "connectors",
-        "herdres",
-        "backend",
-        "target",
-        "targets",
-        "terminal",
-        "terminals",
-        "pane",
-        "panes",
-        "tab",
-        "tabs",
-        "window",
-        "windows",
-        "tty",
-        "pty",
-        "pid",
-        "pids",
-        "process",
-        "processes",
-        "tmux",
-        "screen",
-        "agent_session",
-        "session",
-        "sessions",
-        "private",
-        "argv",
-        "args",
-        "env",
-        "raw",
-        "payload",
-        "payloads",
-        "control",
-        "controls",
-        "escape",
-        "escapes",
-        "stdin",
-        "stderr",
-        "stdout",
-        "shell",
-        "secret",
-        "secrets",
-        "password",
-        "passwords",
-        "api_key",
-        "api_keys",
-        "apikey",
+        "backend_target", "binding_private_fingerprint", "private_fingerprint",
+        "private_binding", "pane_id", "session_id", "terminal_id", "chat_id",
+        "topic_id", "message_id", "bot_token", "credential", "credentials",
+        "secret", "secrets", "password", "api_key", "socket_path", "argv",
+        "environment", "stdin", "stdout", "stderr",
     }
+)
+def _exact_json_value(
+    value: Any, *, depth: int = 0, budget: list[int] | None = None,
+) -> Any:
+    """Copy interoperable JSON without redacting protocol-defined fields."""
+    budget = [0] if budget is None else budget
+    budget[0] += 1
+    if depth > 12 or budget[0] > 4096:
+        raise ValueError("connector response is too deeply nested")
+    if isinstance(value, str):
+        return value
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("connector response contains a non-finite number")
+        return value
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("connector response keys must be strings")
+            if key.lower() in _CONNECTOR_PRIVATE_KEYS:
+                raise ValueError("connector response contains a private key")
+            result[key] = _exact_json_value(item, depth=depth + 1, budget=budget)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_exact_json_value(item, depth=depth + 1, budget=budget) for item in value]
+    raise ValueError("connector response contains a non-JSON value")
+
+
+def _closed_mapping(value: Any, fields: set[str]) -> Mapping[str, Any] | None:
+    return value if isinstance(value, Mapping) and set(value) == fields else None
+
+
+def _matches(pattern: re.Pattern[str], value: Any) -> bool:
+    return isinstance(value, str) and pattern.fullmatch(value) is not None
+
+
+def _optional_match(pattern: re.Pattern[str], value: Any) -> bool:
+    return value is None or _matches(pattern, value)
+
+
+def _exact_int(value: Any, minimum: int = 0) -> bool:
+    return type(value) is int and value >= minimum
+
+
+def _public_exact_identifier(field: str, value: Any) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 512:
+        return False
+    return sanitize_public_mapping({field: value}).get(field) == value
+
+
+def _valid_connector_key(name: str, value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    return bool(
+        valid_delivery_key(value)
+        if name == "turn-final"
+        else _public_exact_identifier("key", value)
+    )
+
+
+def _request_connector_name(value: Any) -> str:
+    if not isinstance(value, str) or not _matches(_CONNECTOR_NAME_RE, value):
+        return ""
+    lowered, compact = value.lower(), re.sub(r"[^a-z0-9]", "", value.lower())
+    return value if _public_exact_identifier("name", value) and not any(
+        token in lowered or token.replace("_", "") in compact
+        for token in _CONNECTOR_NAME_FORBIDDEN
+    ) else ""
+
+
+def _valid_ref_fields(value: Mapping[str, Any], *, dates_required: bool = False) -> bool:
+    dates = (value.get("leased_until"), value.get("available_at"))
+    return bool(
+        _matches(_REF_RE, value.get("ref"))
+        and _exact_int(value.get("attempt"), 1)
+        and all(
+            _valid_utc(item) if dates_required else item is None or _valid_utc(item)
+            for item in dates
+        )
+    )
+
+
+def _valid_nonpoll_connector_result(method: str, value: Mapping[str, Any]) -> bool:
+    name = str(value.get("name"))
+    if method == "connector.reclaim":
+        return type(value.get("reclaimed")) is int and value["reclaimed"] >= 0
+    if method in {
+        "connector.renew", "connector.ack", "connector.release",
+        "connector.fail", "connector.defer",
+    }:
+        available = "available_at" in value
+        needs_available = (
+            (method == "connector.fail" and value.get("status") == "retry_scheduled")
+            or (method == "connector.defer" and value.get("status") == "deferred")
+        )
+        return bool(
+            _valid_ref_fields(value)
+            and _valid_connector_key(name, value.get("key"))
+            and (method not in {"connector.fail", "connector.defer"} or available == needs_available)
+        )
+    if method == "connector.retry":
+        return bool(
+            name == "turn-final"
+            and _valid_connector_key(name, value.get("key"))
+            and _exact_int(value.get("retry_generation"), 1)
+            and _exact_int(value.get("prior_attempt_count"))
+            and value.get("warning") in {None, "provider_acceptance_may_have_occurred"}
+        )
+    if method == "connector.prepare":
+        recovering = "failed_plan_token" in value
+        accepted = value.get("accepted_ordinals", [])
+        part_count = value.get("part_count")
+        return bool(
+            name == "turn-final"
+            and _matches(_PLAN_RE, value.get("plan_token"))
+            and (not recovering or _matches(_PLAN_RE, value.get("failed_plan_token")))
+            and value.get("status") == ("recovered" if recovering else "ok")
+            and _exact_int(value.get("generation"), 1)
+            and (part_count is None or _exact_int(part_count, 1) and part_count <= 10_000)
+            and ("ordinal" not in value or _exact_int(value["ordinal"]) and value["ordinal"] < part_count)
+            and ("job_count" not in value or _exact_int(value["job_count"], 1))
+            and all(field not in value or _exact_int(value[field]) for field in (
+                "acknowledged_prefix_count", "executable_job_count",
+                "retained_failed_job_count", "prior_attempt_count",
+            ))
+            and (
+                "content_revision" not in value
+                or (
+                    _matches(_REVISION_RE, value["content_revision"])
+                )
+            )
+            and isinstance(accepted, list)
+            and all(_exact_int(item) and part_count is not None and item < part_count for item in accepted)
+            and accepted == sorted(set(accepted))
+            and value.get("state") in {
+                "preparing", "active", "waiting_predecessor", "completed",
+                "failed", "superseded",
+            }
+            and ("idempotent_replay" not in value or type(value["idempotent_replay"]) is bool)
+        )
+    if method == "connector.inspect":
+        items = value.get("items")
+        item_fields = {
+            "kind", "key", "final_identity", "failed_plan_token", "decision_ref",
+            "target_key", "reason", "attempt_count", "prior_attempt_count",
+            "created_at", "terminal_at", "retryable", "recoverable",
+        }
+        return bool(
+            name == "turn-final"
+            and _exact_int(value.get("total"))
+            and isinstance(items, list)
+            and all(
+                (item := _closed_mapping(raw, item_fields)) is not None
+                and item.get("kind") in {"working", "final_ready", "final_part", "decision", "retire"}
+                and _valid_connector_key(name, item.get("key"))
+                and (item.get("decision_ref") is None or _public_exact_identifier(
+                    "decision_ref", item.get("decision_ref")
+                ))
+                and _optional_match(_FINAL_RE, item.get("final_identity"))
+                and _optional_match(_PLAN_RE, item.get("failed_plan_token"))
+                and (item.get("target_key") is None or _valid_connector_key(name, item["target_key"]))
+                and _exact_int(item.get("attempt_count"))
+                and _exact_int(item.get("prior_attempt_count"))
+                and item.get("reason") in {
+                    "temporary", "rate_limited", "provider_rejected", "provider_uncertain",
+                    "invalid_payload", "content_unavailable", "route_unavailable",
+                    "provider_binding_unknown", "lease_expired", "ack_deadline_expired",
+                    "superseded", "attempts_exhausted", "operator_recovery",
+                }
+                and _valid_utc(item.get("created_at"))
+                and _valid_utc(item.get("terminal_at"))
+                and type(item.get("retryable")) is bool
+                and type(item.get("recoverable")) is bool
+                for raw in items
+            )
+            and value["total"] >= len(items)
+        )
+    return False
+
+
+def _validated_connector_result(
+    method: str, result: Mapping[str, Any], *, expected_name: str,
+) -> dict[str, Any]:
+    copied = _exact_json_value(result)
+    if not isinstance(copied, dict):
+        raise ValueError("connector result must be an object")
+    common = {"schema_version", "ok", "status", "host_id", "name"}
+    if (
+        not common <= set(copied)
+        or copied.get("schema_version") != 1
+        or type(copied.get("schema_version")) is not int
+        or type(copied.get("ok")) is not bool
+    ):
+        raise ValueError("connector result has an invalid envelope")
+    result_name = copied.get("name")
+    if not _public_exact_identifier("host_id", copied.get("host_id")):
+        raise ValueError("connector result identity is invalid")
+    if copied["ok"] is False:
+        if (
+            result_name not in {"", expected_name}
+            or (bool(result_name) and not _matches(_CONNECTOR_NAME_RE, result_name))
+            or set(copied) != common | {"message"}
+            or copied.get("message") != copied.get("status")
+            or copied.get("status") not in {
+                "invalid_params", "invalid_payload", "invalid_ref", "stale_ref",
+                "store_unavailable", "unknown_method", "revision_not_found",
+                "stale_revision", "content_unavailable", "plan_not_found",
+                "plan_conflict", "part_conflict", "plan_incomplete", "plan_not_failed",
+                "not_recoverable", "request_conflict", "ack_deadline_expired",
+                "not_retryable",
+            }
+        ):
+            raise ValueError("connector error has an invalid envelope")
+        return copied
+    if not expected_name or result_name != expected_name:
+        raise ValueError("connector result identity is invalid")
+    alternatives: dict[str, tuple[frozenset[str], ...]] = {
+        "connector.poll": (frozenset(common | {"items"}),),
+        "connector.reclaim": (frozenset(common | {"reclaimed"}),),
+        "connector.renew": (frozenset(common | {"ref", "key", "attempt", "leased_until"}),),
+        "connector.ack": (frozenset(common | {"ref", "key", "attempt"}),),
+        "connector.release": (frozenset(common | {"ref", "key", "attempt"}),),
+        "connector.fail": (frozenset(common | {"ref", "key", "attempt"}), frozenset(common | {"ref", "key", "attempt", "available_at"})),
+        "connector.defer": (frozenset(common | {"ref", "key", "attempt"}), frozenset(common | {"ref", "key", "attempt", "available_at"})),
+        "connector.inspect": (frozenset(common | {"total", "items"}),),
+        "connector.retry": (frozenset(common | {"key", "retry_generation", "prior_attempt_count"}), frozenset(common | {"key", "retry_generation", "prior_attempt_count", "warning"})),
+    }
+    prepare_sets = (
+        common | {"plan_token", "state", "generation", "part_count", "accepted_ordinals"},
+        common | {"plan_token", "state", "generation", "part_count", "ordinal", "accepted_ordinals"},
+        common | {"plan_token", "state", "generation", "part_count", "job_count", "accepted_ordinals"},
+        common | {"failed_plan_token", "plan_token", "generation", "content_revision", "state", "acknowledged_prefix_count", "executable_job_count", "retained_failed_job_count", "prior_attempt_count", "idempotent_replay"},
+    )
+    allowed = tuple(frozenset(fields) for fields in prepare_sets) if method == "connector.prepare" else alternatives.get(method, ())
+    if frozenset(copied) not in allowed:
+        raise ValueError("connector result has unexpected fields")
+    statuses = {
+        "connector.poll": {"ok"}, "connector.reclaim": {"ok"},
+        "connector.renew": {"renewed"}, "connector.ack": {"acknowledged"},
+        "connector.release": {"released", "superseded"},
+        "connector.fail": {"retry_scheduled", "attempts_exhausted", "superseded"},
+        "connector.defer": {"deferred", "superseded"},
+        "connector.inspect": {"ok"}, "connector.retry": {"requeued"},
+        "connector.prepare": {"ok", "recovered"},
+    }
+    if copied.get("status") not in statuses.get(method, set()):
+        raise ValueError("connector result status is invalid")
+    if method == "connector.poll":
+        items = copied.get("items")
+        item_fields = {"key", "ref", "attempt", "leased_until", "available_at", "payload"}
+        if not isinstance(items, list):
+            raise ValueError("connector poll items are invalid")
+        for item in items:
+            if not isinstance(item, Mapping) or set(item) not in {frozenset(item_fields), frozenset(item_fields | {"created_at"})}:
+                raise ValueError("connector poll item has unexpected fields")
+            if (
+                not _valid_connector_key(copied["name"], item.get("key"))
+                or not _valid_ref_fields(item, dates_required=True)
+                or (
+                    item.get("created_at") is not None
+                    and not _valid_utc(item.get("created_at"))
+                )
+            ):
+                raise ValueError("connector poll item values are invalid")
+            payload = item["payload"]
+            valid_payload = (
+                valid_turn_final_delivery(payload, item["key"], copied["host_id"])
+                if copied["name"] == "turn-final" else valid_generic_payload(payload)
+            )
+            if not valid_payload:
+                raise ValueError("connector poll payload is invalid")
+    elif not _valid_nonpoll_connector_result(method, copied):
+        raise ValueError("connector result values are invalid")
+    return copied
+
+
+_REQUEST_ID_FORBIDDEN_SEGMENTS = frozenset(
+    "telegram chat chats topic topics message messages thread threads token tokens auth "
+    "authorization bearer cookie cookies credential credentials delivery deliveries route "
+    "routes connector connectors herdres backend target targets terminal terminals pane panes "
+    "tab tabs window windows tty pty pid pids process processes tmux screen agent_session session "
+    "sessions private argv args env raw payload payloads control controls escape escapes stdin "
+    "stderr stdout shell secret secrets password passwords api_key api_keys apikey".split()
 )
 _REQUEST_ID_FORBIDDEN_COMPACT = frozenset(
     segment.replace("_", "") for segment in _REQUEST_ID_FORBIDDEN_SEGMENTS
 )
 
 REQUIRED_METHODS = frozenset(
-    {
-        "ping",
-        "health.get",
-        "snapshot.get",
-        "attention.list",
-        "turn.list",
-        "turn.delta",
-        "turn.content.get",
-        "pending.list",
-        "command.submit",
-        "connector.prepare",
-        "connector.poll",
-        "connector.ack",
-        "connector.fail",
-        "connector.defer",
-        "connector.renew",
-        "connector.release",
-        "connector.reclaim",
-        "connector.retry",
-        "connector.inspect",
-    }
+    "ping health.get snapshot.get attention.list turn.list turn.delta turn.content.get "
+    "pending.list command.submit connector.prepare connector.poll connector.ack connector.fail "
+    "connector.defer connector.renew connector.release connector.reclaim connector.retry "
+    "connector.inspect".split()
 )
 
 
@@ -199,18 +432,8 @@ class DaemonProtocolError(DaemonAPIError):
         self.request_started = request_started
 
 def _request_id_has_forbidden_segment_sequence(normalized: str) -> bool:
-    parts = tuple(part for part in normalized.split("_") if part)
-    for forbidden in _REQUEST_ID_FORBIDDEN_SEGMENTS:
-        forbidden_parts = tuple(part for part in forbidden.split("_") if part)
-        if not forbidden_parts:
-            continue
-        part_count = len(forbidden_parts)
-        if any(
-            parts[index : index + part_count] == forbidden_parts
-            for index in range(len(parts) - part_count + 1)
-        ):
-            return True
-    return False
+    wrapped = f"_{normalized}_"
+    return any(f"_{forbidden}_" in wrapped for forbidden in _REQUEST_ID_FORBIDDEN_SEGMENTS)
 
 
 def _public_request_id(value: Any) -> str | int | float | None:
@@ -254,6 +477,26 @@ def success_response(result: Mapping[str, Any] | None = None, *, request_id: Any
     if public_id is not None:
         response["id"] = public_id
     return sanitize_public_mapping(response)
+
+
+def _connector_success_response(
+    method: str,
+    result: Mapping[str, Any],
+    *,
+    expected_name: str,
+    request_id: Any = None,
+) -> _ExactConnectorResponse:
+    response: _ExactConnectorResponse = _ExactConnectorResponse(
+        schema_version=API_SCHEMA_VERSION,
+        ok=True,
+        status="ok",
+        result=_validated_connector_result(method, result, expected_name=expected_name),
+        error=None,
+    )
+    public_id = _public_request_id(request_id)
+    if public_id is not None:
+        response["id"] = public_id
+    return response
 
 
 def _daemon_identity_response(
@@ -317,6 +560,42 @@ def _command_success_response(
     return response
 
 
+def _unknown_params_error(
+    params: Mapping[str, Any], allowed: set[str], method: str, request_id: Any,
+) -> dict[str, Any] | None:
+    unknown = [key for key in params if str(key) not in allowed]
+    return error_response(
+        "invalid_params", f"{method} contains unknown parameters",
+        details={"field_count": len(unknown)}, request_id=request_id,
+    ) if unknown else None
+
+
+def _page_params(
+    params: Mapping[str, Any], token_names: tuple[str, str], default: int,
+    maximum: int, request_id: Any,
+) -> tuple[tuple[Any, Any, Any] | None, dict[str, Any] | None]:
+    limit = params.get("limit", default)
+    if type(limit) is not int or not 1 <= limit <= maximum:
+        return None, error_response(
+            "invalid_params", "limit must be an integer in the supported range",
+            details={"field": "limit", "minimum": 1, "maximum": maximum},
+            request_id=request_id,
+        )
+    tokens = tuple(params.get(name) for name in token_names)
+    for name, token in zip(token_names, tokens, strict=True):
+        if token is not None and (not isinstance(token, str) or not token):
+            return None, error_response(
+                "invalid_params", f"{name} must be a non-empty string or null",
+                details={"field": name}, request_id=request_id,
+            )
+    if all(token is not None for token in tokens):
+        return None, error_response(
+            "invalid_params", f"{token_names[0]} and {token_names[1]} cannot be combined",
+            details={"fields": list(token_names)}, request_id=request_id,
+        )
+    return (limit, *tokens), None
+
+
 class TendwireDaemonAPI:
     """Dispatch stable local daemon methods through injected public helpers."""
 
@@ -326,22 +605,29 @@ class TendwireDaemonAPI:
         get_snapshot: Callable[[], Snapshot],
         get_health: Callable[[], Mapping[str, Any]],
         submit_command: Callable[[Mapping[str, Any]], Mapping[str, Any] | CommandEnvelope],
-        get_attention: Callable[[], Mapping[str, Any]] | None = None,
-        get_turns: Callable[..., Mapping[str, Any]] | None = None,
-        get_turn_delta: Callable[..., Mapping[str, Any]] | None = None,
-        get_turn_content: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
-        get_pending: Callable[[], Mapping[str, Any]] | None = None,
-        connector_call: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None,
+        get_attention: Callable[[], Mapping[str, Any]],
+        get_turns: Callable[..., Mapping[str, Any]],
+        get_turn_delta: Callable[..., Mapping[str, Any]],
+        get_turn_content: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+        get_pending: Callable[[], Mapping[str, Any]],
+        connector_call: Callable[[str, Mapping[str, Any]], Mapping[str, Any]],
     ) -> None:
-        self._get_snapshot = get_snapshot
-        self._get_health = get_health
-        self._submit_command = submit_command
-        self._get_attention = get_attention
-        self._get_turns = get_turns
-        self._get_turn_delta = get_turn_delta
-        self._get_turn_content = get_turn_content
-        self._get_pending = get_pending
-        self._connector_call = connector_call
+        callbacks = {
+            "get_snapshot": get_snapshot,
+            "get_health": get_health,
+            "submit_command": submit_command,
+            "get_attention": get_attention,
+            "get_turns": get_turns,
+            "get_turn_delta": get_turn_delta,
+            "get_turn_content": get_turn_content,
+            "get_pending": get_pending,
+            "connector_call": connector_call,
+        }
+        invalid = sorted(name for name, callback in callbacks.items() if not callable(callback))
+        if invalid:
+            raise TypeError(f"daemon callbacks must be callable: {', '.join(invalid)}")
+        for name, callback in callbacks.items():
+            setattr(self, f"_{name}", callback)
 
     def dispatch(self, request: Any) -> dict[str, Any]:
         if not isinstance(request, Mapping):
@@ -398,26 +684,14 @@ class TendwireDaemonAPI:
             if method == "snapshot.get":
                 return success_response(_snapshot_dict(self._get_snapshot()), request_id=request_id)
             if method == "attention.list":
-                if self._get_attention is not None:
-                    return success_response(self._get_attention(), request_id=request_id)
-                return success_response(attention_payload_from_snapshot(self._get_snapshot()), request_id=request_id)
+                return success_response(self._get_attention(), request_id=request_id)
             if method == "turn.list":
-                allowed_turn_params = {
-                    "schema_version",
-                    "limit",
-                    "cursor",
-                    "since",
-                }
-                unknown_params = sorted(
-                    str(key) for key in params if str(key) not in allowed_turn_params
+                invalid = _unknown_params_error(
+                    params, {"schema_version", "limit", "cursor", "since"},
+                    method, request_id,
                 )
-                if unknown_params:
-                    return error_response(
-                        "invalid_params",
-                        "turn.list contains unknown parameters",
-                        details={"field_count": len(unknown_params)},
-                        request_id=request_id,
-                    )
+                if invalid:
+                    return invalid
                 schema_version = params.get("schema_version", 1)
                 if schema_version not in {1, 2} or isinstance(schema_version, bool):
                     return error_response(
@@ -426,149 +700,54 @@ class TendwireDaemonAPI:
                         details={"supported_turn_schema_versions": [1, 2]},
                         request_id=request_id,
                     )
-                limit = params.get("limit", TURN_LIST_DEFAULT_LIMIT)
-                if (
-                    not isinstance(limit, int)
-                    or isinstance(limit, bool)
-                    or not 1 <= limit <= TURN_LIST_MAX_LIMIT
-                ):
-                    return error_response(
-                        "invalid_params",
-                        "limit must be an integer in the supported range",
-                        details={
-                            "field": "limit",
-                            "minimum": 1,
-                            "maximum": TURN_LIST_MAX_LIMIT,
-                        },
-                        request_id=request_id,
+                page, invalid = _page_params(
+                    params, ("cursor", "since"), TURN_LIST_DEFAULT_LIMIT,
+                    TURN_LIST_MAX_LIMIT, request_id,
+                )
+                if invalid:
+                    return invalid
+                assert page is not None
+                limit, cursor, since = page
+                turn_result = dict(
+                    self._get_turns(
+                        schema_version=schema_version,
+                        limit=limit,
+                        cursor=cursor,
+                        since=since,
                     )
-                cursor = params.get("cursor")
-                since = params.get("since")
-                for token_name, token in (("cursor", cursor), ("since", since)):
-                    if token is not None and (
-                        not isinstance(token, str) or not token
-                    ):
-                        return error_response(
-                            "invalid_params",
-                            f"{token_name} must be a non-empty string or null",
-                            details={"field": token_name},
-                            request_id=request_id,
-                        )
-                if cursor is not None and since is not None:
-                    return error_response(
-                        "invalid_params",
-                        "cursor and since cannot be combined",
-                        details={"fields": ["cursor", "since"]},
-                        request_id=request_id,
-                    )
-                if self._get_turns is not None:
-                    turn_result = dict(
-                        self._get_turns(
-                            schema_version=schema_version,
-                            limit=limit,
-                            cursor=cursor,
-                            since=since,
-                        )
-                    )
-                else:
-                    snapshot = self._get_snapshot()
-                    if schema_version == 1:
-                        try:
-                            turn_result = turns_payload_from_snapshot(snapshot)
-                        except ValueError as exc:
-                            if str(exc) != "upgrade_required":
-                                raise
-                            turn_result = {
-                                "schema_version": 1,
-                                "ok": False,
-                                "status": "upgrade_required",
-                                "required_turn_schema_version": 2,
-                            }
-                    else:
-                        turn_result = turns_payload_from_snapshot(snapshot, schema_version=2)
+                )
                 response = success_response(turn_result, request_id=request_id)
                 _restore_turn_list_text(response, turn_result)
                 return response
             if method == "turn.delta":
-                allowed_delta_params = {"watermark", "cursor", "limit"}
-                unknown_delta = sorted(
-                    str(key) for key in params if str(key) not in allowed_delta_params
+                invalid = _unknown_params_error(
+                    params, {"watermark", "cursor", "limit"}, method, request_id
                 )
-                if unknown_delta:
-                    return error_response(
-                        "invalid_params",
-                        "turn.delta contains unknown parameters",
-                        details={"field_count": len(unknown_delta)},
-                        request_id=request_id,
-                    )
-                delta_limit = params.get("limit", TURN_DELTA_DEFAULT_LIMIT)
-                if (
-                    not isinstance(delta_limit, int)
-                    or isinstance(delta_limit, bool)
-                    or not 1 <= delta_limit <= TURN_DELTA_MAX_LIMIT
-                ):
-                    return error_response(
-                        "invalid_params",
-                        "limit must be an integer in the supported range",
-                        details={
-                            "field": "limit", "minimum": 1,
-                            "maximum": TURN_DELTA_MAX_LIMIT,
-                        },
-                        request_id=request_id,
-                    )
-                delta_watermark = params.get("watermark")
-                delta_cursor = params.get("cursor")
-                for token_name, token in (
-                    ("watermark", delta_watermark), ("cursor", delta_cursor)
-                ):
-                    if token is not None and (not isinstance(token, str) or not token):
-                        return error_response(
-                            "invalid_params",
-                            f"{token_name} must be a non-empty string or null",
-                            details={"field": token_name},
-                            request_id=request_id,
-                        )
-                if delta_watermark is not None and delta_cursor is not None:
-                    return error_response(
-                        "invalid_params",
-                        "watermark and cursor cannot be combined",
-                        details={"fields": ["watermark", "cursor"]},
-                        request_id=request_id,
-                    )
-                if self._get_turn_delta is None:
-                    delta_result = {
-                        "schema_version": 1,
-                        "projection_schema_version": 2,
-                        "ok": False,
-                        "status": "store_unavailable",
-                    }
-                else:
-                    delta_result = dict(self._get_turn_delta(
-                        watermark=delta_watermark,
-                        cursor=delta_cursor,
-                        limit=delta_limit,
-                    ))
+                if invalid:
+                    return invalid
+                page, invalid = _page_params(
+                    params, ("watermark", "cursor"), TURN_DELTA_DEFAULT_LIMIT,
+                    TURN_DELTA_MAX_LIMIT, request_id,
+                )
+                if invalid:
+                    return invalid
+                assert page is not None
+                delta_limit, delta_watermark, delta_cursor = page
+                delta_result = dict(self._get_turn_delta(
+                    watermark=delta_watermark,
+                    cursor=delta_cursor,
+                    limit=delta_limit,
+                ))
                 response = success_response(delta_result, request_id=request_id)
                 _restore_turn_delta_text(response, delta_result)
                 return response
             if method == "turn.content.get":
-                allowed_content_params = {
-                    "schema_version",
-                    "turn_id",
-                    "content_revision",
-                    "field",
-                    "cursor",
-                }
-                unknown_content_params = sorted(
-                    str(key) for key in params if str(key) not in allowed_content_params
+                invalid = _unknown_params_error(
+                    params, {"schema_version", "turn_id", "content_revision", "field", "cursor"},
+                    method, request_id,
                 )
-                if unknown_content_params:
-                    return error_response(
-                        "invalid_params",
-                        "turn.content.get contains unknown parameters",
-                        details={"field_count": len(unknown_content_params)},
-                        request_id=request_id,
-                    )
+                if invalid:
+                    return invalid
                 content_schema = params.get("schema_version", 1)
                 if content_schema != 1 or isinstance(content_schema, bool):
                     return error_response(
@@ -577,22 +756,13 @@ class TendwireDaemonAPI:
                         details={"supported_content_schema_versions": [1]},
                         request_id=request_id,
                     )
-                if not isinstance(params.get("turn_id"), str) or not params.get("turn_id"):
-                    return error_response(
-                        "invalid_params",
-                        "turn_id is required",
-                        details={"field": "turn_id"},
-                        request_id=request_id,
-                    )
-                if not isinstance(params.get("content_revision"), str) or not params.get(
-                    "content_revision"
-                ):
-                    return error_response(
-                        "invalid_params",
-                        "content_revision is required",
-                        details={"field": "content_revision"},
-                        request_id=request_id,
-                    )
+                for field_name in ("turn_id", "content_revision"):
+                    value = params.get(field_name)
+                    if not isinstance(value, str) or not value:
+                        return error_response(
+                            "invalid_params", f"{field_name} is required",
+                            details={"field": field_name}, request_id=request_id,
+                        )
                 if params.get("field") not in {"user_text", "assistant_final_text"}:
                     return error_response(
                         "invalid_params",
@@ -608,51 +778,25 @@ class TendwireDaemonAPI:
                         details={"field": "cursor"},
                         request_id=request_id,
                     )
-                if self._get_turn_content is None:
-                    return success_response(
-                        {
-                            "schema_version": 1,
-                            "ok": False,
-                            "status": "store_unavailable",
-                            "error": {
-                                "code": "store_unavailable",
-                                "message": "content store is unavailable",
-                            },
-                        },
-                        request_id=request_id,
-                    )
                 result = dict(self._get_turn_content(dict(params)))
                 response = success_response(result, request_id=request_id)
                 _restore_content_page_text(response, result)
                 return response
             if method == "pending.list":
-                if self._get_pending is not None:
-                    return success_response(self._get_pending(), request_id=request_id)
-                return success_response(pending_payload_from_snapshot(self._get_snapshot()), request_id=request_id)
+                return success_response(self._get_pending(), request_id=request_id)
             if method == "command.submit":
                 return _command_success_response(
                     self._submit_command(dict(params)),
                     request_id=request_id,
                 )
             if method.startswith("connector."):
-                if self._connector_call is None:
-                    return success_response(
-                        {
-                            "schema_version": 1,
-                            "ok": False,
-                            "status": "store_unavailable",
-                            "error": {
-                                "code": "store_unavailable",
-                                "message": "store is unavailable",
-                            },
-                        },
-                        request_id=request_id,
-                    )
                 connector_result = dict(self._connector_call(method, dict(params)))
-                response = success_response(connector_result, request_id=request_id)
-                if method.startswith("connector."):
-                    _restore_plan_token(response, connector_result)
-                return response
+                return _connector_success_response(
+                    method,
+                    connector_result,
+                    expected_name=_request_connector_name(params.get("name")),
+                    request_id=request_id,
+                )
         except Exception as exc:  # noqa: BLE001
             return error_response(
                 "internal_error",
@@ -666,6 +810,25 @@ class TendwireDaemonAPI:
             "unknown method",
             request_id=request_id,
         )
+
+
+def _restore_turn_text(
+    target: dict[str, Any], original: Mapping[str, Any], schema_version: int,
+) -> None:
+    descriptors = (original.get("content") or {}).get("fields", {})
+    for field in ("user_text", "assistant_final_text"):
+        text = original.get(field)
+        descriptor = descriptors.get(field) if isinstance(descriptors, Mapping) else None
+        trusted_inline = schema_version == 1 or (
+            isinstance(descriptor, Mapping)
+            and descriptor.get("availability") == "complete"
+            and descriptor.get("inline") is True
+        )
+        if trusted_inline and isinstance(text, str):
+            target[field] = text
+    for key in ("user_preview", "assistant_final_preview"):
+        if isinstance(original.get(key), str):
+            target[key] = original[key]
 
 
 def _restore_turn_list_text(
@@ -693,21 +856,7 @@ def _restore_turn_list_text(
         target = by_id.get(original.get("id"))
         if not isinstance(target, dict):
             continue
-        descriptors = (original.get("content") or {}).get("fields", {})
-        for field in ("user_text", "assistant_final_text"):
-            text = original.get(field)
-            descriptor = descriptors.get(field) if isinstance(descriptors, Mapping) else None
-            trusted_inline = original_result.get("schema_version") == 1 or (
-                isinstance(descriptor, Mapping)
-                and descriptor.get("availability") == "complete"
-                and descriptor.get("inline") is True
-            )
-            if trusted_inline and isinstance(text, str):
-                target[field] = text
-        for preview_key in ("user_preview", "assistant_final_preview"):
-            preview = original.get(preview_key)
-            if isinstance(preview, str):
-                target[preview_key] = preview
+        _restore_turn_text(target, original, original_result["schema_version"])
 
 
 def _restore_content_page_text(
@@ -728,11 +877,7 @@ def _restore_content_page_text(
     if isinstance(result, dict):
         result["text"] = text
         content_revision = original_result.get("content_revision")
-        if (
-            isinstance(content_revision, str)
-            and re.fullmatch(r"twrev1\.[A-Za-z0-9_-]+", content_revision)
-            is not None
-        ):
+        if _matches(_RESTORE_REVISION_RE, content_revision):
             result["content_revision"] = content_revision
 
 
@@ -755,11 +900,7 @@ def _restore_turn_delta_text(
         target_turn = target.get("turn")
         if not isinstance(original_turn, Mapping) or not isinstance(target_turn, dict):
             continue
-        wrapper = {"result": {"turns": [target_turn]}}
-        _restore_turn_list_text(
-            wrapper,
-            {"schema_version": 2, "turns": [original_turn]},
-        )
+        _restore_turn_text(target_turn, original_turn, 2)
 
 
 def _restore_plan_token(
@@ -771,43 +912,9 @@ def _restore_plan_token(
         return
 
     def restore(target: dict[str, Any], original: Mapping[str, Any]) -> None:
-        for key in (
-            "plan_token",
-            "failed_plan_token",
-            "recovered_plan_token",
-            "replaces_plan_token",
-            "recovers_plan_token",
-        ):
-            token = original.get(key)
-            if (
-                isinstance(token, str)
-                and re.fullmatch(r"twplan1\.[A-Za-z0-9_-]+", token) is not None
-            ):
-                target[key] = token
-        final_identity = original.get("final_identity")
-        if (
-            isinstance(final_identity, str)
-            and re.fullmatch(r"twfinal1\.[A-Za-z0-9_-]+", final_identity)
-            is not None
-        ):
-            target["final_identity"] = final_identity
-        content_revision = original.get("content_revision")
-        if (
-            isinstance(content_revision, str)
-            and re.fullmatch(r"twrev1\.[A-Za-z0-9_-]+", content_revision)
-            is not None
-        ):
-            target["content_revision"] = content_revision
-        delivery_key = original.get("key")
-        if (
-            isinstance(delivery_key, str)
-            and re.fullmatch(
-                r"turn-final:revision:twfinal1\.[A-Za-z0-9_-]+",
-                delivery_key,
-            )
-            is not None
-        ):
-            target["key"] = delivery_key
+        for key, pattern in _RESTORE_PATTERNS.items():
+            if _matches(pattern, original.get(key)):
+                target[key] = original[key]
         for nested_key in ("turn", "final", "payload", "content"):
             nested_original = original.get(nested_key)
             nested_target = target.get(nested_key)
@@ -829,6 +936,14 @@ def _restore_plan_token(
 
 def _serialized_response(response: Mapping[str, Any]) -> bytes:
     """Serialize one public response while preserving canonical content pages."""
+    if isinstance(response, _ExactConnectorResponse):
+        return json.dumps(
+            _exact_json_value(response),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
     sanitized = sanitize_public_mapping(response)
     original_result = response.get("result")
     if isinstance(original_result, Mapping):
@@ -858,6 +973,7 @@ def _serialized_response(response: Mapping[str, Any]) -> bytes:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
 
 
@@ -1492,7 +1608,7 @@ class UnixSocketJSONServer:
                     response = error_response("invalid_request", "empty request")
                 else:
                     request = json.loads(raw.decode("utf-8"))
-                    response = dict(self.dispatcher(request))
+                    response = self.dispatcher(request)
             except json.JSONDecodeError:
                 response = error_response(
                     "invalid_request",
