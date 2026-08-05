@@ -13,56 +13,281 @@ from typing import Any
 SCHEMA_VERSION = 2
 FINGERPRINT_HEX_CHARS = 24
 
-CANONICAL_STATUSES = frozenset("unknown active idle waiting blocked warning done failed closed".split())
-
-_STATUS_ALIASES = dict(
-    item.split("=", 1) for item in """
-    =unknown ok=active okay=active ready=active running=active run=active
-    online=active connected=active healthy=active success=done open=active working=active
-    busy=active processing=active in-progress=active in_progress=active thinking=active executing=active
-    responding=waiting awaiting-input=waiting awaiting_input=waiting needs-input=waiting needs_input=waiting paused=idle
-    pause=idle sleeping=idle wait=waiting pending=waiting queued=waiting queue=waiting
-    blocked=blocked block=blocked stalled=blocked stuck=blocked warn=warning warning=warning
-    degraded=warning error=failed errors=failed fail=failed failure=failed crashed=failed
-    crash=failed panic=failed closed=closed complete=done completed=done done=done
-    stopped=closed exited=closed terminated=closed
-    """.split()
+CANONICAL_STATUSES = frozenset(
+    {
+        "unknown",
+        "active",
+        "idle",
+        "waiting",
+        "blocked",
+        "warning",
+        "done",
+        "failed",
+        "closed",
+    }
 )
 
-_SEVERITY_ALIASES = dict(
-    item.split("=", 1) for item in """
-    =info warn=warning warning=warning critical=critical error=critical failed=critical
-    failure=critical info=info notice=info debug=info
-    """.split()
-)
+_STATUS_ALIASES = {
+    "": "unknown",
+    "ok": "active",
+    "okay": "active",
+    "ready": "active",
+    "running": "active",
+    "run": "active",
+    "online": "active",
+    "connected": "active",
+    "healthy": "active",
+    "success": "done",
+    "open": "active",
+    "working": "active",
+    "busy": "active",
+    "processing": "active",
+    "in-progress": "active",
+    "in_progress": "active",
+    "thinking": "active",
+    "executing": "active",
+    "responding": "waiting",
+    "awaiting-input": "waiting",
+    "awaiting_input": "waiting",
+    "needs-input": "waiting",
+    "needs_input": "waiting",
+    "paused": "idle",
+    "pause": "idle",
+    "sleeping": "idle",
+    "wait": "waiting",
+    "pending": "waiting",
+    "queued": "waiting",
+    "queue": "waiting",
+    "blocked": "blocked",
+    "block": "blocked",
+    "stalled": "blocked",
+    "stuck": "blocked",
+    "warn": "warning",
+    "warning": "warning",
+    "degraded": "warning",
+    "error": "failed",
+    "errors": "failed",
+    "fail": "failed",
+    "failure": "failed",
+    "crashed": "failed",
+    "crash": "failed",
+    "panic": "failed",
+    "closed": "closed",
+    "complete": "done",
+    "completed": "done",
+    "done": "done",
+    "stopped": "closed",
+    "exited": "closed",
+    "terminated": "closed",
+}
+
+_SEVERITY_ALIASES = {
+    "": "info",
+    "warn": "warning",
+    "warning": "warning",
+    "critical": "critical",
+    "error": "critical",
+    "failed": "critical",
+    "failure": "critical",
+    "info": "info",
+    "notice": "info",
+    "debug": "info",
+}
 
 FORBIDDEN_FIELD_NAMES = frozenset(
-    """
-    agent_session agent_session_id agent_session_ids agent_sessions ansi_escape api_key api_keys args
-    argv auth auth_token auth_tokens authorization authorization_header authorization_headers backend_target
-    backend_target_id backend_target_ids backend_targets bearer_token bearer_tokens bot_token bot_tokens chat_id
-    chat_ids command command_arg command_args command_argv command_argvs command_line command_lines
-    command_payload command_payloads command_text command_texts connector connector_id connector_ids connectors
-    control_sequence control_sequences cookie cookies credential credentials cwd decision_id
-    decision_ids deliveries delivery delivery_id delivery_ids endpoint endpoints env
-    environment escape_sequence escape_sequences file_path file_paths filepath filepaths headers
-    herdr_state herdres_delivery herdres_state ip ip_address message_id message_ids network_endpoint
-    network_endpoints output pane_id pane_ids password passwords path paths
-    pending_decision_id pending_decision_ids pid pids port private private_binding private_bindings
-    private_fingerprint private_fingerprints process process_id process_ids project_root pty raw_arg
-    raw_args raw_argv raw_argvs raw_command raw_command_line raw_command_lines raw_control raw_controls
-    raw_payload raw_payloads repo_root repository_root route route_id route_ids routes
-    screen screen_session screen_session_id screen_session_ids screen_sessions screen_window screen_window_id screen_window_ids
-    screen_windows secret secrets session session_id session_ids sessions shell
-    shell_command shell_commands socket_path socket_paths stderr stdin stdout tab_id
-    tab_ids target_kind target_value telegram telegram_chat_id telegram_chat_ids telegram_id telegram_ids
-    telegram_message_id telegram_message_ids telegram_thread_id telegram_thread_ids telegram_topic_id telegram_topic_ids terminal terminal_control
-    terminal_controls terminal_id terminal_ids terminals thread_id thread_ids tmux tmux_pane
-    tmux_pane_id tmux_pane_ids tmux_panes tmux_session tmux_session_id tmux_session_ids tmux_sessions tmux_window
-    tmux_window_id tmux_window_ids tmux_windows token tokens tool_call_id tool_call_ids tool_id
-    tool_ids tool_use_id tool_use_ids topic_id topic_ids tty turn_target_kind turn_target_value
-    url urls window_id window_ids workdir working_dir working_directory
-    """.split()
+    {
+        "agent_session",
+        "agent_session_id",
+        "agent_session_ids",
+        "agent_sessions",
+        "ansi_escape",
+        "api_key",
+        "api_keys",
+        "args",
+        "argv",
+        "auth",
+        "auth_token",
+        "auth_tokens",
+        "authorization",
+        "authorization_header",
+        "authorization_headers",
+        "backend_target",
+        "backend_target_id",
+        "backend_target_ids",
+        "backend_targets",
+        "bearer_token",
+        "bearer_tokens",
+        "bot_token",
+        "bot_tokens",
+        "chat_id",
+        "chat_ids",
+        "command",
+        "command_arg",
+        "command_args",
+        "command_argv",
+        "command_argvs",
+        "command_line",
+        "command_lines",
+        "command_payload",
+        "command_payloads",
+        "command_text",
+        "command_texts",
+        "connector",
+        "connector_id",
+        "connector_ids",
+        "connectors",
+        "control_sequence",
+        "control_sequences",
+        "cookie",
+        "cookies",
+        "credential",
+        "credentials",
+        "cwd",
+        "decision_id",
+        "decision_ids",
+        "deliveries",
+        "delivery",
+        "delivery_id",
+        "delivery_ids",
+        "endpoint",
+        "endpoints",
+        "env",
+        "environment",
+        "escape_sequence",
+        "escape_sequences",
+        "file_path",
+        "file_paths",
+        "filepath",
+        "filepaths",
+        "headers",
+        "herdr_state",
+        "herdres_delivery",
+        "herdres_state",
+        "ip",
+        "ip_address",
+        "message_id",
+        "message_ids",
+        "network_endpoint",
+        "network_endpoints",
+        "output",
+        "pane_id",
+        "pane_ids",
+        "password",
+        "passwords",
+        "path",
+        "paths",
+        "pending_decision_id",
+        "pending_decision_ids",
+        "pid",
+        "pids",
+        "port",
+        "private",
+        "private_binding",
+        "private_bindings",
+        "private_fingerprint",
+        "private_fingerprints",
+        "process",
+        "process_id",
+        "process_ids",
+        "project_root",
+        "pty",
+        "raw_arg",
+        "raw_args",
+        "raw_argv",
+        "raw_argvs",
+        "raw_command",
+        "raw_command_line",
+        "raw_command_lines",
+        "raw_control",
+        "raw_controls",
+        "raw_payload",
+        "raw_payloads",
+        "repo_root",
+        "repository_root",
+        "route",
+        "route_id",
+        "route_ids",
+        "routes",
+        "screen",
+        "screen_session",
+        "screen_session_id",
+        "screen_session_ids",
+        "screen_sessions",
+        "screen_window",
+        "screen_window_id",
+        "screen_window_ids",
+        "screen_windows",
+        "secret",
+        "secrets",
+        "session",
+        "session_id",
+        "session_ids",
+        "sessions",
+        "shell",
+        "shell_command",
+        "shell_commands",
+        "socket_path",
+        "socket_paths",
+        "stderr",
+        "stdin",
+        "stdout",
+        "tab_id",
+        "tab_ids",
+        "target_kind",
+        "target_value",
+        "telegram",
+        "telegram_chat_id",
+        "telegram_chat_ids",
+        "telegram_id",
+        "telegram_ids",
+        "telegram_message_id",
+        "telegram_message_ids",
+        "telegram_thread_id",
+        "telegram_thread_ids",
+        "telegram_topic_id",
+        "telegram_topic_ids",
+        "terminal",
+        "terminal_control",
+        "terminal_controls",
+        "terminal_id",
+        "terminal_ids",
+        "terminals",
+        "thread_id",
+        "thread_ids",
+        "tmux",
+        "tmux_pane",
+        "tmux_pane_id",
+        "tmux_pane_ids",
+        "tmux_panes",
+        "tmux_session",
+        "tmux_session_id",
+        "tmux_session_ids",
+        "tmux_sessions",
+        "tmux_window",
+        "tmux_window_id",
+        "tmux_window_ids",
+        "tmux_windows",
+        "token",
+        "tokens",
+        "tool_call_id",
+        "tool_call_ids",
+        "tool_id",
+        "tool_ids",
+        "tool_use_id",
+        "tool_use_ids",
+        "topic_id",
+        "topic_ids",
+        "tty",
+        "turn_target_kind",
+        "turn_target_value",
+        "url",
+        "urls",
+        "window_id",
+        "window_ids",
+        "workdir",
+        "working_dir",
+        "working_directory",
+    }
 )
 _FORBIDDEN_FIELD_COMPACT = frozenset(name.replace("_", "") for name in FORBIDDEN_FIELD_NAMES)
 _FORBIDDEN_BACKEND_NAME_TEXT = frozenset(
@@ -71,10 +296,18 @@ _FORBIDDEN_BACKEND_NAME_TEXT = frozenset(
     """.split()
 )
 _PUBLIC_TEXT_ALLOWED_FIELD_WORDS = frozenset(
-    """
-    connector connectors deliveries delivery herdr herdres outbox telegram
-    terminal terminals
-    """.split()
+    {
+        "connector",
+        "connectors",
+        "deliveries",
+        "delivery",
+        "herdr",
+        "herdres",
+        "outbox",
+        "telegram",
+        "terminal",
+        "terminals",
+    }
 )
 _PUBLIC_TEXT_ALLOWED_FIELD_WORDS_COMPACT = frozenset(
     word.replace("_", "") for word in _PUBLIC_TEXT_ALLOWED_FIELD_WORDS
@@ -207,12 +440,36 @@ _PUBLIC_SENSITIVE_CROSSING_RE = re.compile(
     r")\Z"
 )
 _PUBLIC_ALLOWED_MAPPING_KEYS = frozenset(
-    """
-    action_id active_tab_id attention_id choice_id content_fingerprint delivery_state fingerprint host_id
-    id max_outbox_attempts origin_command_id outbox_ack_ttl_seconds outbox_claim_ttl_seconds outbox_max_claim_ttl_seconds output_excerpt_chars raw_status
-    request_id route_generation row_id segment_id source_turn_id space_id submission_id submission_verdict
-    transport_state turn_id worker_fingerprint worker_id
-    """.split()
+    {
+        "action_id",
+        "active_tab_id",
+        "attention_id",
+        "choice_id",
+        "content_fingerprint",
+        "delivery_state",
+        "fingerprint",
+        "host_id",
+        "id",
+        "max_outbox_attempts",
+        "origin_command_id",
+        "outbox_ack_ttl_seconds",
+        "outbox_claim_ttl_seconds",
+        "outbox_max_claim_ttl_seconds",
+        "output_excerpt_chars",
+        "raw_status",
+        "request_id",
+        "route_generation",
+        "row_id",
+        "segment_id",
+        "source_turn_id",
+        "space_id",
+        "submission_id",
+        "submission_verdict",
+        "transport_state",
+        "turn_id",
+        "worker_fingerprint",
+        "worker_id",
+    }
 )
 _PUBLIC_STRUCTURAL_MAPPING_KEY_SUFFIXES = (
     "_id",
@@ -222,17 +479,39 @@ _PUBLIC_STRUCTURAL_MAPPING_KEY_SUFFIXES = (
 )
 _PUBLIC_VALUE_TEXT_MAX_CHARS = 12000
 _PUBLIC_SUBMISSION_VERDICTS = frozenset(
-    """
-    agent_input_pending agent_not_ready agent_prompt_not_received agent_prompt_stalled agent_prompt_unsubmitted agent_target_ambiguous steering_failed submitted
-    unknown written_to_pty
-    """.split()
+    {
+        "agent_input_pending",
+        "agent_not_ready",
+        "agent_prompt_not_received",
+        "agent_prompt_stalled",
+        "agent_prompt_unsubmitted",
+        "agent_target_ambiguous",
+        "steering_failed",
+        "submitted",
+        "unknown",
+        "written_to_pty",
+    }
 )
 _PUBLIC_FREE_TEXT_KEYS = frozenset(
-    """
-    assistant_final_text assistant_stream_text description detail fields label message name
-    prompt question raw_status reason request_id status_line summary title
-    user_text
-    """.split()
+    {
+        "assistant_final_text",
+        "assistant_stream_text",
+        "description",
+        "detail",
+        "fields",
+        "label",
+        "message",
+        "name",
+        "prompt",
+        "question",
+        "raw_status",
+        "reason",
+        "request_id",
+        "status_line",
+        "summary",
+        "title",
+        "user_text",
+    }
 )
 _PUBLIC_OPAQUE_ID_RE = re.compile(
     r"^(?:attn|choice|pending|space|turn|turnsrc|worker)-[0-9a-f]{24}$"
@@ -325,10 +604,21 @@ _SNAPSHOT_CONTENT_IGNORED_KEYS = frozenset({"updated_at", "observed_at", "conten
 
 BACKEND_HEALTH_STATUSES = frozenset("degraded healthy unavailable unknown".split())
 BACKEND_HEALTH_OUTCOMES = frozenset(
-    """
-    continuity_unavailable deadline_exhausted empty_healthy healthy_non_empty launch_error malformed_json missing_binary nonzero
-    protocol_error socket_disconnected timeout unknown worker_cap_exceeded
-    """.split()
+    {
+        "continuity_unavailable",
+        "deadline_exhausted",
+        "empty_healthy",
+        "healthy_non_empty",
+        "launch_error",
+        "malformed_json",
+        "missing_binary",
+        "nonzero",
+        "protocol_error",
+        "socket_disconnected",
+        "timeout",
+        "unknown",
+        "worker_cap_exceeded",
+    }
 )
 BACKEND_HEALTH_COUNT_KEYS = frozenset("spaces workers".split())
 

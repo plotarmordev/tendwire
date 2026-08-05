@@ -110,10 +110,26 @@ _CONNECTOR_PRIVATE_KEYS = frozenset(
 )
 _CONNECTOR_COMMON = frozenset({"schema_version", "ok", "status", "host_id", "name"})
 _CONNECTOR_ERROR_STATUSES = frozenset(
-    "invalid_params invalid_payload invalid_ref stale_ref store_unavailable unknown_method "
-    "revision_not_found stale_revision content_unavailable plan_not_found plan_conflict "
-    "part_conflict plan_incomplete plan_not_failed not_recoverable request_conflict "
-    "ack_deadline_expired not_retryable".split()
+    {
+        "invalid_params",
+        "invalid_payload",
+        "invalid_ref",
+        "stale_ref",
+        "store_unavailable",
+        "unknown_method",
+        "revision_not_found",
+        "stale_revision",
+        "content_unavailable",
+        "plan_not_found",
+        "plan_conflict",
+        "part_conflict",
+        "plan_incomplete",
+        "plan_not_failed",
+        "not_recoverable",
+        "request_conflict",
+        "ack_deadline_expired",
+        "not_retryable",
+    }
 )
 _CONNECTOR_RESULT_SPECS = {
     method: (frozenset(statuses.split()), tuple(frozenset(fields.split()) for fields in shapes))
@@ -229,9 +245,41 @@ def _valid_ref_fields(value: Mapping[str, Any], *, dates_required: bool = False)
     )
 
 
-_INSPECT_FIELDS = frozenset("kind key final_identity failed_plan_token decision_ref target_key reason attempt_count prior_attempt_count created_at terminal_at retryable recoverable".split())
+_INSPECT_FIELDS = frozenset(
+    {
+        "kind",
+        "key",
+        "final_identity",
+        "failed_plan_token",
+        "decision_ref",
+        "target_key",
+        "reason",
+        "attempt_count",
+        "prior_attempt_count",
+        "created_at",
+        "terminal_at",
+        "retryable",
+        "recoverable",
+    }
+)
 _INSPECT_KINDS = frozenset("working final_ready final_part decision retire".split())
-_INSPECT_REASONS = frozenset("temporary rate_limited provider_rejected provider_uncertain invalid_payload content_unavailable route_unavailable provider_binding_unknown lease_expired ack_deadline_expired superseded attempts_exhausted operator_recovery".split())
+_INSPECT_REASONS = frozenset(
+    {
+        "temporary",
+        "rate_limited",
+        "provider_rejected",
+        "provider_uncertain",
+        "invalid_payload",
+        "content_unavailable",
+        "route_unavailable",
+        "provider_binding_unknown",
+        "lease_expired",
+        "ack_deadline_expired",
+        "superseded",
+        "attempts_exhausted",
+        "operator_recovery",
+    }
+)
 
 
 def _valid_inspect_item(value: Any) -> bool:
@@ -380,12 +428,77 @@ def _validated_connector_result(
 
 
 _REQUEST_ID_FORBIDDEN_SEGMENTS = frozenset(
-    "telegram chat chats topic topics message messages thread threads token tokens auth "
-    "authorization bearer cookie cookies credential credentials delivery deliveries route "
-    "routes connector connectors herdres backend target targets terminal terminals pane panes "
-    "tab tabs window windows tty pty pid pids process processes tmux screen agent_session session "
-    "sessions private argv args env raw payload payloads control controls escape escapes stdin "
-    "stderr stdout shell secret secrets password passwords api_key api_keys apikey".split()
+    {
+        "telegram",
+        "chat",
+        "chats",
+        "topic",
+        "topics",
+        "message",
+        "messages",
+        "thread",
+        "threads",
+        "token",
+        "tokens",
+        "auth",
+        "authorization",
+        "bearer",
+        "cookie",
+        "cookies",
+        "credential",
+        "credentials",
+        "delivery",
+        "deliveries",
+        "route",
+        "routes",
+        "connector",
+        "connectors",
+        "herdres",
+        "backend",
+        "target",
+        "targets",
+        "terminal",
+        "terminals",
+        "pane",
+        "panes",
+        "tab",
+        "tabs",
+        "window",
+        "windows",
+        "tty",
+        "pty",
+        "pid",
+        "pids",
+        "process",
+        "processes",
+        "tmux",
+        "screen",
+        "agent_session",
+        "session",
+        "sessions",
+        "private",
+        "argv",
+        "args",
+        "env",
+        "raw",
+        "payload",
+        "payloads",
+        "control",
+        "controls",
+        "escape",
+        "escapes",
+        "stdin",
+        "stderr",
+        "stdout",
+        "shell",
+        "secret",
+        "secrets",
+        "password",
+        "passwords",
+        "api_key",
+        "api_keys",
+        "apikey",
+    }
 )
 _REQUEST_ID_FORBIDDEN_COMPACT = frozenset(
     segment.replace("_", "") for segment in _REQUEST_ID_FORBIDDEN_SEGMENTS

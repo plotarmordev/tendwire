@@ -11,7 +11,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping
 
-from ..core.models import Snapshot, Worker, WorkerBinding, separate_duplicate_worker_bindings
+from ..core.models import (
+    Snapshot,
+    Worker,
+    WorkerBinding,
+    separate_duplicate_worker_bindings,
+)
 from ..worker_identity import is_stable_worker_key
 from .db import canonical_utc, read_transaction, utc_now, write_transaction
 from .schema import init_store
@@ -28,27 +33,43 @@ class SnapshotObservationContext:
 
 
 def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def _binding_dict(binding: WorkerBinding) -> dict[str, Any]:
     return {
-        "host_id": binding.host_id, "worker_id": binding.worker_id,
-        "worker_fingerprint": binding.worker_fingerprint, "backend": binding.backend,
-        "target_kind": binding.target_kind, "target_value": binding.target_value,
-        "turn_target_kind": binding.turn_target_kind, "turn_target_value": binding.turn_target_value,
-        "sendable": binding.sendable, "reason": binding.reason,
-        "observed_at": binding.observed_at, "expires_at": binding.expires_at,
+        "host_id": binding.host_id,
+        "worker_id": binding.worker_id,
+        "worker_fingerprint": binding.worker_fingerprint,
+        "backend": binding.backend,
+        "target_kind": binding.target_kind,
+        "target_value": binding.target_value,
+        "turn_target_kind": binding.turn_target_kind,
+        "turn_target_value": binding.turn_target_value,
+        "sendable": binding.sendable,
+        "reason": binding.reason,
+        "observed_at": binding.observed_at,
+        "expires_at": binding.expires_at,
         "private_fingerprint": binding.private_fingerprint,
     }
 
 
 def _partition(host_id: str, stable_key: str, generation: str) -> str:
-    material = _json({
-        "domain": "tendwire.turn-final.partition.v1", "host_id": host_id,
-        "route_generation": generation, "stable_key": stable_key,
-        "stable_key_version": 1,
-    })
+    material = _json(
+        {
+            "domain": "tendwire.turn-final.partition.v1",
+            "host_id": host_id,
+            "route_generation": generation,
+            "stable_key": stable_key,
+            "stable_key_version": 1,
+        }
+    )
     return "twpart1_" + hashlib.sha256(material.encode()).hexdigest()
 
 
@@ -153,8 +174,19 @@ def _upsert_binding(conn: Any, binding: WorkerBinding, stable_key: str) -> tuple
         route_retain_until=excluded.route_retain_until,observed_at=excluded.observed_at,
         expires_at=excluded.expires_at
         WHERE excluded.observed_at>=worker_bindings.observed_at""",
-        (binding.host_id, binding.worker_id, binding.backend, binding.private_fingerprint,
-         _json(_binding_dict(binding)), stable_key, generation, partition, retain, observed_at, expires_at),
+        (
+            binding.host_id,
+            binding.worker_id,
+            binding.backend,
+            binding.private_fingerprint,
+            _json(_binding_dict(binding)),
+            stable_key,
+            generation,
+            partition,
+            retain,
+            observed_at,
+            expires_at,
+        ),
     )
     return generation, partition
 
@@ -195,13 +227,19 @@ def _enrich(snapshot: Snapshot, bindings: tuple[WorkerBinding, ...], conn: Any) 
         )
         workers.append(enriched_worker)
     return Snapshot(
-        host_id=snapshot.host_id, updated_at=snapshot.updated_at, spaces=snapshot.spaces,
-        workers=workers, attention=snapshot.attention, backend_health=snapshot.backend_health,
+        host_id=snapshot.host_id,
+        updated_at=snapshot.updated_at,
+        spaces=snapshot.spaces,
+        workers=workers,
+        attention=snapshot.attention,
+        backend_health=snapshot.backend_health,
     )
 
 
 def save_snapshot(
-    db_path: Path, snapshot: Snapshot, *,
+    db_path: Path,
+    snapshot: Snapshot,
+    *,
     observation: SnapshotObservationContext | None = None,
     worker_bindings: Iterable[WorkerBinding] | None = None,
     binding_backend: str | None = None,
@@ -209,7 +247,13 @@ def save_snapshot(
     binding_workers_present: bool = True,
 ) -> Snapshot:
     bindings = tuple(separate_duplicate_worker_bindings(worker_bindings or ()))
-    if bindings and (not binding_backend or any(b.host_id != snapshot.host_id or b.backend != binding_backend for b in bindings)):
+    if bindings and (
+        not binding_backend
+        or any(
+            b.host_id != snapshot.host_id or b.backend != binding_backend
+            for b in bindings
+        )
+    ):
         raise ValueError("snapshot binding scope mismatch")
     if not db_path.exists():
         init_store(db_path)
@@ -247,7 +291,9 @@ def save_snapshot(
                         or worker.meta.get("stable_key_version") != 1
                         or not isinstance(stable_key, str)
                     ):
-                        raise ValueError("replayed binding does not match current worker authority")
+                        raise ValueError(
+                            "replayed binding does not match current worker authority"
+                        )
                     _upsert_binding(
                         conn,
                         replace(binding, worker_fingerprint=worker.fingerprint),
@@ -257,23 +303,34 @@ def save_snapshot(
         enriched = _enrich(snapshot, bindings, conn)
         payload = enriched.to_dict()
         conn.execute(
-            """INSERT INTO snapshots(host_id,observed_at,authority_fingerprint,content_fingerprint,payload_json)
+            """INSERT INTO snapshots(
+            host_id,observed_at,authority_fingerprint,content_fingerprint,payload_json)
             VALUES(?,?,?,?,?) ON CONFLICT(host_id,content_fingerprint) DO UPDATE SET
-            observed_at=excluded.observed_at,authority_fingerprint=excluded.authority_fingerprint,
+            observed_at=excluded.observed_at,
+            authority_fingerprint=excluded.authority_fingerprint,
             payload_json=excluded.payload_json""",
-            (enriched.host_id, observed_at, authority_fingerprint,
-             enriched.content_fingerprint, _json(payload)),
+            (
+                enriched.host_id,
+                observed_at,
+                authority_fingerprint,
+                enriched.content_fingerprint,
+                _json(payload),
+            ),
         )
         conn.execute("DELETE FROM attention_items WHERE host_id=?", (enriched.host_id,))
         for item in payload.get("attention", []):
             conn.execute(
-                "INSERT INTO attention_items(host_id,attention_id,payload_json,state,observed_at) VALUES(?,?,?,?,?)",
+                """INSERT INTO attention_items(
+                host_id,attention_id,payload_json,state,observed_at)
+                VALUES(?,?,?,?,?)""",
                 (enriched.host_id, str(item.get("id")), _json(item), "open", observed_at),
             )
         for health in enriched.backend_health:
             conn.execute(
-                """INSERT INTO backend_health(host_id,backend,payload_json,observed_at) VALUES(?,?,?,?)
-                ON CONFLICT(host_id,backend) DO UPDATE SET payload_json=excluded.payload_json,observed_at=excluded.observed_at""",
+                """INSERT INTO backend_health(
+                host_id,backend,payload_json,observed_at) VALUES(?,?,?,?)
+                ON CONFLICT(host_id,backend) DO UPDATE SET
+                payload_json=excluded.payload_json,observed_at=excluded.observed_at""",
                 (enriched.host_id, health.name, _json(health.to_dict()), observed_at),
             )
         if binding_observation_authoritative and (bindings or not binding_workers_present):
@@ -305,21 +362,44 @@ def latest_snapshot(db_path: Path, host_id: str | None = None) -> Snapshot | Non
     try:
         with read_transaction(db_path) as conn:
             if host_id is None:
-                row = conn.execute("SELECT payload_json FROM snapshots ORDER BY observed_at DESC,authority_fingerprint DESC LIMIT 1").fetchone()
+                row = conn.execute(
+                    """SELECT payload_json FROM snapshots
+                    ORDER BY observed_at DESC,authority_fingerprint DESC LIMIT 1"""
+                ).fetchone()
             else:
-                row = conn.execute("SELECT payload_json FROM snapshots WHERE host_id=? ORDER BY observed_at DESC,authority_fingerprint DESC LIMIT 1", (host_id,)).fetchone()
+                row = conn.execute(
+                    """SELECT payload_json FROM snapshots WHERE host_id=?
+                    ORDER BY observed_at DESC,authority_fingerprint DESC LIMIT 1""",
+                    (host_id,),
+                ).fetchone()
     except Exception:
         return None
     return None if row is None else Snapshot.from_dict(json.loads(row[0]))
 
 
-def attention_payload_from_store(db_path: Path, host_id: str, *, include_resolved: bool = False) -> dict[str, Any] | None:
+def attention_payload_from_store(
+    db_path: Path,
+    host_id: str,
+    *,
+    include_resolved: bool = False,
+) -> dict[str, Any] | None:
     snapshot = latest_snapshot(db_path, host_id)
     if snapshot is None:
         return None
     with read_transaction(db_path) as conn:
-        rows = conn.execute("SELECT payload_json FROM attention_items WHERE host_id=? AND (? OR state='open') ORDER BY observed_at DESC,attention_id", (host_id, int(include_resolved))).fetchall()
-    return {"schema_version": 1, "host_id": host_id, "updated_at": snapshot.updated_at, "attention": [json.loads(row[0]) for row in rows], "backend_health": [h.to_dict() for h in snapshot.backend_health]}
+        rows = conn.execute(
+            """SELECT payload_json FROM attention_items
+            WHERE host_id=? AND (? OR state='open')
+            ORDER BY observed_at DESC,attention_id""",
+            (host_id, int(include_resolved)),
+        ).fetchall()
+    return {
+        "schema_version": 1,
+        "host_id": host_id,
+        "updated_at": snapshot.updated_at,
+        "attention": [json.loads(row[0]) for row in rows],
+        "backend_health": [h.to_dict() for h in snapshot.backend_health],
+    }
 
 
 def upsert_worker_bindings(db_path: Path, bindings: Iterable[WorkerBinding]) -> int:
@@ -363,15 +443,27 @@ def _binding(row: Any) -> WorkerBinding:
     return replace(binding, worker_id=str(row["worker_id"]))
 
 
-def list_worker_bindings(db_path: Path, host_id: str, *, backend: str | None = None, include_expired: bool = False, now: str | None = None) -> list[WorkerBinding]:
+def list_worker_bindings(
+    db_path: Path,
+    host_id: str,
+    *,
+    backend: str | None = None,
+    include_expired: bool = False,
+    now: str | None = None,
+) -> list[WorkerBinding]:
     clauses, values = ["host_id=?"], [host_id]
     if backend is not None:
-        clauses.append("backend=?"); values.append(backend)
+        clauses.append("backend=?")
+        values.append(backend)
     if not include_expired:
         clauses.append("(expires_at IS NULL OR expires_at>?)")
         values.append(canonical_utc(now) if now else utc_now())
     with read_transaction(db_path) as conn:
-        rows = conn.execute(f"SELECT * FROM worker_bindings WHERE {' AND '.join(clauses)} ORDER BY worker_id", values).fetchall()
+        rows = conn.execute(
+            f"""SELECT * FROM worker_bindings
+            WHERE {' AND '.join(clauses)} ORDER BY worker_id""",
+            values,
+        ).fetchall()
     return [_binding(row) for row in rows]
 
 
@@ -458,10 +550,31 @@ def expire_worker_bindings(
 def backend_pending_health(db_path: Path, host_id: str) -> dict[str, Any]:
     try:
         with read_transaction(db_path) as conn:
-            total = int(conn.execute("SELECT COUNT(*) FROM backend_pending WHERE host_id=? AND state='open'", (host_id,)).fetchone()[0])
+            total = int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM backend_pending
+                    WHERE host_id=? AND state='open'""",
+                    (host_id,),
+                ).fetchone()[0]
+            )
     except Exception:
-        return {"status": "store_unavailable", "counts": {"fresh": 0, "stale": 0, "total": 0}}
-    return {"status": "healthy", "counts": {"fresh": total, "stale": 0, "total": total}}
+        return {
+            "status": "store_unavailable",
+            "counts": {"fresh": 0, "stale": 0, "total": 0},
+        }
+    return {
+        "status": "healthy",
+        "counts": {"fresh": total, "stale": 0, "total": total},
+    }
 
 
-__all__ = ("SnapshotObservationContext", "save_snapshot", "latest_snapshot", "attention_payload_from_store", "upsert_worker_bindings", "list_worker_bindings", "expire_worker_bindings", "backend_pending_health")
+__all__ = (
+    "SnapshotObservationContext",
+    "save_snapshot",
+    "latest_snapshot",
+    "attention_payload_from_store",
+    "upsert_worker_bindings",
+    "list_worker_bindings",
+    "expire_worker_bindings",
+    "backend_pending_health",
+)

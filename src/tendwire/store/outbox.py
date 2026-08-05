@@ -20,9 +20,21 @@ from .db import add_seconds, canonical_utc, read_transaction, utc_now, write_tra
 TURN_FINAL_CONNECTOR = "turn-final"
 
 _PRIVATE_REASONS = frozenset(
-    "temporary rate_limited provider_rejected provider_uncertain invalid_payload "
-    "content_unavailable route_unavailable provider_binding_unknown lease_expired "
-    "ack_deadline_expired superseded attempts_exhausted operator_recovery".split()
+    {
+        "temporary",
+        "rate_limited",
+        "provider_rejected",
+        "provider_uncertain",
+        "invalid_payload",
+        "content_unavailable",
+        "route_unavailable",
+        "provider_binding_unknown",
+        "lease_expired",
+        "ack_deadline_expired",
+        "superseded",
+        "attempts_exhausted",
+        "operator_recovery",
+    }
 )
 _REF_RE = re.compile(r"^twref1\.[A-Za-z0-9_-]{43}$")
 _PLAN_RE = re.compile(r"^twplan1\.[A-Za-z0-9_-]{1,256}$")
@@ -209,12 +221,26 @@ def _payload_row_correlates(row: Any, payload: Mapping[str, Any]) -> bool:
 
 
 def _validate_generic(row: Any, payload: Mapping[str, Any]) -> bool:
-    correlation_fields = (
-        "partition_key partition_sequence turn_id final_identity decision_ref content_revision "
-        "presentation_version plan_token plan_generation logical_sequence logical_ordinal "
-        "predecessor_outbox_id replaces_outbox_id target_outbox_id source_outbox_id "
-        "active_lineage_generation recovery_request_digest recovered_from_plan_token"
-    ).split()
+    correlation_fields = [
+        "partition_key",
+        "partition_sequence",
+        "turn_id",
+        "final_identity",
+        "decision_ref",
+        "content_revision",
+        "presentation_version",
+        "plan_token",
+        "plan_generation",
+        "logical_sequence",
+        "logical_ordinal",
+        "predecessor_outbox_id",
+        "replaces_outbox_id",
+        "target_outbox_id",
+        "source_outbox_id",
+        "active_lineage_generation",
+        "recovery_request_digest",
+        "recovered_from_plan_token",
+    ]
     return bool(
         row["connector"] != TURN_FINAL_CONNECTOR
         and row["kind"] == "generic"
@@ -1859,9 +1885,20 @@ def reason_for_retry_requires_warning(db_path: Path | str, outbox_id: int) -> bo
 
 
 __all__ = tuple(
-    "ack_connector_delivery connector_reclaim_due defer_connector_delivery "
-    "fail_connector_delivery inspect_connector_outbox poll_connector_outbox "
-    "prepare_connector_plan_begin prepare_connector_plan_commit prepare_connector_plan_part "
-    "prepare_connector_plan_recover reclaim_expired_connector_leases release_connector_delivery "
-    "renew_connector_delivery retry_connector_dead_letter".split()
+    (
+        "ack_connector_delivery",
+        "connector_reclaim_due",
+        "defer_connector_delivery",
+        "fail_connector_delivery",
+        "inspect_connector_outbox",
+        "poll_connector_outbox",
+        "prepare_connector_plan_begin",
+        "prepare_connector_plan_commit",
+        "prepare_connector_plan_part",
+        "prepare_connector_plan_recover",
+        "reclaim_expired_connector_leases",
+        "release_connector_delivery",
+        "renew_connector_delivery",
+        "retry_connector_dead_letter",
+    )
 )

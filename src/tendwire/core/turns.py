@@ -55,8 +55,18 @@ PENDING_KINDS = frozenset("approval question choice review confirm_destructive_a
 PENDING_STATUSES = frozenset({"open", "answered", "cancelled", "expired", "unknown"})
 
 _VOLATILE_KEYS = frozenset(
-    "updated_at observed_at created_at started_at completed_at expires_at "
-    "last_seen_at timestamp fingerprint content_fingerprint".split()
+    {
+        "updated_at",
+        "observed_at",
+        "created_at",
+        "started_at",
+        "completed_at",
+        "expires_at",
+        "last_seen_at",
+        "timestamp",
+        "fingerprint",
+        "content_fingerprint",
+    }
 )
 def _normalize_pending_kind(kind: Any) -> str:
     raw = _string_value(kind, "unknown").strip().lower()

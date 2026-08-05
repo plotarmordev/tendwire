@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import ast
+import io
 import os
+import re
 import sqlite3
+import tokenize
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
@@ -43,9 +47,210 @@ EXPECTED_TABLES = {
     "connector_deliveries",
 }
 
+_SQL_VERB = re.compile(r"\b(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER)\b", re.I)
+_SQL_DENSITY_WORD = re.compile(
+    r"\b(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|FROM|WHERE|JOIN|ON|AND|OR|"
+    r"SET|VALUES|INTO|CONFLICT|FOREIGN|KEY|PRIMARY|REFERENCES|RETURNING|ORDER|"
+    r"GROUP|LIMIT|CHECK|NOT|NULL)\b",
+    re.I,
+)
+_COMPOUND_STATEMENTS = (
+    ast.If,
+    ast.For,
+    ast.AsyncFor,
+    ast.While,
+    ast.With,
+    ast.AsyncWith,
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+)
+
 
 def _python_files() -> list[Path]:
     return sorted(path for root in SCAN_ROOTS for path in root.rglob("*.py"))
+
+
+def _assignment_name(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str:
+    current = node
+    while current in parents:
+        current = parents[current]
+        if isinstance(current, (ast.Assign, ast.AnnAssign)):
+            targets = (
+                current.targets if isinstance(current, ast.Assign) else [current.target]
+            )
+            names = [target.id for target in targets if isinstance(target, ast.Name)]
+            if len(names) == 1:
+                return names[0]
+    return "<unowned>"
+
+
+def _protocol_ellipsis_lines(tree: ast.AST) -> set[int]:
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef) or not any(
+            isinstance(base, ast.Name) and base.id == "Protocol" for base in node.bases
+        ):
+            continue
+        for member in node.body:
+            if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if (
+                len(member.body) == 1
+                and isinstance(member.body[0], ast.Expr)
+                and isinstance(member.body[0].value, ast.Constant)
+                and member.body[0].value.value is Ellipsis
+                and member.body[0].lineno == member.lineno
+            ):
+                lines.add(member.lineno)
+    return lines
+
+
+def _structural_length(line: str) -> int:
+    parts: list[str] = []
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(line).readline)
+        for token in tokens:
+            if token.type == tokenize.STRING:
+                parts.append("S")
+            elif token.type not in {
+                tokenize.ENDMARKER,
+                tokenize.NEWLINE,
+                tokenize.NL,
+                tokenize.INDENT,
+                tokenize.DEDENT,
+                tokenize.COMMENT,
+            }:
+                parts.append(token.string)
+    except (IndentationError, tokenize.TokenError):
+        return len(line.strip())
+    return len("".join(parts))
+
+
+def _statement_complexity(node: ast.stmt) -> int:
+    dense_nodes = (
+        ast.Call,
+        ast.Dict,
+        ast.List,
+        ast.Tuple,
+        ast.Set,
+        ast.comprehension,
+        ast.keyword,
+        ast.BinOp,
+        ast.BoolOp,
+        ast.Compare,
+        ast.IfExp,
+    )
+    return sum(isinstance(child, dense_nodes) for child in ast.walk(node))
+
+
+def _packing_findings(path: Path) -> set[tuple[str, str, str]]:
+    relative = str(path.relative_to(ROOT / "src"))
+    source = path.read_text(encoding="utf-8")
+    lines = source.splitlines()
+    tree = ast.parse(source, filename=str(path))
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    allowed_stub_lines = _protocol_ellipsis_lines(tree)
+    findings: set[tuple[str, str, str]] = set()
+
+    statements: dict[int, list[ast.stmt]] = defaultdict(list)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.stmt) and node.lineno not in allowed_stub_lines:
+            statements[node.lineno].append(node)
+    for line_number, nodes in statements.items():
+        if len(nodes) > 1:
+            findings.add((relative, "multiple_statements", str(line_number)))
+
+    for node in ast.walk(tree):
+        if not isinstance(node, _COMPOUND_STATEMENTS):
+            continue
+        if node.lineno in allowed_stub_lines:
+            continue
+        bodies = [node.body]
+        if isinstance(node, ast.If):
+            bodies.append(node.orelse)
+        if any(body and body[0].lineno == node.lineno for body in bodies):
+            findings.add((relative, "one_line_suite", str(node.lineno)))
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.stmt) or node.end_lineno != node.lineno:
+            continue
+        raw = lines[node.lineno - 1]
+        if (
+            len(raw) > 180
+            and _structural_length(raw) > 120
+            and _statement_complexity(node) >= 6
+        ):
+            findings.add((relative, "dense_statement", str(node.lineno)))
+        value = getattr(node, "value", None)
+        density = 0
+        category = ""
+        if isinstance(value, ast.Dict):
+            density = sum(
+                key is not None and key.lineno == node.lineno for key in value.keys
+            )
+            category = "mapping_density"
+            threshold = 5
+        elif isinstance(value, ast.Call):
+            density = sum(
+                item.lineno == node.lineno for item in (*value.args, *value.keywords)
+            )
+            category = "call_density"
+            threshold = 6
+        elif isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+            density = sum(item.lineno == node.lineno for item in value.elts)
+            category = "sequence_density"
+            threshold = 8
+        else:
+            threshold = 0
+        if category and density >= threshold and len(raw) > 120:
+            findings.add((relative, category, str(node.lineno)))
+
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "split"
+            and isinstance(node.func.value, ast.Constant)
+            and isinstance(node.func.value.value, str)
+            and len(node.func.value.value.split()) >= 8
+        ):
+            continue
+        findings.add(
+            (
+                relative,
+                "vocabulary_literal",
+                _assignment_name(node, parents),
+            )
+        )
+
+    tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+    for token in tokens:
+        if token.type != tokenize.STRING or not _SQL_VERB.search(token.string):
+            continue
+        for line_number in range(token.start[0], token.end[0] + 1):
+            raw = lines[line_number - 1]
+            if len(raw) <= 180:
+                continue
+            comma_count = raw.count(",")
+            keyword_count = len(_SQL_DENSITY_WORD.findall(raw))
+            if comma_count >= 6 or keyword_count >= 6:
+                findings.add((relative, "sql_density", str(line_number)))
+    return findings
+
+
+def test_production_source_has_no_physical_packing() -> None:
+    findings = set().union(
+        *(
+            _packing_findings(path)
+            for path in sorted((ROOT / "src" / "tendwire").rglob("*.py"))
+        )
+    )
+    assert findings == set()
 
 
 def test_no_deleted_store_module_import_patch_or_reexport() -> None:
