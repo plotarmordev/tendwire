@@ -9,11 +9,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import tendwire.command_submission as command_submission
-from tendwire.backends.acp_permissions import AcpPermissionBroker
+from tendwire.backends.acp_permissions import (
+    AcpPermissionBroker,
+    AcpPermissionBrokerError,
+)
 from tendwire.backends.acp_protocol import (
     PermissionOption,
     PermissionRequest,
@@ -629,6 +633,18 @@ def test_acp_permission_never_falls_back_to_legacy_socket(tmp_path: Path) -> Non
     thread.join(timeout=2)
 
 
+def test_empty_permission_options_fail_closed_without_public_overlay(
+    tmp_path: Path,
+) -> None:
+    config, worker, session_id, broker = _setup(tmp_path)
+    assert broker(replace(_permission(session_id), options=())) is None
+    assert config.db_path is not None
+    payload = pending_payload_from_store(config.db_path, config.host_id)
+    assert all(
+        row["worker_id"] != worker.id for row in payload["pending_interactions"]
+    )
+
+
 def test_concurrent_answers_write_exactly_one_permission_response(
     tmp_path: Path,
 ) -> None:
@@ -732,6 +748,47 @@ def test_late_permission_frame_completion_retires_uncertain_overlay(
     )
     assert receipt is not None and receipt["state"] == "uncertain"
     broker.close()
+
+
+def test_answer_timeout_before_adapter_consumes_selection_keeps_ordinal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, worker, session_id, broker = _setup(tmp_path)
+    broker.timeout = 0.2
+    selections: list[Any] = []
+    adapter = threading.Thread(
+        target=lambda: selections.append(broker(_permission(session_id)))
+    )
+    adapter.start()
+    pending = _wait_pending(config, worker.id)
+    assert config.db_path is not None
+    binding = list_worker_bindings(
+        config.db_path, config.host_id, backend="acp"
+    )[0]
+
+    # Suppress the answer notification so its 0.1s deadline expires before
+    # the adapter's 0.2s wait. The selected ordinal must remain immutable while
+    # the late adapter consumes it and completes the response frame.
+    monkeypatch.setattr(broker._condition, "notify_all", lambda: None)
+    decision = SimpleNamespace(
+        worker_id=worker.id,
+        worker_fingerprint=worker.fingerprint,
+        binding_private_fingerprint=binding.private_fingerprint,
+        turn_target_value=session_id,
+        decision_ref=pending["meta"]["decision"]["decision_ref"],
+        text=None,
+        option_refs=("1",),
+    )
+    with pytest.raises(AcpPermissionBrokerError, match="response state is uncertain"):
+        broker.answer(decision, timeout=0.01)
+    adapter.join(timeout=1)
+    assert len(selections) == 1 and selections[0] is not None
+    assert selections[0].option_id == "private-allow-id"
+    selections[0].response_written()
+    assert not pending_payload_from_store(config.db_path, config.host_id)[
+        "pending_interactions"
+    ]
 
 
 def test_failed_permission_frame_retires_overlay_without_retry(

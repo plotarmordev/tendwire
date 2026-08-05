@@ -78,6 +78,11 @@ class AcpVisibleConsoleUnavailable(AcpCoordinatorError):
     """A worker cannot accept new prompts while its pane bridge is lost."""
 
 
+def _ensure(valid: bool, message: str) -> None:
+    if not valid:
+        raise AcpCoordinatorError(message)
+
+
 # Herdr's aggregate console queue admission is 768 KiB and its normal control
 # frame is 2 MiB. Keep Tendwire's retained output contribution below 512 KiB
 # so queued pane input and the echoed response retain explicit headroom.
@@ -88,6 +93,20 @@ _CONSOLE_OUTPUT_ITEM_TEXT_BYTES = 128 * 1024
 # sub-second while leaving enough server capacity for delivery and health API
 # traffic. Active prompts continue independently inside their ACP runtimes.
 _CONSOLE_BRIDGE_INTERVAL_SECONDS = 0.5
+_WORKER_IDENTITY_FIELDS = frozenset({
+    "terminal_id", "workspace_id", "tab_id", "pane_id",
+    "name", "agent", "generation",
+})
+_ENDPOINT_FIELDS = frozenset({
+    "type", "endpoint", "console", "worker", "adapter", "session", "cwd", "lifecycle",
+})
+_STATUS_FIELDS = frozenset({
+    "type", "worker", "adapter", "session", "cwd", "lifecycle", "console_lifecycle",
+})
+_CONSOLE_EXCHANGE_FIELDS = frozenset({
+    "type", "inputs", "outputs", "input_floor_sequence", "output_floor_sequence",
+    "next_input_sequence", "next_output_sequence",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,17 +146,6 @@ class _SessionSlot:
     console_bridge_thread: threading.Thread | None = None
 
 
-@dataclass(slots=True)
-class _RuntimeBindingHandle:
-    """Retain a coordinator-created ACP lease until runtime startup settles."""
-
-    binding: WorkerBinding | None = None
-
-    def retain(self, binding: WorkerBinding) -> WorkerBinding:
-        self.binding = binding
-        return binding
-
-
 class _PromptRoute:
     def __init__(
         self,
@@ -166,18 +174,7 @@ class _PromptRoute:
         timeout: float,
         on_send_start: Callable[[], None] | None = None,
     ) -> object:
-        return self._owner._submit_route(
-            self._worker,
-            self._slot,
-            text,
-            producer_turn_id=producer_turn_id,
-            acknowledgement_timeout=timeout,
-            on_send_start=on_send_start,
-            generation_prepared=bool(
-                getattr(self._prepared, "depth", 0)
-            ),
-            steering=False,
-        )
+        return self._submit(text, producer_turn_id, timeout, on_send_start, False)
 
     @property
     def supports_steering(self) -> bool:
@@ -195,6 +192,16 @@ class _PromptRoute:
         timeout: float,
         on_send_start: Callable[[], None] | None = None,
     ) -> object:
+        return self._submit(text, producer_turn_id, timeout, on_send_start, True)
+
+    def _submit(
+        self,
+        text: str,
+        producer_turn_id: str,
+        timeout: float,
+        on_send_start: Callable[[], None] | None,
+        steering: bool,
+    ) -> object:
         return self._owner._submit_route(
             self._worker,
             self._slot,
@@ -203,7 +210,7 @@ class _PromptRoute:
             acknowledgement_timeout=timeout,
             on_send_start=on_send_start,
             generation_prepared=bool(getattr(self._prepared, "depth", 0)),
-            steering=True,
+            steering=steering,
         )
 
     @contextmanager
@@ -455,32 +462,31 @@ class AcpSupervisor:
 
     def owns_permission_decision(self, decision: Any) -> bool:
         """Return whether one pending decision belongs to an exact live slot."""
-        worker_id = str(getattr(decision, "worker_id", "") or "")
-        with self._lock:
-            slot = self._slots.get(worker_id)
-        if slot is None or slot.permission_broker is None:
-            return False
         try:
-            self._require_attached_generation(slot)
-            return slot.permission_broker.owns(decision)
+            self._permission_route(decision)
+            return True
         except Exception:
             return False
 
     def answer_permission_decision(self, decision: Any, *, timeout: float) -> None:
         """Select an offered option and wait for its response-frame write."""
-        worker_id = str(getattr(decision, "worker_id", "") or "")
         with self._reconcile_lock:
             self._require_reconcile_state(allow_starting=False)
-            with self._lock:
-                slot = self._slots.get(worker_id)
-            if slot is None or slot.permission_broker is None:
-                raise AcpCoordinatorError("ACP permission route is unavailable")
-            self._require_attached_generation(slot)
-            if not slot.permission_broker.owns(decision):
-                raise AcpCoordinatorError("ACP permission authority changed")
+            broker = self._permission_route(decision)
             # Keep retirement fenced until respond_permission has acknowledged
             # writing the complete JSON-RPC response frame.
-            slot.permission_broker.answer(decision, timeout=timeout)
+            broker.answer(decision, timeout=timeout)
+
+    def _permission_route(self, decision: Any) -> AcpPermissionBroker:
+        worker_id = str(getattr(decision, "worker_id", "") or "")
+        with self._lock:
+            slot = self._slots.get(worker_id)
+        if slot is None or slot.permission_broker is None:
+            raise AcpCoordinatorError("ACP permission route is unavailable")
+        self._require_attached_generation(slot)
+        if not slot.permission_broker.owns(decision):
+            raise AcpCoordinatorError("ACP permission authority changed")
+        return slot.permission_broker
 
     def _current_slot(self, worker: Worker) -> _SessionSlot:
         with self._lock:
@@ -594,17 +600,8 @@ class AcpSupervisor:
                 try:
                     with self._reconcile_lock:
                         self._require_reconcile_state(allow_starting=False)
-                        self._retire_worker(
-                            worker_id,
-                            expected=slot,
-                        )
-                        current, _ambiguities = self._continuity_bindings()
-                        continuity = current.get(worker_id)
-                        if continuity is None:
-                            raise AcpCoordinatorError(
-                                "worker has no unique Herdr authority"
-                            )
-                        self._reconcile_binding(continuity)
+                        self._retire_worker(worker_id, expected=slot)
+                        self._reconcile_worker(worker_id, strict=True)
                 except Exception:
                     # Keep the worker in the persistent failure set until a
                     # replacement slot completes a successful console pass.
@@ -640,83 +637,27 @@ class AcpSupervisor:
             if slot.retired:
                 return
             local_turns = set(slot.console_local_turns)
-        output: list[dict[str, str]] = []
-        completed_submissions: list[int] = []
         output_budget = max(
             0,
             _CONSOLE_OUTPUT_QUEUE_BUDGET_BYTES - (retained_output_bytes or 0),
         )
+        output: list[dict[str, str]] = []
+        completed_submissions: list[int] = []
         for sequence, future in tuple(submissions.items()):
             if not future.done():
                 continue
-            item: dict[str, str] | None = None
-            try:
-                outcome = future.result()
-            except Exception:
-                item = _bounded_console_output(
-                    f"console-input:{slot.generation}:{sequence}",
-                    "error",
-                    "instruction failed",
-                )
-            else:
-                status = (
-                    {
-                        "permission": "permission selection accepted",
-                        "cancelled": "active turn cancellation requested",
-                    }.get(outcome)
-                    if isinstance(outcome, str)
-                    else None
-                )
-                if status is not None:
-                    item = _bounded_console_output(
-                        f"console-input:{slot.generation}:{sequence}",
-                        "status",
-                        status,
-                    )
-            if item is not None:
-                if _console_output_wire_bytes([*output, item]) > output_budget:
-                    continue
-                output.append(item)
+            item = _console_submission_output(slot.generation, sequence, future)
+            if item is not None and not _append_console_output(
+                output, item, output_budget
+            ):
+                continue
             completed_submissions.append(sequence)
             input_sequence = max(input_sequence, sequence)
-        pending = _console_pending_decision(
-            Path(self.config.db_path),
-            self.config.host_id,
-            slot.continuity.worker_id,
-        )
-        if pending is not None:
-            decision_ref, _options, prompt = pending
-            item = _bounded_console_output(
-                "permission:" + stable_fingerprint(
-                    {
-                        "worker_id": slot.continuity.worker_id,
-                        "decision_ref": decision_ref,
-                    }
-                ),
-                "status",
-                prompt,
-            )
-            if _console_output_wire_bytes([*output, item]) <= output_budget:
-                output.append(item)
-        consumed_local_turns: set[str] = set()
-        processed_event_sequence = event_sequence
-        for stored in events:
-            event = stored.event
-            if event.kind == "user_message" and event.source_turn_id in local_turns:
-                if event.source_turn_id is not None:
-                    consumed_local_turns.add(event.source_turn_id)
-                processed_event_sequence = stored.sequence
-                continue
-            rendered = _console_event_output(event.kind, event.payload)
-            if rendered is None:
-                processed_event_sequence = stored.sequence
-                continue
-            stream, text = rendered
-            item = _bounded_console_output(event.event_id, stream, text)
-            if _console_output_wire_bytes([*output, item]) > output_budget:
-                break
-            output.append(item)
-            processed_event_sequence = stored.sequence
+        item = _console_permission_output(self.config, slot)
+        if item is not None:
+            _append_console_output(output, item, output_budget)
+        processed_event_sequence, consumed_local_turns = _append_console_events(
+            output, events, local_turns, output_budget, event_sequence)
         probing_retained_output = retained_output_bytes is None
         client = self._endpoint_client_factory(self.config)
         inputs: tuple[tuple[int, str], ...] = ()
@@ -784,28 +725,18 @@ class AcpSupervisor:
         self, slot: _SessionSlot, sequence: int, text: str
     ) -> str:
         snapshot = latest_snapshot(Path(self.config.db_path), self.config.host_id)
-        worker = next(
-            (
-                item
-                for item in (snapshot.workers if snapshot is not None else ())
-                if item.id == slot.continuity.worker_id
-                and item.fingerprint == slot.continuity.worker_fingerprint
-            ),
-            None,
-        )
+        workers = snapshot.workers if snapshot is not None else ()
+        worker = next((item for item in workers if (
+            item.id == slot.continuity.worker_id
+            and item.fingerprint == slot.continuity.worker_fingerprint)), None)
         stable_key = worker.meta.get("stable_key") if worker is not None else None
-        stable_version = (
-            worker.meta.get("stable_key_version") if worker is not None else None
-        )
+        stable_version = worker.meta.get("stable_key_version") if worker else None
         if not isinstance(stable_key, str) or stable_version != 1:
             raise AcpCoordinatorError("ACP console stable worker identity is unavailable")
-        request_id = "acpc." + stable_fingerprint(
-            {
-                "generation": slot.generation,
-                "input_sequence": sequence,
-                "worker_id": slot.continuity.worker_id,
-            }
-        )
+        request_id = "acpc." + stable_fingerprint({
+            "generation": slot.generation, "input_sequence": sequence,
+            "worker_id": slot.continuity.worker_id,
+        })
         if text.strip() == "/cancel":
             slot.runtime.cancel()
             return "cancelled"
@@ -868,22 +799,17 @@ class AcpSupervisor:
                 acp_permission_router=self,
             )
         except Exception:
-            if local_turn_id is not None:
-                with slot.lock:
-                    slot.console_local_turns.discard(local_turn_id)
+            _discard_local_turn(slot, local_turn_id)
             raise
         if result.status not in {"accepted", "duplicate_request"}:
-            if local_turn_id is not None:
-                with slot.lock:
-                    slot.console_local_turns.discard(local_turn_id)
+            _discard_local_turn(slot, local_turn_id)
             raise AcpCoordinatorError("ACP console input was not accepted")
         if request["action"] == "answer_decision":
             return "permission"
         if result.status == "duplicate_request" and local_turn_id is not None:
             # A duplicate receipt does not start a new ACP turn, so there is no
             # corresponding user event left to suppress in this process.
-            with slot.lock:
-                slot.console_local_turns.discard(local_turn_id)
+            _discard_local_turn(slot, local_turn_id)
         return "instruction"
 
     def _require_reconcile_state(self, *, allow_starting: bool) -> None:
@@ -983,28 +909,22 @@ class AcpSupervisor:
                 self._console_failure_type = None
         for worker_id in stale:
             self._retire_worker(worker_id)
-        failures: list[BaseException] = [
-            AcpCoordinatorError("worker has ambiguous Herdr authority")
-            for _ in range(ambiguities)
-        ]
-        if discovery_omissions:
-            failures.append(
-                AcpCoordinatorError("one or more Herdr pane routes were omitted")
-            )
+        failure_type = (
+            "AcpCoordinatorError"
+            if ambiguities or discovery_omissions
+            else None
+        )
         for worker_id, continuity in current.items():
             self._require_reconcile_state(allow_starting=True)
             try:
                 self._reconcile_binding(continuity)
             except Exception as exc:  # noqa: BLE001
-                failures.append(exc)
+                failure_type = failure_type or type(exc).__name__
                 self._retire_worker(worker_id)
         with self._lock:
-            self._required_degraded = bool(failures)
-            if failures:
-                self._failure_type = type(failures[0]).__name__
-            elif not self._required_degraded:
-                self._failure_type = None
-        if strict and failures:
+            self._required_degraded = failure_type is not None
+            self._failure_type = failure_type
+        if strict and failure_type is not None:
             raise AcpCoordinatorError("one or more ACP workers failed to attach")
 
     def _discover_continuity(self) -> int:
@@ -1071,21 +991,19 @@ class AcpSupervisor:
                 continuity = current.get(worker_id)
                 if continuity is None:
                     with self._lock:
-                        failed_fingerprint = self._console_failed_claims.get(worker_id)
-                    claimed_fingerprint = failed_fingerprint
-                    authority_remains = True
-                    if claimed_fingerprint is not None:
+                        fingerprint = self._console_failed_claims.get(worker_id)
+                        slot_exists = worker_id in self._slots
+                    disappeared = False
+                    if fingerprint is not None and not slot_exists:
                         try:
-                            authority_remains = (
-                                worker_id,
-                                claimed_fingerprint,
-                            ) in self._herdr_authority_claims()
+                            disappeared = (
+                                worker_id, fingerprint) not in self._herdr_authority_claims()
                         except Exception:
                             # A failed ownership check cannot prove that the
                             # Herdr endpoint disappeared; retry periodically.
-                            authority_remains = True
-                    with self._lock:
-                        if worker_id not in self._slots and not authority_remains:
+                            pass
+                    if disappeared:
+                        with self._lock:
                             self._console_failed_claims.pop(worker_id, None)
                             if not self._console_failed_claims:
                                 self._console_failure_type = None
@@ -1116,7 +1034,7 @@ class AcpSupervisor:
         if existing is not None:
             self._retire_worker(continuity.worker_id, expected=existing)
         endpoint = self._resolve_endpoint(continuity)
-        runtime, permission_broker, binding_handle = self._build_runtime(
+        runtime, permission_broker, owned_bindings = self._build_runtime(
             continuity,
             endpoint,
         )
@@ -1124,7 +1042,8 @@ class AcpSupervisor:
             runtime.start()
         except Exception:
             permission_broker.close()
-            self._stop_runtime(runtime, owned_binding=binding_handle.binding)
+            owned = owned_bindings[0] if owned_bindings else None
+            self._stop_runtime(runtime, owned_binding=owned)
             raise
         console_executor: ThreadPoolExecutor | None = None
         try:
@@ -1157,38 +1076,30 @@ class AcpSupervisor:
                 console_event_sequence=console_cursor,
             )
             with self._lock:
-                displaced = self._slots.get(continuity.worker_id)
                 self._slots[continuity.worker_id] = slot
         except Exception:
             if console_executor is not None:
                 console_executor.shutdown(wait=False, cancel_futures=True)
             permission_broker.close()
-            self._stop_runtime(runtime, owned_binding=binding_handle.binding)
+            owned = owned_bindings[0] if owned_bindings else None
+            self._stop_runtime(runtime, owned_binding=owned)
             raise
-        if displaced is not None:
-            self._stop_runtime(displaced.runtime)
 
     def _resolve_endpoint(self, continuity: WorkerBinding) -> HerdrAcpEndpoint:
-        client = self._endpoint_client_factory(self.config)
-        try:
-            result = client.agent_acp_endpoint(
-                continuity.target_value,
-                timeout=self.config.herdr_timeout_seconds,
-            )
-        finally:
-            client.close()
+        result = self._herdr_request("agent_acp_endpoint", continuity.target_value)
         return _parse_endpoint(self.config, continuity, result)
 
     def _resolve_status(self, continuity: WorkerBinding) -> tuple[str, str, str]:
+        result = self._herdr_request("agent_acp_status", continuity.target_value)
+        return _parse_status(continuity, result)
+
+    def _herdr_request(self, method: str, target: str) -> Any:
         client = self._endpoint_client_factory(self.config)
         try:
-            result = client.agent_acp_status(
-                continuity.target_value,
-                timeout=self.config.herdr_timeout_seconds,
-            )
+            return getattr(client, method)(
+                target, timeout=self.config.herdr_timeout_seconds)
         finally:
             client.close()
-        return _parse_status(continuity, result)
 
     def _require_attached_generation(self, slot: _SessionSlot) -> None:
         try:
@@ -1245,7 +1156,7 @@ class AcpSupervisor:
     ) -> tuple[
         AcpWorkerSession,
         AcpPermissionBroker,
-        _RuntimeBindingHandle,
+        list[WorkerBinding],
     ]:
         client = self._connection_factory(
             endpoint.command,
@@ -1255,7 +1166,7 @@ class AcpSupervisor:
             close_timeout=self.config.acp_shutdown_timeout_seconds,
             max_frame_bytes=self.config.acp_max_frame_bytes,
         )
-        binding_handle = _RuntimeBindingHandle()
+        owned_bindings: list[WorkerBinding] = []
         if endpoint.session_mode is SessionOpenMode.NEW:
             binding = continuity
 
@@ -1263,14 +1174,14 @@ class AcpSupervisor:
                 session_id: str,
                 anchor: WorkerBinding,
             ) -> WorkerBinding:
-                return binding_handle.retain(
-                    self._bind_new_session(session_id, anchor)
-                )
+                bound = self._bind_new_session(session_id, anchor)
+                owned_bindings[:] = [bound]
+                return bound
         else:
             assert endpoint.session_id is not None
             binding = _derived_binding(continuity, endpoint.session_id)
             upsert_worker_bindings(Path(self.config.db_path), [binding])
-            binding_handle.retain(binding)
+            owned_bindings.append(binding)
             callback = None
         permission_broker = AcpPermissionBroker(
             self.config,
@@ -1298,17 +1209,16 @@ class AcpSupervisor:
                 poll_timeout=min(0.25, self.config.acp_request_timeout_seconds),
                 stop_timeout=self.config.acp_shutdown_timeout_seconds,
             )
-            return runtime, permission_broker, binding_handle
+            return runtime, permission_broker, owned_bindings
         except Exception:
             permission_broker.close()
             try:
                 client.close()
             except Exception:
                 pass
-            owned_binding = binding_handle.binding
-            if owned_binding is not None:
+            if owned_bindings:
                 try:
-                    self._retire_binding(owned_binding)
+                    self._retire_binding(owned_bindings[0])
                 except Exception:
                     pass
             raise
@@ -1327,6 +1237,7 @@ class AcpSupervisor:
         worker_id: str,
         *,
         expected: _SessionSlot | None = None,
+        timeout: float | None = None,
     ) -> None:
         with self._reconcile_lock:
             with self._lock:
@@ -1342,7 +1253,7 @@ class AcpSupervisor:
                 # positive-disappearance path in reconciliation may remove it.
                 if not self._console_failed_claims:
                     self._console_failure_type = None
-            self._retire_slot(slot)
+            self._retire_slot(slot, timeout=timeout)
 
     def _retire_slot(self, slot: _SessionSlot, *, timeout: float | None = None) -> None:
         """Fence one slot and retire all generation-owned resources."""
@@ -1396,16 +1307,9 @@ class AcpSupervisor:
                 binding,
                 reason="acp_runtime_retired",
             )
-            live = next(
-                (
-                    row
-                    for row in list_worker_bindings(
-                        Path(self.config.db_path), binding.host_id, backend="acp"
-                    )
-                    if _binding_key(row) == key
-                ),
-                None,
-            )
+            live = next((row for row in list_worker_bindings(
+                Path(self.config.db_path), binding.host_id, backend="acp"
+            ) if _binding_key(row) == key), None)
             if live is not None:
                 self._pending_binding_releases[key] = live
                 raise AcpCoordinatorError("ACP binding changed during retirement")
@@ -1424,20 +1328,12 @@ class AcpSupervisor:
 
     def _stop_all(self, *, timeout: float | None = None) -> None:
         with self._lock:
-            slots = tuple(self._slots.values())
-            self._slots.clear()
-            self._retired_slots.update((id(slot), slot) for slot in slots)
-        if not slots:
-            return
-        total = (
-            self.config.acp_shutdown_timeout_seconds
-            if timeout is None
-            else timeout
-        )
+            worker_ids = tuple(self._slots)
+        total = self.config.acp_shutdown_timeout_seconds if timeout is None else timeout
         deadline = time.monotonic() + total
-        for slot in slots:
-            self._retire_slot(
-                slot,
+        for worker_id in worker_ids:
+            self._retire_worker(
+                worker_id,
                 timeout=max(0.001, deadline - time.monotonic()),
             )
 
@@ -1486,20 +1382,13 @@ def _expire_derived_binding(
 
 
 def _binding_key(binding: WorkerBinding) -> tuple[str, str, str]:
-    return (
-        binding.worker_id,
-        binding.worker_fingerprint,
-        binding.private_fingerprint,
-    )
+    return (binding.worker_id, binding.worker_fingerprint, binding.private_fingerprint)
 
 
 def _same_continuity(left: WorkerBinding, right: WorkerBinding) -> bool:
     """Compare authority identity while ignoring observation lease refreshes."""
     return replace(
-        left,
-        observed_at=right.observed_at,
-        expires_at=right.expires_at,
-    ) == right
+        left, observed_at=right.observed_at, expires_at=right.expires_at) == right
 
 
 def _text(item: Mapping[str, Any], *names: str) -> str | None:
@@ -1513,33 +1402,23 @@ def _text(item: Mapping[str, Any], *names: str) -> str | None:
 
 
 def _items(payload: Any, name: str) -> list[dict[str, Any]]:
-    if isinstance(payload, list):
-        values = payload
-    elif isinstance(payload, Mapping):
-        values = payload.get(name, [])
-    else:
+    values = payload if isinstance(payload, list) else (
+        payload.get(name, []) if isinstance(payload, Mapping) else [])
+    if not isinstance(values, list):
         return []
-    return (
-        [dict(value) for value in values if isinstance(value, Mapping)]
-        if isinstance(values, list)
-        else []
-    )
+    return [dict(value) for value in values if isinstance(value, Mapping)]
 
 
 def _discovered_spaces(payload: Any) -> list[Space]:
-    spaces: list[Space] = []
+    spaces = []
     for item in _items(payload, "workspaces"):
-        space_id = _text(item, "workspace_id", "space_id", "id", "name")
-        if space_id is None:
-            continue
-        spaces.append(
-            Space(
+        if space_id := _text(item, "workspace_id", "space_id", "id", "name"):
+            spaces.append(Space(
                 id=space_id,
                 name=_text(item, "label", "name", "title") or space_id,
                 status=normalize_status(_text(item, "status", "state")),
                 updated_at=_text(item, "updated_at", "observed_at"),
-            )
-        )
+            ))
     return spaces
 
 
@@ -1626,6 +1505,7 @@ def _discovered_workers(
     agents = _items(agent_payload, "agents")
     rows: list[dict[str, Any]] = []
     candidate_count = 0
+    installation_key: bytes | None = None
     for pane in panes:
         agent, ambiguous_agent = _agent_match(pane, agents)
         if agent is None and not ambiguous_agent and not _text(
@@ -1652,10 +1532,11 @@ def _discovered_workers(
                 break
         if not target_value:
             continue
-        base_id = (
-            _text(agent or {}, "agent", "name")
-            or _text(pane, "agent", "name", "label")
-            or "worker"
+        if installation_key is None:
+            installation_key = load_or_create_installation_key(config.data_dir)
+        stable_key = stable_worker_key(
+            installation_key, backend="herdr", host_id=config.host_id,
+            workspace_id=identity[0], pane_id=identity[1],
         )
         private_fingerprint = worker_binding_private_fingerprint(
             host_id=config.host_id,
@@ -1670,26 +1551,14 @@ def _discovered_workers(
         rows.append(
             {
                 "agent": agent or {},
-                "base_id": base_id,
-                "identity": identity,
                 "pane": pane,
                 "private_fingerprint": private_fingerprint,
+                "stable_key": stable_key,
                 "target_kind": target_kind,
                 "target_value": target_value,
+                "desired_id": "worker-" + stable_fingerprint(
+                    {"stable_key": stable_key}),
             }
-        )
-
-    installation_key = load_or_create_installation_key(config.data_dir) if rows else None
-    for row in rows:
-        identity = row["identity"]
-        assert installation_key is not None and identity is not None
-        workspace_id, pane_id = identity
-        row["stable_key"] = stable_worker_key(
-            installation_key, backend="herdr", host_id=config.host_id,
-            workspace_id=workspace_id, pane_id=pane_id,
-        )
-        row["desired_id"] = "worker-" + stable_fingerprint(
-            {"stable_key": row["stable_key"]}
         )
     private_counts = Counter(str(row["private_fingerprint"]) for row in rows)
     target_counts = Counter(str(row["target_value"]) for row in rows)
@@ -1704,11 +1573,22 @@ def _discovered_workers(
     return workers, bindings, candidate_count - len(unique)
 
 
+def _exact_mapping(
+    value: Any, fields: set[str] | frozenset[str], message: str
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise AcpCoordinatorError(message)
+    return value
+
+
+def _u64(value: Any) -> bool:
+    return type(value) is int and 0 <= value <= (1 << 64) - 1
+
+
 def _nonempty_text(value: Any, field: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise AcpCoordinatorError(f"Herdr ACP endpoint {field} is invalid")
-    if len(value) > 4096 or "\x00" in value:
-        raise AcpCoordinatorError(f"Herdr ACP endpoint {field} is invalid")
+    message = f"Herdr ACP endpoint {field} is invalid"
+    _ensure(isinstance(value, str) and bool(value) and value.strip() == value, message)
+    _ensure(len(value) <= 4096 and "\x00" not in value, message)
     return value
 
 
@@ -1740,8 +1620,7 @@ def _require_target_identity(
             worker.get("name"),
             worker.get("agent"),
         }
-    if not matched:
-        raise AcpCoordinatorError(f"Herdr ACP {response} target changed")
+    _ensure(matched, f"Herdr ACP {response} target changed")
 
 
 def _parse_endpoint_identity(
@@ -1753,28 +1632,29 @@ def _parse_endpoint_identity(
     worker = value.get("worker")
     adapter = value.get("adapter")
     session = value.get("session")
-    if not all(isinstance(item, Mapping) for item in (worker, adapter, session)):
-        raise AcpCoordinatorError(f"Herdr ACP {response} nested shape is invalid")
-    assert isinstance(worker, Mapping)
-    assert isinstance(adapter, Mapping)
-    assert isinstance(session, Mapping)
-    worker_fields = {
-        "terminal_id", "workspace_id", "tab_id", "pane_id",
-        "name", "agent", "generation",
-    }
-    if set(worker) != worker_fields:
-        raise AcpCoordinatorError(f"Herdr ACP {response} worker identity shape is invalid")
+    _ensure(
+        all(isinstance(item, Mapping) for item in (worker, adapter, session)),
+        f"Herdr ACP {response} nested shape is invalid",
+    )
+    worker = _exact_mapping(
+        worker, _WORKER_IDENTITY_FIELDS,
+        f"Herdr ACP {response} worker identity shape is invalid",
+    )
     generation = worker.get("generation")
-    if type(generation) is not int or not 0 <= generation <= (1 << 64) - 1:
-        raise AcpCoordinatorError(f"Herdr ACP {response} generation is invalid")
-    for field in worker_fields - {"generation"}:
+    _ensure(
+        _u64(generation),
+        f"Herdr ACP {response} generation is invalid",
+    )
+    for field in _WORKER_IDENTITY_FIELDS - {"generation"}:
         _nonempty_text(worker.get(field), field)
     _require_target_identity(continuity, worker, response=response)
-    if set(adapter) != {"name", "version"}:
-        raise AcpCoordinatorError(f"Herdr ACP {response} adapter identity shape is invalid")
+    adapter = _exact_mapping(
+        adapter, {"name", "version"},
+        f"Herdr ACP {response} adapter identity shape is invalid",
+    )
     _nonempty_text(adapter.get("name"), "adapter name")
     _nonempty_text(adapter.get("version"), "adapter version")
-    if set(session) not in ({"mode"}, {"id", "mode"}):
+    if not isinstance(session, Mapping) or set(session) not in ({"mode"}, {"id", "mode"}):
         raise AcpCoordinatorError(f"Herdr ACP {response} session shape is invalid")
     try:
         mode = SessionOpenMode(session.get("mode"))
@@ -1788,8 +1668,7 @@ def _parse_endpoint_identity(
     else:
         session_id = _nonempty_text(session_id_value, "session id")
     cwd = Path(_nonempty_text(value.get("cwd"), "cwd"))
-    if not cwd.is_absolute():
-        raise AcpCoordinatorError(f"Herdr ACP {response} cwd must be absolute")
+    _ensure(cwd.is_absolute(), f"Herdr ACP {response} cwd must be absolute")
     return generation, mode, session_id, cwd
 
 
@@ -1799,69 +1678,49 @@ def _parse_endpoint(
     value: Any,
 ) -> HerdrAcpEndpoint:
     """Strictly validate the private, one-shot Herdr launch contract."""
-    if not isinstance(value, Mapping) or set(value) != {
-        "type",
-        "endpoint",
-        "console",
-        "worker",
-        "adapter",
-        "session",
-        "cwd",
-        "lifecycle",
-    }:
-        raise AcpCoordinatorError("Herdr ACP endpoint response shape is invalid")
-    if (
-        value.get("type") != "agent_acp_endpoint"
-        or value.get("lifecycle") != "acp_owned_ready"
-    ):
-        raise AcpCoordinatorError("Herdr ACP endpoint is not ready")
+    value = _exact_mapping(
+        value, _ENDPOINT_FIELDS, "Herdr ACP endpoint response shape is invalid")
+    ready = (value.get("type"), value.get("lifecycle")) == (
+        "agent_acp_endpoint", "acp_owned_ready")
+    _ensure(ready, "Herdr ACP endpoint is not ready")
     endpoint = value.get("endpoint")
     console = value.get("console")
     worker = value.get("worker")
-    if not all(
-        isinstance(item, Mapping)
-        for item in (endpoint, console, worker, value.get("adapter"), value.get("session"))
-    ):
-        raise AcpCoordinatorError("Herdr ACP endpoint nested shape is invalid")
-    assert isinstance(endpoint, Mapping)
-    assert isinstance(console, Mapping)
-    assert isinstance(worker, Mapping)
-    if set(endpoint) != {"transport", "command", "args", "protocol_version"}:
-        raise AcpCoordinatorError("Herdr ACP launch specification is invalid")
-    if (
-        endpoint.get("transport") != "stdio"
-        or type(endpoint.get("protocol_version")) is not int
-        or endpoint.get("protocol_version") != 1
-    ):
-        raise AcpCoordinatorError("Herdr ACP launch protocol is unsupported")
+    nested = (endpoint, console, worker, value.get("adapter"), value.get("session"))
+    nested_valid = all(isinstance(item, Mapping) for item in nested)
+    _ensure(nested_valid, "Herdr ACP endpoint nested shape is invalid")
+    endpoint = _exact_mapping(
+        endpoint, {"transport", "command", "args", "protocol_version"},
+        "Herdr ACP launch specification is invalid",
+    )
+    protocol = endpoint.get("protocol_version")
+    launch_valid = endpoint.get("transport") == "stdio" and type(protocol) is int
+    _ensure(launch_valid and protocol == 1, "Herdr ACP launch protocol is unsupported")
     command = _nonempty_text(endpoint.get("command"), "command")
-    if command != "herdr" or Path(config.herdr_bin).name != "herdr":
-        raise AcpCoordinatorError("Herdr ACP endpoint executable is not configured Herdr")
+    executable_valid = command == "herdr" and Path(config.herdr_bin).name == "herdr"
+    _ensure(executable_valid, "Herdr ACP endpoint executable is not configured Herdr")
     raw_generation, mode, session_id, cwd = _parse_endpoint_identity(
         continuity, value, response="endpoint"
     )
     generation = str(raw_generation)
-    if set(console) != {"generation", "lease"}:
-        raise AcpCoordinatorError("Herdr ACP console endpoint shape is invalid")
-    if console.get("generation") != raw_generation:
-        raise AcpCoordinatorError("Herdr ACP console generation is inconsistent")
+    console = _exact_mapping(
+        console, {"generation", "lease"},
+        "Herdr ACP console endpoint shape is invalid",
+    )
+    console_current = console.get("generation") == raw_generation
+    _ensure(console_current, "Herdr ACP console generation is inconsistent")
     console_lease = _nonempty_text(console.get("lease"), "console lease")
-    if len(console_lease) > 512:
-        raise AcpCoordinatorError("Herdr ACP console lease is invalid")
+    _ensure(len(console_lease) <= 512, "Herdr ACP console lease is invalid")
     args = endpoint.get("args")
-    if (
-        not isinstance(args, list)
-        or len(args) != 7
-        or args[0:2] != ["agent", "acp-attach"]
-        or args[3] != "--generation"
-        or args[5] != "--ticket"
-    ):
-        raise AcpCoordinatorError("Herdr ACP attach arguments are invalid")
+    valid_args = isinstance(args, list) and len(args) == 7
+    valid_args = valid_args and args[0:2] == ["agent", "acp-attach"]
+    valid_args = valid_args and args[3::2] == ["--generation", "--ticket"]
+    _ensure(valid_args, "Herdr ACP attach arguments are invalid")
     target = _nonempty_text(args[2], "target")
-    if target != continuity.target_value:
-        raise AcpCoordinatorError("Herdr ACP endpoint target changed")
-    if _nonempty_text(args[4], "argument generation") != generation:
-        raise AcpCoordinatorError("Herdr ACP endpoint generation is inconsistent")
+    _ensure(target == continuity.target_value, "Herdr ACP endpoint target changed")
+    argument_generation = _nonempty_text(args[4], "argument generation")
+    _ensure(argument_generation == generation,
+            "Herdr ACP endpoint generation is inconsistent")
     _nonempty_text(args[6], "ticket")
     return HerdrAcpEndpoint(
         command=(
@@ -1881,25 +1740,19 @@ def _parse_status(
     value: Any,
 ) -> tuple[str, str, str]:
     """Validate Herdr's non-ticketing ACP generation/lease status."""
-    if not isinstance(value, Mapping) or set(value) != {
-        "type",
-        "worker",
-        "adapter",
-        "session",
-        "cwd",
-        "lifecycle",
-        "console_lifecycle",
-    }:
-        raise AcpCoordinatorError("Herdr ACP status response shape is invalid")
+    value = _exact_mapping(
+        value, _STATUS_FIELDS, "Herdr ACP status response shape is invalid")
     lifecycle = value.get("lifecycle")
     console_lifecycle = value.get("console_lifecycle")
-    if value.get("type") != "agent_acp_status" or lifecycle not in {
-        "acp_owned_ready",
-        "acp_owned_attached",
-    }:
-        raise AcpCoordinatorError("Herdr ACP status lifecycle is invalid")
-    if console_lifecycle not in {"starting", "attached", "missing"}:
-        raise AcpCoordinatorError("Herdr ACP console lifecycle is invalid")
+    _ensure(
+        value.get("type") == "agent_acp_status"
+        and lifecycle in {"acp_owned_ready", "acp_owned_attached"},
+        "Herdr ACP status lifecycle is invalid",
+    )
+    _ensure(
+        console_lifecycle in {"starting", "attached", "missing"},
+        "Herdr ACP console lifecycle is invalid",
+    )
     raw_generation, _mode, _session_id, _cwd = _parse_endpoint_identity(
         continuity, value, response="status"
     )
@@ -1909,34 +1762,32 @@ def _parse_status(
 def _parse_console_exchange(
     value: Any, after_sequence: int
 ) -> tuple[tuple[int, str], ...]:
-    if not isinstance(value, Mapping) or set(value) != {
-        "type",
-        "inputs",
-        "outputs",
-        "input_floor_sequence",
-        "output_floor_sequence",
-        "next_input_sequence",
-        "next_output_sequence",
-    }:
-        raise AcpCoordinatorError("Herdr ACP console exchange shape is invalid")
-    if value.get("type") != "agent_acp_console_exchange":
-        raise AcpCoordinatorError("Herdr ACP console exchange type is invalid")
+    value = _exact_mapping(
+        value, _CONSOLE_EXCHANGE_FIELDS,
+        "Herdr ACP console exchange shape is invalid",
+    )
+    _ensure(
+        value.get("type") == "agent_acp_console_exchange",
+        "Herdr ACP console exchange type is invalid",
+    )
     raw_inputs, raw_outputs = value.get("inputs"), value.get("outputs")
-    if not isinstance(raw_inputs, list) or not isinstance(raw_outputs, list):
-        raise AcpCoordinatorError("Herdr ACP console exchange lists are invalid")
+    _ensure(
+        isinstance(raw_inputs, list) and isinstance(raw_outputs, list),
+        "Herdr ACP console exchange lists are invalid",
+    )
     input_floor, output_floor, next_input, next_output = (
         value.get(name) for name in (
             "input_floor_sequence", "output_floor_sequence",
             "next_input_sequence", "next_output_sequence",
         )
     )
-    if (
-        any(type(number) is not int or not 0 <= number <= (1 << 64) - 1
-            for number in (after_sequence, input_floor, output_floor, next_input, next_output))
-        or next_input < input_floor
-        or next_output < output_floor
-    ):
-        raise AcpCoordinatorError("Herdr ACP console exchange floors are invalid")
+    numbers = (after_sequence, input_floor, output_floor, next_input, next_output)
+    _ensure(
+        all(_u64(number) for number in numbers)
+        and next_input >= input_floor
+        and next_output >= output_floor,
+        "Herdr ACP console exchange floors are invalid",
+    )
     if input_floor > after_sequence + 1:
         raise AcpConsoleInputGap(
             "Herdr ACP console input floor has a gap",
@@ -1945,8 +1796,10 @@ def _parse_console_exchange(
     parsed: list[tuple[int, str]] = []
     expected = after_sequence + 1
     for item in raw_inputs:
-        if not isinstance(item, Mapping) or set(item) != {"sequence", "text"}:
-            raise AcpCoordinatorError("Herdr ACP console input shape is invalid")
+        item = _exact_mapping(
+            item, {"sequence", "text"},
+            "Herdr ACP console input shape is invalid",
+        )
         sequence = item.get("sequence")
         text = item.get("text")
         if (
@@ -1973,6 +1826,63 @@ def _parse_console_exchange(
             "Herdr ACP console next input sequence is invalid"
         )
     return tuple(parsed)
+
+
+def _console_submission_output(
+    generation: str, sequence: int, future: Future[Any]
+) -> dict[str, str] | None:
+    try:
+        outcome = future.result()
+    except Exception:
+        stream, text = "error", "instruction failed"
+    else:
+        text = {
+            "permission": "permission selection accepted",
+            "cancelled": "active turn cancellation requested",
+        }.get(outcome) if isinstance(outcome, str) else None
+        if text is None:
+            return None
+        stream = "status"
+    return _bounded_console_output(
+        f"console-input:{generation}:{sequence}", stream, text)
+
+
+def _discard_local_turn(slot: _SessionSlot, turn_id: str | None) -> None:
+    if turn_id is not None:
+        with slot.lock:
+            slot.console_local_turns.discard(turn_id)
+
+
+def _append_console_output(
+    output: list[dict[str, str]], item: dict[str, str], budget: int
+) -> bool:
+    if _console_output_wire_bytes([*output, item]) > budget:
+        return False
+    output.append(item)
+    return True
+
+
+def _append_console_events(
+    output: list[dict[str, str]],
+    events: Sequence[Any],
+    local_turns: set[str],
+    budget: int,
+    after: int,
+) -> tuple[int, set[str]]:
+    consumed: set[str] = set()
+    for stored in events:
+        event = stored.event
+        if event.kind == "user_message" and event.source_turn_id in local_turns:
+            if event.source_turn_id is not None:
+                consumed.add(event.source_turn_id)
+        else:
+            rendered = _console_event_output(event.kind, event.payload)
+            if rendered is not None:
+                item = _bounded_console_output(event.event_id, *rendered)
+                if not _append_console_output(output, item, budget):
+                    break
+        after = stored.sequence
+    return after, consumed
 
 
 def _console_event_output(
@@ -2050,6 +1960,21 @@ def _latest_console_event_sequence(
             return after
 
 
+def _console_permission_output(
+    config: Config, slot: _SessionSlot
+) -> dict[str, str] | None:
+    pending = _console_pending_decision(
+        Path(config.db_path), config.host_id, slot.continuity.worker_id)
+    if pending is None:
+        return None
+    decision_ref, _options, prompt = pending
+    event_id = "permission:" + stable_fingerprint({
+        "worker_id": slot.continuity.worker_id,
+        "decision_ref": decision_ref,
+    })
+    return _bounded_console_output(event_id, "status", prompt)
+
+
 def _console_pending_decision(
     db_path: Path,
     host_id: str,
@@ -2087,7 +2012,8 @@ def _console_pending_decision(
         return None
     question = str(item.get("question") or "Permission required")
     choices = " ".join(f"{ref}={label}" for ref, label in options)
-    return decision_ref, options, f"permission> {question} ({choices}); reply with a number or /cancel"
+    prompt = f"permission> {question} ({choices}); reply with a number or /cancel"
+    return decision_ref, options, prompt
 
 
 def _console_permission_selection(

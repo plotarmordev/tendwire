@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import secrets
 import threading
-import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,8 +57,7 @@ class AcpPermissionBroker:
         self.worker_fingerprint = worker_fingerprint
         self.generation = generation
         self.timeout = float(timeout)
-        self._lock = threading.RLock()
-        self._condition = threading.Condition(self._lock)
+        self._condition = threading.Condition()
         self._offer: _Offer | None = None
         self._closed = False
 
@@ -69,8 +67,7 @@ class AcpPermissionBroker:
         binding = self._exact_binding(request.session_id)
         title = _tool_title(request.tool_call)
         labels = tuple(
-            _option_label(option.name, option.kind)
-            for option in request.options
+            _option_label(option.name, option.kind) for option in request.options
         )
         if not labels:
             return None
@@ -128,7 +125,7 @@ class AcpPermissionBroker:
             decision_question_count=1,
         )
         try:
-            with self._lock:
+            with self._condition:
                 if self._closed or self._offer is not None:
                     return None
                 self._offer = offer
@@ -143,13 +140,13 @@ class AcpPermissionBroker:
                 )
             if not changed:
                 raise AcpPermissionBrokerError("permission overlay was not published")
-            deadline = time.monotonic() + self.timeout
             with self._condition:
-                while offer.selected is None and not self._closed:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    self._condition.wait(remaining)
+                self._condition.wait_for(
+                    lambda: offer.selected is not None
+                    or self._closed
+                    or self._offer is not offer,
+                    self.timeout,
+                )
                 if offer.selected is None:
                     self._clear_offer(offer)
                     return None
@@ -164,7 +161,7 @@ class AcpPermissionBroker:
             raise
 
     def owns(self, decision: Any) -> bool:
-        with self._lock:
+        with self._condition:
             offer = self._offer
             return bool(
                 not self._closed
@@ -178,8 +175,7 @@ class AcpPermissionBroker:
 
     def answer(self, decision: Any, *, timeout: float) -> None:
         clear_failed = False
-        uncertain = False
-        with self._lock:
+        with self._condition:
             offer = self._offer
             if offer is None or not self.owns(decision):
                 raise AcpPermissionBrokerError("ACP permission authority changed")
@@ -190,12 +186,12 @@ class AcpPermissionBroker:
                 raise AcpPermissionBrokerError("ACP permission was already answered")
             offer.selected = ordinal
             self._condition.notify_all()
-            deadline = time.monotonic() + max(0.1, float(timeout))
-            while offer.response_state == "pending" and not self._closed:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                self._condition.wait(remaining)
+            self._condition.wait_for(
+                lambda: offer.response_state != "pending"
+                or self._closed
+                or self._offer is not offer,
+                max(0.1, float(timeout)),
+            )
             if offer.response_state != "written":
                 # The command receipt is now terminally uncertain.  A late
                 # transport callback must retire the stale public overlay and
@@ -205,16 +201,15 @@ class AcpPermissionBroker:
                 # second time.
                 offer.answer_abandoned = True
                 clear_failed = offer.response_state == "failed"
-                uncertain = True
             else:
                 self._offer = None
+                return
         if clear_failed:
             self._clear_offer(offer)
-        if uncertain:
-            raise AcpPermissionBrokerError("ACP permission response state is uncertain")
+        raise AcpPermissionBrokerError("ACP permission response state is uncertain")
 
     def close(self) -> None:
-        with self._lock:
+        with self._condition:
             self._closed = True
             offer = self._offer
             if offer is not None:
@@ -233,7 +228,7 @@ class AcpPermissionBroker:
             self._clear_offer(offer)
 
     def _clear_offer(self, offer: _Offer) -> None:
-        with self._lock:
+        with self._condition:
             if self._offer is not offer:
                 return
             self._offer = None

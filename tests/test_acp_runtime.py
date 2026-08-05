@@ -948,6 +948,31 @@ def test_callback_failure_cancels_permission_before_propagating(tmp_path: Path) 
     assert raised.value is callback_failure
 
 
+def test_callback_failure_yields_to_cancellation_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient()
+    callback_failure = LookupError("decision failed")
+    response_failure = BrokenPipeError("partial permission frame")
+
+    def fail_callback(_request: PermissionRequest) -> str:
+        raise callback_failure
+
+    def fail_response(*_args: Any, **_kwargs: Any) -> None:
+        raise response_failure
+
+    monkeypatch.setattr(client, "respond_permission", fail_response)
+    service = runtime(tmp_path, client, permission_callback=fail_callback).start()
+    client.permissions.put(permission())
+    wait_until(lambda: service.status().state is RuntimeState.FAILED)
+
+    assert service.status().failure_type == "BrokenPipeError"
+    with pytest.raises(BrokenPipeError) as raised:
+        service.stop()
+    assert raised.value is response_failure
+
+
 def test_permission_ingestion_failure_cancels_before_runtime_fails(
     tmp_path: Path,
 ) -> None:
@@ -965,6 +990,30 @@ def test_permission_ingestion_failure_cancels_before_runtime_fails(
     with pytest.raises(OSError) as raised:
         service.stop()
     assert raised.value is failure
+
+
+def test_ingestion_failure_survives_cancellation_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient()
+    ingestor = FakeIngestor()
+    ingestion_failure = LookupError("journal unavailable")
+    response_failure = BrokenPipeError("partial permission frame")
+    ingestor.permission_failure = ingestion_failure
+
+    def fail_response(*_args: Any, **_kwargs: Any) -> None:
+        raise response_failure
+
+    monkeypatch.setattr(client, "respond_permission", fail_response)
+    service = runtime(tmp_path, client, ingestor).start()
+    client.permissions.put(permission())
+    wait_until(lambda: service.status().state is RuntimeState.FAILED)
+
+    assert service.status().failure_type == "LookupError"
+    with pytest.raises(LookupError) as raised:
+        service.stop()
+    assert raised.value is ingestion_failure
 
 
 def test_replaced_binding_cancels_permission_before_callback_and_is_terminal(
