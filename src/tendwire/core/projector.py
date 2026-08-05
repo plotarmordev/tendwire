@@ -7,25 +7,10 @@ Telegram, Herdres, or concrete backend connector modules.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
 from ..config import Config
 from .attention import update_snapshot_attention
 from .models import BackendHealth, Snapshot, Space, Worker, utc_timestamp
-
-
-def project_empty(config: Config) -> Snapshot:
-    """Return an empty neutral snapshot for the configured host."""
-    return update_snapshot_attention(
-        Snapshot(
-            host_id=config.host_id,
-            updated_at=utc_timestamp(),
-            spaces=[],
-            workers=[],
-            attention=[],
-            backend_health=[],
-        )
-    )
 
 
 def project_from_observations(
@@ -44,25 +29,5 @@ def project_from_observations(
         workers=list(workers or []),
         attention=[],
         backend_health=list(backend_health or []),
-    )
-    return update_snapshot_attention(snapshot)
-
-
-def project_from_raw(
-    config: Config,
-    *,
-    spaces: list[dict[str, Any]] | None = None,
-    workers: list[dict[str, Any]] | None = None,
-    backend_health: list[dict[str, Any]] | None = None,
-    timestamp: datetime | None = None,
-) -> Snapshot:
-    """Build a neutral snapshot from raw dict observations."""
-    snapshot = Snapshot(
-        host_id=config.host_id,
-        updated_at=utc_timestamp(timestamp),
-        spaces=[Space.from_dict(s) for s in (spaces or [])],
-        workers=[Worker.from_dict(w) for w in (workers or [])],
-        attention=[],
-        backend_health=[BackendHealth.from_dict(health) for health in (backend_health or [])],
     )
     return update_snapshot_attention(snapshot)

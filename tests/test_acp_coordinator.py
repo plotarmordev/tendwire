@@ -33,7 +33,12 @@ from tendwire.backends.acp_coordinator import (
     _parse_status,
     production_acp_supervisor_factory as production_acp_runtime_factory,
 )
-from tendwire.backends.acp_runtime import RuntimeState, SessionOpenMode
+from tendwire.backends.acp_runtime import (
+    AcpRuntimeBindingError,
+    AcpWorkerSession,
+    RuntimeState,
+    SessionOpenMode,
+)
 from tendwire.backends.herdr_protocol import HerdrErrorResponse
 from tendwire.command_submission import submit_command
 from tendwire.config import Config
@@ -46,6 +51,7 @@ from tendwire.core.models import (
 from tendwire.daemon import DaemonHooks, TendwireDaemon
 from tendwire.store.events import list_agent_events, record_agent_event
 from tendwire.store.projection import (
+    expire_worker_bindings,
     latest_snapshot,
     list_worker_bindings,
     save_snapshot,
@@ -1979,7 +1985,10 @@ def test_prompt_frame_acknowledgement_fences_generation_retirement(tmp_path: Pat
         coordinator.stop()
 
 
-def test_runtime_factory_failure_rolls_back_resumed_binding(tmp_path: Path) -> None:
+def test_runtime_factory_failure_rolls_back_resumed_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = _config(tmp_path)
     assert config.db_path is not None
     init_store(config.db_path)
@@ -2012,13 +2021,368 @@ def test_runtime_factory_failure_rolls_back_resumed_binding(tmp_path: Path) -> N
         reconcile_interval=60.0,
     ).start()
     upsert_worker_bindings(config.db_path, [_binding()])
+    attempts = 0
+
+    def fail_once(*args: Any, **kwargs: Any) -> int:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("transient construction cleanup failure")
+        return expire_worker_bindings(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "tendwire.backends.acp_coordinator.expire_worker_bindings",
+        fail_once,
+    )
     try:
         with pytest.raises(RuntimeError, match="constructor failed"):
             coordinator._reconcile_worker("worker-1", strict=True)
+        assert coordinator._pending_binding_releases
+        coordinator._retry_binding_releases()
         assert client.closed
         assert list_worker_bindings(config.db_path, config.host_id, backend="acp") == []
     finally:
         coordinator.stop()
+
+
+@pytest.mark.parametrize("mode", ("new", "resume"))
+def test_runtime_start_failure_retires_coordinator_owned_binding(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+
+    class EndpointClient:
+        def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
+            endpoint = _endpoint()
+            if mode == "resume":
+                endpoint["session"] = {"mode": mode, "id": "session-private"}
+            return endpoint
+
+        def close(self) -> None:
+            return None
+
+    class Runtime:
+        def __init__(self, _client: Any, **kwargs: Any) -> None:
+            self._binding = kwargs["binding"]
+            self._binder = kwargs["session_binding_callback"]
+
+        def start(self) -> None:
+            if self._binder is not None:
+                self._binding = self._binder("session-private", self._binding)
+            raise RuntimeError("startup failed")
+
+        def stop(self, *, timeout: float) -> None:
+            return None
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        connection_factory=lambda *_args, **_kwargs: object(),
+        session_factory=Runtime,
+        reconcile_interval=60.0,
+    ).start()
+    upsert_worker_bindings(config.db_path, [_binding()])
+    try:
+        with pytest.raises(RuntimeError, match="startup failed"):
+            coordinator._reconcile_worker("worker-1", strict=True)
+        assert list_worker_bindings(
+            config.db_path,
+            config.host_id,
+            backend="acp",
+        ) == []
+    finally:
+        coordinator.stop()
+
+
+def test_runtime_start_failure_retains_binding_when_first_expiry_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+
+    class EndpointClient:
+        def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
+            return _endpoint()
+
+        def close(self) -> None:
+            return None
+
+    class Runtime:
+        def __init__(self, _client: Any, **kwargs: Any) -> None:
+            self._binding = kwargs["binding"]
+            self._binder = kwargs["session_binding_callback"]
+
+        def start(self) -> None:
+            self._binding = self._binder("session-private", self._binding)
+            raise RuntimeError("authoritative startup failure")
+
+        def stop(self, *, timeout: float) -> None:
+            return None
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        connection_factory=lambda *_args, **_kwargs: object(),
+        session_factory=Runtime,
+        reconcile_interval=60.0,
+    ).start()
+    upsert_worker_bindings(config.db_path, [_binding()])
+    attempts = 0
+
+    def fail_once(*args: Any, **kwargs: Any) -> int:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("transient expiry failure")
+        return expire_worker_bindings(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "tendwire.backends.acp_coordinator.expire_worker_bindings",
+        fail_once,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="authoritative startup failure"):
+            coordinator._reconcile_worker("worker-1", strict=True)
+        assert coordinator._pending_binding_releases
+        coordinator._retry_binding_releases()
+        assert coordinator._pending_binding_releases == {}
+        assert list_worker_bindings(
+            config.db_path,
+            config.host_id,
+            backend="acp",
+        ) == []
+    finally:
+        coordinator.stop()
+
+
+def test_real_runtime_post_bind_validation_failure_retries_exact_lease_retirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+
+    class EndpointClient:
+        def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
+            return _endpoint()
+
+        def close(self) -> None:
+            return None
+
+    class Client:
+        def initialize(self) -> object:
+            return object()
+
+        def new_session(self, _cwd: Path) -> str:
+            return "session-private"
+
+        def close(self) -> None:
+            return None
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        connection_factory=lambda *_args, **_kwargs: Client(),
+        session_factory=AcpWorkerSession,
+        reconcile_interval=60.0,
+    ).start()
+    upsert_worker_bindings(config.db_path, [_binding()])
+
+    def hide_persisted_acp_binding(
+        *args: Any,
+        **kwargs: Any,
+    ) -> list[WorkerBinding]:
+        if kwargs.get("backend") == "acp":
+            return []
+        return list_worker_bindings(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "tendwire.backends.acp_runtime.list_worker_bindings",
+        hide_persisted_acp_binding,
+    )
+    attempts = 0
+
+    def fail_once(*args: Any, **kwargs: Any) -> int:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("transient post-bind expiry failure")
+        return expire_worker_bindings(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "tendwire.backends.acp_coordinator.expire_worker_bindings",
+        fail_once,
+    )
+    try:
+        with pytest.raises(AcpRuntimeBindingError, match="not current"):
+            coordinator._reconcile_worker("worker-1", strict=True)
+        pending = tuple(coordinator._pending_binding_releases.values())
+        assert len(pending) == 1
+        assert pending[0].turn_target_value == "session-private"
+        assert len(
+            list_worker_bindings(config.db_path, config.host_id, backend="acp")
+        ) == 1
+
+        coordinator._retry_binding_releases()
+
+        assert attempts == 2
+        assert coordinator._pending_binding_releases == {}
+        assert list_worker_bindings(
+            config.db_path,
+            config.host_id,
+            backend="acp",
+        ) == []
+    finally:
+        coordinator.stop()
+
+
+def test_post_start_publication_failure_retries_exact_lease_retirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+
+    class EndpointClient:
+        def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
+            return _endpoint()
+
+        def close(self) -> None:
+            return None
+
+    class Runtime:
+        def __init__(self, _client: Any, **kwargs: Any) -> None:
+            self._binding = kwargs["binding"]
+            self._binder = kwargs["session_binding_callback"]
+            self.stopped = False
+
+        def start(self) -> None:
+            self._binding = self._binder("session-private", self._binding)
+
+        def stop(self, *, timeout: float) -> None:
+            self.stopped = True
+
+    runtime: Runtime | None = None
+
+    def make_runtime(*args: Any, **kwargs: Any) -> Runtime:
+        nonlocal runtime
+        runtime = Runtime(*args, **kwargs)
+        return runtime
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        connection_factory=lambda *_args, **_kwargs: object(),
+        session_factory=make_runtime,
+        reconcile_interval=60.0,
+    ).start()
+    upsert_worker_bindings(config.db_path, [_binding()])
+    monkeypatch.setattr(
+        "tendwire.backends.acp_coordinator._latest_console_event_sequence",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("publication failed")
+        ),
+    )
+    attempts = 0
+
+    def fail_once(*args: Any, **kwargs: Any) -> int:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("transient publication cleanup failure")
+        return expire_worker_bindings(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "tendwire.backends.acp_coordinator.expire_worker_bindings",
+        fail_once,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="publication failed"):
+            coordinator._reconcile_worker("worker-1", strict=True)
+        assert runtime is not None and runtime.stopped
+        assert coordinator._slots == {}
+        pending = tuple(coordinator._pending_binding_releases.values())
+        assert len(pending) == 1
+        assert pending[0].turn_target_value == "session-private"
+
+        coordinator._retry_binding_releases()
+
+        assert attempts == 2
+        assert coordinator._pending_binding_releases == {}
+        assert list_worker_bindings(
+            config.db_path,
+            config.host_id,
+            backend="acp",
+        ) == []
+    finally:
+        coordinator.stop()
+
+
+def test_unhealthy_runtime_reconcile_and_stop_retire_each_owned_binding(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    upsert_worker_bindings(config.db_path, [_binding()])
+    runtimes: list[Any] = []
+
+    class EndpointClient:
+        def agent_acp_endpoint(self, _target: Any, *, timeout: float) -> Any:
+            return _endpoint(generation=42 + len(runtimes))
+
+        def agent_acp_status(self, _target: Any, *, timeout: float) -> Any:
+            return _status(generation=41 + len(runtimes))
+
+        def close(self) -> None:
+            return None
+
+    class Runtime:
+        def __init__(self, _client: Any, **kwargs: Any) -> None:
+            self._binding = kwargs["binding"]
+            self._binder = kwargs["session_binding_callback"]
+            self.healthy = True
+            runtimes.append(self)
+
+        def start(self) -> None:
+            self._binding = self._binder(
+                f"session-private-{len(runtimes)}",
+                self._binding,
+            )
+
+        def stop(self, *, timeout: float) -> None:
+            self.healthy = False
+
+        def status(self) -> Any:
+            return SimpleNamespace(healthy=self.healthy, failure_type=None)
+
+    coordinator = AcpRuntimeCoordinator(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        connection_factory=lambda *_args, **_kwargs: object(),
+        session_factory=Runtime,
+        reconcile_interval=60.0,
+    ).start()
+    assert len(list_worker_bindings(config.db_path, config.host_id, backend="acp")) == 1
+    runtimes[0].healthy = False
+    coordinator._reconcile_worker("worker-1", strict=True)
+    live = list_worker_bindings(config.db_path, config.host_id, backend="acp")
+    assert len(live) == 1
+    assert live[0].turn_target_value == "session-private-2"
+    coordinator.stop()
+    assert list_worker_bindings(config.db_path, config.host_id, backend="acp") == []
 
 
 def test_coordinator_start_revokes_orphaned_process_binding(tmp_path: Path) -> None:

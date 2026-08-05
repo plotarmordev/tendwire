@@ -19,7 +19,7 @@ from typing import Any
 
 from ..config import Config
 from ..core.models import WorkerBinding, stable_fingerprint
-from ..store.projection import expire_worker_bindings, list_worker_bindings
+from ..store.projection import list_worker_bindings
 from .acp_ingestion import AcpSessionIngestor
 from .acp_protocol import (
     PermissionRequest,
@@ -80,6 +80,14 @@ class AcpWorkerSessionStatus:
     prompts_failed: int
     cancellation_requests: int
     failure_type: str | None
+
+    @classmethod
+    def counter_names(cls) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name in cls.__dataclass_fields__
+            if name not in {"state", "healthy", "failure_type"}
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,27 +205,11 @@ class AcpWorkerSession:
         self._threads: tuple[threading.Thread, ...] = ()
         self._event_idle_epoch = 0
         self._setup_replay = False
-        # NEW acquires authority through its binder during start. LOAD/RESUME
-        # are handed an existing live ACP lease and own releasing it once the
-        # runtime stops or fails.
-        self._provisional_bindings: dict[tuple[str, str, str], WorkerBinding] = (
-            {_binding_release_key(binding): binding}
-            if mode is not SessionOpenMode.NEW
-            else {}
-        )
         self._close_thread: threading.Thread | None = None
         self._close_failure: BaseException | None = None
         self._prompt_threads: set[threading.Thread] = set()
 
-        self._updates_ingested = 0
-        self._permissions_ingested = 0
-        self._permissions_selected = 0
-        self._permissions_cancelled = 0
-        self._invalid_permission_selections = 0
-        self._prompts_started = 0
-        self._prompts_completed = 0
-        self._prompts_failed = 0
-        self._cancellation_requests = 0
+        self._counters = dict.fromkeys(AcpWorkerSessionStatus.counter_names(), 0)
 
     def start(self) -> "AcpWorkerSession":
         """Initialize capabilities, open one session, and start consumers."""
@@ -276,11 +268,7 @@ class AcpWorkerSession:
                         raise self._failure
                     self._state = RuntimeState.RUNNING
             except BaseException as exc:
-                try:
-                    self._release_derived_bindings(reason="acp_startup_rollback")
-                except BaseException:
-                    pass
-                self._record_failure(exc, release_bindings=False)
+                self._record_failure(exc)
                 # ``__enter__`` is never completed when start fails, so no
                 # caller cleanup can be assumed. Bound shutdown prevents an
                 # initialized adapter or a partially started consumer leaking.
@@ -310,7 +298,7 @@ class AcpWorkerSession:
                 raise ValueError("producer_turn_id must be non-empty text")
             stable_producer_turn_id = producer_turn_id.strip()
             with self._state_lock:
-                self._prompts_started += 1
+                self._counters["prompts_started"] += 1
             try:
                 self._require_current_binding(self._binding)
                 prepared_prompt = _prepare_prompt_content(self._client, prompt)
@@ -321,7 +309,7 @@ class AcpWorkerSession:
                 _raise_for_binding_rejection(prompt_event)
             except BaseException as exc:
                 with self._state_lock:
-                    self._prompts_failed += 1
+                    self._counters["prompts_failed"] += 1
                 self._record_failure(exc)
                 raise
             try:
@@ -337,7 +325,7 @@ class AcpWorkerSession:
                 )
             except BaseException as exc:
                 with self._state_lock:
-                    self._prompts_failed += 1
+                    self._counters["prompts_failed"] += 1
                 # Once a turn has been opened locally, a timed-out or failed
                 # prompt cannot be retried safely: late updates would otherwise
                 # be attributed to the next turn. Best-effort cancellation
@@ -350,7 +338,7 @@ class AcpWorkerSession:
                     "ACP prompt returned an invalid response"
                 )
                 with self._state_lock:
-                    self._prompts_failed += 1
+                    self._counters["prompts_failed"] += 1
                 self._close_failed_prompt(session_id, ingestor)
                 self._record_failure(error)
                 raise error
@@ -366,11 +354,11 @@ class AcpWorkerSession:
                     _raise_for_binding_rejection(completion)
             except BaseException as exc:
                 with self._state_lock:
-                    self._prompts_failed += 1
+                    self._counters["prompts_failed"] += 1
                 self._record_failure(exc)
                 raise
             with self._state_lock:
-                self._prompts_completed += 1
+                self._counters["prompts_completed"] += 1
             return result
 
     def submit_prompt(
@@ -524,15 +512,7 @@ class AcpWorkerSession:
             return AcpWorkerSessionStatus(
                 state=self._state,
                 healthy=self._state is RuntimeState.RUNNING and self._failure is None,
-                updates_ingested=self._updates_ingested,
-                permissions_ingested=self._permissions_ingested,
-                permissions_selected=self._permissions_selected,
-                permissions_cancelled=self._permissions_cancelled,
-                invalid_permission_selections=self._invalid_permission_selections,
-                prompts_started=self._prompts_started,
-                prompts_completed=self._prompts_completed,
-                prompts_failed=self._prompts_failed,
-                cancellation_requests=self._cancellation_requests,
+                **self._counters,
                 failure_type=(
                     type(self._failure).__name__ if self._failure is not None else None
                 ),
@@ -599,16 +579,8 @@ class AcpWorkerSession:
                 self._record_failure(error)
                 raise error
 
-            cleanup_failure: BaseException | None = None
-            try:
-                self._release_derived_bindings(reason="acp_runtime_stopped")
-            except BaseException as exc:
-                cleanup_failure = exc
             with self._state_lock:
                 failure = self._failure
-            if failure is None and cleanup_failure is not None:
-                failure = cleanup_failure
-                self._record_failure(failure, release_bindings=False)
             if self._close_failure is not None and failure is None:
                 failure = self._close_failure
                 self._record_failure(failure)
@@ -677,139 +649,43 @@ class AcpWorkerSession:
             raise AcpRuntimeBindingError("ACP session binding is unavailable")
         continuity = self._binding
         self._require_current_binding(continuity)
-        existing_acp = {
-            item.private_fingerprint
-            for item in self._authority_acp_bindings(continuity)
-        }
-        try:
-            bound = callback(session_id, continuity)
-            with self._state_lock:
-                if self._state is not RuntimeState.STARTING:
-                    raise AcpRuntimeStateError(
-                        "ACP runtime stopped during session binding"
-                    )
-            if not isinstance(bound, WorkerBinding):
-                raise AcpRuntimeBindingError(
-                    "ACP session binder returned an invalid binding"
-                )
-            if (
-                bound.host_id != continuity.host_id
-                or bound.worker_id != continuity.worker_id
-                or bound.worker_fingerprint != continuity.worker_fingerprint
-                or bound.backend != "acp"
-                or bound.target_kind != continuity.target_kind
-                or bound.target_value != continuity.target_value
-            ):
-                raise AcpRuntimeBindingError(
-                    "ACP session binder changed worker continuity"
-                )
-            if (
-                bound.turn_target_kind != "acp_session_id"
-                or bound.turn_target_value != session_id
-            ):
-                raise AcpRuntimeBindingError(
-                    "ACP session binder returned the wrong session"
-                )
-            if (
-                not bound.private_fingerprint
-                or bound.private_fingerprint == continuity.private_fingerprint
-            ):
-                raise AcpRuntimeBindingError(
-                    "ACP session binder did not establish a distinct private binding"
-                )
-            # The callback must add a distinct ACP binding. It must not
-            # repurpose or overwrite the Herdr continuity row it was given.
-            self._require_current_binding(continuity)
-            self._require_current_binding(bound)
-            created = [
-                item for item in self._authority_acp_bindings(continuity)
-                if item.private_fingerprint not in existing_acp
-            ]
-            if len(created) != 1 or not _same_binding_authority(created[0], bound):
-                raise AcpRuntimeBindingError(
-                    "ACP session binder did not establish one exact binding"
-                )
-        except BaseException:
-            try:
-                self._expire_new_acp_bindings(continuity, existing_acp)
-            except BaseException:
-                pass
-            raise
+        bound = callback(session_id, continuity)
         with self._state_lock:
-            self._provisional_bindings[_binding_release_key(bound)] = bound
-        return bound
-
-    def _authority_acp_bindings(
-        self,
-        continuity: WorkerBinding,
-    ) -> list[WorkerBinding]:
-        return [
-            item
-            for item in list_worker_bindings(
-                Path(self._config.db_path), continuity.host_id, backend="acp"
+            if self._state is not RuntimeState.STARTING:
+                raise AcpRuntimeStateError(
+                    "ACP runtime stopped during session binding"
+                )
+        if not isinstance(bound, WorkerBinding):
+            raise AcpRuntimeBindingError("ACP session binder returned an invalid binding")
+        normalized = replace(
+            bound,
+            backend=continuity.backend,
+            turn_target_kind=continuity.turn_target_kind,
+            turn_target_value=continuity.turn_target_value,
+            observed_at=continuity.observed_at,
+            expires_at=continuity.expires_at,
+            private_fingerprint=continuity.private_fingerprint,
+        )
+        if normalized != continuity:
+            raise AcpRuntimeBindingError("ACP session binder changed worker continuity")
+        if (
+            bound.backend != "acp"
+            or bound.turn_target_kind != "acp_session_id"
+            or bound.turn_target_value != session_id
+        ):
+            raise AcpRuntimeBindingError("ACP session binder returned the wrong session")
+        if (
+            not bound.private_fingerprint
+            or bound.private_fingerprint == continuity.private_fingerprint
+        ):
+            raise AcpRuntimeBindingError(
+                "ACP session binder did not establish a distinct private binding"
             )
-            if item.worker_id == continuity.worker_id
-            and item.worker_fingerprint == continuity.worker_fingerprint
-        ]
-
-    def _expire_new_acp_bindings(
-        self,
-        continuity: WorkerBinding,
-        existing_fingerprints: set[str],
-    ) -> None:
-        created = [
-            item for item in self._authority_acp_bindings(continuity)
-            if item.private_fingerprint not in existing_fingerprints
-        ]
-        with self._state_lock:
-            for item in created:
-                self._provisional_bindings[_binding_release_key(item)] = item
-        self._release_derived_bindings(reason="acp_startup_rollback")
-
-    def _release_derived_bindings(self, *, reason: str) -> None:
-        with self._state_lock:
-            pending = tuple(self._provisional_bindings.items())
-        failures: list[BaseException] = []
-        for key, bound in pending:
-            try:
-                expire_worker_bindings(
-                    Path(self._config.db_path),
-                    bound.host_id,
-                    backend="acp",
-                    worker_id=bound.worker_id,
-                    private_fingerprints=[bound.private_fingerprint],
-                    observed_before=bound.observed_at,
-                    reason=reason,
-                )
-                live = next(
-                    (
-                        item
-                        for item in list_worker_bindings(
-                            Path(self._config.db_path),
-                            bound.host_id,
-                            backend="acp",
-                        )
-                        if _binding_release_key(item) == key
-                    ),
-                    None,
-                )
-            except BaseException as exc:
-                failures.append(exc)
-                continue
-            with self._state_lock:
-                if self._provisional_bindings.get(key) is not bound:
-                    continue
-                if live is None:
-                    self._provisional_bindings.pop(key, None)
-                else:
-                    self._provisional_bindings[key] = live
-                    failures.append(
-                        AcpRuntimeBindingError(
-                            "ACP derived binding changed during cleanup"
-                        )
-                    )
-        if failures:
-            raise failures[0]
+        # The coordinator owns creation and retirement; the runtime verifies
+        # that both continuity and the returned session lease are current.
+        self._require_current_binding(continuity)
+        self._require_current_binding(bound)
+        return bound
 
     def _require_current_binding(self, expected: WorkerBinding) -> None:
         db_path = self._config.db_path
@@ -867,7 +743,7 @@ class AcpWorkerSession:
                         _raise_for_binding_rejection(outcome)
                     if getattr(outcome, "event", None) is not None:
                         with self._state_lock:
-                            self._updates_ingested += 1
+                            self._counters["updates_ingested"] += 1
                 elif isinstance(event, PermissionRequest):
                     self._handle_permission(event)
                 else:  # pragma: no cover - typed protocol invariant
@@ -899,7 +775,7 @@ class AcpWorkerSession:
                 _raise_for_binding_rejection(outcome)
             if getattr(outcome, "event", None) is not None:
                 with self._state_lock:
-                    self._permissions_ingested += 1
+                    self._counters["permissions_ingested"] += 1
 
             selected: str | None = None
             selection: PermissionSelection | None = None
@@ -923,7 +799,7 @@ class AcpWorkerSession:
                         )
                     elif candidate_id is not None:
                         with self._state_lock:
-                            self._invalid_permission_selections += 1
+                            self._counters["invalid_permission_selections"] += 1
                 except BaseException as exc:
                     callback_failure = exc
             response_attempted = True
@@ -933,7 +809,7 @@ class AcpWorkerSession:
                     cancelled=True,
                 )
                 with self._state_lock:
-                    self._permissions_cancelled += 1
+                    self._counters["permissions_cancelled"] += 1
             else:
                 try:
                     self._client.respond_permission(
@@ -947,7 +823,7 @@ class AcpWorkerSession:
                 if selection is not None:
                     selection.response_written()
                 with self._state_lock:
-                    self._permissions_selected += 1
+                    self._counters["permissions_selected"] += 1
             if callback_failure is not None:
                 raise callback_failure
         except BaseException:
@@ -964,7 +840,7 @@ class AcpWorkerSession:
                     pass
                 else:
                     with self._state_lock:
-                        self._permissions_cancelled += 1
+                        self._counters["permissions_cancelled"] += 1
             raise
 
     def _wait_for_event_idle(
@@ -1011,7 +887,7 @@ class AcpWorkerSession:
     def _cancel_session(self, session_id: str) -> None:
         self._client.cancel(session_id)
         with self._state_lock:
-            self._cancellation_requests += 1
+            self._counters["cancellation_requests"] += 1
 
     def _close_failed_prompt(
         self,
@@ -1048,18 +924,7 @@ class AcpWorkerSession:
         except BaseException:
             pass
 
-    def _record_failure(
-        self,
-        failure: BaseException,
-        *,
-        release_bindings: bool = True,
-    ) -> None:
-        if release_bindings:
-            try:
-                self._release_derived_bindings(reason="acp_runtime_failed")
-            except BaseException:
-                # Keep failed cleanup handles for the bounded stop/restart retry.
-                pass
+    def _record_failure(self, failure: BaseException) -> None:
         with self._idle_condition:
             if self._failure is None:
                 self._failure = failure
@@ -1078,14 +943,6 @@ def _prepare_prompt_content(
     if not prepared or any(not isinstance(block, Mapping) for block in prepared):
         raise ValueError("prompt must contain at least one content block")
     return tuple(dict(block) for block in prepared)
-
-
-def _binding_release_key(binding: WorkerBinding) -> tuple[str, str, str]:
-    return (
-        binding.worker_id,
-        binding.worker_fingerprint,
-        binding.private_fingerprint,
-    )
 
 
 def _same_binding_authority(left: WorkerBinding, right: WorkerBinding) -> bool:

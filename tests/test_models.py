@@ -22,7 +22,7 @@ from tendwire.core.models import (
     utc_timestamp,
     worker_binding_private_fingerprint,
 )
-from tendwire.core.projector import project_empty, project_from_raw
+from .model_helpers import project_empty, project_from_raw
 
 
 _FORBIDDEN_FIELDS = {

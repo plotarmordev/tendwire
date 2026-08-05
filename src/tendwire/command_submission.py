@@ -8,7 +8,6 @@ from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from .config import Config
-from .core.actions import CommandContext, execute_command
 from .core.commands import (
     COMMAND_ENVELOPE_SCHEMA_VERSION,
     COMMAND_ENVELOPE_V3_SCHEMA_VERSION,
@@ -26,10 +25,12 @@ from .core.commands import (
     STATUS_DUPLICATE_REQUEST,
     STATUS_INVALID_SELECTION,
     STATUS_NOT_FOUND,
+    STATUS_NOOP,
     STATUS_PENDING,
     STATUS_REJECTED,
     STATUS_REQUEST_STATE_UNCERTAIN,
     STATUS_RESOLVED,
+    STATUS_SNAPSHOT,
     STATUS_STALE_TARGET,
     STATUS_UNKNOWN_WORKER,
     STATUS_UNSUPPORTED_DECISION,
@@ -43,6 +44,7 @@ from .core.commands import (
     turn_submission_id,
     parse_command_request,
     resolve_target,
+    snapshot_result,
     validate_request,
     worker_candidate,
 )
@@ -933,16 +935,30 @@ def _answer_decision(
 
 def _execute_non_mutating(config: Config, request: CommandRequest) -> CommandEnvelope:
     if request.action == "noop":
-        return execute_command(request, CommandContext(host_id=config.host_id, workers=[]))
+        return CommandEnvelope.from_result(
+            request, ok=True, status=STATUS_NOOP, result={}
+        )
     snapshot = _current_snapshot(config)
-    return execute_command(
-        request,
-        CommandContext(
-            host_id=config.host_id,
-            workers=list(snapshot.workers),
-            snapshot=snapshot,
-        ),
+    if request.action == "read_snapshot":
+        return CommandEnvelope.from_result(
+            request,
+            ok=True,
+            status=STATUS_SNAPSHOT,
+            result=snapshot_result(snapshot),
+        )
+    resolved, candidates, status = resolve_target(
+        request.target, list(snapshot.workers)
     )
+    if status != STATUS_RESOLVED:
+        return _target_resolution_error(request, status, candidates)
+    return CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_RESOLVED,
+        result={"target": resolved},
+    )
+
+
 def _mutation_dry_run(request: CommandRequest) -> CommandEnvelope:
     if request.action == "send_instruction":
         return CommandEnvelope.from_result(

@@ -417,15 +417,9 @@ def cmd_snapshot(
     json_output: bool = True,
 ) -> int:
     """Read the daemon's current neutral snapshot."""
-    if not json_output:
-        print("error: only --json output is supported", file=sys.stderr)
-        return 2
-    payload = _daemon_read_payload(
-        _try_daemon_attempt(config, "snapshot.get"),
-        schema_version=2,
+    return _cmd_simple_read(
+        config, "snapshot.get", json_output=json_output, schema_version=2
     )
-    print(public_json_dumps(payload, indent=2))
-    return 0 if payload.get("ok") is not False else 1
 
 
 def _daemon_payload_json(payload: dict[str, Any], *, indent: int | None = None) -> str:
@@ -474,6 +468,33 @@ def _daemon_read_payload(
     return payload
 
 
+def _cmd_simple_read(
+    config: Config,
+    method: str,
+    *,
+    json_output: bool,
+    schema_version: int = 1,
+    require_ok_status: bool = False,
+    trusted_daemon_json: bool = False,
+) -> int:
+    if not json_output:
+        print("error: only --json output is supported", file=sys.stderr)
+        return 2
+    payload = _daemon_read_payload(
+        _try_daemon_attempt(config, method), schema_version=schema_version
+    )
+    serialized = (
+        _daemon_payload_json(payload, indent=2)
+        if trusted_daemon_json
+        else public_json_dumps(payload, indent=2)
+    )
+    print(serialized)
+    success = payload.get("ok") is not False
+    if require_ok_status:
+        success = success and payload.get("status") == "ok"
+    return 0 if success else 1
+
+
 def cmd_turns(
     config: Config,
     *,
@@ -519,35 +540,6 @@ def cmd_turn_content_get(config: Config, args: argparse.Namespace) -> int:
     return 0 if payload.get("ok") is not False and isinstance(payload.get("text"), str) else 1
 
 
-def cmd_attention(
-    config: Config,
-    *,
-    json_output: bool = True,
-) -> int:
-    """Print neutral public attention items."""
-    if not json_output:
-        print("error: only --json output is supported", file=sys.stderr)
-        return 2
-    payload = _daemon_read_payload(_try_daemon_attempt(config, "attention.list"))
-    print(public_json_dumps(payload, indent=2))
-    return 0 if payload.get("ok") is not False else 1
-
-
-def cmd_pending(
-    config: Config,
-    *,
-    json_output: bool = True,
-) -> int:
-    """Print pending interactions from the daemon."""
-    if not json_output:
-        print("error: only --json output is supported", file=sys.stderr)
-        return 2
-
-    payload = _daemon_read_payload(_try_daemon_attempt(config, "pending.list"))
-    print(public_json_dumps(payload, indent=2))
-    return 0 if payload.get("ok") is not False else 1
-
-
 def cmd_turn_delta(config: Config, args: argparse.Namespace) -> int:
     """Read one delta page from the daemon."""
     params = {
@@ -561,20 +553,6 @@ def cmd_turn_delta(config: Config, args: argparse.Namespace) -> int:
     )
     print(_daemon_payload_json(payload, indent=2))
     return 0 if payload.get("ok") is not False else 1
-
-
-def cmd_doctor(
-    config: Config,
-    *,
-    json_output: bool = True,
-) -> int:
-    """Read daemon and lifecycle diagnostics."""
-    if not json_output:
-        print("error: only --json output is supported", file=sys.stderr)
-        return 2
-    payload = _daemon_read_payload(_try_daemon_attempt(config, "health.get"))
-    print(json.dumps(payload, indent=2, sort_keys=True))
-    return 0 if payload.get("status") == "ok" and payload.get("ok") is not False else 1
 
 
 def _command_exit_code(envelope: CommandEnvelope) -> int:
@@ -817,9 +795,8 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.command == "attention":
-        return cmd_attention(
-            config,
-            json_output=args.json_output,
+        return _cmd_simple_read(
+            config, "attention.list", json_output=args.json_output
         )
 
     if args.command == "turns":
@@ -838,7 +815,9 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_turn_content_get(config, args)
 
     if args.command == "pending":
-        return cmd_pending(config, json_output=args.json_output)
+        return _cmd_simple_read(
+            config, "pending.list", json_output=args.json_output
+        )
 
     if args.command == "command":
         return cmd_command(config, json_output=args.json_output)
@@ -850,7 +829,13 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_daemon(config)
 
     if args.command == "doctor":
-        return cmd_doctor(config, json_output=args.json_output)
+        return _cmd_simple_read(
+            config,
+            "health.get",
+            json_output=args.json_output,
+            require_ok_status=True,
+            trusted_daemon_json=True,
+        )
 
     parser.print_help()
     return 0

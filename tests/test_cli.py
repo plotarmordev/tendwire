@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from tendwire.cli import _daemon_client_timeout_seconds, main
 from tendwire.config import Config
@@ -32,3 +33,18 @@ def test_attention_uses_daemon_and_never_reads_store(capsys, monkeypatch, tmp_pa
     assert code == 1
     assert payload["status"] == "daemon_unavailable"
     assert not (tmp_path / "tendwire.db").exists()
+
+
+def test_doctor_preserves_trusted_daemon_identity(capsys, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tendwire.cli._try_daemon_attempt",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            result={"schema_version": 1, "status": "ok", "pid": 1234},
+            response_error=None,
+            error_kind=None,
+            request_started=True,
+        ),
+    )
+
+    assert main(["doctor", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["pid"] == 1234

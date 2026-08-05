@@ -12,7 +12,7 @@ from tendwire.backends.acp_ingestion import AcpSessionIngestor
 from tendwire.config import Config
 from tendwire.core.agent_events import AgentEvent, agent_event
 from tendwire.core.models import WorkerBinding
-from tendwire.core.projector import project_from_raw
+from .model_helpers import project_from_raw
 from tendwire.store.events import list_agent_events
 from tendwire.store.projection import save_snapshot, upsert_worker_bindings
 from tendwire.store.schema import init_store

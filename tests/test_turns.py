@@ -15,7 +15,7 @@ from tendwire.core.models import (
     Worker,
     sanitize_canonical_turn_text,
 )
-from tendwire.core.projector import project_from_raw
+from .model_helpers import project_from_raw
 from tendwire.core.turns import (
     InteractionChoice,
     PendingInteraction,

@@ -12,7 +12,6 @@ _CORE_MODULE_NAMES = (
     "tendwire.core.projector",
     "tendwire.core.attention",
     "tendwire.core.commands",
-    "tendwire.core.actions",
     "tendwire.core.turns",
 )
 

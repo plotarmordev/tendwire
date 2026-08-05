@@ -54,6 +54,7 @@ from .acp_client import BoundedAcpConnection
 from .acp_permissions import AcpPermissionBroker
 from .acp_runtime import (
     AcpWorkerSession,
+    AcpWorkerSessionStatus,
     RuntimeState,
     SessionOpenMode,
 )
@@ -126,6 +127,17 @@ class _SessionSlot:
     console_bridge_thread: threading.Thread | None = None
 
 
+@dataclass(slots=True)
+class _RuntimeBindingHandle:
+    """Retain a coordinator-created ACP lease until runtime startup settles."""
+
+    binding: WorkerBinding | None = None
+
+    def retain(self, binding: WorkerBinding) -> WorkerBinding:
+        self.binding = binding
+        return binding
+
+
 class _PromptRoute:
     def __init__(
         self,
@@ -140,7 +152,11 @@ class _PromptRoute:
 
     @property
     def binding_fingerprint(self) -> str:
-        return self._owner._route_binding_fingerprint(self._worker, self._slot)
+        with self._owner._reconcile_lock:
+            self._owner._require_reconcile_state(allow_starting=False)
+            if self._owner._current_slot(self._worker) is not self._slot:
+                raise AcpCoordinatorError("ACP worker route is stale")
+            return str(self._slot.runtime._binding.private_fingerprint)
 
     def prompt(
         self,
@@ -150,7 +166,7 @@ class _PromptRoute:
         timeout: float,
         on_send_start: Callable[[], None] | None = None,
     ) -> object:
-        return self._owner._submit_prompt(
+        return self._owner._submit_route(
             self._worker,
             self._slot,
             text,
@@ -160,11 +176,16 @@ class _PromptRoute:
             generation_prepared=bool(
                 getattr(self._prepared, "depth", 0)
             ),
+            steering=False,
         )
 
     @property
     def supports_steering(self) -> bool:
-        return self._owner._supports_steering(self._worker, self._slot)
+        try:
+            current = self._owner._current_slot(self._worker)
+            return current is self._slot and self._slot.runtime.can_steer()
+        except Exception:
+            return False
 
     def steer(
         self,
@@ -174,7 +195,7 @@ class _PromptRoute:
         timeout: float,
         on_send_start: Callable[[], None] | None = None,
     ) -> object:
-        return self._owner._submit_steering(
+        return self._owner._submit_route(
             self._worker,
             self._slot,
             text,
@@ -182,6 +203,7 @@ class _PromptRoute:
             acknowledgement_timeout=timeout,
             on_send_start=on_send_start,
             generation_prepared=bool(getattr(self._prepared, "depth", 0)),
+            steering=True,
         )
 
     @contextmanager
@@ -232,14 +254,14 @@ class AcpSupervisor:
             self._discovery_client_factory = _default_endpoint_client_factory
         self._session_factory = session_factory
         self._connection_factory = connection_factory
-        resolved_reconcile_interval = float(
+        interval = (
             config.reconcile_interval_seconds
             if reconcile_interval is None
             else reconcile_interval
         )
-        if not math.isfinite(resolved_reconcile_interval) or resolved_reconcile_interval <= 0:
+        self._reconcile_interval = float(interval)
+        if not math.isfinite(self._reconcile_interval) or self._reconcile_interval <= 0:
             raise ValueError("reconcile_interval must be finite and positive")
-        self._reconcile_interval = resolved_reconcile_interval
         self._lock = threading.RLock()
         # Endpoint minting, runtime publication, prompt lease validation, and
         # shutdown are one private generation transaction. Herdr
@@ -251,6 +273,7 @@ class AcpSupervisor:
         # Retirement removes routing authority immediately, but shutdown must
         # still account for bridge and executor work that already started.
         self._retired_slots: dict[int, _SessionSlot] = {}
+        self._pending_binding_releases: dict[tuple[str, str, str], WorkerBinding] = {}
         self._thread: threading.Thread | None = None
         self._state = RuntimeState.NEW
         self._failure_type: str | None = None
@@ -331,6 +354,11 @@ class AcpSupervisor:
             )
         try:
             self._stop_all(timeout=max(0.001, deadline - time.monotonic()))
+            try:
+                self._retry_binding_releases()
+            except Exception as exc:
+                with self._lock:
+                    self._failure_type = type(exc).__name__
         finally:
             self._reconcile_lock.release()
         with self._lock:
@@ -338,7 +366,10 @@ class AcpSupervisor:
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
-        unfinished = bool(thread is not None and thread.is_alive())
+        unfinished = bool(
+            (thread is not None and thread.is_alive())
+            or self._pending_binding_releases
+        )
         for slot in slots:
             with slot.lock:
                 bridge_thread = slot.console_bridge_thread
@@ -370,17 +401,7 @@ class AcpSupervisor:
                 self._state = RuntimeState.STOPPED
 
     def status(self) -> dict[str, Any]:
-        counters = {
-            "updates_ingested": 0,
-            "permissions_ingested": 0,
-            "permissions_selected": 0,
-            "permissions_cancelled": 0,
-            "invalid_permission_selections": 0,
-            "prompts_started": 0,
-            "prompts_completed": 0,
-            "prompts_failed": 0,
-            "cancellation_requests": 0,
-        }
+        counters = dict.fromkeys(AcpWorkerSessionStatus.counter_names(), 0)
         with self._lock:
             state = self._state
             slots = tuple(self._slots.values())
@@ -922,6 +943,13 @@ class AcpSupervisor:
                     self._stop_all()
 
     def _reconcile_locked(self, *, strict: bool) -> None:
+        try:
+            self._retry_binding_releases()
+        except Exception as exc:
+            with self._lock:
+                self._failure_type = type(exc).__name__
+            if strict:
+                raise
         discovery_omissions = 0
         if self._discovery_client_factory is not None:
             try:
@@ -1089,46 +1117,55 @@ class AcpSupervisor:
         if existing is not None:
             self._retire_worker(continuity.worker_id, expected=existing)
         endpoint = self._resolve_endpoint(continuity)
-        runtime, permission_broker = self._build_runtime(continuity, endpoint)
+        runtime, permission_broker, binding_handle = self._build_runtime(
+            continuity,
+            endpoint,
+        )
         try:
             runtime.start()
         except Exception:
             permission_broker.close()
-            try:
-                runtime.stop(timeout=self.config.acp_shutdown_timeout_seconds)
-            except Exception:
-                pass
+            self._stop_runtime(runtime, owned_binding=binding_handle.binding)
             raise
+        console_executor: ThreadPoolExecutor | None = None
         try:
             self._require_reconcile_state(allow_starting=True)
-        except Exception:
-            permission_broker.close()
-            self._stop_runtime(runtime)
-            raise
-        runtime_binding = getattr(runtime, "_binding", None)
-        console_cursor = 0
-        if isinstance(runtime_binding, WorkerBinding) and runtime_binding.turn_target_value:
-            console_cursor = _latest_console_event_sequence(
-                Path(self.config.db_path),
-                self.config.host_id,
-                continuity.worker_id,
-                runtime_binding.turn_target_value,
-            )
-        slot = _SessionSlot(
-            continuity,
-            endpoint.generation,
-            runtime,
-            console=endpoint.console,
-            console_executor=ThreadPoolExecutor(
+            runtime_binding = getattr(runtime, "_binding", None)
+            console_cursor = 0
+            if (
+                isinstance(runtime_binding, WorkerBinding)
+                and runtime_binding.turn_target_value
+            ):
+                console_cursor = _latest_console_event_sequence(
+                    Path(self.config.db_path),
+                    self.config.host_id,
+                    continuity.worker_id,
+                    runtime_binding.turn_target_value,
+                )
+            console_executor = ThreadPoolExecutor(
                 max_workers=1,
-                thread_name_prefix=f"tendwire-acp-console-{continuity.worker_id}",
-            ),
-            permission_broker=permission_broker,
-            console_event_sequence=console_cursor,
-        )
-        with self._lock:
-            displaced = self._slots.get(continuity.worker_id)
-            self._slots[continuity.worker_id] = slot
+                thread_name_prefix=(
+                    f"tendwire-acp-console-{continuity.worker_id}"
+                ),
+            )
+            slot = _SessionSlot(
+                continuity,
+                endpoint.generation,
+                runtime,
+                console=endpoint.console,
+                console_executor=console_executor,
+                permission_broker=permission_broker,
+                console_event_sequence=console_cursor,
+            )
+            with self._lock:
+                displaced = self._slots.get(continuity.worker_id)
+                self._slots[continuity.worker_id] = slot
+        except Exception:
+            if console_executor is not None:
+                console_executor.shutdown(wait=False, cancel_futures=True)
+            permission_broker.close()
+            self._stop_runtime(runtime, owned_binding=binding_handle.binding)
+            raise
         if displaced is not None:
             self._stop_runtime(displaced.runtime)
 
@@ -1164,7 +1201,7 @@ class AcpSupervisor:
             self._retire_worker(slot.continuity.worker_id, expected=slot)
             raise AcpCoordinatorError("ACP worker generation lease is not current")
 
-    def _submit_prompt(
+    def _submit_route(
         self,
         worker: Worker,
         slot: _SessionSlot,
@@ -1172,89 +1209,45 @@ class AcpSupervisor:
         *,
         producer_turn_id: str,
         acknowledgement_timeout: float,
-        on_send_start: Callable[[], None] | None = None,
-        generation_prepared: bool = False,
+        on_send_start: Callable[[], None] | None,
+        generation_prepared: bool,
+        steering: bool,
     ) -> object:
-        """Write through the exact route generation used by the receipt."""
+        """Fence and submit one prompt operation on an exact generation."""
 
         with self._reconcile_lock:
             self._require_reconcile_state(allow_starting=False)
-            current = self._current_slot(worker)
-            if current is not slot:
+            if self._current_slot(worker) is not slot:
                 raise AcpCoordinatorError("ACP worker route is stale")
             if not generation_prepared:
                 self._require_attached_generation(slot)
             if self._current_slot(worker) is not slot:
                 raise AcpCoordinatorError("ACP worker route is stale")
-            # The route lease covers the complete JSON-RPC request frame, not
-            # just status validation. Retirement can proceed as soon as the
-            # runtime acknowledges that the frame is written; turn completion
-            # remains supervised asynchronously by the runtime.
-            return slot.runtime.submit_prompt(
-                text,
-                producer_turn_id=producer_turn_id,
-                acknowledgement_timeout=acknowledgement_timeout,
-                on_send_start=on_send_start,
-            )
-
-    def _supports_steering(self, worker: Worker, slot: _SessionSlot) -> bool:
-        try:
-            return self._current_slot(worker) is slot and slot.runtime.can_steer()
-        except Exception:
-            return False
-
-    def _submit_steering(
-        self,
-        worker: Worker,
-        slot: _SessionSlot,
-        text: str,
-        *,
-        producer_turn_id: str,
-        acknowledgement_timeout: float,
-        on_send_start: Callable[[], None] | None = None,
-        generation_prepared: bool = False,
-    ) -> object:
-        """Steer the exact attached generation used by the receipt."""
-
-        with self._reconcile_lock:
-            self._require_reconcile_state(allow_starting=False)
-            current = self._current_slot(worker)
-            if current is not slot:
-                raise AcpCoordinatorError("ACP worker route is stale")
-            if not generation_prepared:
-                self._require_attached_generation(slot)
-            if self._current_slot(worker) is not slot or not slot.runtime.can_steer():
+            if steering and not slot.runtime.can_steer():
                 raise AcpCoordinatorError("ACP steering route is unavailable")
-            return slot.runtime.submit_steering(
+            submit = (
+                slot.runtime.submit_steering
+                if steering
+                else slot.runtime.submit_prompt
+            )
+            # Hold the route lease through the complete request-frame write;
+            # end-of-turn completion remains supervised by the runtime.
+            return submit(
                 text,
                 producer_turn_id=producer_turn_id,
                 acknowledgement_timeout=acknowledgement_timeout,
                 on_send_start=on_send_start,
-            )
-
-    def _route_binding_fingerprint(
-        self,
-        worker: Worker,
-        slot: _SessionSlot,
-    ) -> str:
-        """Return authority only while this exact route remains current."""
-
-        with self._reconcile_lock:
-            self._require_reconcile_state(allow_starting=False)
-            if self._current_slot(worker) is not slot:
-                raise AcpCoordinatorError("ACP worker route is stale")
-            binding = getattr(slot.runtime, "_binding", None)
-            return (
-                str(binding.private_fingerprint)
-                if isinstance(binding, WorkerBinding)
-                else ""
             )
 
     def _build_runtime(
         self,
         continuity: WorkerBinding,
         endpoint: HerdrAcpEndpoint,
-    ) -> tuple[AcpWorkerSession, AcpPermissionBroker]:
+    ) -> tuple[
+        AcpWorkerSession,
+        AcpPermissionBroker,
+        _RuntimeBindingHandle,
+    ]:
         client = self._connection_factory(
             endpoint.command,
             cwd=endpoint.cwd,
@@ -1263,13 +1256,22 @@ class AcpSupervisor:
             close_timeout=self.config.acp_shutdown_timeout_seconds,
             max_frame_bytes=self.config.acp_max_frame_bytes,
         )
+        binding_handle = _RuntimeBindingHandle()
         if endpoint.session_mode is SessionOpenMode.NEW:
             binding = continuity
-            callback = self._bind_new_session
+
+            def callback(
+                session_id: str,
+                anchor: WorkerBinding,
+            ) -> WorkerBinding:
+                return binding_handle.retain(
+                    self._bind_new_session(session_id, anchor)
+                )
         else:
             assert endpoint.session_id is not None
             binding = _derived_binding(continuity, endpoint.session_id)
             upsert_worker_bindings(Path(self.config.db_path), [binding])
+            binding_handle.retain(binding)
             callback = None
         permission_broker = AcpPermissionBroker(
             self.config,
@@ -1297,19 +1299,19 @@ class AcpSupervisor:
                 poll_timeout=min(0.25, self.config.acp_request_timeout_seconds),
                 stop_timeout=self.config.acp_shutdown_timeout_seconds,
             )
-            return runtime, permission_broker
+            return runtime, permission_broker, binding_handle
         except Exception:
             permission_broker.close()
             try:
                 client.close()
             except Exception:
                 pass
-            if endpoint.session_mode is not SessionOpenMode.NEW:
-                _expire_derived_binding(
-                    self.config,
-                    binding,
-                    reason="acp_runtime_construction_failed",
-                )
+            owned_binding = binding_handle.binding
+            if owned_binding is not None:
+                try:
+                    self._retire_binding(owned_binding)
+                except Exception:
+                    pass
             raise
 
     def _bind_new_session(
@@ -1341,18 +1343,30 @@ class AcpSupervisor:
                 # positive-disappearance path in reconciliation may remove it.
                 if not self._console_failed_claims:
                     self._console_failure_type = None
-            with slot.lock:
-                slot.retired = True
-                executor = slot.console_executor
-            if slot.permission_broker is not None:
-                slot.permission_broker.close()
-            executor.shutdown(wait=False, cancel_futures=True)
-            self._stop_runtime(slot.runtime)
+            self._retire_slot(slot)
+
+    def _retire_slot(self, slot: _SessionSlot, *, timeout: float | None = None) -> None:
+        """Fence one slot and retire all generation-owned resources."""
+
+        with slot.lock:
+            slot.retired = True
+            executor = slot.console_executor
+        if slot.permission_broker is not None:
+            slot.permission_broker.close()
+        executor.shutdown(wait=False, cancel_futures=True)
+        self._stop_runtime(slot.runtime, timeout=timeout)
 
     def _stop_runtime(
-        self, runtime: AcpWorkerSession, *, timeout: float | None = None
+        self,
+        runtime: AcpWorkerSession,
+        *,
+        timeout: float | None = None,
+        owned_binding: WorkerBinding | None = None,
     ) -> None:
-        binding = getattr(runtime, "_binding", None)
+        bindings: dict[tuple[str, str, str], WorkerBinding] = {}
+        for candidate in (owned_binding, getattr(runtime, "_binding", None)):
+            if isinstance(candidate, WorkerBinding) and candidate.backend == "acp":
+                bindings[_binding_key(candidate)] = candidate
         try:
             runtime.stop(
                 timeout=(
@@ -1364,12 +1378,39 @@ class AcpSupervisor:
         except Exception:
             pass
         finally:
-            if isinstance(binding, WorkerBinding) and binding.backend == "acp":
-                _expire_derived_binding(
-                    self.config,
-                    binding,
-                    reason="acp_runtime_retired",
-                )
+            for binding in bindings.values():
+                try:
+                    self._retire_binding(binding)
+                except Exception:
+                    pass
+
+    def _retire_binding(self, binding: WorkerBinding) -> None:
+        self._pending_binding_releases[_binding_key(binding)] = binding
+        self._retry_binding_releases()
+
+    def _retry_binding_releases(self) -> None:
+        """Retry exact ACP lease retirement without losing cleanup handles."""
+
+        for key, binding in tuple(self._pending_binding_releases.items()):
+            _expire_derived_binding(
+                self.config,
+                binding,
+                reason="acp_runtime_retired",
+            )
+            live = next(
+                (
+                    row
+                    for row in list_worker_bindings(
+                        Path(self.config.db_path), binding.host_id, backend="acp"
+                    )
+                    if _binding_key(row) == key
+                ),
+                None,
+            )
+            if live is not None:
+                self._pending_binding_releases[key] = live
+                raise AcpCoordinatorError("ACP binding changed during retirement")
+            self._pending_binding_releases.pop(key, None)
 
     def _expire_orphaned_bindings(self) -> None:
         """Revoke ACP leases that no runtime in this process can own."""
@@ -1396,17 +1437,8 @@ class AcpSupervisor:
         )
         deadline = time.monotonic() + total
         for slot in slots:
-            # Bridge-held slot critical sections are deliberately local and
-            # non-blocking; synchronize the retirement flag with every reader
-            # so shutdown cannot race a last console mutation or submission.
-            with slot.lock:
-                slot.retired = True
-                executor = slot.console_executor
-            if slot.permission_broker is not None:
-                slot.permission_broker.close()
-            executor.shutdown(wait=False, cancel_futures=True)
-            self._stop_runtime(
-                slot.runtime,
+            self._retire_slot(
+                slot,
                 timeout=max(0.001, deadline - time.monotonic()),
             )
 
@@ -1451,6 +1483,14 @@ def _expire_derived_binding(
         private_fingerprints=[binding.private_fingerprint],
         observed_before=binding.observed_at,
         reason=reason,
+    )
+
+
+def _binding_key(binding: WorkerBinding) -> tuple[str, str, str]:
+    return (
+        binding.worker_id,
+        binding.worker_fingerprint,
+        binding.private_fingerprint,
     )
 
 

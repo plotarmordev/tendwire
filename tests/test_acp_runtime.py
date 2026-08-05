@@ -400,15 +400,7 @@ def test_start_negotiates_opens_one_session_and_binds_factory(tmp_path: Path) ->
         assert service.status().healthy
     finally:
         service.stop()
-    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
-    retired = list_worker_bindings(
-        db_path,
-        "host-a",
-        backend="acp",
-        include_expired=True,
-    )
-    assert len(retired) == 1
-    assert retired[0].reason == "acp_runtime_stopped"
+    assert len(list_worker_bindings(db_path, "host-a", backend="acp")) == 1
 
 @pytest.mark.parametrize(
     ("mode", "method"),
@@ -441,267 +433,7 @@ def test_load_and_resume_use_requested_session(
         assert client.calls[1][1][0] == "existing-private"
     finally:
         service.stop()
-    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
-    retired = list_worker_bindings(
-        db_path,
-        "host-a",
-        backend="acp",
-        include_expired=True,
-    )
-    assert len(retired) == 1
-    assert retired[0].reason == "acp_runtime_stopped"
-
-
-def test_derived_binding_release_retries_after_store_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "events.db"
-    existing = binding("existing-private")
-    upsert_worker_bindings(db_path, [existing])
-    service = AcpRuntime(
-        FakeClient(),  # type: ignore[arg-type]
-        config=Config(host_id="host-a", db_path=db_path),
-        binding=existing,
-        cwd=tmp_path,
-        session_mode=SessionOpenMode.LOAD,
-        session_id="existing-private",
-    )
-    attempts = 0
-
-    def fail_once(*args: object, **kwargs: object) -> int:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise sqlite3.OperationalError("injected expiry failure")
-        return expire_worker_bindings(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(
-        "tendwire.backends.acp_runtime.expire_worker_bindings",
-        fail_once,
-    )
-    with pytest.raises(sqlite3.OperationalError, match="injected expiry failure"):
-        service._release_derived_bindings(reason="acp_runtime_failed")
-
-    assert service._provisional_bindings == {
-        (
-            existing.worker_id,
-            existing.worker_fingerprint,
-            existing.private_fingerprint,
-        ): existing,
-    }
     assert list_worker_bindings(db_path, "host-a", backend="acp") == [existing]
-
-    service._release_derived_bindings(reason="acp_runtime_stopped")
-    assert service._provisional_bindings == {}
-    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
-
-
-def test_callback_cleanup_retains_every_new_binding_until_expiry_succeeds(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "events.db"
-    continuity = continuity_binding()
-    upsert_worker_bindings(db_path, [continuity])
-    service = AcpRuntime(
-        FakeClient(),  # type: ignore[arg-type]
-        config=Config(host_id="host-a", db_path=db_path),
-        binding=continuity,
-        cwd=tmp_path,
-        session_binding_callback=binding_callback(db_path),
-    )
-    existing = {
-        item.private_fingerprint
-        for item in service._authority_acp_bindings(continuity)
-    }
-    created = replace(
-        continuity,
-        backend="acp",
-        turn_target_kind="acp_session_id",
-        turn_target_value="persisted-before-callback-failure",
-        private_fingerprint="",
-    )
-    upsert_worker_bindings(db_path, [created])
-    persisted = list_worker_bindings(db_path, "host-a", backend="acp")[0]
-    attempts = 0
-
-    def fail_once(*args: object, **kwargs: object) -> int:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise sqlite3.OperationalError("injected callback cleanup failure")
-        return expire_worker_bindings(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(
-        "tendwire.backends.acp_runtime.expire_worker_bindings",
-        fail_once,
-    )
-    with pytest.raises(sqlite3.OperationalError, match="callback cleanup failure"):
-        service._expire_new_acp_bindings(continuity, existing)
-
-    assert service._provisional_bindings == {
-        (
-            persisted.worker_id,
-            persisted.worker_fingerprint,
-            persisted.private_fingerprint,
-        ): persisted,
-    }
-    service._release_derived_bindings(reason="acp_runtime_failed")
-    assert service._provisional_bindings == {}
-    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
-
-
-def test_callback_cleanup_is_scoped_to_one_exact_worker_authority(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "events.db"
-    continuity = replace(
-        continuity_binding(), observed_at="2026-08-05T11:59:59+00:00"
-    )
-    other_continuity = replace(
-        continuity,
-        worker_id="other-worker",
-        target_value="other-pane",
-        turn_target_value="other-pane",
-        private_fingerprint="other-continuity",
-    )
-    upsert_worker_bindings(db_path, [continuity])
-    save_snapshot(
-        db_path,
-        Snapshot(
-            host_id="host-a",
-            updated_at="2026-08-05T12:00:00+00:00",
-            workers=(
-                Worker(
-                    id=continuity.worker_id,
-                    name="own worker",
-                    fingerprint=continuity.worker_fingerprint,
-                    meta={
-                        "stable_key": "wsk1_" + "a" * 64,
-                        "stable_key_version": 1,
-                    },
-                ),
-                Worker(
-                    id=other_continuity.worker_id,
-                    name="other worker",
-                    fingerprint=other_continuity.worker_fingerprint,
-                    meta={
-                        "stable_key": "wsk1_" + "b" * 64,
-                        "stable_key_version": 1,
-                    },
-                ),
-            ),
-        ),
-    )
-    upsert_worker_bindings(db_path, [other_continuity])
-    service = AcpRuntime(
-        FakeClient(),  # type: ignore[arg-type]
-        config=Config(host_id="host-a", db_path=db_path),
-        binding=continuity,
-        cwd=tmp_path,
-        session_binding_callback=binding_callback(db_path),
-    )
-    own = replace(
-        continuity,
-        backend="acp",
-        turn_target_kind="acp_session_id",
-        turn_target_value="own-session",
-        private_fingerprint="shared-explicit-fingerprint",
-    )
-    other = replace(
-        other_continuity,
-        backend="acp",
-        turn_target_kind="acp_session_id",
-        turn_target_value="other-session",
-        private_fingerprint="shared-explicit-fingerprint",
-    )
-    upsert_worker_bindings(db_path, [own, other])
-
-    service._expire_new_acp_bindings(continuity, set())
-
-    assert list_worker_bindings(db_path, "host-a", backend="acp") == [other]
-
-
-def test_release_retains_binding_refreshed_after_expiry_snapshot(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "events.db"
-    existing = binding("existing-private")
-    upsert_worker_bindings(db_path, [existing])
-    service = AcpRuntime(
-        FakeClient(),  # type: ignore[arg-type]
-        config=Config(host_id="host-a", db_path=db_path),
-        binding=existing,
-        cwd=tmp_path,
-        session_mode=SessionOpenMode.LOAD,
-        session_id="existing-private",
-    )
-    refreshed = replace(
-        existing,
-        observed_at="2099-01-01T00:00:00+00:00",
-    )
-    refreshed_once = False
-
-    def refresh_then_expire(*args: object, **kwargs: object) -> int:
-        nonlocal refreshed_once
-        if not refreshed_once:
-            refreshed_once = True
-            upsert_worker_bindings(db_path, [refreshed])
-        return expire_worker_bindings(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(
-        "tendwire.backends.acp_runtime.expire_worker_bindings",
-        refresh_then_expire,
-    )
-    with pytest.raises(AcpRuntimeBindingError, match="changed during cleanup"):
-        service._release_derived_bindings(reason="acp_runtime_failed")
-
-    assert tuple(service._provisional_bindings.values()) == (refreshed,)
-    service._release_derived_bindings(reason="acp_runtime_stopped")
-    assert service._provisional_bindings == {}
-    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
-
-
-def test_stop_prefers_original_failure_when_binding_cleanup_also_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "events.db"
-    existing = binding("existing-private")
-    upsert_worker_bindings(db_path, [existing])
-    service = AcpRuntime(
-        FakeClient(),  # type: ignore[arg-type]
-        config=Config(host_id="host-a", db_path=db_path),
-        binding=existing,
-        cwd=tmp_path,
-        session_mode=SessionOpenMode.LOAD,
-        session_id="existing-private",
-    )
-    original = RuntimeError("original runtime failure")
-    with service._state_lock:
-        service._failure = original
-        service._state = RuntimeState.FAILED
-
-    def fail_cleanup(*_args: object, **_kwargs: object) -> int:
-        raise sqlite3.OperationalError("secondary cleanup failure")
-
-    monkeypatch.setattr(
-        "tendwire.backends.acp_runtime.expire_worker_bindings",
-        fail_cleanup,
-    )
-    with pytest.raises(RuntimeError, match="original runtime failure"):
-        service.stop()
-
-    assert service._failure is original
-    assert service._provisional_bindings
-    monkeypatch.setattr(
-        "tendwire.backends.acp_runtime.expire_worker_bindings",
-        expire_worker_bindings,
-    )
-    service._release_derived_bindings(reason="acp_runtime_stopped")
-    assert service._provisional_bindings == {}
 
 
 @pytest.mark.parametrize("mode", [SessionOpenMode.LOAD, SessionOpenMode.RESUME])
@@ -734,15 +466,7 @@ def test_load_and_resume_reject_agent_session_mismatch_and_close(
     assert client.closed
     assert client.close_calls == 1
     assert service.status().state is RuntimeState.FAILED
-    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
-    retired = list_worker_bindings(
-        db_path,
-        "host-a",
-        backend="acp",
-        include_expired=True,
-    )
-    assert len(retired) == 1
-    assert retired[0].reason == "acp_startup_rollback"
+    assert list_worker_bindings(db_path, "host-a", backend="acp") == [existing]
 
 
 @pytest.mark.parametrize("mode", [SessionOpenMode.LOAD, SessionOpenMode.RESUME])
@@ -829,15 +553,7 @@ def test_new_acp_binding_survives_herdr_refresh_and_normal_stop(
     )
     assert list_worker_bindings(db_path, "host-a", backend="acp") == derived
     service.stop()
-    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
-    released = list_worker_bindings(
-        db_path,
-        "host-a",
-        backend="acp",
-        include_expired=True,
-    )
-    assert len(released) == 1
-    assert released[0].reason == "acp_runtime_stopped"
+    assert list_worker_bindings(db_path, "host-a", backend="acp") == derived
 
 
 def test_new_session_binding_accepts_concurrent_herdr_lease_refresh(
@@ -881,47 +597,7 @@ def test_new_session_binding_accepts_concurrent_herdr_lease_refresh(
         service.stop()
 
 
-@pytest.mark.parametrize("failure_mode", ("raise", "bad_return"))
-def test_new_cleans_binding_persisted_by_failed_callback(
-    tmp_path: Path,
-    failure_mode: str,
-) -> None:
-    client = FakeClient()
-    db_path = tmp_path / "events.db"
-    continuity = continuity_binding()
-    upsert_worker_bindings(db_path, [continuity])
-
-    def fail_after_persist(session_id: str, anchor: WorkerBinding):
-        bound = binding_callback(db_path)(session_id, anchor)
-        if failure_mode == "raise":
-            raise RuntimeError("after persist")
-        return object()
-
-    service = AcpRuntime(
-        client,  # type: ignore[arg-type]
-        config=Config(host_id="host-a", db_path=db_path),
-        binding=continuity,
-        cwd=tmp_path,
-        session_binding_callback=fail_after_persist,  # type: ignore[arg-type]
-        poll_timeout=0.01,
-        stop_timeout=0.5,
-    )
-    with pytest.raises((RuntimeError, AcpRuntimeBindingError)):
-        service.start()
-
-    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
-    retired = list_worker_bindings(
-        db_path,
-        "host-a",
-        backend="acp",
-        include_expired=True,
-    )
-    assert len(retired) == 1
-    assert retired[0].reason == "acp_startup_rollback"
-    assert list_worker_bindings(db_path, "host-a", backend="herdr") == [continuity]
-
-
-def test_new_rolls_back_persisted_binding_when_ingestor_startup_fails(
+def test_new_leaves_persisted_binding_for_coordinator_after_startup_failure(
     tmp_path: Path,
 ) -> None:
     client = FakeClient()
@@ -944,7 +620,7 @@ def test_new_rolls_back_persisted_binding_when_ingestor_startup_fails(
     )
     with pytest.raises(RuntimeError, match="factory failed"):
         service.start()
-    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
+    assert len(list_worker_bindings(db_path, "host-a", backend="acp")) == 1
 
 
 def test_new_callback_can_stop_runtime_without_lifecycle_deadlock(
@@ -974,7 +650,7 @@ def test_new_callback_can_stop_runtime_without_lifecycle_deadlock(
     with pytest.raises(AcpRuntimeStateError, match="stopped during"):
         service.start()
     assert time.monotonic() - started < 0.5
-    assert list_worker_bindings(db_path, "host-a", backend="acp") == []
+    assert len(list_worker_bindings(db_path, "host-a", backend="acp")) == 1
 
 
 def test_prompt_rechecks_binding_before_remote_send(tmp_path: Path) -> None:
