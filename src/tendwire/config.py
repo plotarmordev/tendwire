@@ -10,7 +10,7 @@ import math
 import os
 import platform
 import socket
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 ACP_THOUGHT_POLICIES = frozenset({"disabled", "private_summary", "private_all"})
@@ -62,27 +62,6 @@ _BOUNDED_INT_FIELDS = {
     "turn_change_retention_days": MAX_RETENTION_DAYS,
     "turn_change_compaction_batch_size": 10_000,
 }
-_LOAD_DEFAULTS = {
-    "acp_thought_policy": DEFAULT_ACP_THOUGHT_POLICY,
-    "acp_request_timeout_seconds": DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS,
-    "acp_shutdown_timeout_seconds": DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS,
-    "acp_max_frame_bytes": DEFAULT_ACP_MAX_FRAME_BYTES,
-    "reconcile_interval_seconds": DEFAULT_RECONCILE_INTERVAL_SECONDS,
-    "event_retention_days": DEFAULT_EVENT_RETENTION_DAYS,
-    "submission_link_window_seconds": DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS,
-    "submission_hard_ttl_seconds": DEFAULT_SUBMISSION_HARD_TTL_SECONDS,
-    "max_outbox_attempts": DEFAULT_MAX_OUTBOX_ATTEMPTS,
-    "connector_claim_ttl_seconds": DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS,
-    "connector_max_claim_ttl_seconds": DEFAULT_CONNECTOR_MAX_CLAIM_TTL_SECONDS,
-    "connector_ack_ttl_seconds": DEFAULT_CONNECTOR_ACK_TTL_SECONDS,
-    "acknowledged_final_retention_days": DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_DAYS,
-    "command_receipt_retention_seconds": DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS,
-    "snapshot_retention_days": DEFAULT_SNAPSHOT_RETENTION_DAYS,
-    "snapshot_maintenance_batch_size": DEFAULT_SNAPSHOT_MAINTENANCE_BATCH_SIZE,
-    "store_maintenance_cadence_seconds": DEFAULT_STORE_MAINTENANCE_CADENCE_SECONDS,
-    "turn_change_retention_days": DEFAULT_TURN_CHANGE_RETENTION_DAYS,
-    "turn_change_compaction_batch_size": DEFAULT_TURN_CHANGE_COMPACTION_BATCH_SIZE,
-}
 
 
 @dataclass(frozen=True)
@@ -91,7 +70,9 @@ class Config:
 
     host_id: str = field(default_factory=lambda: platform.node() or "unknown")
     herdr_bin: str = "herdr"
-    data_dir: Path = field(default_factory=lambda: Path.home() / ".local" / "share" / "tendwire")
+    data_dir: Path = field(
+        default_factory=lambda: Path.home() / ".local" / "share" / "tendwire"
+    )
     db_path: Path | None = None
     socket_path: Path | None = None
     herdr_timeout_seconds: float = 5.0
@@ -119,51 +100,42 @@ class Config:
     def __post_init__(self) -> None:
         object.__setattr__(self, "herdr_bin", os.path.expanduser(self.herdr_bin))
         object.__setattr__(self, "data_dir", Path(self.data_dir).expanduser())
-        if self.db_path is None:
+        db_path = (
+            self.data_dir / "tendwire.db" if self.db_path is None else self.db_path
+        )
+        object.__setattr__(self, "db_path", Path(db_path).expanduser())
+        if self.socket_path is not None:
             object.__setattr__(
                 self,
-                "db_path",
-                self.data_dir / "tendwire.db",
+                "socket_path",
+                Path(self.socket_path).expanduser(),
             )
-        else:
-            object.__setattr__(self, "db_path", Path(self.db_path).expanduser())
-        if self.socket_path is not None:
-            object.__setattr__(self, "socket_path", Path(self.socket_path).expanduser())
         if self.socket_group is not None:
             normalized_socket_group = str(self.socket_group).strip()
             object.__setattr__(self, "socket_group", normalized_socket_group or None)
-
-        object.__setattr__(
-            self,
+        herdr_timeout = _positive_finite_float(
+            self.herdr_timeout_seconds,
             "herdr_timeout_seconds",
-            _positive_finite_float(
-                self.herdr_timeout_seconds,
-                "herdr_timeout_seconds",
-            ),
         )
+        object.__setattr__(self, "herdr_timeout_seconds", herdr_timeout)
         acp_thought_policy = str(self.acp_thought_policy or "").strip().lower()
         if acp_thought_policy not in ACP_THOUGHT_POLICIES:
             allowed = ", ".join(sorted(ACP_THOUGHT_POLICIES))
             raise ValueError(f"acp_thought_policy must be one of: {allowed}")
         object.__setattr__(self, "acp_thought_policy", acp_thought_policy)
         for name in _POSITIVE_FLOAT_FIELDS:
-            object.__setattr__(
-                self,
-                name,
-                _positive_finite_float(getattr(self, name), name),
-            )
+            value = _positive_finite_float(getattr(self, name), name)
+            object.__setattr__(self, name, value)
         for name in _POSITIVE_INT_FIELDS:
-            object.__setattr__(
-                self,
-                name,
-                _positive_int(getattr(self, name), name, minimum=1),
-            )
+            value = _positive_int(getattr(self, name), name, minimum=1)
+            object.__setattr__(self, name, value)
         for name, maximum in _BOUNDED_INT_FIELDS.items():
-            object.__setattr__(
-                self,
+            value = _bounded_positive_int(
+                getattr(self, name),
                 name,
-                _bounded_positive_int(getattr(self, name), name, maximum=maximum),
+                maximum=maximum,
             )
+            object.__setattr__(self, name, value)
         if self.submission_hard_ttl_seconds < self.submission_link_window_seconds:
             raise ValueError(
                 "submission_hard_ttl_seconds must be >= submission_link_window_seconds"
@@ -173,7 +145,7 @@ class Config:
             < MIN_COMMAND_RECEIPT_RETENTION_SECONDS
         ):
             raise ValueError(
-                "command_receipt_retention_seconds must be >= "
+                f"command_receipt_retention_seconds must be >= "
                 f"{MIN_COMMAND_RECEIPT_RETENTION_SECONDS}"
             )
 
@@ -191,6 +163,24 @@ class Config:
     def installation_key_sentinel_path(self) -> Path:
         """Nonsecret durable marker that the installation identity was initialized."""
         return self.data_dir / "installation.key.initialized"
+
+
+_SPECIAL_LOAD_FIELDS = frozenset(
+    {
+        "host_id",
+        "herdr_bin",
+        "data_dir",
+        "db_path",
+        "socket_path",
+        "herdr_timeout_seconds",
+        "socket_group",
+    }
+)
+_LOAD_DEFAULTS = {
+    item.name: item.default
+    for item in fields(Config)
+    if item.name not in _SPECIAL_LOAD_FIELDS
+}
 
 
 def _positive_finite_float(value: float | str, name: str) -> float:
@@ -233,12 +223,7 @@ def _bounded_positive_int(
 
 
 def _resolve_value(explicit: object, env_name: str, default: object) -> object:
-    if explicit is not None:
-        return explicit
-    env_value = os.environ.get(env_name)
-    if env_value is not None:
-        return env_value
-    return default
+    return explicit if explicit is not None else os.environ.get(env_name, default)
 
 
 def load_config(
@@ -273,23 +258,18 @@ def load_config(
     """Build a Config from explicit args, then environment, then defaults."""
     explicit = locals()
     resolved: dict[str, object] = {
-        name: _resolve_value(
-            explicit[name],
-            f"TENDWIRE_{name.upper()}",
-            default,
-        )
+        name: _resolve_value(explicit[name], f"TENDWIRE_{name.upper()}", default)
         for name, default in _LOAD_DEFAULTS.items()
     }
     resolved["host_id"] = host_id or os.environ.get("TENDWIRE_HOST_ID") or (
         platform.node() or "unknown"
     )
-    resolved["herdr_bin"] = herdr_bin or os.environ.get("TENDWIRE_HERDR_BIN") or "herdr"
+    resolved["herdr_bin"] = (
+        herdr_bin or os.environ.get("TENDWIRE_HERDR_BIN") or "herdr"
+    )
+    default_dir = Path.home() / ".local" / "share" / "tendwire"
     resolved["data_dir"] = Path(
-        _resolve_value(
-            data_dir,
-            "TENDWIRE_DATA_DIR",
-            Path.home() / ".local" / "share" / "tendwire",
-        )
+        _resolve_value(data_dir, "TENDWIRE_DATA_DIR", default_dir)
     )
     for name, explicit_path in (("db_path", db_path), ("socket_path", socket_path)):
         raw_path = _resolve_value(explicit_path, f"TENDWIRE_{name.upper()}", None)

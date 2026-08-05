@@ -11,8 +11,10 @@ from pathlib import Path
 
 import pytest
 
+from tendwire import worker_identity
 from tendwire.daemon_api import DaemonUnavailable, _validate_connected_peer
 from tendwire.local_state import (
+    EntryIdentity,
     EntryType,
     LocalStateError,
     LocalStateErrorCode,
@@ -113,6 +115,164 @@ def test_installation_key_create_load_and_acknowledged_reset(tmp_path: Path) -> 
     reset_installation_key(state, acknowledge_continuity_break=True)
     second = load_or_create_installation_key(state, random_bytes=lambda size: b"b" * size)
     assert second != first
+
+
+def test_installation_key_refreshes_earlier_missing_parts_after_sentinel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = tmp_path / "identity-race"
+    expected = load_or_create_installation_key(
+        state,
+        random_bytes=lambda size: b"a" * size,
+    )
+    read_file = worker_identity._read_file
+    missing_once = {
+        worker_identity.INSTALLATION_KEY_FILENAME,
+        worker_identity.INSTALLATION_KEY_MARKER_FILENAME,
+    }
+
+    def interleaved(
+        dir_fd: int,
+        name: str,
+        size: int,
+    ) -> tuple[bytes, EntryIdentity] | None:
+        if name in missing_once:
+            missing_once.remove(name)
+            return None
+        return read_file(dir_fd, name, size)
+
+    monkeypatch.setattr(worker_identity, "_read_file", interleaved)
+    assert load_or_create_installation_key(state) == expected
+
+
+@pytest.mark.parametrize("missing", ["installation.key", "installation.key.sha256"])
+def test_installation_sentinel_with_missing_identity_part_fails_closed(
+    tmp_path: Path,
+    missing: str,
+) -> None:
+    state = tmp_path / "identity-missing"
+    load_or_create_installation_key(state, random_bytes=lambda size: b"a" * size)
+    (state / missing).unlink()
+    with pytest.raises(InstallationKeyError, match="identity is unavailable"):
+        load_or_create_installation_key(state)
+
+
+@pytest.mark.parametrize(
+    ("name", "content"),
+    [
+        ("installation.key.sha256", b"0" * 64),
+        ("installation.key.initialized", b"0"),
+    ],
+)
+def test_corrupt_installation_marker_or_sentinel_fails_closed(
+    tmp_path: Path,
+    name: str,
+    content: bytes,
+) -> None:
+    state = tmp_path / "identity-corrupt"
+    load_or_create_installation_key(state, random_bytes=lambda size: b"a" * size)
+    (state / name).write_bytes(content)
+    with pytest.raises(InstallationKeyError, match="identity is unavailable"):
+        load_or_create_installation_key(state)
+
+
+@pytest.mark.parametrize("wrong_type", ["symlink", "directory"])
+def test_installation_identity_wrong_type_fails_closed(
+    tmp_path: Path,
+    wrong_type: str,
+) -> None:
+    state = tmp_path / "identity-type"
+    state.mkdir()
+    key = state / "installation.key"
+    if wrong_type == "symlink":
+        target = state / "target"
+        target.write_bytes(b"a" * 32)
+        key.symlink_to(target)
+    else:
+        key.mkdir()
+    with pytest.raises(InstallationKeyError, match="identity is unavailable"):
+        load_or_create_installation_key(state)
+
+
+def test_installation_identity_replacement_during_read_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = tmp_path / "identity-replaced"
+    load_or_create_installation_key(state, random_bytes=lambda size: b"a" * size)
+    original = worker_identity.local_state.open_private_file_at
+    replaced = False
+
+    def replace_before_open(dir_fd: int, name: str, *, flags: int = os.O_RDONLY) -> int:
+        nonlocal replaced
+        if name == "installation.key" and not replaced:
+            replaced = True
+            os.unlink(name, dir_fd=dir_fd)
+            fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=dir_fd,
+            )
+            os.write(fd, b"b" * 32)
+            os.close(fd)
+        return original(dir_fd, name, flags=flags)
+
+    monkeypatch.setattr(
+        worker_identity.local_state,
+        "open_private_file_at",
+        replace_before_open,
+    )
+    with pytest.raises(InstallationKeyError, match="identity is unavailable"):
+        load_or_create_installation_key(state)
+
+
+def test_installation_identity_repairs_permissive_regular_files(tmp_path: Path) -> None:
+    state = tmp_path / "identity-mode"
+    expected = load_or_create_installation_key(
+        state,
+        random_bytes=lambda size: b"a" * size,
+    )
+    paths = [
+        state / name
+        for name in (
+            "installation.key",
+            "installation.key.sha256",
+            "installation.key.initialized",
+        )
+    ]
+    for path in paths:
+        path.chmod(0o666)
+    assert load_or_create_installation_key(state) == expected
+    assert all(_mode(path) == 0o600 for path in paths)
+
+
+def test_interrupted_acknowledged_reset_remains_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = tmp_path / "identity-reset-interrupted"
+    load_or_create_installation_key(state, random_bytes=lambda size: b"a" * size)
+    unlink = worker_identity.local_state.unlink_verified_entry
+    calls = 0
+
+    def interrupt(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("interrupted reset")
+        return unlink(*args, **kwargs)
+
+    monkeypatch.setattr(
+        worker_identity.local_state,
+        "unlink_verified_entry",
+        interrupt,
+    )
+    with pytest.raises(InstallationKeyError, match="identity is unavailable"):
+        reset_installation_key(state, acknowledge_continuity_break=True)
+    with pytest.raises(InstallationKeyError, match="identity is unavailable"):
+        load_or_create_installation_key(state)
 
 
 def test_identity_verified_unlink_refuses_replacement(tmp_path: Path) -> None:

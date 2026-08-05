@@ -135,3 +135,33 @@ after B is checkpointed and then owns API/local-state/store security test adapta
 Every phase must compare behavior to `af0e5be`, run its focused failure matrices, and pass
 the full Tendwire suite. Final validation also exercises the authoritative Herdres client
 against a real daemon socket.
+
+## Phase B outcome and reassessment
+
+The numeric Phase B gate was not achieved. A daemon reduction was implemented and
+adversarially reviewed, but its apparent saving depended on count-oriented packing. After
+restoring conventional formatting, `daemon.py` grew from 571 to 579 canonical SLOC. That
+experiment was rejected and reverted; the checkpoint keeps the baseline daemon byte for
+byte.
+
+The independently useful configuration and installation-identity cleanup passed focused,
+differential, adversarial, and full-suite review and is retained as a **partial stable
+checkpoint**:
+
+```text
+daemon.py             571 -> 571    (unchanged)
+config.py             280 -> 259    (-21)
+worker_identity.py    330 -> 246    (-84)
+phase total          1181 -> 1076   (-105; gate <=795 not met)
+Tendwire total      21090 -> 20985
+```
+
+The exact retained diff passes 96 focused tests and the full suite with 1,047 passed and
+2 skipped. Public signatures, configuration defaults and environment precedence, stable
+worker-key vectors, pane-identity vectors, identity permissions, concurrent publication,
+and fail-closed reset behavior match the baseline contract.
+
+This result does not complete Phase B and does not authorize Phase A. The planned
+`daemon_api.py`/`local_state.py`/`store/db.py` phase is blocked under the numeric and
+sequential gates above until the daemon and security boundary are redesigned and a new
+honest contract is reviewed.
