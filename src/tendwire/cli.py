@@ -8,23 +8,21 @@ from __future__ import annotations
 
 import argparse
 import json
-import socket
 import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Mapping
 
 from .config import Config, load_config
 from .core.commands import (
     STATUS_BACKEND_UNAVAILABLE,
+    STATUS_INVALID_REQUEST,
     CommandEnvelope,
+    CommandRequest,
     error_value,
     parse_command_request,
     validate_request,
 )
-from .core.models import (
-    public_json_dumps,
-)
+from .core.models import public_json_dumps
 from .core.turns import (
     TURN_DELTA_DEFAULT_LIMIT,
     TURN_DELTA_MAX_LIMIT,
@@ -90,186 +88,115 @@ def _connector_inspect_limit(value: str) -> int:
     return _bounded_limit(value, 100)
 
 
+def _json_flag(parser: argparse.ArgumentParser, help_text: str | None = None) -> None:
+    parser.add_argument(
+        "--json", dest="json_output", action="store_true", default=True,
+        help=help_text,
+    )
+
+
+def _json_subcommand(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+    name: str,
+    description: str,
+    subject: str,
+) -> argparse.ArgumentParser:
+    parser = subparsers.add_parser(name, help=description)
+    _json_flag(parser, f"Print {subject} as JSON (default).")
+    return parser
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="tendwire",
-        description="Local-first control plane for terminal-based agents.",
+        prog="tendwire", description="Local-first control plane for terminal-based agents."
     )
+    parser.add_argument("--host-id", help="Override the host identifier used in snapshots.")
+    parser.add_argument("--herdr-bin", help="Path or name of the herdr binary (default: herdr).")
     parser.add_argument(
-        "--host-id",
-        dest="host_id",
-        default=None,
-        help="Override the host identifier used in snapshots.",
-    )
-    parser.add_argument(
-        "--herdr-bin",
-        dest="herdr_bin",
-        default=None,
-        help="Path or name of the herdr binary (default: herdr).",
-    )
-    parser.add_argument(
-        "--herdr-timeout",
-        dest="herdr_timeout_seconds",
-        default=None,
+        "--herdr-timeout", dest="herdr_timeout_seconds",
         help="Seconds to wait for each Herdr socket request (default: 5.0).",
     )
     parser.add_argument(
         "--socket-path",
-        dest="socket_path",
-        default=None,
         help="Unix socket path for daemon requests (default: data-dir/tendwire.sock).",
     )
 
     subparsers = parser.add_subparsers(dest="command")
 
-    snapshot_parser = subparsers.add_parser(
-        "snapshot",
-        help="Print a neutral device-independent snapshot.",
+    _json_subcommand(
+        subparsers, "snapshot", "Print a neutral device-independent snapshot.", "snapshot"
     )
-    snapshot_parser.add_argument(
-        "--json",
-        dest="json_output",
-        action="store_true",
-        default=True,
-        help="Print snapshot as JSON (default).",
+    _json_subcommand(
+        subparsers, "attention", "Print neutral public attention items.", "attention"
     )
-
-    attention_parser = subparsers.add_parser(
-        "attention",
-        help="Print neutral public attention items.",
-    )
-    attention_parser.add_argument(
-        "--json",
-        dest="json_output",
-        action="store_true",
-        default=True,
-        help="Print attention as JSON (default).",
-    )
-
     turns_parser = subparsers.add_parser(
         "turns",
         help="Print neutral public turns derived from the current snapshot.",
     )
+    _json_flag(turns_parser, "Print turns as JSON (default).")
     turns_parser.add_argument(
-        "--json",
-        dest="json_output",
-        action="store_true",
-        default=True,
-        help="Print turns as JSON (default).",
-    )
-    turns_parser.add_argument(
-        "--schema-version",
-        dest="schema_version",
-        type=int,
-        choices=(1, 2),
-        default=1,
+        "--schema-version", dest="schema_version", type=int, choices=(1, 2), default=1,
         help="Turn-list schema version (default: 1).",
     )
     turns_parser.add_argument(
-        "--limit",
-        type=_turn_list_limit,
-        default=TURN_LIST_DEFAULT_LIMIT,
+        "--limit", type=_turn_list_limit, default=TURN_LIST_DEFAULT_LIMIT,
         help=(
-            "Maximum turns in this page "
-            f"(default: {TURN_LIST_DEFAULT_LIMIT}, maximum: {TURN_LIST_MAX_LIMIT})."
+            f"Maximum turns in this page (default: {TURN_LIST_DEFAULT_LIMIT}, "
+            f"maximum: {TURN_LIST_MAX_LIMIT})."
         ),
     )
     turn_page_position = turns_parser.add_mutually_exclusive_group()
+    turn_page_position.add_argument("--cursor", help="Opaque cursor for the next page.")
     turn_page_position.add_argument(
-        "--cursor",
-        default=None,
-        help="Opaque cursor for the next page.",
+        "--since", help="Opaque token for turns newer than a completed traversal."
     )
-    turn_page_position.add_argument(
-        "--since",
-        default=None,
-        help="Opaque token for turns newer than a completed traversal.",
-    )
-    turn_parser = subparsers.add_parser(
-        "turn",
-        help="Access bounded canonical turn content.",
-    )
+    turn_parser = subparsers.add_parser("turn", help="Access bounded canonical turn content.")
     turn_actions = turn_parser.add_subparsers(dest="turn_action", required=True)
     content_parser = turn_actions.add_parser("content", help="Access turn content.")
     content_actions = content_parser.add_subparsers(dest="content_action", required=True)
     content_get = content_actions.add_parser("get", help="Fetch one bounded content page.")
-    content_get.add_argument("--json", dest="json_output", action="store_true", default=True)
+    _json_flag(content_get)
     content_get.add_argument("--turn-id", dest="turn_id", required=True)
     content_get.add_argument("--revision", dest="content_revision", required=True)
     content_get.add_argument(
-        "--field",
-        choices=("user_text", "assistant_final_text"),
-        required=True,
+        "--field", choices=("user_text", "assistant_final_text"), required=True
     )
     content_get.add_argument("--cursor", default=None)
     delta_parser = turn_actions.add_parser(
-        "delta",
-        help="Read one cache-only public turn change page.",
+        "delta", help="Read one cache-only public turn change page."
     )
-    delta_parser.add_argument("--json", dest="json_output", action="store_true", default=True)
-    delta_parser.add_argument(
-        "--limit", type=_turn_delta_limit, default=TURN_DELTA_DEFAULT_LIMIT,
-    )
+    _json_flag(delta_parser)
+    delta_parser.add_argument("--limit", type=_turn_delta_limit, default=TURN_DELTA_DEFAULT_LIMIT)
     delta_position = delta_parser.add_mutually_exclusive_group()
     delta_position.add_argument("--watermark", default=None)
     delta_position.add_argument("--cursor", default=None)
 
-    pending_parser = subparsers.add_parser(
-        "pending",
-        help="Print neutral public pending interactions from the daemon.",
+    _json_subcommand(
+        subparsers, "pending",
+        "Print neutral public pending interactions from the daemon.", "pending interactions",
     )
-    pending_parser.add_argument(
-        "--json",
-        dest="json_output",
-        action="store_true",
-        default=True,
-        help="Print pending interactions as JSON (default).",
-    )
-    command_parser = subparsers.add_parser(
-        "command",
-        help="Read a JSON command request from stdin and print a JSON result.",
-    )
-    command_parser.add_argument(
-        "--json",
-        dest="json_output",
-        action="store_true",
-        default=True,
-        help="Print result as JSON (default).",
+    _json_subcommand(
+        subparsers, "command",
+        "Read a JSON command request from stdin and print a JSON result.", "result",
     )
     daemon_parser = subparsers.add_parser(
-        "daemon",
-        help="Run the local Tendwire JSON request daemon.",
+        "daemon", help="Run the local Tendwire JSON request daemon."
     )
     daemon_parser.add_argument(
-        "--db-path",
-        dest="db_path",
-        default=None,
+        "--db-path", dest="db_path", default=None,
         help="SQLite database path for daemon state (default: config path).",
     )
     daemon_parser.add_argument(
-        "--socket-path",
-        dest="socket_path",
-        default=argparse.SUPPRESS,
+        "--socket-path", dest="socket_path", default=argparse.SUPPRESS,
         help="Unix socket path to listen on (default: data_dir/tendwire.sock).",
     )
     daemon_parser.add_argument(
-        "--socket-group",
-        dest="socket_group",
-        default=argparse.SUPPRESS,
-        metavar="GROUP",
+        "--socket-group", dest="socket_group", default=argparse.SUPPRESS, metavar="GROUP",
         help="Share the daemon socket with a validated local group.",
     )
 
-    doctor_parser = subparsers.add_parser(
-        "doctor",
-        help="Print read-only Herdr diagnostics.",
-    )
-    doctor_parser.add_argument(
-        "--json",
-        dest="json_output",
-        action="store_true",
-        default=True,
-        help="Print diagnostics as JSON (default).",
+    _json_subcommand(
+        subparsers, "doctor", "Print read-only Herdr diagnostics.", "diagnostics",
     )
 
     _add_connector_parser(subparsers)
@@ -284,57 +211,50 @@ def _add_connector_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     )
     actions = connector_parser.add_subparsers(dest="connector_action", required=True)
 
-    def add_common(action_parser: argparse.ArgumentParser) -> None:
-        action_parser.add_argument("--name", required=True, help="Neutral connector queue name.")
+    def named_action(name: str, help_text: str) -> argparse.ArgumentParser:
+        action_parser = actions.add_parser(name, help=help_text)
+        action_parser.add_argument(
+            "--name", required=True, help="Neutral connector queue name."
+        )
+        return action_parser
 
-    prepare_parser = actions.add_parser(
-        "prepare",
-        help="Stage one bounded neutral presentation-plan action from stdin.",
+    prepare_parser = named_action(
+        "prepare", "Stage one bounded neutral presentation-plan action from stdin."
     )
-    add_common(prepare_parser)
-    prepare_parser.add_argument(
-        "--json",
-        dest="json_output",
-        action="store_true",
-        default=True,
-        help="Read one schema-v1 JSON action from stdin and print JSON.",
-    )
+    _json_flag(prepare_parser, "Read one schema-v1 JSON action from stdin and print JSON.")
 
-    poll_parser = actions.add_parser("poll", help="Lease due connector outbox items.")
-    add_common(poll_parser)
+    poll_parser = named_action("poll", "Lease due connector outbox items.")
     poll_parser.add_argument("--limit", type=int, default=1)
     poll_parser.add_argument("--lease-seconds", dest="lease_seconds", type=int, default=None)
 
-    inspect_parser = actions.add_parser(
-        "inspect",
-        help="Inspect bounded unresolved connector items by neutral status.",
+    inspect_parser = named_action(
+        "inspect", "Inspect bounded unresolved connector items by neutral status."
     )
-    add_common(inspect_parser)
     inspect_parser.add_argument("--status", choices=("dead_letter",), required=True)
     inspect_parser.add_argument("--limit", type=_connector_inspect_limit, default=100)
 
-    retry_parser = actions.add_parser(
-        "retry",
-        help="Explicitly requeue one unresolved final-ready item.",
+    retry_parser = named_action(
+        "retry", "Explicitly requeue one unresolved final-ready item."
     )
-    add_common(retry_parser)
     retry_parser.add_argument("--final-identity", dest="final_identity", required=True)
 
-    reclaim_parser = actions.add_parser("reclaim", help="Expire stale connector leases.")
-    add_common(reclaim_parser)
+    named_action("reclaim", "Expire stale connector leases.")
 
     for action in ("ack", "fail", "defer", "renew", "release"):
-        action_parser = actions.add_parser(action, help=f"Apply connector.{action} to a live ref.")
-        add_common(action_parser)
+        action_parser = named_action(action, f"Apply connector.{action} to a live ref.")
         action_parser.add_argument("--ref", required=True)
         if action in {"ack", "fail", "defer"}:
             action_parser.add_argument("--response-json", dest="response_json", default=None)
         if action in {"fail", "defer"}:
             action_parser.add_argument("--reason", default="")
             action_parser.add_argument("--available-at", dest="available_at", default=None)
-            action_parser.add_argument("--delay-seconds", dest="delay_seconds", type=int, default=None)
+            action_parser.add_argument(
+                "--delay-seconds", dest="delay_seconds", type=int, default=None
+            )
         if action == "renew":
-            action_parser.add_argument("--lease-seconds", dest="lease_seconds", type=int, default=None)
+            action_parser.add_argument(
+                "--lease-seconds", dest="lease_seconds", type=int, default=None
+            )
 
 
 def _try_daemon_attempt(
@@ -344,69 +264,41 @@ def _try_daemon_attempt(
 ) -> _DaemonAttempt:
     """Return one result from the daemon's authoritative socket API."""
     from .daemon import default_socket_path
-
-    socket_path = default_socket_path(config)
-
     try:
-        from .daemon_api import (
-            DaemonAPIClient,
-            DaemonAPIError,
-            DaemonProtocolError,
-            DaemonUnavailable,
-        )
+        from . import daemon_api
     except Exception:
         return _DaemonAttempt(error_kind="protocol", request_started=False)
     try:
-        timeout_seconds = _daemon_client_timeout_seconds(config, method)
-        if config.socket_group is None:
-            client = DaemonAPIClient(
-                socket_path,
-                timeout_seconds=timeout_seconds,
-            )
-        else:
-            client = DaemonAPIClient(
-                socket_path,
-                timeout_seconds=timeout_seconds,
-                socket_group=config.socket_group,
-            )
+        client = daemon_api.DaemonAPIClient(
+            default_socket_path(config),
+            timeout_seconds=_daemon_client_timeout_seconds(config, method),
+            socket_group=config.socket_group,
+        )
         response = client.request(method, params or {})
-    except DaemonUnavailable as exc:
-        cause = exc.__cause__
+    except daemon_api.DaemonUnavailable as exc:
         if exc.request_started is False:
             return _DaemonAttempt(error_kind="unavailable", request_started=False)
-        if exc.timed_out or isinstance(cause, (TimeoutError, socket.timeout)):
+        if exc.timed_out:
             return _DaemonAttempt(error_kind="timeout", request_started=True)
         return _DaemonAttempt(
             error_kind="unavailable",
             request_started=exc.request_started,
         )
-    except DaemonProtocolError as exc:
-        return _DaemonAttempt(
-            error_kind="protocol",
-            request_started=exc.request_started,
-        )
-    except DaemonAPIError:
+    except daemon_api.DaemonProtocolError as exc:
+        return _DaemonAttempt(error_kind="protocol", request_started=exc.request_started)
+    except daemon_api.DaemonAPIError:
         return _DaemonAttempt(error_kind="protocol", request_started=None)
-    if not isinstance(response, dict):
+    if not isinstance(response, dict) or type(response.get("ok")) is not bool:
         return _DaemonAttempt(error_kind="protocol", request_started=True)
     if response.get("ok") is False:
         if isinstance(response.get("error"), dict):
             return _DaemonAttempt(
-                error_kind="daemon_error",
                 response_error=dict(response),
                 request_started=True,
             )
         return _DaemonAttempt(error_kind="protocol", request_started=True)
-    if response.get("ok") is not True:
-        return _DaemonAttempt(error_kind="protocol", request_started=True)
     result = response.get("result")
     if isinstance(result, dict):
-        if method == "command.submit":
-            try:
-                command_result = CommandEnvelope.from_dict(result).to_dict()
-            except (TypeError, ValueError):
-                return _DaemonAttempt(error_kind="protocol", request_started=True)
-            return _DaemonAttempt(result=command_result, request_started=True)
         return _DaemonAttempt(result=dict(result), request_started=True)
     return _DaemonAttempt(error_kind="protocol", request_started=True)
 
@@ -417,55 +309,12 @@ def cmd_snapshot(
     json_output: bool = True,
 ) -> int:
     """Read the daemon's current neutral snapshot."""
-    return _cmd_simple_read(
-        config, "snapshot.get", json_output=json_output, schema_version=2
-    )
+    return _cmd_simple_read(config, "snapshot.get", json_output=json_output, schema_version=2)
 
 
 def _daemon_payload_json(payload: dict[str, Any], *, indent: int | None = None) -> str:
     """Serialize a response already validated by the local daemon boundary."""
-    return json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        indent=indent,
-    )
-
-
-def _daemon_read_payload(
-    attempt: _DaemonAttempt,
-    *,
-    schema_version: int = 1,
-    extra: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    if attempt.result is not None:
-        return attempt.result
-    if attempt.response_error is not None:
-        return attempt.response_error
-    status = (
-        "daemon_timeout"
-        if attempt.error_kind == "timeout"
-        else "daemon_unavailable"
-        if attempt.request_started is False
-        else "daemon_protocol_error"
-    )
-    payload: dict[str, Any] = {
-        "schema_version": schema_version,
-        "ok": False,
-        "status": status,
-        "error": {
-            "code": status,
-            "message": {
-                "daemon_timeout": "Tendwire daemon request timed out",
-                "daemon_unavailable": "Tendwire daemon is unavailable",
-                "daemon_protocol_error": "Tendwire daemon returned an invalid response",
-            }[status],
-        },
-    }
-    if extra:
-        payload.update(extra)
-    return payload
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), indent=indent)
 
 
 def _cmd_simple_read(
@@ -473,122 +322,75 @@ def _cmd_simple_read(
     method: str,
     *,
     json_output: bool,
+    params: dict[str, Any] | None = None,
     schema_version: int = 1,
+    extra: Mapping[str, Any] | None = None,
     require_ok_status: bool = False,
+    require_text: bool = False,
     trusted_daemon_json: bool = False,
 ) -> int:
     if not json_output:
         print("error: only --json output is supported", file=sys.stderr)
         return 2
-    payload = _daemon_read_payload(
-        _try_daemon_attempt(config, method), schema_version=schema_version
-    )
-    serialized = (
-        _daemon_payload_json(payload, indent=2)
-        if trusted_daemon_json
-        else public_json_dumps(payload, indent=2)
-    )
-    print(serialized)
+    attempt = _try_daemon_attempt(config, method, params)
+    if attempt.result is not None:
+        payload = attempt.result
+    elif attempt.response_error is not None:
+        payload = attempt.response_error
+    else:
+        if attempt.error_kind == "timeout":
+            status, message = "daemon_timeout", "Tendwire daemon request timed out"
+        elif attempt.request_started is False:
+            status, message = "daemon_unavailable", "Tendwire daemon is unavailable"
+        else:
+            status = "daemon_protocol_error"
+            message = "Tendwire daemon returned an invalid response"
+        payload = {
+            "schema_version": schema_version,
+            "ok": False,
+            "status": status,
+            "error": {"code": status, "message": message},
+        }
+        if extra:
+            payload.update(extra)
+    serializer = _daemon_payload_json if trusted_daemon_json else public_json_dumps
+    print(serializer(payload, indent=2))
     success = payload.get("ok") is not False
     if require_ok_status:
         success = success and payload.get("status") == "ok"
+    if require_text:
+        success = success and isinstance(payload.get("text"), str)
     return 0 if success else 1
 
 
-def cmd_turns(
-    config: Config,
-    *,
-    json_output: bool = True,
-    schema_version: int = 1,
-    limit: int = TURN_LIST_DEFAULT_LIMIT,
-    cursor: str | None = None,
-    since: str | None = None,
-) -> int:
-    """Print exactly one insertion-stable public turn-list page."""
-    if not json_output:
-        print("error: only --json output is supported", file=sys.stderr)
-        return 2
-    params: dict[str, Any] = {
-        "schema_version": schema_version,
-        "limit": limit,
-        "cursor": cursor,
-        "since": since,
-    }
-    payload = _daemon_read_payload(
-        _try_daemon_attempt(config, "turn.list", params),
-        schema_version=schema_version,
-        extra={"host_id": config.host_id},
-    )
-    print(_daemon_payload_json(payload, indent=2))
-    return 0 if payload.get("ok") is not False else 1
-
-
-def cmd_turn_content_get(config: Config, args: argparse.Namespace) -> int:
-    """Fetch one bounded canonical content page from the daemon."""
-    params: dict[str, Any] = {
-        "schema_version": 1,
-        "turn_id": args.turn_id,
-        "content_revision": args.content_revision,
-        "field": args.field,
-    }
-    if args.cursor is not None:
-        params["cursor"] = args.cursor
-    payload = _daemon_read_payload(
-        _try_daemon_attempt(config, "turn.content.get", params)
-    )
-    print(_daemon_payload_json(payload, indent=2))
-    return 0 if payload.get("ok") is not False and isinstance(payload.get("text"), str) else 1
-
-
-def cmd_turn_delta(config: Config, args: argparse.Namespace) -> int:
-    """Read one delta page from the daemon."""
-    params = {
-        "limit": args.limit,
-        "watermark": args.watermark,
-        "cursor": args.cursor,
-    }
-    payload = _daemon_read_payload(
-        _try_daemon_attempt(config, "turn.delta", params),
-        extra={"projection_schema_version": 2},
-    )
-    print(_daemon_payload_json(payload, indent=2))
-    return 0 if payload.get("ok") is not False else 1
-
-
-def _command_exit_code(envelope: CommandEnvelope) -> int:
-    return 0 if envelope.ok else 1
-
-
-def _daemon_backend_failure_envelope(
-    request: Any,
-    attempt: _DaemonAttempt,
-) -> CommandEnvelope:
-    if attempt.request_started is not False:
-        raise ValueError("ambiguous daemon attempt has no authoritative command envelope")
-    return CommandEnvelope.from_error(
-        request,
-        error_value(
-            STATUS_BACKEND_UNAVAILABLE,
-            "Tendwire daemon backend is unavailable",
-        ),
-    )
-
-
-def _strict_daemon_command_envelope(
-    request: Any,
-    value: dict[str, Any],
-) -> CommandEnvelope | None:
-    try:
-        envelope = CommandEnvelope.from_dict(value)
-    except (TypeError, ValueError):
-        return None
-    if (
-        envelope.action != request.action
-        or envelope.request_id != request.request_id
-        or envelope.dry_run != request.dry_run
-    ):
-        return None
-    return envelope
+def _cmd_turn_read(config: Config, args: argparse.Namespace) -> int:
+    """Read one authoritative turn list, content page, or delta page."""
+    options: dict[str, Any] = {"trusted_daemon_json": True}
+    if args.command == "turns":
+        method = "turn.list"
+        params = {
+            "schema_version": args.schema_version,
+            "limit": args.limit,
+            "cursor": args.cursor,
+            "since": args.since,
+        }
+        options.update(schema_version=args.schema_version, extra={"host_id": config.host_id})
+    elif args.turn_action == "delta":
+        method = "turn.delta"
+        params = {"limit": args.limit, "watermark": args.watermark, "cursor": args.cursor}
+        options["extra"] = {"projection_schema_version": 2}
+    else:
+        method = "turn.content.get"
+        params = {
+            "schema_version": 1,
+            "turn_id": args.turn_id,
+            "content_revision": args.content_revision,
+            "field": args.field,
+        }
+        if args.cursor is not None:
+            params["cursor"] = args.cursor
+        options["require_text"] = True
+    return _cmd_simple_read(config, method, json_output=args.json_output, params=params, **options)
 
 
 def cmd_command(
@@ -597,39 +399,57 @@ def cmd_command(
     json_output: bool = True,
 ) -> int:
     """Read a JSON command request from stdin and print a JSON result envelope."""
-    payload = sys.stdin.read()
     if not json_output:
         print("error: only --json output is supported", file=sys.stderr)
         return 2
+    raw = sys.stdin.read()
     try:
-        request_payload = json.loads(payload)
+        payload = json.loads(raw)
     except (json.JSONDecodeError, TypeError, ValueError):
-        request_payload = None
-    request, parse_error = parse_command_request(payload)
-    if parse_error is not None or request is None:
-        envelope = CommandEnvelope.from_error(request, parse_error or error_value(
-            "invalid_request", "unknown parse error"
-        ))
+        payload = None
+    if not isinstance(payload, dict):
+        try:
+            request, parse_error = parse_command_request(raw)
+        except Exception:
+            request, parse_error = None, None
+        error = parse_error or error_value(STATUS_INVALID_REQUEST, "request must be a JSON object")
+        envelope = CommandEnvelope.from_error(request, error)
         print(envelope.to_json(indent=2))
-        return _command_exit_code(envelope)
-    validation_error = validate_request(request)
-    if validation_error is not None or not isinstance(request_payload, dict):
-        envelope = CommandEnvelope.from_error(
-            request,
-            validation_error or error_value("invalid_request", "request must be an object"),
-        )
-        print(envelope.to_json(indent=2))
-        return _command_exit_code(envelope)
-    attempt = _try_daemon_attempt(config, "command.submit", request_payload)
+        return 1
+    witness = None
+    try:
+        candidate, parse_error = parse_command_request(raw)
+        if candidate is not None and parse_error is None and validate_request(candidate) is None:
+            witness = candidate
+    except Exception:
+        witness = None
+    attempt = _try_daemon_attempt(config, "command.submit", payload)
     if attempt.result is not None:
-        envelope = _strict_daemon_command_envelope(request, attempt.result)
+        try:
+            envelope = CommandEnvelope.from_dict(attempt.result)
+        except (TypeError, ValueError):
+            envelope = None
+        if envelope is not None and witness is not None:
+            response_identity = (envelope.action, envelope.request_id, envelope.dry_run)
+            witness_identity = (witness.action, witness.request_id, witness.dry_run)
+            if response_identity != witness_identity:
+                envelope = None
         if envelope is not None:
             print(envelope.to_json(indent=2))
-            return _command_exit_code(envelope)
+            return 0 if envelope.ok else 1
     if attempt.request_started is False:
-        envelope = _daemon_backend_failure_envelope(request, attempt)
+        action = payload.get("action") if isinstance(payload.get("action"), str) else ""
+        request_id = payload.get("request_id")
+        request_id = request_id if isinstance(request_id, str) else None
+        dry_run = payload.get("dry_run")
+        dry_run = dry_run if type(dry_run) is bool else True
+        request = CommandRequest(action=action, request_id=request_id, dry_run=dry_run)
+        envelope = CommandEnvelope.from_error(
+            request,
+            error_value(STATUS_BACKEND_UNAVAILABLE, "Tendwire daemon backend is unavailable"),
+        )
         print(envelope.to_json(indent=2))
-        return _command_exit_code(envelope)
+        return 1
     print("error: Tendwire daemon command result is unresolved", file=sys.stderr)
     return 2
 
@@ -646,26 +466,17 @@ def _connector_params_from_args(args: argparse.Namespace) -> dict[str, Any]:
         params.update(parsed)
         params["name"] = args.name
         return params
+    if args.connector_action in {"inspect", "retry"} and args.name != "turn-final":
+        raise ValueError(f"{args.connector_action} requires --name turn-final")
     if args.connector_action == "inspect":
-        if args.name != "turn-final":
-            raise ValueError("inspect requires --name turn-final")
-        return {
-            "schema_version": 1,
-            "name": args.name,
-            "status": args.status,
-            "limit": args.limit,
-        }
+        params.update(schema_version=1, status=args.status, limit=args.limit)
+        return params
     if args.connector_action == "retry":
-        if args.name != "turn-final":
-            raise ValueError("retry requires --name turn-final")
         final_identity = str(args.final_identity).strip()
         if not final_identity:
             raise ValueError("retry requires a final identity")
-        return {
-            "schema_version": 1,
-            "name": args.name,
-            "final_identity": final_identity,
-        }
+        params.update(schema_version=1, final_identity=final_identity)
+        return params
     if args.connector_action == "poll":
         params["limit"] = args.limit
         if args.lease_seconds is not None:
@@ -700,65 +511,18 @@ def cmd_connector(config: Config, args: argparse.Namespace) -> int:
             "schema_version": 1,
             "ok": False,
             "status": "invalid_request",
-            "error": {
-                "code": "invalid_request",
-                "message": str(exc),
-            },
+            "error": {"code": "invalid_request", "message": str(exc)},
         }
         print(public_json_dumps(payload, indent=2))
         return 2
-    daemon_attempt = _try_daemon_attempt(config, method, params)
-    if daemon_attempt.result is not None:
-        print(_daemon_payload_json(daemon_attempt.result, indent=2))
-        return 0 if daemon_attempt.result.get("ok") is not False else 1
-    if daemon_attempt.response_error is not None:
-        print(_daemon_payload_json(daemon_attempt.response_error, indent=2))
-        return 1
-    if daemon_attempt.request_started is not False:
-        status = (
-            "daemon_timeout"
-            if daemon_attempt.error_kind == "timeout"
-            else "daemon_protocol_error"
-        )
-        payload = {
-            "schema_version": 1,
-            "ok": False,
-            "status": status,
-            "host_id": config.host_id,
-            "name": params.get("name", ""),
-            "error": {
-                "code": status,
-                "message": (
-                    "Tendwire daemon request timed out"
-                    if status == "daemon_timeout"
-                    else "Tendwire daemon returned an invalid response"
-                ),
-            },
-        }
-        print(_daemon_payload_json(payload, indent=2))
-        return 1
-    payload = _daemon_read_payload(
-        daemon_attempt,
+    return _cmd_simple_read(
+        config,
+        method,
+        json_output=True,
+        params=params,
         extra={"host_id": config.host_id, "name": params.get("name", "")},
+        trusted_daemon_json=True,
     )
-    print(_daemon_payload_json(payload, indent=2))
-    return 1
-
-
-def cmd_daemon(config: Config) -> int:
-    """Run the long-lived local daemon."""
-    from .daemon import run_daemon
-    from .daemon_api import DaemonUnavailable
-    from ._version import __version__
-
-    try:
-        return run_daemon(config)
-    except DaemonUnavailable as exc:
-        print(
-            f"tendwire daemon {__version__}: startup failed: {exc}",
-            file=sys.stderr,
-        )
-        return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -794,30 +558,13 @@ def main(argv: list[str] | None = None) -> int:
             json_output=args.json_output,
         )
 
-    if args.command == "attention":
+    if args.command in {"attention", "pending"}:
         return _cmd_simple_read(
-            config, "attention.list", json_output=args.json_output
+            config, f"{args.command}.list", json_output=args.json_output
         )
 
-    if args.command == "turns":
-        return cmd_turns(
-            config,
-            json_output=args.json_output,
-            schema_version=args.schema_version,
-            limit=args.limit,
-            cursor=args.cursor,
-            since=args.since,
-        )
-
-    if args.command == "turn":
-        if args.turn_action == "delta":
-            return cmd_turn_delta(config, args)
-        return cmd_turn_content_get(config, args)
-
-    if args.command == "pending":
-        return _cmd_simple_read(
-            config, "pending.list", json_output=args.json_output
-        )
+    if args.command in {"turns", "turn"}:
+        return _cmd_turn_read(config, args)
 
     if args.command == "command":
         return cmd_command(config, json_output=args.json_output)
@@ -826,7 +573,15 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_connector(config, args)
 
     if args.command == "daemon":
-        return cmd_daemon(config)
+        from .daemon import run_daemon
+        from .daemon_api import DaemonUnavailable
+        from ._version import __version__
+
+        try:
+            return run_daemon(config)
+        except DaemonUnavailable as exc:
+            print(f"tendwire daemon {__version__}: startup failed: {exc}", file=sys.stderr)
+            return 1
 
     if args.command == "doctor":
         return _cmd_simple_read(
