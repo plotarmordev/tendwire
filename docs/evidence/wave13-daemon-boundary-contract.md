@@ -73,8 +73,10 @@ installation.key.sha256
 installation.key.initialized
 ```
 
-Missing, corrupt, mismatched, replaced, symlinked, insecure, or partial identity state
-continues to fail closed once the initialization sentinel exists.
+Missing, corrupt, mismatched, replaced, symlinked, wrong-owner, wrong-type, or partial
+identity state continues to fail closed once the initialization sentinel exists.
+Over-permissive modes on same-owner regular identity files continue to be repaired to
+`0600` and identity-reverified rather than rejected.
 
 ## Local security and lifecycle invariants
 
