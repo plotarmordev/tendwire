@@ -218,6 +218,22 @@ def test_canonical_mutation_ignores_selector_spelling_and_fingerprint() -> None:
     assert "fresh" not in canonical[0].canonical_json
 
 
+def test_frozen_instruction_submission_and_canonical_hashes() -> None:
+    mutation = build_canonical_mutation(_request(_send()), public_worker_id="worker-1")
+    assert instruction_fingerprint("do it") == (
+        "twins1.42b20435f0339cbd9b57ccc42274a73510884ccb782be66e9eea0866b195c744"
+    )
+    assert turn_submission_id("host-1", "request-1") == (
+        "twsub1.31c304698ea3929a58ba2107a2eafb77ae834441c849e50f0591444da333609b"
+    )
+    assert mutation.canonical_json == (
+        '{"action":"send_instruction","canonical_version":1,'
+        '"instruction":{"text":"do it"},"options":{},'
+        '"target":{"worker_id":"worker-1"}}'
+    )
+    assert mutation.fingerprint == "5d96fbf2b73a645dc718a789"
+
+
 def test_canonical_mutation_changes_for_instruction_and_decision_semantics() -> None:
     first = build_canonical_mutation(_request(_send()), public_worker_id="worker-1")
     second = build_canonical_mutation(
@@ -323,6 +339,17 @@ def test_envelope_rejects_nonfixed_wire_shape(mutation: dict[str, Any]) -> None:
     data.update(mutation)
     with pytest.raises((TypeError, ValueError)):
         CommandEnvelope.from_dict(data)
+
+
+def test_envelope_validation_preserves_dry_run_precedence() -> None:
+    with pytest.raises(ValueError, match="dry_run must be false"):
+        CommandEnvelope(
+            ok=False,
+            status=STATUS_REJECTED,
+            action="send_instruction",
+            dry_run=True,  # type: ignore[arg-type]
+            result=[],  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize(
