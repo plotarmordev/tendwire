@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from tendwire.core.models import Snapshot, Worker, WorkerBinding
-from tendwire.store.projection import save_snapshot, upsert_worker_bindings
+from tendwire.store.projection import save_snapshot
 from tendwire.store.retention import RetentionPolicy, run_retention_cycle
 from tendwire.store.receipts import (
     finish_command_request,
@@ -26,32 +26,35 @@ from tendwire.store.turns import apply_turn_refresh
 NOW = "2026-08-05T00:00:00.000000Z"
 
 
-def _acp_binding(worker: Worker) -> WorkerBinding:
+def _acp_binding(
+    worker: Worker,
+    *,
+    target: str = "session-private",
+    private_fingerprint: str = "private-acp",
+    sendable: bool = True,
+) -> WorkerBinding:
     return WorkerBinding(
         host_id="host-a",
         worker_id=worker.id,
         worker_fingerprint=worker.fingerprint,
         backend="acp",
         target_kind="acp_session_id",
-        target_value="session-private",
+        target_value=target,
         turn_target_kind="acp_session_id",
-        turn_target_value="session-private",
-        sendable=True,
+        turn_target_value=target,
+        sendable=sendable,
         observed_at=NOW,
-        private_fingerprint="private-acp",
+        private_fingerprint=private_fingerprint,
     )
 
 
 def _seed(db_path: Path) -> Worker:
     init_store(db_path)
     worker = Worker(id="worker-a", name="codex", meta={"stable_key": "wsk1_" + "a" * 64, "stable_key_version": 1})
-    binding = WorkerBinding(host_id="host-a", worker_id=worker.id, worker_fingerprint=worker.fingerprint, backend="herdr", target_kind="agent_id", target_value="private", observed_at=NOW, private_fingerprint="private-a")
     base = Snapshot(host_id="host-a", updated_at=NOW, workers=[worker])
-    public = save_snapshot(
-        db_path, base, worker_bindings=[binding], binding_backend="herdr"
+    return save_snapshot(
+        db_path, base, worker_bindings=[_acp_binding(worker)], binding_backend="acp"
     ).workers[0]
-    upsert_worker_bindings(db_path, [_acp_binding(public)])
-    return public
 
 
 def _reserve(db_path: Path, request_id: str = "request-a") -> dict[str, object]:
@@ -100,61 +103,42 @@ def test_send_started_requires_current_route_and_owner(tmp_path: Path) -> None:
     assert started["submission_id"]
 
 
-def test_send_started_rejects_herdr_and_unsendable_acp_authority(
+@pytest.mark.parametrize("failure", ["unsendable", "stale_fingerprint"])
+def test_send_started_rejects_invalid_acp_authority(
     tmp_path: Path,
+    failure: str,
 ) -> None:
-    herdr_db = tmp_path / "herdr-route.db"
-    worker = _seed(herdr_db)
-    reserved = _reserve(herdr_db)
-    herdr = mark_command_send_started(
-        herdr_db,
-        host_id="host-a",
-        request_id="request-a",
-        canonical_fingerprint="fingerprint-a",
-        owner_token=reserved["owner_token"],
-        binding_fingerprint="private-a",
-        submission_worker=worker,
-        instruction_text="do it",
-        now=NOW,
-    )
-    assert herdr["status"] == "stale_route"
-    assert get_command_request(herdr_db, "host-a", "request-a")["state"] == "reserved"
-
-    unsendable_db = tmp_path / "unsendable-acp.db"
-    worker = _seed(unsendable_db)
-    unsendable = WorkerBinding(
-        host_id="host-a",
-        worker_id=worker.id,
-        worker_fingerprint=worker.fingerprint,
-        backend="acp",
-        target_kind="acp_session_id",
-        target_value="unsendable-session",
-        turn_target_kind="acp_session_id",
-        turn_target_value="unsendable-session",
-        sendable=False,
-        observed_at=NOW,
-        private_fingerprint="private-unsendable",
-    )
-    worker = save_snapshot(
-        unsendable_db,
-        Snapshot(host_id="host-a", updated_at=NOW, workers=[worker]),
-        worker_bindings=[unsendable],
-        binding_backend="acp",
-    ).workers[0]
-    reserved = _reserve(unsendable_db)
+    db_path = tmp_path / "unsendable-acp.db"
+    worker = _seed(db_path)
+    fingerprint = "private-stale"
+    if failure == "unsendable":
+        binding = _acp_binding(
+            worker,
+            target="unsendable-session",
+            private_fingerprint="private-unsendable",
+            sendable=False,
+        )
+        worker = save_snapshot(
+            db_path,
+            Snapshot(host_id="host-a", updated_at=NOW, workers=[worker]),
+            worker_bindings=[binding],
+            binding_backend="acp",
+        ).workers[0]
+        fingerprint = "private-unsendable"
+    reserved = _reserve(db_path)
     rejected = mark_command_send_started(
-        unsendable_db,
+        db_path,
         host_id="host-a",
         request_id="request-a",
         canonical_fingerprint="fingerprint-a",
         owner_token=reserved["owner_token"],
-        binding_fingerprint="private-unsendable",
+        binding_fingerprint=fingerprint,
         submission_worker=worker,
         instruction_text="do it",
         now=NOW,
     )
     assert rejected["status"] == "stale_route"
-    assert get_command_request(unsendable_db, "host-a", "request-a")["state"] == "reserved"
+    assert get_command_request(db_path, "host-a", "request-a")["state"] == "reserved"
 
 
 def test_terminal_receipt_is_immutable(tmp_path: Path) -> None:
@@ -426,22 +410,17 @@ def test_submission_does_not_link_same_worker_on_another_route(
         now=NOW,
     )
     assert started["status"] == "send_started"
-    herdr = WorkerBinding(
-        host_id="host-a",
-        worker_id=worker.id,
-        worker_fingerprint=worker.fingerprint,
-        backend="herdr",
-        target_kind="agent_id",
-        target_value="private",
-        observed_at=NOW,
-        private_fingerprint="private-a",
+    other_route = _acp_binding(
+        worker,
+        target="session-other",
+        private_fingerprint="private-other",
     )
     apply_turn_refresh(
         db_path,
         "host-a",
         worker.id,
         {"source_turn_id": "turn-other-route", "user_text": "do it"},
-        expected_binding=herdr,
+        expected_binding=other_route,
         observed_at="2026-08-05T00:00:01Z",
     )
     settled = settle_submission_link_for_request(

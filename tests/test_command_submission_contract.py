@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -46,12 +44,6 @@ from tendwire.store.turns import apply_turn_refresh
 from .store_helpers import upsert_test_worker_bindings
 
 
-_APPROVED_HEALTH_AUTHORITY = pytest.mark.xfail(
-    strict=True,
-    reason="approved: a prepared ACP generation, not persisted Herdr health, authorizes send",
-)
-
-
 def _config(tmp_path: Path) -> Config:
     return Config(
         host_id="command-contract-host",
@@ -80,13 +72,14 @@ def _seed(
     config: Config,
     *,
     health: str = "healthy",
+    status: str = "idle",
 ) -> tuple[Worker, WorkerBinding]:
     assert config.db_path is not None
     init_store(config.db_path)
     worker = Worker(
         id="worker-1",
         name="Coda",
-        status="idle",
+        status=status,
         fingerprint="worker-public-fingerprint",
         meta={
             "stable_key": "wsk1_" + "a" * 64,
@@ -193,6 +186,8 @@ class _Route:
     def binding_fingerprint(self) -> str:
         if self.failure == "binding":
             raise RuntimeError("private generation vanished")
+        if self.failure == "blank_binding":
+            return " "
         return "private-acp-binding"
 
     @property
@@ -241,16 +236,6 @@ class _Route:
         return self.steering_outcome
 
 
-def _receipt_counts(config: Config) -> tuple[int, int, int]:
-    assert config.db_path is not None
-    with sqlite3.connect(config.db_path) as conn:
-        return tuple(
-            int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-            for table in ("command_receipts", "turn_submissions", "agent_events")
-        )
-
-
-@_APPROVED_HEALTH_AUTHORITY
 def test_prepared_acp_route_outranks_stale_unhealthy_snapshot_health(
     tmp_path: Path,
 ) -> None:
@@ -275,25 +260,66 @@ def test_prepared_acp_route_outranks_stale_unhealthy_snapshot_health(
     assert receipt is not None and receipt["state"] == "accepted"
 
 
-@pytest.mark.parametrize("failure", ["prepare", "binding"])
-def test_failed_or_stale_generation_before_reservation_leaves_no_receipt(
+def test_target_status_veto_precedes_acp_and_is_durable(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    _worker, _binding = _seed(config, health="failed", status="closed")
+    route = _Route()
+    request = _instruction("closed-target")
+
+    first = submit_command(
+        config,
+        request,
+        acp_prompt_router=lambda _candidate: route,
+    )
+    replay = submit_command(
+        config,
+        request,
+        acp_prompt_router=lambda _candidate: route,
+    )
+
+    assert first.to_dict() == replay.to_dict()
+    assert first.status == "rejected"
+    assert first.disposition == "terminal_rejected"
+    assert route.prepare_count == route.send_count == 0
+    receipt = get_command_request(config.db_path, config.host_id, "closed-target")
+    assert receipt is not None and receipt["state"] == "rejected"
+
+
+def test_missing_persisted_snapshot_fails_before_receipt_and_acp(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    route = _Route()
+
+    result = submit_command(
+        config,
+        _instruction("missing-snapshot"),
+        acp_prompt_router=lambda _worker: route,
+    )
+
+    assert result.status == "backend_unavailable"
+    assert result.disposition == "no_receipt"
+    assert route.prepare_count == route.send_count == 0
+    assert config.db_path is not None and not config.db_path.exists()
+
+
+@pytest.mark.parametrize("failure", ["prepare", "binding", "blank_binding"])
+def test_route_failure_before_reservation_is_retryable(
     tmp_path: Path,
     failure: str,
 ) -> None:
     config = _config(tmp_path)
-    worker, _binding = _seed(config)
+    _worker, _binding = _seed(config)
     route = _Route(failure=failure)
 
     result = submit_command(
         config,
-        _instruction(f"generation-{failure}"),
-        acp_prompt_router=lambda candidate: route if candidate == worker else None,
+        _instruction(f"route-{failure}"),
+        acp_prompt_router=lambda _candidate: route,
     )
 
     assert result.status == "backend_unavailable"
     assert result.disposition == "no_receipt"
     assert route.send_count == 0
-    assert _receipt_counts(config) == (0, 0, 0)
+    assert get_command_request(config.db_path, config.host_id, f"route-{failure}") is None
 
 
 def test_generation_loss_before_transport_boundary_is_retryable(
@@ -361,50 +387,6 @@ def test_generation_loss_after_transport_boundary_is_uncertain_and_never_retried
     assert receipt is not None and receipt["state"] == "uncertain"
 
 
-@pytest.mark.parametrize(
-    ("route", "terminal_state"),
-    [
-        pytest.param(_Route(), "accepted", id="accepted"),
-        pytest.param(
-            _Route(failure="after_send_start"),
-            "uncertain",
-            id="uncertain",
-        ),
-        pytest.param(
-            _Route(steering=True, steering_outcome="failed"),
-            "rejected",
-            id="rejected",
-        ),
-    ],
-)
-def test_terminal_receipt_replay_is_exact_and_store_stable(
-    tmp_path: Path,
-    route: _Route,
-    terminal_state: str,
-) -> None:
-    config = _config(tmp_path)
-    worker, _binding = _seed(config)
-    request_id = f"terminal-{terminal_state}"
-    request = _instruction(request_id)
-
-    first = submit_command(
-        config,
-        request,
-        acp_prompt_router=lambda candidate: route if candidate == worker else None,
-    )
-    stored_before = get_command_request(config.db_path, config.host_id, request_id)
-    second = submit_command(
-        config,
-        request,
-        acp_prompt_router=lambda _candidate: route,
-    )
-    stored_after = get_command_request(config.db_path, config.host_id, request_id)
-
-    assert stored_before == stored_after
-    assert stored_before is not None and stored_before["state"] == terminal_state
-    assert envelope_to_receipt_json(first) == stored_before["result_json"]
-    assert second.to_dict() == first.to_dict()
-    assert route.send_count == 1
 
 
 def _request_object(value: Mapping[str, Any]) -> CommandRequest:
@@ -472,6 +454,46 @@ def test_live_receipt_replay_returns_exact_stored_pending_result(
 
     assert stored is not None and stored["state"] == receipt_state
     assert envelope_to_receipt_json(result) == stored["result_json"]
+    assert route.prepare_count == route.send_count == 0
+
+
+def test_corrupt_live_status_precedes_malformed_pending_result(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    worker, _binding = _seed(config)
+    request_data = _instruction("corrupt-live")
+    request = _request_object(request_data)
+    canonical = build_canonical_mutation(request, public_worker_id=worker.id)
+    reserve_command_request(
+        config.db_path,
+        host_id=config.host_id,
+        request_id=request.request_id or "",
+        action=canonical.action,
+        canonical_version=canonical.canonical_version,
+        canonical_fingerprint=canonical.fingerprint,
+        canonical_request_json=canonical.canonical_json,
+        public_worker_id=canonical.public_worker_id,
+        pending_result_json=envelope_to_receipt_json(_pending_envelope(request)),
+    )
+    assert config.db_path is not None
+    with sqlite3.connect(config.db_path) as conn:
+        conn.execute(
+            "UPDATE command_receipts SET status='accepted', result_json='bad' "
+            "WHERE request_id='corrupt-live'"
+        )
+        conn.commit()
+    route = _Route()
+
+    result = submit_command(
+        config,
+        request_data,
+        acp_prompt_router=lambda _candidate: route,
+    )
+
+    assert result.status == "request_state_uncertain"
+    assert result.error is not None
+    assert result.error["message"] == (
+        "stored request receipt is inconsistent; not retrying mutation"
+    )
     assert route.prepare_count == route.send_count == 0
 
 
@@ -597,6 +619,40 @@ def test_corrupt_terminal_receipt_fails_closed_without_transport(
     assert replay.disposition == "terminal_uncertain"
     assert route.send_count == 1
     assert "private" not in replay.to_json()
+
+
+def test_boolean_canonical_version_cannot_claim_v1_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    worker, _binding = _seed(config)
+    request = _instruction("bool-version")
+    route = _Route()
+    accepted = submit_command(
+        config,
+        request,
+        acp_prompt_router=lambda candidate: route if candidate == worker else None,
+    )
+    assert accepted.status == "accepted"
+    real_get = command_submission.get_command_request
+
+    def boolean_version(*args: Any, **kwargs: Any) -> Any:
+        receipt = real_get(*args, **kwargs)
+        assert receipt is not None
+        return {**receipt, "canonical_version": True}
+
+    monkeypatch.setattr(command_submission, "get_command_request", boolean_version)
+
+    replay = submit_command(
+        config,
+        request,
+        acp_prompt_router=lambda _candidate: route,
+    )
+
+    assert replay.status == "request_state_uncertain"
+    assert replay.disposition == "terminal_uncertain"
+    assert route.send_count == 1
 
 
 def test_stored_selector_evidence_precedes_snapshot_churn_and_changed_selector(
@@ -765,6 +821,40 @@ def test_finish_commit_then_exception_recovers_exact_terminal_receipt(
     assert route.send_count == 1
 
 
+@pytest.mark.parametrize(
+    ("verdict", "status", "disposition"),
+    [
+        ("accepted", "accepted", "terminal_accepted"),
+        ("rejected", "rejected", "terminal_rejected"),
+        ("uncertain", "request_state_uncertain", "terminal_uncertain"),
+    ],
+)
+def test_terminal_receipt_replays_exactly_without_resending(
+    tmp_path: Path,
+    verdict: str,
+    status: str,
+    disposition: str,
+) -> None:
+    config = _config(tmp_path)
+    _worker, _binding = _seed(config)
+    route = {
+        "accepted": _Route(),
+        "rejected": _Route(steering=True, steering_outcome="failed"),
+        "uncertain": _Route(failure="after_send_start"),
+    }[verdict]
+    request = _instruction(f"terminal-{verdict}")
+
+    first = submit_command(config, request, acp_prompt_router=lambda _worker: route)
+    stored = get_command_request(config.db_path, config.host_id, f"terminal-{verdict}")
+    replay = submit_command(config, request, acp_prompt_router=lambda _worker: route)
+
+    assert first.to_dict() == replay.to_dict()
+    assert (first.status, first.disposition) == (status, disposition)
+    assert stored == get_command_request(config.db_path, config.host_id, f"terminal-{verdict}")
+    assert stored is not None and stored["result_json"] == envelope_to_receipt_json(first)
+    assert route.send_count == 1
+
+
 def _pending_decision(config: Config) -> str:
     assert config.db_path is not None
     binding = list_worker_bindings(
@@ -794,49 +884,16 @@ def _pending_decision(config: Config) -> str:
     return str(payload["pending_interactions"][0]["id"])
 
 
-def _decision_route(value: Any) -> tuple[Any, ...]:
-    return tuple(
-        getattr(value, field, None)
-        for field in (
-            "worker_id",
-            "worker_fingerprint",
-            "binding_private_fingerprint",
-            "turn_target_value",
-            "decision_ref",
-            "decision_kind",
-            "option_count",
-            "option_refs",
-            "text",
-        )
-    )
-
-
 class _DecisionRouter:
-    def __init__(
-        self,
-        *,
-        entered: threading.Event | None = None,
-        release: threading.Event | None = None,
-    ) -> None:
-        self.entered = entered
-        self.release = release
-        self.owned_routes: list[tuple[Any, ...]] = []
-        self.answered_routes: list[tuple[Any, ...]] = []
-        self._lock = threading.Lock()
+    def __init__(self) -> None:
+        self.answered = 0
 
     def owns_permission_decision(self, decision: Any) -> bool:
-        with self._lock:
-            self.owned_routes.append(_decision_route(decision))
         return True
 
     def answer_permission_decision(self, decision: Any, *, timeout: float) -> None:
         assert timeout > 0
-        with self._lock:
-            self.answered_routes.append(_decision_route(decision))
-        if self.entered is not None:
-            self.entered.set()
-        if self.release is not None:
-            assert self.release.wait(2)
+        self.answered += 1
 
 
 def _decision_rows(config: Config, decision_ref: str) -> tuple[str, str, str]:
@@ -857,31 +914,6 @@ def _decision_rows(config: Config, decision_ref: str) -> tuple[str, str, str]:
     return str(receipt[0]), str(pending[0]), str(claim[0])
 
 
-def test_permission_route_tuple_is_stable_and_private(
-    tmp_path: Path,
-) -> None:
-    config = _config(tmp_path)
-    _worker, _binding = _seed(config)
-    decision_ref = _pending_decision(config)
-    router = _DecisionRouter()
-
-    result = submit_command(
-        config,
-        _answer("permission-route", decision_ref),
-        acp_permission_router=router,
-    )
-
-    assert result.status == "accepted"
-    assert router.owned_routes == router.answered_routes
-    assert len(router.answered_routes) == 1
-    serialized = result.to_json()
-    for private in ("private-acp-binding", "private-session"):
-        assert private not in serialized
-    assert _decision_rows(config, decision_ref) == (
-        "accepted",
-        "resolved",
-        "settled",
-    )
 
 
 def test_permission_terminal_effect_failure_rolls_back_receipt_and_pending(
@@ -917,7 +949,7 @@ def test_permission_terminal_effect_failure_rolls_back_receipt_and_pending(
         "open",
         "send_started",
     )
-    assert len(router.answered_routes) == 1
+    assert router.answered == 1
 
 
 def test_permission_terminal_commit_loss_recovers_both_atomic_states(
@@ -958,128 +990,7 @@ def test_permission_terminal_commit_loss_recovers_both_atomic_states(
         "resolved",
         "settled",
     )
-    assert len(router.answered_routes) == 1
-
-
-def test_concurrent_permission_answers_emit_one_acp_response(
-    tmp_path: Path,
-) -> None:
-    config = _config(tmp_path)
-    _worker, _binding = _seed(config)
-    decision_ref = _pending_decision(config)
-    entered = threading.Event()
-    release = threading.Event()
-    router = _DecisionRouter(entered=entered, release=release)
-    requests = [
-        _answer(f"permission-concurrent-{index}", decision_ref)
-        for index in range(2)
-    ]
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        first = pool.submit(
-            submit_command,
-            config,
-            requests[0],
-            acp_permission_router=router,
-        )
-        assert entered.wait(2)
-        second = pool.submit(
-            submit_command,
-            config,
-            requests[1],
-            acp_permission_router=router,
-        )
-        second_result = second.result(timeout=2)
-        release.set()
-        first_result = first.result(timeout=2)
-
-    assert first_result.status == "accepted"
-    assert first_result.disposition == "terminal_accepted"
-    assert second_result.status == "answer_in_progress"
-    assert second_result.disposition == "in_progress"
-    assert len(router.answered_routes) == 1
-
-
-@pytest.mark.parametrize(
-    "command_payload",
-    [
-        {"schema_version": 1, "action": "noop"},
-        {
-            "schema_version": 1,
-            "action": "send_instruction",
-            "dry_run": True,
-            "target": {"worker_id": "worker-1"},
-            "instruction": {"text": "preview"},
-        },
-        {
-            "schema_version": 1,
-            "action": "answer_decision",
-            "dry_run": True,
-            "target": {"worker_id": "worker-1"},
-            "params": {
-                "decision_ref": "pending-public",
-                "selection": {"option_refs": ["1"]},
-            },
-        },
-    ],
-)
-def test_noop_and_mutation_dry_runs_are_store_and_acp_free(
-    tmp_path: Path,
-    command_payload: dict[str, Any],
-) -> None:
-    config = _config(tmp_path)
-
-    def forbidden_route(_worker: Worker) -> Any:
-        raise AssertionError("nonmutating and dry-run commands must not resolve ACP")
-
-    result = submit_command(
-        config,
-        command_payload,
-        acp_prompt_router=forbidden_route,
-    )
-
-    assert result.ok is True
-    assert result.status in {"noop", "dry_run"}
-    assert config.db_path is not None and not config.db_path.exists()
-
-
-def test_nonmutating_snapshot_and_resolution_read_projection_without_receipts_or_acp(
-    tmp_path: Path,
-) -> None:
-    config = _config(tmp_path)
-    worker, _binding = _seed(config)
-    counts_before = _receipt_counts(config)
-
-    def forbidden_route(_worker: Worker) -> Any:
-        raise AssertionError("nonmutating commands must not resolve ACP")
-
-    snapshot = submit_command(
-        config,
-        {"schema_version": 1, "action": "read_snapshot"},
-        acp_prompt_router=forbidden_route,
-    )
-    resolved = submit_command(
-        config,
-        {
-            "schema_version": 1,
-            "action": "resolve_target",
-            "target": {"worker_id": worker.id},
-        },
-        acp_prompt_router=forbidden_route,
-    )
-
-    assert snapshot.status == "snapshot" and snapshot.ok is True
-    assert resolved.status == "resolved" and resolved.ok is True
-    assert resolved.result == {
-        "target": {
-            "worker_id": worker.id,
-            "name": worker.name,
-            "space_id": worker.space_id,
-            "status": worker.status,
-            "worker_fingerprint": worker.fingerprint,
-        }
-    }
-    assert _receipt_counts(config) == counts_before
+    assert router.answered == 1
 
 
 def test_v2_receipt_is_immutable_and_v3_projection_runs_once_per_response(

@@ -705,20 +705,22 @@ class CommandEnvelope:
     schema_version: int = COMMAND_ENVELOPE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        type_requirements = (
-            (isinstance(self.ok, bool), "ok must be a boolean"),
-            (isinstance(self.action, str), "action must be a string"),
-            (self.request_id is None or isinstance(self.request_id, str),
-             "request_id must be a string or null"),
-            (isinstance(self.dry_run, bool), "dry_run must be a boolean"),
-            (self.result is None or isinstance(self.result, Mapping), "result must be an object or null"),
-            (self.error is None or isinstance(self.error, Mapping), "error must be an object or null"),
-            (isinstance(self.warnings, list) and all(isinstance(w, str) for w in self.warnings),
-             "warnings must be an array of strings"),
-        )
-        for valid, message in type_requirements:
-            if not valid:
-                raise TypeError(message)
+        if not isinstance(self.ok, bool):
+            raise TypeError("ok must be a boolean")
+        if not isinstance(self.action, str):
+            raise TypeError("action must be a string")
+        if self.request_id is not None and not isinstance(self.request_id, str):
+            raise TypeError("request_id must be a string or null")
+        if not isinstance(self.dry_run, bool):
+            raise TypeError("dry_run must be a boolean")
+        if self.result is not None and not isinstance(self.result, Mapping):
+            raise TypeError("result must be an object or null")
+        if self.error is not None and not isinstance(self.error, Mapping):
+            raise TypeError("error must be an object or null")
+        if not isinstance(self.warnings, list) or not all(
+            isinstance(warning, str) for warning in self.warnings
+        ):
+            raise TypeError("warnings must be an array of strings")
         if not isinstance(self.status, str) or self.status not in VALID_STATUSES:
             raise ValueError("status must be a supported command status")
         if self.disposition not in VALID_DISPOSITIONS:
@@ -728,16 +730,12 @@ class CommandEnvelope:
         ):
             raise ValueError("command envelope schema_version must be 2 or 3")
 
-        mutating = self.action in {
-            "send_instruction",
-            "answer_decision",
-        }
+        mutating = self.action in {"send_instruction", "answer_decision"}
         live_mutation = mutating and self.dry_run is False
         if live_mutation and not is_valid_request_id(self.request_id):
             raise ValueError("non-dry-run mutation requires a valid request_id")
-        if (
-            self.disposition != DISPOSITION_NO_RECEIPT
-            and not is_valid_request_id(self.request_id)
+        if self.disposition != DISPOSITION_NO_RECEIPT and not is_valid_request_id(
+            self.request_id
         ):
             raise ValueError("receipt-bearing disposition requires a valid request_id")
 
@@ -752,36 +750,7 @@ class CommandEnvelope:
 
         if self.ok and clean_error is not None:
             raise ValueError("successful command envelope must not include an error")
-        if self.disposition == DISPOSITION_NO_RECEIPT:
-            valid_tuple = not mutating or (
-                live_mutation and not self.ok
-                and self.status in LIVE_MUTATION_NO_RECEIPT_REJECTION_STATUSES
-                and (self.status != STATUS_ANSWER_IN_PROGRESS or self.action == "answer_decision")
-            ) or (
-                not live_mutation and (
-                    self.ok and self.status == STATUS_DRY_RUN
-                    or not self.ok and self.status in DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES
-                )
-            )
-        elif self.disposition == DISPOSITION_IN_PROGRESS:
-            valid_tuple = (
-                live_mutation and not self.ok
-                and self.status in {STATUS_PENDING, STATUS_ANSWER_IN_PROGRESS}
-                and (self.status != STATUS_ANSWER_IN_PROGRESS or self.action == "answer_decision")
-            )
-        elif self.disposition == DISPOSITION_TERMINAL_ACCEPTED:
-            valid_tuple = live_mutation and self.ok and self.status == STATUS_ACCEPTED
-        elif self.disposition == DISPOSITION_TERMINAL_REJECTED:
-            valid_tuple = (
-                live_mutation and not self.ok
-                and self.status in TERMINAL_MUTATION_REJECTION_STATUSES
-            )
-        else:
-            valid_tuple = (
-                live_mutation and not self.ok
-                and self.status == STATUS_REQUEST_STATE_UNCERTAIN
-            )
-        if not valid_tuple:
+        if not _valid_envelope_tuple(self, mutating, live_mutation):
             raise ValueError(f"{self.disposition} disposition has an inconsistent command tuple")
         if self.schema_version == COMMAND_ENVELOPE_V3_SCHEMA_VERSION:
             submission_id = clean_result.get("submission_id") if clean_result else None
@@ -796,16 +765,6 @@ class CommandEnvelope:
                 or not (turn_id is None or isinstance(turn_id, str) and bool(turn_id))
             ):
                 raise ValueError("schema-v3 envelopes require an accepted instruction submission")
-        if self.status == STATUS_ANSWER_IN_PROGRESS and not (
-            self.action == "answer_decision"
-            and live_mutation
-            and not self.ok
-            and self.disposition
-            in {DISPOSITION_NO_RECEIPT, DISPOSITION_IN_PROGRESS}
-        ):
-            raise ValueError(
-                "answer_in_progress has an inconsistent command tuple"
-            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -873,6 +832,45 @@ class CommandEnvelope:
             ok=False, status=error.get("code", default_status), action=action,
             request_id=request_id, dry_run=dry_run, error=error,
         )
+
+
+def _valid_envelope_tuple(
+    envelope: CommandEnvelope,
+    mutating: bool,
+    live: bool,
+) -> bool:
+    answer_progress = envelope.status != STATUS_ANSWER_IN_PROGRESS or (
+        envelope.action == "answer_decision" and live and not envelope.ok
+    )
+    if not answer_progress:
+        return False
+    if envelope.disposition == DISPOSITION_NO_RECEIPT:
+        if not mutating:
+            return True
+        if live:
+            return not envelope.ok and (
+                envelope.status in LIVE_MUTATION_NO_RECEIPT_REJECTION_STATUSES
+            )
+        return (
+            envelope.ok and envelope.status == STATUS_DRY_RUN
+        ) or (
+            not envelope.ok
+            and envelope.status in DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES
+        )
+    if envelope.disposition == DISPOSITION_IN_PROGRESS:
+        return live and not envelope.ok and envelope.status in {
+            STATUS_PENDING,
+            STATUS_ANSWER_IN_PROGRESS,
+        }
+    if envelope.disposition == DISPOSITION_TERMINAL_ACCEPTED:
+        return live and envelope.ok and envelope.status == STATUS_ACCEPTED
+    if envelope.disposition == DISPOSITION_TERMINAL_REJECTED:
+        return live and not envelope.ok and (
+            envelope.status in TERMINAL_MUTATION_REJECTION_STATUSES
+        )
+    return live and not envelope.ok and (
+        envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
+    )
 
 
 def worker_candidate(worker: Worker) -> dict[str, Any]:

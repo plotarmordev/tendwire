@@ -48,8 +48,7 @@ from .core.commands import (
     validate_request,
     worker_candidate,
 )
-from .core.models import BackendHealth, Snapshot, Worker
-from .core.projector import project_from_observations
+from .core.models import Snapshot, Worker
 from .store.pending import (
     abandon_backend_pending_decision_claim,
     backend_pending_decision_terminal_effect,
@@ -71,7 +70,6 @@ from .store.receipts import (
 )
 
 
-HERDR_BACKEND = "herdr"
 _MUTATING_ACTIONS = frozenset(
     {"send_instruction", "answer_decision"}
 )
@@ -81,6 +79,29 @@ _TERMINAL_DISPOSITIONS = {
     "accepted": DISPOSITION_TERMINAL_ACCEPTED,
     "rejected": DISPOSITION_TERMINAL_REJECTED,
     "uncertain": DISPOSITION_TERMINAL_UNCERTAIN,
+}
+_FAILURE_MESSAGES = {
+    STATUS_PENDING: "request is already in progress",
+    STATUS_ANSWER_IN_PROGRESS: "another request is currently answering this decision",
+    STATUS_DUPLICATE_REQUEST: "request_id reused with a different canonical mutation",
+    STATUS_DECISION_NOT_PENDING: "decision is not the worker's current pending decision",
+    STATUS_UNKNOWN_WORKER: "target worker does not exist or is not open",
+    STATUS_INVALID_SELECTION: "selection is invalid for the current decision",
+    STATUS_UNSUPPORTED_DECISION: "multi-question decisions are not supported",
+}
+_TARGET_MESSAGES = {
+    STATUS_STALE_TARGET: "target worker fingerprint does not match the current worker",
+    STATUS_AMBIGUOUS_TARGET: "target matches more than one worker",
+    STATUS_REJECTED: "target worker status does not allow instructions",
+    STATUS_NOT_FOUND: "no worker matches the target",
+}
+_RECEIPT_MESSAGES = {
+    "missing": "stored request receipt is missing or malformed; not retrying mutation",
+    "malformed": "stored request receipt is malformed; not retrying mutation",
+    "illegal": "stored request receipt has an illegal state; not retrying mutation",
+    "inconsistent": "stored request receipt is inconsistent; not retrying mutation",
+    "unreadable": "stored request result is unreadable; not retrying mutation",
+    "result_malformed": "stored request result is malformed; not retrying mutation",
 }
 
 
@@ -101,34 +122,25 @@ class AcpPermissionDecisionRouter(Protocol):
     def answer_permission_decision(self, decision: Any, *, timeout: float) -> None: ...
 
 
-def _backend_health(snapshot: Snapshot) -> BackendHealth:
-    for health in snapshot.backend_health:
-        if health.name == HERDR_BACKEND:
-            return health
-    return BackendHealth(name=HERDR_BACKEND, status="unknown", outcome="unknown")
+def _attempt(call: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    try:
+        return call(*args, **kwargs)
+    except Exception:
+        return None
 
 
 def _current_snapshot(config: Config) -> Snapshot:
     snapshot = latest_snapshot(config.db_path, config.host_id)
-    if snapshot is not None:
-        return snapshot
-    return project_from_observations(config)
+    if snapshot is None:
+        raise RuntimeError("persisted worker authority is unavailable")
+    return snapshot
 
 
 def _backend_unavailable(
     request: CommandRequest,
     message: str,
-    *,
-    health: BackendHealth | None = None,
 ) -> CommandEnvelope:
-    details: dict[str, Any] = {}
-    if health is not None:
-        details["backend"] = {
-            "name": health.name,
-            "status": health.status,
-            "outcome": health.outcome,
-        }
-    error = error_value(STATUS_BACKEND_UNAVAILABLE, message, details=details)
+    error = error_value(STATUS_BACKEND_UNAVAILABLE, message)
     return CommandEnvelope.from_error(request, error)
 
 
@@ -137,16 +149,11 @@ def _target_resolution_error(
     status: str,
     candidates: list[dict[str, Any]],
 ) -> CommandEnvelope:
-    if status == STATUS_STALE_TARGET:
-        message = "target worker fingerprint does not match the current worker"
-    elif status == STATUS_AMBIGUOUS_TARGET:
-        message = "target matches more than one worker"
-    elif status == STATUS_REJECTED:
-        message = "target worker status does not allow instructions"
-        if candidates:
-            message = f"target worker status does not allow instructions: {candidates[0]['status']!r}"
-    else:
-        status, candidates, message = STATUS_NOT_FOUND, [], "no worker matches the target"
+    if status not in _TARGET_MESSAGES:
+        status, candidates = STATUS_NOT_FOUND, []
+    message = _TARGET_MESSAGES[status]
+    if status == STATUS_REJECTED and candidates:
+        message = f"{message}: {candidates[0]['status']!r}"
     return CommandEnvelope.from_result(
         request,
         ok=False,
@@ -168,10 +175,8 @@ def _resolve_authoritative_worker(
     if status != STATUS_RESOLVED:
         return _target_resolution_error(request, status, candidates)
 
-    worker = next(
-        (item for item in snapshot.workers if item.id == (resolved or {}).get("worker_id")),
-        None,
-    )
+    worker_id = (resolved or {}).get("worker_id")
+    worker = next((item for item in snapshot.workers if item.id == worker_id), None)
     if worker is None:
         return _target_resolution_error(request, STATUS_NOT_FOUND, [])
     return worker
@@ -190,68 +195,54 @@ def _instruction_text(request: CommandRequest) -> str:
 
 
 
-def _backend_uncertain(request: CommandRequest, message: str) -> CommandEnvelope:
-    return _failure_envelope(
-        request, STATUS_REQUEST_STATE_UNCERTAIN, message,
-        disposition=DISPOSITION_TERMINAL_UNCERTAIN,
-    )
-
-
 def _failure_envelope(
     request: CommandRequest,
     status: str,
-    message: str,
+    message: str | None = None,
     *,
-    disposition: str = DISPOSITION_NO_RECEIPT,
+    disposition: str | None = None,
     result: dict[str, Any] | None = None,
 ) -> CommandEnvelope:
+    if disposition is None:
+        disposition = {
+            STATUS_PENDING: DISPOSITION_IN_PROGRESS,
+            STATUS_ANSWER_IN_PROGRESS: DISPOSITION_IN_PROGRESS,
+            STATUS_DUPLICATE_REQUEST: DISPOSITION_TERMINAL_REJECTED,
+            STATUS_REQUEST_STATE_UNCERTAIN: DISPOSITION_TERMINAL_UNCERTAIN,
+        }.get(status, DISPOSITION_NO_RECEIPT)
     return CommandEnvelope.from_result(
         request,
         ok=False,
         status=status,
         disposition=disposition,
         result=result,
-        error=error_value(status, message),
+        error=error_value(status, message or _FAILURE_MESSAGES[status]),
     )
+
+
+def _backend_uncertain(request: CommandRequest, message: str) -> CommandEnvelope:
+    return _failure_envelope(request, STATUS_REQUEST_STATE_UNCERTAIN, message)
 
 
 def _request_in_progress(request: CommandRequest) -> CommandEnvelope:
-    return _failure_envelope(
-        request, STATUS_PENDING, "request is already in progress",
-        disposition=DISPOSITION_IN_PROGRESS,
-    )
+    return _failure_envelope(request, STATUS_PENDING)
 
 
-def _answer_in_progress(
-    request: CommandRequest,
-) -> CommandEnvelope:
-    return _failure_envelope(
-        request, STATUS_ANSWER_IN_PROGRESS,
-        "another request is currently answering this decision",
-        disposition=DISPOSITION_IN_PROGRESS,
-    )
+def _answer_in_progress(request: CommandRequest) -> CommandEnvelope:
+    return _failure_envelope(request, STATUS_ANSWER_IN_PROGRESS)
 
 
 def _duplicate_request(request: CommandRequest) -> CommandEnvelope:
-    return _failure_envelope(
-        request, STATUS_DUPLICATE_REQUEST,
-        "request_id reused with a different canonical mutation",
-        disposition=DISPOSITION_TERMINAL_REJECTED,
-    )
+    return _failure_envelope(request, STATUS_DUPLICATE_REQUEST)
 
 
 def _decision_failure_envelope(
     request: CommandRequest,
     status: str,
 ) -> CommandEnvelope:
-    messages = {
-        STATUS_ANSWER_IN_PROGRESS: "another request is currently answering this decision",
-        STATUS_DECISION_NOT_PENDING: "decision is not the worker's current pending decision",
-        STATUS_UNKNOWN_WORKER: "target worker does not exist or is not open",
-        STATUS_INVALID_SELECTION: "selection is invalid for the current decision",
-        STATUS_UNSUPPORTED_DECISION: "multi-question decisions are not supported",
-    }
-    return _failure_envelope(request, status, messages[status])
+    return _failure_envelope(
+        request, status, disposition=DISPOSITION_NO_RECEIPT
+    )
 
 
 def _decision_route(claim: Any) -> tuple[Any, ...] | None:
@@ -264,48 +255,18 @@ def _decision_route(claim: Any) -> tuple[Any, ...] | None:
         )
     )
     worker_id, worker_fp, binding_fp, target, ref, kind, count, refs, text = route
-    valid = (
-        all(isinstance(value, str) and bool(value) for value in (worker_id, worker_fp, binding_fp, ref))
-        and isinstance(target, str) and bool(target.strip())
-        and kind in {"single", "multi", "plan"}
-        and type(count) is int and count >= 1
-        and isinstance(refs, tuple)
-        and ((text is None and bool(refs)) or (isinstance(text, str) and bool(text) and not refs))
+    strings = (worker_id, worker_fp, binding_fp, target, ref)
+    valid = all(isinstance(value, str) and bool(value.strip()) for value in strings)
+    valid = valid and kind in {"single", "multi", "plan"}
+    valid = valid and type(count) is int and count >= 1 and isinstance(refs, tuple)
+    valid = valid and (
+        text is None and bool(refs)
+        or isinstance(text, str) and bool(text) and not refs
     )
     return route if valid else None
 
 
 PreSendFailure = tuple[CommandEnvelope, bool]
-
-
-def _abandon_pending_claim(config: Config, claim_token: str | None) -> bool:
-    if not claim_token:
-        return False
-    try:
-        return abandon_backend_pending_decision_claim(
-            config.db_path,
-            config.host_id,
-            claim_token,
-        )
-    except Exception:
-        return False
-
-
-def _abandon_request_reservation(
-    config: Config,
-    request: CommandRequest,
-    reservation: ReservedCommandMutation,
-) -> bool:
-    try:
-        return abandon_command_request_reservation(
-            config.db_path,
-            host_id=config.host_id,
-            request_id=request.request_id or "",
-            canonical_fingerprint=reservation.canonical.fingerprint,
-            owner_token=reservation.owner_token,
-        )
-    except Exception:
-        return False
 
 
 def _transition_payload(
@@ -325,13 +286,32 @@ def _transition_payload(
     return payload
 
 
-def _receipt_is_canonical(
+def _receipt_error(request: CommandRequest, kind: str) -> CommandEnvelope:
+    return _backend_uncertain(request, _RECEIPT_MESSAGES[kind])
+
+
+def _decode_receipt(
     request: CommandRequest,
     canonical: CanonicalMutation,
-    receipt: Mapping[str, Any],
-) -> bool:
+    receipt: Any,
+) -> CommandEnvelope:
+    if not isinstance(receipt, Mapping):
+        return _receipt_error(request, "missing")
+    required = {
+        "request_id",
+        "action",
+        "canonical_version",
+        "canonical_fingerprint",
+        "canonical_request_json",
+        "public_worker_id",
+        "state",
+        "status",
+        "result_json",
+    }
+    if not required.issubset(receipt):
+        return _receipt_error(request, "malformed")
     version = receipt.get("canonical_version")
-    return (
+    identity = (
         type(version) is int
         and version == canonical.canonical_version
         and receipt.get("request_id") == request.request_id
@@ -340,110 +320,72 @@ def _receipt_is_canonical(
         and receipt.get("canonical_request_json") == canonical.canonical_json
         and receipt.get("public_worker_id") == canonical.public_worker_id
     )
-
-
-def _stored_terminal_envelope(
-    request: CommandRequest,
-    receipt: Mapping[str, Any],
-) -> CommandEnvelope:
-    malformed = "stored request result is malformed; not retrying mutation"
+    if not identity:
+        return _duplicate_request(request)
+    state = receipt.get("state")
+    if state not in {"reserved", "send_started", "accepted", "rejected", "uncertain"}:
+        return _receipt_error(request, "illegal")
+    if state in {"reserved", "send_started"} and receipt.get("status") != STATUS_PENDING:
+        return _receipt_error(request, "inconsistent")
     try:
         data = json.loads(receipt["result_json"])
         if not isinstance(data, dict):
             raise TypeError
     except (KeyError, TypeError, json.JSONDecodeError):
-        return _backend_uncertain(
-            request,
-            "stored request result is unreadable; not retrying mutation",
-        )
-
-    state = receipt.get("state")
-    expected_disposition = _TERMINAL_DISPOSITIONS.get(state)
-    if expected_disposition is None:
-        return _backend_uncertain(request, malformed)
-
+        if state in {"reserved", "send_started"}:
+            return _request_in_progress(request)
+        return _receipt_error(request, "unreadable")
     try:
         if data.get("schema_version") != COMMAND_ENVELOPE_SCHEMA_VERSION:
             raise ValueError("unsupported stored envelope schema")
         envelope = CommandEnvelope.from_dict(data)
     except (TypeError, ValueError):
-        return _backend_uncertain(request, malformed)
-
-    status = receipt.get("status")
-    valid_identity = (
-        envelope.action == request.action
+        if state in {"reserved", "send_started"}:
+            return _request_in_progress(request)
+        return _receipt_error(request, "result_malformed")
+    if state in {"reserved", "send_started"}:
+        if (
+            envelope.action != request.action
+            or envelope.request_id != request.request_id
+            or envelope.status != STATUS_PENDING
+        ):
+            return _receipt_error(request, "inconsistent")
+        return envelope
+    valid_terminal = (
+        envelope.schema_version == COMMAND_ENVELOPE_SCHEMA_VERSION
+        and envelope.action == request.action
         and envelope.request_id == request.request_id
         and envelope.dry_run is False
-        and envelope.status == status
-        and envelope.disposition == expected_disposition
+        and envelope.status == receipt.get("status")
+        and envelope.disposition == _TERMINAL_DISPOSITIONS[state]
     )
-    if not valid_identity:
-        return _backend_uncertain(
-            request,
-            "stored request result is inconsistent; not retrying mutation",
-        )
-    return envelope
-
-
-def _stored_in_progress_envelope(
-    request: CommandRequest,
-    receipt: Mapping[str, Any],
-) -> CommandEnvelope:
-    try:
-        data = json.loads(receipt["result_json"])
-        envelope = CommandEnvelope.from_dict(data)
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return _request_in_progress(request)
-    if (
-        envelope.action != request.action
-        or envelope.request_id != request.request_id
-        or envelope.status != STATUS_PENDING
-    ):
-        return _request_in_progress(request)
-    return envelope
-
-
-def _envelope_from_receipt(
-    request: CommandRequest,
-    canonical: CanonicalMutation,
-    receipt: Any,
-) -> CommandEnvelope:
-    if not isinstance(receipt, Mapping):
-        return _backend_uncertain(
-            request,
-            "stored request receipt is missing or malformed; not retrying mutation",
-        )
-    required = (
-        "request_id", "action", "canonical_version", "canonical_fingerprint",
-        "canonical_request_json", "public_worker_id", "state", "status", "result_json",
-    )
-    if any(field not in receipt for field in required):
-        return _backend_uncertain(
-            request,
-            "stored request receipt is malformed; not retrying mutation",
-        )
-    if not _receipt_is_canonical(request, canonical, receipt):
-        return _duplicate_request(request)
-    state = receipt.get("state")
-    if state in {"reserved", "send_started"}:
-        if receipt.get("status") != STATUS_PENDING:
-            return _backend_uncertain(
-                request,
-                "stored request receipt is inconsistent; not retrying mutation",
-            )
-        return _stored_in_progress_envelope(request, receipt)
-    if state in {"accepted", "rejected", "uncertain"}:
-        return _stored_terminal_envelope(request, receipt)
-    return _backend_uncertain(
-        request,
-        "stored request receipt has an illegal state; not retrying mutation",
-    )
+    return envelope if valid_terminal else _receipt_error(request, "inconsistent")
 
 
 @dataclass(frozen=True)
 class ReservedCommandMutation:
     canonical: CanonicalMutation
     owner_token: str
+
+@dataclass(frozen=True)
+class _ReceiptTakeover:
+    public_worker_id: str
+
+
+def _read_receipt(config: Config, request: CommandRequest) -> Mapping[str, Any] | None:
+    receipt = _attempt(
+        get_command_request, config.db_path, config.host_id, request.request_id or ""
+    )
+    return receipt if isinstance(receipt, Mapping) else None
+
+
+def _readback(
+    config: Config,
+    request: CommandRequest,
+    canonical: CanonicalMutation,
+) -> CommandEnvelope:
+    return _decode_receipt(request, canonical, _read_receipt(config, request))
+
 
 def _reserve_canonical_request(
     config: Config,
@@ -465,25 +407,18 @@ def _reserve_canonical_request(
             selector_proof=_selector_proof(request),
         )
     except Exception:  # noqa: BLE001
-        try:
-            receipt = get_command_request(
-                config.db_path,
-                config.host_id,
-                request.request_id or "",
-            )
-        except Exception:
-            receipt = None
+        receipt = _read_receipt(config, request)
         if receipt is not None:
-            return _envelope_from_receipt(request, canonical, receipt)
+            return _decode_receipt(request, canonical, receipt)
         return _backend_unavailable(request, "command receipt store is unavailable")
 
     if not isinstance(reservation, Mapping):
-        return _recover_request(config, request, canonical)
+        return _readback(config, request, canonical)
     status = reservation.get("status")
     if status == "request_id_conflict":
         return _duplicate_request(request)
     if status != "reserved":
-        return _envelope_from_receipt(
+        return _decode_receipt(
             request,
             canonical,
             reservation.get("receipt"),
@@ -492,13 +427,12 @@ def _reserve_canonical_request(
     owner_token = reservation.get("owner_token")
     if (
         not isinstance(receipt, Mapping)
-        or not _receipt_is_canonical(request, canonical, receipt)
         or receipt.get("state") != "reserved"
-        or receipt.get("status") != STATUS_PENDING
         or not isinstance(owner_token, str)
         or not owner_token
+        or _decode_receipt(request, canonical, receipt).status != STATUS_PENDING
     ):
-        return _recover_request(config, request, canonical)
+        return _readback(config, request, canonical)
     return ReservedCommandMutation(canonical=canonical, owner_token=owner_token)
 
 
@@ -507,19 +441,7 @@ def _recover_request(
     request: CommandRequest,
     canonical: CanonicalMutation,
 ) -> CommandEnvelope:
-    try:
-        receipt = get_command_request(
-            config.db_path,
-            config.host_id,
-            request.request_id or "",
-        )
-    except Exception:
-        receipt = None
-    return _negotiated_submission_envelope(
-        config,
-        request,
-        _envelope_from_receipt(request, canonical, receipt),
-    )
+    return _readback(config, request, canonical)
 
 
 def _finish_request(
@@ -532,10 +454,8 @@ def _finish_request(
     terminal_state: str,
     terminal_effect: Callable[[Any], Any] | None = None,
 ) -> CommandEnvelope:
+    terminal = replace(envelope, disposition=_TERMINAL_DISPOSITIONS[terminal_state])
     try:
-        terminal = replace(
-            envelope, disposition=_TERMINAL_DISPOSITIONS[terminal_state]
-        )
         finished = finish_command_request(
             config.db_path,
             host_id=config.host_id,
@@ -547,8 +467,7 @@ def _finish_request(
             status=terminal.status,
             result_json=envelope_to_receipt_json(terminal),
             event_payload=_transition_payload(
-                request,
-                worker_id=reservation.canonical.public_worker_id,
+                request, worker_id=reservation.canonical.public_worker_id,
                 envelope=terminal,
             ),
             terminal_effect=terminal_effect,
@@ -557,11 +476,7 @@ def _finish_request(
         finished = None
     if not isinstance(finished, Mapping):
         return _recover_request(config, request, reservation.canonical)
-    return _envelope_from_receipt(
-        request,
-        reservation.canonical,
-        finished.get("receipt"),
-    )
+    return _decode_receipt(request, reservation.canonical, finished.get("receipt"))
 
 
 def _finish_before_send(
@@ -604,13 +519,10 @@ def _mark_request_send_started(
             send_started_effect=None,
             submission_worker=worker,
             instruction_text=instruction_text,
-            submission_link_window_seconds=(
-                config.submission_link_window_seconds
-            ),
+            submission_link_window_seconds=config.submission_link_window_seconds,
             submission_hard_ttl_seconds=config.submission_hard_ttl_seconds,
             event_payload=_transition_payload(
-                request,
-                worker_id=reservation.canonical.public_worker_id,
+                request, worker_id=reservation.canonical.public_worker_id
             ),
         )
     except Exception:  # noqa: BLE001
@@ -621,7 +533,8 @@ def _mark_request_send_started(
         and started.get("owner_token") == reservation.owner_token
         and isinstance(started.get("receipt"), Mapping)
         and started["receipt"].get("state") == "send_started"
-        and _receipt_is_canonical(request, reservation.canonical, started["receipt"])
+        and _decode_receipt(request, reservation.canonical, started["receipt"]).status
+        == STATUS_PENDING
     ):
         if worker is None:
             return None
@@ -632,16 +545,42 @@ def _mark_request_send_started(
         )
         return linked or {"id": None}
     if isinstance(started, Mapping) and isinstance(started.get("receipt"), Mapping):
-        embedded = _envelope_from_receipt(
-            request,
-            reservation.canonical,
-            started["receipt"],
-        )
+        embedded = _decode_receipt(request, reservation.canonical, started["receipt"])
         if embedded.status != STATUS_REQUEST_STATE_UNCERTAIN:
             return embedded
         if started["receipt"].get("state") in {"send_started", "uncertain"}:
             return embedded
     return _recover_request(config, request, reservation.canonical)
+
+
+def _abandon_pending_claim(config: Config, claim_token: str | None) -> bool:
+    if not claim_token:
+        return False
+    return bool(
+        _attempt(
+            abandon_backend_pending_decision_claim,
+            config.db_path,
+            config.host_id,
+            claim_token,
+        )
+    )
+
+
+def _abandon_request_reservation(
+    config: Config,
+    request: CommandRequest,
+    reservation: ReservedCommandMutation,
+) -> bool:
+    return bool(
+        _attempt(
+            abandon_command_request_reservation,
+            config.db_path,
+            host_id=config.host_id,
+            request_id=request.request_id or "",
+            canonical_fingerprint=reservation.canonical.fingerprint,
+            owner_token=reservation.owner_token,
+        )
+    )
 
 
 def _linked_submission_turn(
@@ -731,14 +670,13 @@ def _pending_terminal_effect(
     *,
     accepted: bool = False,
 ) -> Callable[[Any], Any] | None:
-    try:
-        return backend_pending_decision_terminal_effect(
-            host_id=config.host_id,
-            claim_token=claim_token,
-            accepted=accepted,
-        )
-    except Exception:
-        return None
+    effect = _attempt(
+        backend_pending_decision_terminal_effect,
+        host_id=config.host_id,
+        claim_token=claim_token,
+        accepted=accepted,
+    )
+    return effect if callable(effect) else None
 
 
 def _pending_decision(config: Config, request: CommandRequest, *, claim: bool) -> Any:
@@ -983,13 +921,6 @@ def _mutation_dry_run(request: CommandRequest) -> CommandEnvelope:
     )
 
 
-@dataclass(frozen=True)
-class _ReceiptTakeover:
-    """An abandoned reservation this caller may re-drive to a terminal state."""
-
-    public_worker_id: str
-
-
 def _selector_proof(request: CommandRequest) -> str:
     """Return the request's selector proof, or empty when none can be built."""
     try:
@@ -1011,16 +942,12 @@ def _proven_replay_worker_id(
     """
     version = receipt.get("canonical_version")
     if isinstance(version, bool) or not isinstance(version, int) or version < 0:
-        return _backend_uncertain(
-            request, "stored request receipt is malformed; not retrying mutation"
-        )
+        return _receipt_error(request, "malformed")
     stored = receipt.get("public_worker_id")
     stored_worker_id = stored if isinstance(stored, str) and stored else ""
 
     if not stored_worker_id:
-        return _backend_uncertain(
-            request, "stored request receipt is malformed; not retrying mutation"
-        )
+        return _receipt_error(request, "malformed")
     target = request.target or {}
     worker_id = target.get("worker_id")
     explicit_worker_id = (
@@ -1029,16 +956,12 @@ def _proven_replay_worker_id(
         and isinstance(worker_id, str) and bool(worker_id.strip())
         else None
     )
-    if request.action == "answer_decision":
-        if explicit_worker_id != stored_worker_id:
-            return _duplicate_request(request)
-        return stored_worker_id
-    # 1. An explicit worker ID names the canonical worker outright. A refreshed
-    #    worker_fingerprint beside it stays noncanonical.
-    if explicit_worker_id is not None:
-        if explicit_worker_id != stored_worker_id:
-            return _duplicate_request(request)
-        return stored_worker_id
+    if request.action == "answer_decision" or explicit_worker_id is not None:
+        return (
+            stored_worker_id
+            if explicit_worker_id == stored_worker_id
+            else _duplicate_request(request)
+        )
 
     # 2. An exact selector proof recognizes the original spelling of a name or
     #    space alias even after the resolved worker left current authority.
@@ -1078,11 +1001,9 @@ def _receipt_authority(
     try:
         canonical = build_canonical_mutation(request, public_worker_id=proven)
     except (TypeError, ValueError):
-        return _backend_uncertain(
-            request, "stored request receipt is malformed; not retrying mutation"
-        )
+        return _receipt_error(request, "malformed")
 
-    replay = _envelope_from_receipt(request, canonical, receipt)
+    replay = _decode_receipt(request, canonical, receipt)
     state = receipt.get("state")
     if state in {"accepted", "rejected", "uncertain"}:
         return replay
@@ -1114,11 +1035,7 @@ def _receipt_authority(
             return replay
         if not isinstance(recovered, Mapping):
             return replay
-        return _envelope_from_receipt(
-            request,
-            canonical,
-            recovered.get("receipt"),
-        )
+        return _decode_receipt(request, canonical, recovered.get("receipt"))
     if command_reservation_is_live(receipt):
         return replay
     # An abandoned reservation never reached a send. Re-driving it is the
@@ -1130,13 +1047,132 @@ def _existing_command_authority(
     config: Config,
     request: CommandRequest,
 ) -> CommandEnvelope | _ReceiptTakeover | None:
+    receipt = _read_receipt(config, request)
+    return _receipt_authority(config, request, receipt) if receipt is not None else None
+
+
+def _send_instruction_through_route(
+    config: Config,
+    request: CommandRequest,
+    worker: Worker,
+    takeover: _ReceiptTakeover | None,
+    active_route: AcpPromptRoute,
+) -> CommandEnvelope:
     try:
-        receipt = get_command_request(
-            config.db_path, config.host_id, request.request_id or ""
+        binding_fingerprint = active_route.binding_fingerprint.strip()
+    except Exception:  # noqa: BLE001
+        binding_fingerprint = ""
+    if not binding_fingerprint:
+        if takeover is not None:
+            return _request_in_progress(request)
+        return _backend_unavailable(
+            request, "ACP worker route has no durable authority"
         )
-    except Exception:
-        return None
-    return _receipt_authority(config, request, receipt) if isinstance(receipt, Mapping) else None
+
+    canonical = build_canonical_mutation(request, public_worker_id=worker.id)
+    reservation = _reserve_canonical_request(config, request, canonical)
+    if isinstance(reservation, CommandEnvelope):
+        return reservation
+
+    send_started: Mapping[str, Any] | None = None
+
+    class SendStartRejected(RuntimeError):
+        pass
+
+    def mark_send_started_at_transport_boundary() -> None:
+        nonlocal send_started
+        started = _mark_request_send_started(
+            config,
+            request,
+            reservation,
+            binding_fingerprint=binding_fingerprint,
+            worker=worker,
+            instruction_text=_instruction_text(request),
+        )
+        if isinstance(started, CommandEnvelope):
+            raise SendStartRejected(started)
+        if not isinstance(started, Mapping):
+            raise SendStartRejected(
+                _recover_request(config, request, reservation.canonical)
+            )
+        send_started = started
+
+    def retryable_before_transport() -> CommandEnvelope:
+        if _abandon_request_reservation(config, request, reservation):
+            return _backend_unavailable(
+                request,
+                "ACP prompt did not reach its transport boundary",
+            )
+        return _recover_request(config, request, reservation.canonical)
+
+    try:
+        use_steering = active_route.supports_steering
+        submit = active_route.steer if use_steering else active_route.prompt
+        route_result = submit(
+            _instruction_text(request),
+            producer_turn_id=turn_submission_id(
+                config.host_id,
+                request.request_id or "",
+            ),
+            timeout=config.acp_request_timeout_seconds,
+            on_send_start=mark_send_started_at_transport_boundary,
+        )
+        if use_steering:
+            steering_outcome = getattr(route_result, "value", route_result)
+            if steering_outcome not in {"injected", "startedNewTurn"}:
+                rejected = steering_outcome == "failed"
+                return _finish_request(
+                    config,
+                    request,
+                    reservation,
+                    _instruction_failure_envelope(
+                        request,
+                        worker_id=worker.id,
+                        verdict="steering_failed" if rejected else "unknown",
+                        target_state=_target_state_at_send(worker),
+                    ),
+                    expected_state="send_started",
+                    terminal_state="rejected" if rejected else "uncertain",
+                )
+    except SendStartRejected as exc:
+        return exc.args[0]
+    except Exception:  # noqa: BLE001
+        if send_started is None:
+            return retryable_before_transport()
+        return _finish_request(
+            config,
+            request,
+            reservation,
+            _instruction_failure_envelope(
+                request,
+                worker_id=worker.id,
+                verdict="unknown",
+                target_state=_target_state_at_send(worker),
+            ),
+            expected_state="send_started",
+            terminal_state="uncertain",
+        )
+
+    if send_started is None:
+        # A route that claims success without crossing the durable
+        # transport boundary is not an accepted implementation.
+        return retryable_before_transport()
+
+    refreshed = _linked_submission_turn(config, request)
+    observed_turn = refreshed if refreshed is not None else send_started
+    accepted = _accepted_send_envelope(
+        request,
+        worker,
+        observed_turn,
+    )
+    return _finish_request(
+        config,
+        request,
+        reservation,
+        accepted,
+        expected_state="send_started",
+        terminal_state="accepted",
+    )
 
 
 def _submit_instruction(
@@ -1161,31 +1197,23 @@ def _submit_instruction(
             "Current worker authority is temporarily unavailable",
         )
 
-    health = _backend_health(snapshot)
-    health_error = None if health.status == "healthy" else _backend_unavailable(
-        request, "Herdr socket backend is not healthy", health=health
-    )
     worker = _resolve_authoritative_worker(request, snapshot)
     if isinstance(worker, CommandEnvelope):
         if takeover is not None:
             return _request_in_progress(request)
-        if health_error is not None:
-            return health_error
         return worker
     if takeover is not None and worker.id != takeover.public_worker_id:
         return _duplicate_request(request)
 
-    route: AcpPromptRoute | None = None
-    status_error = None if worker.status not in _DISALLOWED_SEND_STATUSES else (
-        _target_resolution_error(request, STATUS_REJECTED, [worker_candidate(worker)])
-    )
-    permanent_error = status_error or health_error
-    if permanent_error is not None:
+    if worker.status in _DISALLOWED_SEND_STATUSES:
+        status_error = _target_resolution_error(
+            request, STATUS_REJECTED, [worker_candidate(worker)]
+        )
         canonical = build_canonical_mutation(request, public_worker_id=worker.id)
         reservation = _reserve_canonical_request(config, request, canonical)
         if isinstance(reservation, CommandEnvelope):
             return reservation
-        return _finish_before_send(config, request, reservation, permanent_error)
+        return _finish_before_send(config, request, reservation, status_error)
 
     try:
         route = prompt_router(worker)
@@ -1195,122 +1223,6 @@ def _submit_instruction(
         if takeover is not None:
             return _request_in_progress(request)
         return _backend_unavailable(request, "ACP worker route is unavailable")
-    def submit_through(active_route: AcpPromptRoute) -> CommandEnvelope | None:
-        try:
-            binding_fingerprint = active_route.binding_fingerprint.strip()
-        except Exception:  # noqa: BLE001
-            binding_fingerprint = ""
-        if not binding_fingerprint:
-            if takeover is not None:
-                return _request_in_progress(request)
-            return _backend_unavailable(
-                request, "ACP worker route has no durable authority"
-            )
-
-        canonical = build_canonical_mutation(request, public_worker_id=worker.id)
-        reservation = _reserve_canonical_request(config, request, canonical)
-        if isinstance(reservation, CommandEnvelope):
-            return reservation
-
-        send_started: Mapping[str, Any] | None = None
-
-        class SendStartRejected(RuntimeError):
-            pass
-
-        def mark_send_started_at_transport_boundary() -> None:
-            nonlocal send_started
-            started = _mark_request_send_started(
-                config,
-                request,
-                reservation,
-                binding_fingerprint=binding_fingerprint,
-                worker=worker,
-                instruction_text=_instruction_text(request),
-            )
-            if isinstance(started, CommandEnvelope):
-                raise SendStartRejected(started)
-            if not isinstance(started, Mapping):
-                raise SendStartRejected(
-                    _recover_request(config, request, reservation.canonical)
-                )
-            send_started = started
-
-        def retryable_before_transport() -> CommandEnvelope:
-            if _abandon_request_reservation(config, request, reservation):
-                return _backend_unavailable(
-                    request,
-                    "ACP prompt did not reach its transport boundary",
-                )
-            return _recover_request(config, request, reservation.canonical)
-
-        try:
-            use_steering = active_route.supports_steering
-            submit = active_route.steer if use_steering else active_route.prompt
-            route_result = submit(
-                _instruction_text(request),
-                producer_turn_id=turn_submission_id(
-                    config.host_id,
-                    request.request_id or "",
-                ),
-                timeout=config.acp_request_timeout_seconds,
-                on_send_start=mark_send_started_at_transport_boundary,
-            )
-            if use_steering:
-                steering_outcome = getattr(route_result, "value", route_result)
-                if steering_outcome not in {"injected", "startedNewTurn"}:
-                    rejected = steering_outcome == "failed"
-                    return _finish_request(
-                        config,
-                        request,
-                        reservation,
-                        _instruction_failure_envelope(
-                            request,
-                            worker_id=worker.id,
-                            verdict="steering_failed" if rejected else "unknown",
-                            target_state=_target_state_at_send(worker),
-                        ),
-                        expected_state="send_started",
-                        terminal_state="rejected" if rejected else "uncertain",
-                    )
-        except SendStartRejected as exc:
-            return exc.args[0]
-        except Exception:  # noqa: BLE001
-            if send_started is None:
-                return retryable_before_transport()
-            return _finish_request(
-                config,
-                request,
-                reservation,
-                _instruction_failure_envelope(
-                    request,
-                    worker_id=worker.id,
-                    verdict="unknown",
-                    target_state=_target_state_at_send(worker),
-                ),
-                expected_state="send_started",
-                terminal_state="uncertain",
-            )
-
-        if send_started is None:
-            # A route that claims success without crossing the durable
-            # transport boundary is not an accepted implementation.
-            return retryable_before_transport()
-
-        refreshed = _linked_submission_turn(config, request)
-        observed_turn = refreshed if refreshed is not None else send_started
-        accepted = _accepted_send_envelope(
-            request,
-            worker,
-            observed_turn,
-        )
-        return _finish_request(
-            config,
-            request,
-            reservation,
-            accepted,
-            expected_state="send_started",
-            terminal_state="accepted",
-        )
 
     try:
         preparation = route.prepare()
@@ -1322,7 +1234,9 @@ def _submit_instruction(
             request, "ACP worker route could not be prepared"
         )
     try:
-        return submit_through(active_route)
+        return _send_instruction_through_route(
+            config, request, worker, takeover, active_route
+        )
     finally:
         preparation.__exit__(None, None, None)
 
