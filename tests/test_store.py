@@ -18,10 +18,10 @@ from tendwire.store.projection import (
     save_snapshot,
 )
 from tendwire.store.receipts import (
+    abandon_command_request_reservation,
     finish_command_request,
     get_command_request,
     reserve_command_request,
-    reserve_terminal_command_replay,
 )
 from tendwire.store.schema import STORE_SCHEMA_VERSION, init_store
 from tendwire.store.turns import apply_turn_refresh, get_turn_content, turns_payload_from_store
@@ -462,23 +462,55 @@ def test_command_reservation_replay_conflict_and_terminal_immutability(tmp_path:
     assert get_command_request(db_path, "host-a", "request-a")["state"] == "rejected"
 
 
-def test_terminal_replay_rejects_nonidentical_request_id(tmp_path: Path) -> None:
+def test_reservation_atomically_fences_selector_proof_across_takeover(
+    tmp_path: Path,
+) -> None:
     db_path = tmp_path / "store.db"
     init_store(db_path)
-    common = dict(
+    common = {
+        "host_id": "host-a",
+        "request_id": "request-a",
+        "action": "send_instruction",
+        "canonical_version": 1,
+        "canonical_fingerprint": "fingerprint-a",
+        "canonical_request_json": "{}",
+        "public_worker_id": "worker-a",
+        "pending_result_json": "{}",
+    }
+    first = reserve_command_request(
+        db_path, **common, selector_proof="proof-a", now=NOW,
+    )
+    assert first["status"] == "reserved"
+    assert reserve_command_request(
+        db_path, **common, selector_proof="proof-b", now=NOW,
+    )["status"] == "request_id_conflict"
+    assert abandon_command_request_reservation(
+        db_path,
         host_id="host-a",
         request_id="request-a",
-        action="send_instruction",
-        canonical_version=1,
         canonical_fingerprint="fingerprint-a",
-        canonical_request_json="{}",
-        public_worker_id="worker-a",
-        terminal_state="uncertain",
-        status="request_state_uncertain",
-        result_json="{}",
+        owner_token=str(first["owner_token"]),
         now=NOW,
     )
-    assert reserve_terminal_command_replay(db_path, **common)["status"] == "uncertain"
-    assert reserve_terminal_command_replay(
-        db_path, **{**common, "canonical_fingerprint": "different"}
+    assert reserve_command_request(
+        db_path, **common, selector_proof="proof-b", now=NOW,
     )["status"] == "request_id_conflict"
+    takeover = reserve_command_request(
+        db_path, **common, selector_proof="proof-a", now=NOW,
+    )
+    assert takeover["status"] == "reserved"
+    assert takeover["receipt"]["selector_proof"] == "proof-a"
+
+    legacy = {**common, "request_id": "request-legacy"}
+    empty = reserve_command_request(db_path, **legacy, selector_proof="", now=NOW)
+    assert abandon_command_request_reservation(
+        db_path,
+        host_id="host-a",
+        request_id="request-legacy",
+        canonical_fingerprint="fingerprint-a",
+        owner_token=str(empty["owner_token"]),
+        now=NOW,
+    )
+    assert reserve_command_request(
+        db_path, **legacy, selector_proof="", now=NOW,
+    )["status"] == "reserved"

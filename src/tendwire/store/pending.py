@@ -885,19 +885,6 @@ def backend_pending_decision_terminal_effect(
     return lambda conn: _terminal(conn, host_id, claim_token, accepted)
 
 
-def finish_backend_pending_decision_send(
-    db_path: Path | str,
-    host_id: str,
-    claim_token: str,
-    *,
-    accepted: bool,
-    observed_at: str | None = None,
-) -> bool:
-    with write_transaction(db_path) as conn:
-        _terminal(conn, host_id, claim_token, accepted)
-    return accepted
-
-
 __all__ = tuple(
     name
     for name in globals()
@@ -909,7 +896,6 @@ __all__ = tuple(
             "claim_",
             "start_",
             "abandon_",
-            "finish_",
             "backend_",
         )
     )

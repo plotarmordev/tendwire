@@ -98,6 +98,7 @@ def _same(
     canonical_fingerprint: str,
     canonical_request_json: str,
     public_worker_id: str,
+    selector_proof: str,
 ) -> bool:
     return (
         row["action"],
@@ -111,7 +112,7 @@ def _same(
         canonical_fingerprint,
         canonical_request_json,
         public_worker_id,
-    )
+    ) and str(row["selector_proof"] or "") == selector_proof
 
 
 def get_command_request(
@@ -193,6 +194,7 @@ def reserve_command_request(
                 canonical_fingerprint=canonical_fingerprint,
                 canonical_request_json=canonical_request_json,
                 public_worker_id=public_worker_id,
+                selector_proof=selector_proof,
             ):
                 return _response("request_id_conflict", row)
             if row["state"] in _TERMINAL_STATES:
@@ -273,81 +275,6 @@ def abandon_command_request_reservation(
             ).rowcount
             == 1
         )
-
-
-def reserve_terminal_command_replay(
-    db_path: Path,
-    *,
-    terminal_state: str,
-    status: str,
-    result_json: str,
-    now: str | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
-    if terminal_state not in {"rejected", "uncertain"}:
-        raise ValueError("terminal replay state is invalid")
-    if terminal_state == "uncertain" and status != "request_state_uncertain":
-        raise ValueError("uncertain replay status is invalid")
-    host_id = kwargs["host_id"]
-    request_id = kwargs["request_id"]
-    _validate_request_identity(
-        host_id=host_id,
-        request_id=request_id,
-        action=kwargs["action"],
-        canonical_version=kwargs["canonical_version"],
-        canonical_fingerprint=kwargs["canonical_fingerprint"],
-        canonical_request_json=kwargs["canonical_request_json"],
-        public_worker_id=kwargs["public_worker_id"],
-    )
-    with write_transaction(db_path) as conn:
-        row = conn.execute(
-            """SELECT * FROM command_receipts
-            WHERE host_id=? AND request_id=?""",
-            (host_id, request_id),
-        ).fetchone()
-        if row:
-            if not _same(
-                row,
-                action=kwargs["action"],
-                canonical_version=kwargs["canonical_version"],
-                canonical_fingerprint=kwargs["canonical_fingerprint"],
-                canonical_request_json=kwargs["canonical_request_json"],
-                public_worker_id=kwargs["public_worker_id"],
-            ):
-                return _response("request_id_conflict", row)
-            return _response(
-                "terminal" if row["state"] in _TERMINAL_STATES else "in_progress",
-                row,
-            )
-        current = _now(now)
-        conn.execute(
-            """INSERT INTO command_receipts(
-            host_id,request_id,request_fingerprint,action,canonical_version,
-            public_worker_id,state,status,owner_hash,owner_until,selector_proof,
-            request_json,result_json,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?, '',NULL,?,?,?,?,?)""",
-            (
-                host_id,
-                request_id,
-                kwargs["canonical_fingerprint"],
-                kwargs["action"],
-                kwargs["canonical_version"],
-                kwargs["public_worker_id"],
-                terminal_state,
-                status,
-                kwargs.get("selector_proof", ""),
-                kwargs["canonical_request_json"],
-                result_json,
-                current,
-                current,
-            ),
-        )
-        row = conn.execute(
-            """SELECT * FROM command_receipts
-            WHERE host_id=? AND request_id=?""",
-            (host_id, request_id),
-        ).fetchone()
-    return _response(terminal_state, row)
 
 
 def mark_command_send_started(

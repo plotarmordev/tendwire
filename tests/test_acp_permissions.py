@@ -24,11 +24,12 @@ from tendwire.config import Config
 from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
 from tendwire.daemon import TendwireDaemon
 from tendwire.store.pending import (
+    backend_pending_decision_terminal_effect,
     claim_backend_pending_decision,
-    finish_backend_pending_decision_send,
     pending_payload_from_store,
     start_backend_pending_decision_send,
 )
+from tendwire.store.db import write_transaction
 from tendwire.store.projection import (
     expire_worker_bindings,
     list_worker_bindings,
@@ -108,7 +109,6 @@ def _answer_request(
         "schema_version": 1,
         "action": "answer_decision",
         "request_id": request_id,
-        "dry_run": False,
         "target": {"worker_id": worker_id},
         "params": {
             "decision_ref": decision_ref,
@@ -443,13 +443,11 @@ def test_retention_deletes_settled_pending_claim_before_prompt(tmp_path: Path) -
         claim.claim_token,
         observed_at="2026-08-05T00:00:02Z",
     ).status == "started"
-    assert finish_backend_pending_decision_send(
-        config.db_path,
-        config.host_id,
-        claim.claim_token,
-        accepted=True,
-        observed_at="2026-08-05T00:00:03Z",
+    effect = backend_pending_decision_terminal_effect(
+        host_id=config.host_id, claim_token=claim.claim_token, accepted=True,
     )
+    with write_transaction(config.db_path) as conn:
+        effect(conn)
     result = run_retention_cycle(
         config.db_path,
         policy=RetentionPolicy(command_retention_days=1),
