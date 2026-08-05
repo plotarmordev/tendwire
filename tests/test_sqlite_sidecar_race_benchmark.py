@@ -133,11 +133,41 @@ def test_recursive_privacy_gate_rejects_values_and_success_error_keys() -> None:
     assert not driver._privacy_scan({**safe, "nested": {"error_type": "none"}}, [])
 
 
+def test_paired_source_binding_requires_a_clean_stable_checkout(tmp_path: Path) -> None:
+    driver = _load_driver()
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "benchmark@example.invalid"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Benchmark Test"], cwd=tmp_path, check=True
+    )
+    source = tmp_path / "paired.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "paired.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=tmp_path, check=True)
+
+    revision, tree, digest, count = driver._clean_source_binding(tmp_path)
+    assert len(revision) == len(tree) == 40
+    assert len(digest) == 64
+    assert count == 1
+
+    (tmp_path / "untracked.py").write_text("VALUE = 2\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="checkout_dirty"):
+        driver._clean_source_binding(tmp_path)
+    (tmp_path / "untracked.py").unlink()
+    source.write_text("VALUE = 3\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="checkout_dirty"):
+        driver._clean_source_binding(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
         ("requests_per_method", 0),
-        ("herdres_sync_passes", 2),
+        ("herdres_presenter_passes", 3),
         ("phase_timeout_seconds", 0),
     ],
 )
@@ -155,14 +185,10 @@ def test_argument_contract_requires_positive_exact_work(
 @_requires_herdres_root
 def test_tiny_installed_candidate_run_emits_complete_aggregate() -> None:
     completed = _invoke(
-        "--iterations",
-        "1",
-        "--daemon-wal-cycles",
-        "1",
         "--requests-per-method",
         "1",
-        "--herdres-sync-passes",
-        "3",
+        "--herdres-presenter-passes",
+        "2",
         "--phase-timeout-seconds",
         "30",
         "--json",
@@ -180,20 +206,25 @@ def test_tiny_installed_candidate_run_emits_complete_aggregate() -> None:
         report["candidate"]["source_revision_binding"]
         == "base_revision_plus_source_tree_sha256"
     )
-    assert report["churn"]["family_iterations"] == 2
-    assert report["churn"]["bounded_family_preparations"] == 2
-    assert report["churn"]["optional_disappearances"] == 3
-    assert report["daemon"]["wal_cycles"] == 1
+    assert len(report["paired_herdres"]["revision"]) == 40
+    assert len(report["paired_herdres"]["tree"]) == 40
+    assert len(report["paired_herdres"]["tracked_source_sha256"]) == 64
+    assert report["paired_herdres"]["tracked_files"] > 0
+    assert report["paired_herdres"]["clean_checkout_verified"] is True
+    assert str(Path(_HERDRES_ROOT).resolve()) not in completed.stdout
     assert report["daemon"]["api_successes"] == {
         "health_get": 1,
         "snapshot_get": 1,
         "turn_list": 1,
     }
     assert report["daemon"]["api_failures"] == {}
-    assert report["herdres"]["sync_passes"] == 3
+    assert report["herdres"]["mode"] == "daemon_socket_presenter"
+    assert report["herdres"]["presenter_passes"] == 2
     assert report["herdres"]["noop_passes"] == 2
     assert report["herdres"]["noop_passes_valid"] == 2
-    assert report["herdres"]["production_client_subprocesses"] == 9
+    assert report["herdres"]["connector_poll_requests"] == 2
+    assert report["herdres"]["state_file_identity_pinned"] is True
+    assert report["herdres"]["daemon_socket_identity_pinned"] is True
     assert report["herdres"]["direct_herdr_calls"] == 0
     assert report["herdres"]["external_network_attempts"] == 0
     assert report["accounting"]["fd_count_after"] == report["accounting"]["fd_count_before"]
@@ -207,7 +238,6 @@ def test_tiny_installed_candidate_run_emits_complete_aggregate() -> None:
         report["accounting"]["thread_count_peak_observed"]
         > report["accounting"]["thread_count_before"]
     )
-    assert report["accounting"]["direct_children_peak_observed"] >= 1
     assert report["accounting"]["socket_present_after"] is False
     assert report["checks"]
     assert all(value is True for value in report["checks"].values())
@@ -221,18 +251,14 @@ def test_hostile_failure_is_redacted_and_restores_parent_resources() -> None:
     children_before = _direct_children()
 
     completed = _invoke(
-        "--iterations",
-        "1",
-        "--daemon-wal-cycles",
-        "1",
         "--requests-per-method",
         "1",
-        "--herdres-sync-passes",
-        "3",
+        "--herdres-presenter-passes",
+        "2",
         "--phase-timeout-seconds",
         "30",
         "--inject-failure",
-        "churn",
+        "herdres",
         "--json",
         testing=True,
     )

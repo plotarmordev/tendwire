@@ -1,9 +1,0 @@
-{
-  "status": "ambiguous",
-  "ok": false,
-  "variants": [
-    "alpha-worker",
-    "alpha-worker-2"
-  ],
-  "detail": "multiple public names matched"
-}

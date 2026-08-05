@@ -38,8 +38,6 @@ jobs:
           python -m compileall -q src tests scripts
       - name: Run hermetic suite
         run: python -m pytest -q
-      - name: Run offline Herdr smoke
-        run: python scripts/herdr_smoke.py --fixture-dir tests/fixtures/herdr/live_smoke/ok
       - name: Build and inspect artifacts
         run: |
           python -m build

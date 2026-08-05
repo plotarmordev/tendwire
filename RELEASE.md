@@ -370,48 +370,35 @@ git diff --check
 Synthetic installed-candidate evidence:
 
 ```sh
-python3 scripts/sqlite_sidecar_race_benchmark.py \
-  --iterations 128 \
-  --daemon-wal-cycles 64 \
+TENDWIRE_BENCHMARK_HERDRES_ROOT=/absolute/path/to/accepted/herdres \
+  python3 scripts/sqlite_sidecar_race_benchmark.py \
   --requests-per-method 64 \
-  --herdres-sync-passes 3 \
+  --herdres-presenter-passes 2 \
   --phase-timeout-seconds 120 \
   --json
 ```
 
 The driver is `scripts/sqlite_sidecar_race_benchmark.py`, its focused harness
-test is `tests/test_sqlite_sidecar_race_benchmark.py`, and the frozen compact
-aggregate JSON plus exact execution record is
-`docs/evidence/goal08b-sqlite-sidecar-race-recovery.md`. Its captured aggregate
-records a private temporary directory, installed-candidate import/origin checks,
-production callback and Herdres source-sync markers, and exact file-descriptor,
-thread, direct-child, and socket accounting. It records one settling sync
-followed by exactly two no-op syncs, zero direct Herdr calls, and zero outbound
-network attempts. The aggregate does not establish the absence of every possible
-access to operator live configuration, database, socket, or service lifecycle;
-run the command only under the isolated-candidate directions above.
+test is `tests/test_sqlite_sidecar_race_benchmark.py`. A current compact
+aggregate records the private temporary directory, installed-candidate
+import/origin checks, production daemon callback binding, two production
+Herdres presenter passes over the real daemon Unix socket, exact file/socket
+identity, and bounded file-descriptor/thread/child accounting. Both presenter
+passes must be no-ops, with zero provider writes, zero direct Herdres-to-Herdr
+calls, and zero outbound network attempts.
+
+The paired Herdres checkout must be clean. The aggregate binds its exact commit,
+Git tree, tracked-source SHA-256, and tracked-file count without publishing its
+absolute path. A dirty, changing, or unbound checkout fails closed.
 
 The driver removes `PYTHONPATH`, deterministically builds a versioned wheel from
 this isolated source checkout, installs it with `pip --no-index --no-deps` into
 a private temporary virtual environment, and re-executes the candidate with
 isolated Python. It verifies that the imported package originates in that
-private installation and not a mutable source checkout.
-Provenance binds base revision
-`c0ebff7cfba401f6c13da1b58a00abf8ff0b5f36` to packaged-source SHA-256
-`15b1ca262f6051b191d1587d353c465cc74fd6c6a9d0676eb9348eafef35ff87`;
-the historical installed Goal 08B wheel SHA-256 was
-`7be0f975b0241aaf092a9bba38ace2e3e2efd2f91996f02b2cbcb24b93fac02d`.
-
-The frozen run exited `0` with 256 bounded family preparations, 384 scheduled
-optional disappearances, 64 daemon WAL cycles, 64 successful requests for each
-of `snapshot.get`, schema-v2 `turn.list`, and `health.get`, three Herdres source
-passes, exactly two subsequent no-op passes, nine real candidate CLI
-subprocesses, zero direct Herdr calls, and zero outbound network attempts.
-Candidate resources were file descriptors `3/10/3`, threads `1/11/1`, and
-direct children `0/1/0` (before/peak/after); the socket was absent after
-shutdown and every frozen Boolean check passed. The evidence document is the
-authority for the compact JSON and recorded-host timings; those timings are
-observations, not portable CI gates or service-level claims.
+private installation and not a mutable source checkout. Record the current
+revision and generated source-tree/wheel hashes; no historical aggregate may
+substitute for the current paired run. Timings remain observations, not
+portable CI gates or service-level claims.
 
 ## 8. Goal 10 delivery-aware final retention gate
 
@@ -563,7 +550,6 @@ clean checkouts:
 python3 scripts/release_artifacts.py source
 python3 -m compileall -q src tests scripts
 python3 -m pytest -q
-python3 scripts/herdr_smoke.py --fixture-dir tests/fixtures/herdr/live_smoke/ok
 python3 -m build
 python3 scripts/release_artifacts.py artifacts dist
 
@@ -572,23 +558,43 @@ python3 -m compileall -q herdres.py herdres_gateway.py herdres_connector tests
 python3 -m pytest -q
 ```
 
-Then run the paired Herdres source fixtures against the exact Tendwire checkout
-and record both commits. They must prove `direct_herdr_calls=0`, exact turn and
-pending schemas, stable-worker migration, command disposition validation,
-connector outbox behavior, and two independent no-op forced syncs.
+Run the owner-authorized ACP-primary gate in
+`docs/acp-primary-release-proof.md`. It uses production Tendwire and Herdres
+processes, the production Herdr socket's bounded ACP ownership seam
+(`agent.acp_status`, `agent.acp_endpoint`, and
+`agent.acp_console_exchange`), the required ACP supervisor, and live Telegram.
+Direct Herdr CLI observation, injected daemon or connector callbacks, and
+mock-provider substitution for the live happy path are forbidden.
+
+The gate must produce these revision-bound, privacy-scanned files under
+`docs/evidence/`:
+
+- `wave16-cross-repo-e2e.json`
+- `wave16-live-telegram-e2e.json`
+- `wave16-acp-adapter-matrix.json`
+- `wave16-release-summary.md`
+
+Missing, stale, skipped, or generic evidence blocks both the RC and deployment.
+
+The paired hermetic contract suite must bind both commits and prove
+`direct_herdr_calls=0`, exact turn and pending schemas, command receipt
+validation, and production-daemon-socket connector outbox and provider-binding
+semantics. The live gate must finish with two independent no-operation
+connector-outbox polls and presenter passes that make no Telegram write.
 
 Deployment is a separate owner-authorized step. Before changing installed
 artifacts, stop writers and capture a coherent private backup of the Tendwire
 database family, installation identity, and Herdres state. Install the exact
 wheel and paired Herdres files, reload user units, start Tendwire before
-Herdres/gateway, and never restart Herdr. If migration, integrity, source-mode,
-or command smoke fails, stop the writers, restore the complete backup and prior
-artifacts, reload units, and re-run read-only health checks.
+Herdres/gateway, and never restart Herdr. If migration, integrity, paired
+contract, or command proof fails, stop the writers, restore the complete backup
+and prior artifacts, reload units, and re-run read-only health checks.
 
 The final live record must include: exact commits and artifact digests; SQLite
 integrity; private filesystem modes; Herdr status without restart; Tendwire and
-Herdres service status; `source-smoke --with-outbox`; two zero-operation forced
-syncs; no `Closed by User` spam; legacy timer inactive and disabled; one inbound
-Telegram-to-Tendwire command with duplicate guard; one lossless multipart
-final; and a zero-finding public JSON scan. Missing evidence means the RC is not
-complete.
+Herdres service status; two no-operation production connector-outbox polls and
+presenter passes; `direct_herdr_calls=0`; no `Closed by User` spam; legacy timer
+inactive and disabled; one inbound Telegram-to-Tendwire command with exact
+durable receipt finality and duplicate guard; preserved provider bindings; one
+lossless multipart final; and a zero-finding public JSON scan. Missing evidence
+means the RC is not complete.

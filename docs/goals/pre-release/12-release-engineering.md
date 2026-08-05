@@ -31,12 +31,13 @@ machine's environment.
 4. Run public-contract/forbidden-value tests and a repository/archive secret
    scan. Test secrets must be assembled at runtime from inert fragments so the
    repository does not itself contain a provider-shaped credential.
-5. Run the offline Herdr fixture smoke. Live Herdr, Telegram, systemd, and user
-   home state must not be required in default CI.
+5. Run the hermetic Herdr-socket, ACP client/coordinator/daemon, and paired
+   daemon-socket tests. Live Herdr, Telegram, systemd, and user home state must
+   not be required in default CI, and no Herdr CLI observer may be substituted.
 6. Add a paired contract job or documented downstream workflow that tests the
-   supported Tendwire/Herdres source-mode versions together, including
-   `direct_herdr_calls=0`, turn/pending schemas, connector outbox semantics, and
-   stable-worker migration.
+   supported exact Tendwire/Herdres revisions together, including
+   `direct_herdr_calls=0`, turn/pending schemas, daemon-socket connector outbox
+   behavior, receipt finality, and provider-binding preservation.
 7. Pin action major versions and use least-privilege workflow permissions. Pull
    requests must not receive deployment credentials.
 8. Keep CI deterministic and bounded. Cache dependencies, not private runtime
@@ -63,10 +64,9 @@ machine's environment.
 1. Decide and document the RC version, compatibility pair, support status, and
    Python range. Version, classifiers, changelog/release notes, tag, and artifact
    metadata must agree.
-2. Include every file needed by documented install, doctor, offline smoke, and
-   license/security workflows in the sdist. Alternatively move smoke behavior
-   behind an installed Tendwire console command and stop documenting source-only
-   paths.
+2. Include every file needed by documented install, doctor, license, and
+   security workflows in the sdist. Legacy Herdr CLI smoke scripts and fixtures
+   must not be shipped.
 3. Add build/test tooling to a documented development/release extra without
    adding unnecessary runtime dependencies.
 4. Ensure wheel and sdist contain no DBs, sockets, caches, local paths, tokens,
@@ -85,22 +85,30 @@ proof must record all of the following from current commits:
 - Tendwire compile and full pytest result.
 - Tendwire wheel/sdist build, archive inspection, clean-install smoke, and
   SQLite integrity check.
-- Herdres compile, source tests, and full hermetic suite.
+- Herdres compile and full hermetic suite.
 - Non-disruptive Herdr check only:
   `systemctl --user is-active herdr-server.service`; status only if needed.
-- Tendwire live Herdr smoke and Herdres `source-smoke --with-outbox`.
-- Two forced source syncs proving no duplicate delivery or old-turn reposting.
+- The ACP-primary production-process and live Telegram procedure in
+  `docs/acp-primary-release-proof.md`.
+- Two no-operation production connector-outbox polls and presenter passes,
+  proving no duplicate delivery or Telegram repost.
 - `direct_herdr_calls=0`.
 - No new `Closed by User` spam.
 - Legacy `herdr-telegram-topics.timer` inactive and disabled.
 - One live inbound proof:
-  Telegram reply -> Herdres gateway -> Tendwire `command.submit` -> one Herdr
-  worker receipt, recording opaque request ID, worker ID, public fingerprint,
-  command status, and duplicate guard result.
+  Telegram reply -> Herdres gateway -> Tendwire `command.submit` -> one ACP
+  worker receipt, recording opaque request ID, worker ID, public fingerprint
+  digest, command status, and duplicate guard result.
 - Long/multipart final proof with no cutoff and no duplicate parts.
 - Topic/status/pinned-message behavior remains Herdres-owned and correct.
 - Public JSON forbidden-key/value scan returns zero findings.
 - Data directory, DB family, local key, and socket modes match Goal 04.
+
+The proof must produce `wave16-cross-repo-e2e.json`,
+`wave16-live-telegram-e2e.json`, `wave16-acp-adapter-matrix.json`, and
+`wave16-release-summary.md` under `docs/evidence/`. Any missing artifact blocks
+the RC and deployment. A failed or blocked adapter-matrix row also blocks both;
+artifact presence alone is insufficient.
 
 Do not restart `herdr-server.service`. Restarting `tendwired.service`,
 `herdres-gateway.service`, or `herdres.timer` is allowed only in the separately

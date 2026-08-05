@@ -55,12 +55,10 @@ include = [
     "/RELEASE.md",
     "/tendwired.service.example",
     "/scripts",
+    "/docs/acp-primary-release-proof.md",
     "/docs/evidence",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-markers = [
-    "herdr_live: opt-in live Herdr smoke checks that require an isolated Herdr session",
-]

@@ -8,6 +8,11 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PROHIBITED_GOAL_SECTION_3_HERDR_OBSERVER_ASSETS = {
+    "scripts/herdr_smoke.py",
+    "scripts/live_herdr_smoke.sh",
+    "tests/fixtures/herdr/live_smoke",
+}
 SPEC = importlib.util.spec_from_file_location(
     "release_artifacts", ROOT / "scripts/release_artifacts.py"
 )
@@ -57,6 +62,7 @@ def test_sdist_declares_release_and_script_assets() -> None:
     assert {
         "/RELEASE.md",
         "/scripts",
+        "/docs/acp-primary-release-proof.md",
         "/docs/evidence",
         "/tendwired.service.example",
     } <= includes
@@ -67,11 +73,26 @@ def test_sdist_declares_release_and_script_assets() -> None:
         "README.md",
         "RELEASE.md",
         "SECURITY.md",
+        "docs/acp-primary-release-proof.md",
         "tendwired.service.example",
         "pyproject.toml",
-        "scripts/herdr_smoke.py",
         "scripts/release_artifacts.py",
     }
+
+
+def test_goal_section_three_herdr_cli_observer_does_not_return() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert "herdr_smoke" not in workflow
+    assert "live_smoke" not in workflow
+    assert release_artifacts.REQUIRED_SDIST.isdisjoint(
+        PROHIBITED_GOAL_SECTION_3_HERDR_OBSERVER_ASSETS
+    )
+    fixture_root = ROOT / "tests/fixtures/herdr/live_smoke"
+    deleted_scripts = PROHIBITED_GOAL_SECTION_3_HERDR_OBSERVER_ASSETS - {
+        "tests/fixtures/herdr/live_smoke"
+    }
+    assert all(not (ROOT / path).exists() for path in deleted_scripts)
+    assert not fixture_root.exists()
 
 
 def test_shipped_systemd_unit_owns_the_entire_process_tree() -> None:

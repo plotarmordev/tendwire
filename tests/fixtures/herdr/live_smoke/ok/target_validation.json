@@ -1,8 +1,0 @@
-{
-  "status": "ok",
-  "valid_cases": 1,
-  "invalid_cases": 2,
-  "ambiguous_cases": 1,
-  "send_attempts": 1,
-  "rejected_send_attempts": 0
-}

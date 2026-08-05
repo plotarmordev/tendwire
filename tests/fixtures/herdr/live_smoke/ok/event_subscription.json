@@ -1,7 +1,0 @@
-{
-  "status": "ok",
-  "method": "events.subscribe",
-  "official_event_count": 16,
-  "params_shape_ok": true,
-  "legacy_event_count": 0
-}

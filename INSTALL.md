@@ -670,33 +670,33 @@ retrieves only complete non-inline fields, isolates known-incomplete turns, and
 uses Tendwire's neutral range plans without making direct Herdr calls.
 
 Before the first candidate reconciliation against existing state, preserve the
-coherent stopped-writer checkpoint described above. Copy both state files of
-interest again for the dry check, and point the candidates only at those
-scratch files. Never point the first check at live state:
+coherent stopped-writer checkpoint described above. Prove the exact candidate
+pair hermetically before either candidate touches copied or live state. Point
+the benchmark at the accepted contract-v3 Herdres checkout; it builds and
+installs the Tendwire wheel in a private environment, starts the real Tendwire
+daemon API on a private Unix socket, and runs the production Herdres presenter:
 
 ```sh
-# Run from the compatible Herdres checkout after all writers are confirmed stopped.
-tendwire_db="${TENDWIRE_DB_PATH:-$HOME/.local/share/tendwire/tendwire.db}"
-herdres_state="${HERDR_TELEGRAM_TOPICS_STATE:-$HOME/.local/share/herdres/state.json}"
-scratch_db="${tendwire_db}.pre-goal05b-check"
-scratch_state="${herdres_state}.pre-goal05b-check"
-cp -p -- "$tendwire_db" "$scratch_db"
-cp -p -- "$herdres_state" "$scratch_state"
-TENDWIRE_DB_PATH="$scratch_db" \
-  HERDR_TELEGRAM_TOPICS_STATE="$scratch_state" \
-  HERDRES_TENDWIRE_MODE=source \
-  ./herdres.py tendwire source-smoke --with-outbox
+TENDWIRE_BENCHMARK_HERDRES_ROOT=/absolute/path/to/accepted/herdres \
+  python3 scripts/sqlite_sidecar_race_benchmark.py \
+  --requests-per-method 64 \
+  --herdres-presenter-passes 2 \
+  --phase-timeout-seconds 120 \
+  --json
 ```
 
-Keep both the untouched paired checkpoint and the scratch files private. The
-dry result must succeed with turn-list schema version `2`, content descriptor
-schema version `1`, and `direct_herdr_calls=0`. It must not save the copied
-Herdres state or send/edit provider messages. If it fails, leave live state
-untouched, retain the checkpoint, and investigate; do not edit state, copy
-public handles, delete individual identity files, rotate continuity identity,
-or recover a failed presentation plan speculatively. These checks establish
-pair compatibility and rollback readiness only; they do not deploy, restart,
-or migrate live state.
+The result must bind the installed wheel plus the paired Herdres checkout's
+exact clean commit, Git tree, and tracked-source SHA-256; complete the bounded
+daemon requests; report two valid no-operation production presenter passes
+over `connector.poll`; preserve the pinned state-file and daemon-socket
+identities; make no Telegram network attempt; and report
+`direct_herdr_calls=0`. If it fails, leave live state untouched, retain the
+checkpoint, and investigate; do not edit state, copy public handles, delete
+individual identity files, rotate continuity identity, or recover a failed
+presentation plan speculatively. This hermetic evidence establishes pair
+compatibility and rollback readiness only. The separately owner-authorized
+live gate is `docs/acp-primary-release-proof.md`; neither procedure deploys or
+restarts Herdr.
 
 ## Verification
 
@@ -803,7 +803,7 @@ status, and SQLite integrity `ok`.
 
 ## RC Checklist
 
-Before tagging a Tendwire/Herdres source-mode pair:
+Before tagging a Tendwire/Herdres ACP-primary pair:
 
 ```bash
 # Tendwire source checkout
@@ -828,14 +828,16 @@ with sqlite3.connect(uri, uri=True) as conn:
 PY
 ```
 
-Pair this with the Herdres source-mode RC checklist. Herdres source smoke must
-report `direct_herdr_calls=0`, two forced source syncs must not repost completed
-turn text, and `herdr-server.service` should be checked with status-only
-commands unless the operator explicitly asks for an external restart.
+Pair this with `docs/acp-primary-release-proof.md`. Two no-operation production
+connector-outbox polls and presenter passes must make no Telegram write and
+must report `direct_herdr_calls=0`; this means Herdres made no direct Herdr
+calls while Tendwire retained its bounded ACP socket ownership. Check
+`herdr-server.service` with status-only commands and never restart it as part of
+the proof.
 
 ## Rollback
 
-Tendwire and source-only Herdres must be rolled back as a compatible code pair,
+Tendwire and ACP-primary Herdres must be rolled back as a compatible code pair,
 by selecting reviewed matching branches or release tags and reinstalling them;
 an `off` or `enrich` environment toggle is not a substitute for pair
 compatibility or state recovery. Stop Herdres consumers before Tendwire when an

@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
-import copy
 import hashlib
 import importlib
 import importlib.metadata
@@ -21,7 +20,6 @@ import multiprocessing
 import os
 import platform
 import resource
-import shutil
 import sqlite3
 import socket
 import stat
@@ -126,26 +124,6 @@ def _merge_resource_peak(target: dict[str, int], observed: Mapping[str, int]) ->
         target[name] = max(target.get(name, 0), int(observed.get(name, 0)))
 
 
-class _SubprocessResourceObserver:
-    def __init__(self) -> None:
-        self.peak = _resource_counts()
-        self._original = subprocess.Popen
-
-    def __enter__(self) -> "_SubprocessResourceObserver":
-        original = self._original
-
-        def observed_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
-            process = original(*args, **kwargs)
-            _merge_resource_peak(self.peak, _resource_counts())
-            return process
-
-        subprocess.Popen = observed_popen  # type: ignore[assignment]
-        return self
-
-    def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
-        subprocess.Popen = self._original
-
-
 class _OutboundNetworkGuard:
     def __init__(self) -> None:
         self.attempts = 0
@@ -237,6 +215,61 @@ def _source_revision(checkout: Path) -> str:
     if completed.returncode != 0 or len(revision) != 40:
         raise RuntimeError("source_revision_unavailable")
     return revision
+
+
+def _clean_source_binding(checkout: Path) -> tuple[str, str, str, int]:
+    root = checkout.resolve()
+
+    def git(*arguments: str) -> bytes:
+        completed = subprocess.run(
+            ["git", *arguments],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=False,
+            timeout=15,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError("paired_herdres_binding_unavailable")
+        return completed.stdout
+
+    revision = git("rev-parse", "--verify", "HEAD").decode("ascii").strip()
+    tree = git("rev-parse", "--verify", "HEAD^{tree}").decode("ascii").strip()
+    if len(revision) != 40 or len(tree) != 40:
+        raise RuntimeError("paired_herdres_binding_unavailable")
+    if git("status", "--porcelain=v1", "--untracked-files=all"):
+        raise RuntimeError("paired_herdres_checkout_dirty")
+    relative_paths = [
+        Path(raw.decode("utf-8"))
+        for raw in git("ls-files", "-z").split(b"\0")
+        if raw
+    ]
+    if not relative_paths:
+        raise RuntimeError("paired_herdres_sources_missing")
+    digest = hashlib.sha256()
+    for relative in relative_paths:
+        if relative.is_absolute() or ".." in relative.parts:
+            raise RuntimeError("paired_herdres_source_path_invalid")
+        source = root / relative
+        if source.is_symlink():
+            content = os.readlink(source).encode("utf-8")
+        elif source.is_file():
+            content = source.read_bytes()
+        else:
+            raise RuntimeError("paired_herdres_source_missing")
+        encoded = relative.as_posix().encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    if (
+        git("status", "--porcelain=v1", "--untracked-files=all")
+        or git("rev-parse", "--verify", "HEAD").decode("ascii").strip() != revision
+        or git("rev-parse", "--verify", "HEAD^{tree}").decode("ascii").strip()
+        != tree
+    ):
+        raise RuntimeError("paired_herdres_checkout_changed")
+    return revision, tree, digest.hexdigest(), len(relative_paths)
 
 
 def _wheel_record_line(name: str, content: bytes) -> str:
@@ -364,8 +397,8 @@ def _argument_values(namespace: argparse.Namespace) -> None:
     for name in ("requests_per_method",):
         if int(getattr(namespace, name)) <= 0:
             raise _ArgumentError("positive_count_required")
-    if namespace.herdres_sync_passes != 3:
-        raise _ArgumentError("three_sync_passes_required")
+    if namespace.herdres_presenter_passes != 2:
+        raise _ArgumentError("two_presenter_passes_required")
     if not 1.0 <= namespace.phase_timeout_seconds <= 600.0:
         raise _ArgumentError("timeout_out_of_range")
     if not namespace.json:
@@ -377,7 +410,7 @@ def _argument_values(namespace: argparse.Namespace) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run hermetic SQLite daemon/store evidence.")
     parser.add_argument("--requests-per-method", type=int, default=DEFAULT_REQUESTS)
-    parser.add_argument("--herdres-sync-passes", type=int, default=3)
+    parser.add_argument("--herdres-presenter-passes", type=int, default=2)
     parser.add_argument("--phase-timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     configured_herdres_root = os.environ.get("TENDWIRE_BENCHMARK_HERDRES_ROOT")
     parser.add_argument(
@@ -395,6 +428,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--artifact-digest", help=argparse.SUPPRESS)
     parser.add_argument("--source-revision", help=argparse.SUPPRESS)
     parser.add_argument("--source-tree-digest", help=argparse.SUPPRESS)
+    parser.add_argument("--herdres-revision", help=argparse.SUPPRESS)
+    parser.add_argument("--herdres-tree", help=argparse.SUPPRESS)
+    parser.add_argument("--herdres-source-digest", help=argparse.SUPPRESS)
+    parser.add_argument("--herdres-tracked-files", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--inject-failure", choices=("daemon", "herdres"), help=argparse.SUPPRESS)
     return parser
 
@@ -507,6 +544,30 @@ def _seed_daemon_store(db_path: Path) -> None:
         or applied.turn.updated != 1
     ):
         raise RuntimeError("turn_seed_failed")
+
+
+def _seed_paired_store(db_path: Path) -> None:
+    from tendwire.core.models import BackendHealth, Snapshot
+    from tendwire.store.projection import save_snapshot
+    from tendwire.store.schema import init_store
+
+    init_store(db_path)
+    save_snapshot(
+        db_path,
+        Snapshot(
+            host_id=FIXTURE_HOST,
+            updated_at="2026-07-12T00:10:00+00:00",
+            workers=[],
+            backend_health=[
+                BackendHealth(
+                    name="herdr",
+                    status="healthy",
+                    outcome="healthy_empty",
+                    observed_at="2026-07-12T00:10:00+00:00",
+                )
+            ],
+        ),
+    )
 
 
 def _run_daemon_phase(
@@ -645,228 +706,86 @@ def _run_daemon_phase(
     )
 
 
-def _write_candidate_recorder(path: Path, log_path: Path, candidate_python: Path) -> None:
-    path.write_text(
-        "#!" + str(candidate_python) + "\n"
-        "import json,os,sys\n"
-        f"log={str(log_path)!r}\n"
-        "fd=os.open(log,os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)\n"
-        "try: os.write(fd,(json.dumps(sys.argv[1:],separators=(',',':'))+'\\n').encode())\n"
-        "finally: os.close(fd)\n"
-        f"python={str(candidate_python)!r}\n"
-        "os.execv(python,[python,'-I','-m','tendwire.cli',*sys.argv[1:]])\n",
-        encoding="utf-8",
-    )
-    path.chmod(0o700)
-
-
-def _noop_result(result: Mapping[str, Any]) -> bool:
-    zero_fields = (
-        "created",
-        "updated",
-        "icon_updated",
-        "pinned_status_updated",
-        "feed_sent",
-        "sent",
-        "routing_repaired",
-        "turn_updates",
-        "message_bindings",
-        "content_pages",
-    )
-    if result.get("ok") is not True or result.get("changed") is not False:
-        return False
-    if any(int(result.get(field, -1)) != 0 for field in zero_fields):
-        return False
-    cleanup = result.get("topic_cleanup")
-    if not isinstance(cleanup, Mapping) or cleanup.get("changed") is not False:
-        return False
-    for section_name in ("tendwire_turn_final", "tendwire_outbox"):
-        section = result.get(section_name)
-        if not isinstance(section, Mapping) or section.get("changed") is not False:
-            return False
-        for field in ("polled", "operations", "delivered", "acked", "failed", "deferred", "uncertain"):
-            if field in section and int(section[field]) != 0:
-                return False
-    return True
-
-
 def _run_herdres_phase(
     root: Path,
-    db_path: Path,
     socket_path: Path,
-    daemon: Any,
-    candidate_python: Path,
     herdres_root: Path,
 ) -> dict[str, Any]:
-    from tendwire.core.models import BackendHealth, Snapshot
-    from tendwire.store.projection import save_snapshot
-
-    empty_snapshot = Snapshot(
-        host_id=FIXTURE_HOST,
-        updated_at="2026-07-12T00:10:00+00:00",
-        workers=[],
-        backend_health=[
-            BackendHealth(
-                name="herdr",
-                status="healthy",
-                outcome="healthy_empty",
-                observed_at="2026-07-12T00:10:00+00:00",
-            )
-        ],
-    )
-    save_snapshot(db_path, empty_snapshot)
-    # Clear only the benchmark daemon's documented cache so the production callback
-    # re-reads the newly durable settling snapshot; no public schema is bypassed.
-    daemon._snapshot_cache = None
-
-    call_log = root / "candidate-cli-calls.jsonl"
-    recorder = root / "candidate-cli-recorder"
-    _write_candidate_recorder(recorder, call_log, candidate_python)
     state_path = root / "herdres-state.json"
-    absent_source = root / "absent-source"
-    environment = os.environ.copy()
-    private_environment = {
-        "HERDRES_TENDWIRE_MODE": "source",
-        "HERDRES_TENDWIRE_BIN": f"{recorder} --socket-path {socket_path}",
-        "HERDR_TELEGRAM_TOPICS_STATE": str(state_path),
-        "TENDWIRE_DB_PATH": str(db_path),
-        "TENDWIRE_DATA_DIR": str(root),
-        "TENDWIRE_SOCKET_PATH": str(socket_path),
-        "TENDWIRE_HERDR_BACKEND": "socket",
-        "TENDWIRE_SOURCE_DIR": str(absent_source),
-        "HERDRES_PINNED_STATUS": "0",
-        "TELEGRAM_BOT_TOKEN": "",
-        "TELEGRAM_CHAT_ID": "0",
-    }
     before_modules = set(sys.modules)
     previous_path = list(sys.path)
     origin_ok = False
     try:
-        os.environ.clear()
-        os.environ.update(environment)
-        os.environ.update(private_environment)
         sys.path.insert(0, str(herdres_root))
-        source_sync = importlib.import_module("herdres_connector.source_sync")
+        presenter = importlib.import_module("herdres_connector.presenter")
+        state = importlib.import_module("herdres_connector.state")
         tendwire_client = importlib.import_module("herdres_connector.tendwire_client")
         telegram_delivery = importlib.import_module("herdres_connector.telegram_delivery")
-        for module in (source_sync, tendwire_client, telegram_delivery):
+        for module in (presenter, state, tendwire_client, telegram_delivery):
             module_path = Path(module.__file__).resolve()
             if herdres_root.resolve() not in module_path.parents:
                 raise RuntimeError("herdres_origin_failed")
         origin_ok = True
-        # The paired Herdres owns its turn page size (it changed 50 -> 100 in
-        # luminexord/herdres 31c3152); derive the expected command sequence from
-        # the paired checkout instead of hardcoding a value that breaks the
-        # pairing every time Herdres retunes it.
-        turn_page_limit = getattr(tendwire_client, "TURN_LIST_PAGE_LIMIT", 50)
-        if type(turn_page_limit) is not int or turn_page_limit < 1:
-            raise RuntimeError("herdres_turn_page_limit_invalid")
-        runtime = source_sync.SyncRuntime(
-            tendwire=tendwire_client.TendwireClient(timeout=10.0),
+        state.initialize_state(state_path)
+        state_before = state_path.stat()
+        socket_before = os.stat(socket_path)
+        initial_digest = hashlib.sha256(state_path.read_bytes()).hexdigest()
+        runtime = presenter.PresenterRuntime(
+            state_path=state_path,
+            tendwire=tendwire_client.TendwireClient(
+                timeout=10.0,
+                socket_path=socket_path,
+            ),
             telegram=telegram_delivery.TelegramClient(token="", dry_run=True),
-            dry_run=True,
-            with_outbox=False,
-            max_sends=0,
+            poll_limit=4,
         )
-        private_store: dict[str, Any] = {
-            "version": 2,
-            "enabled": True,
-            "telegram": {},
-            "panes": {},
-            "spaces": {},
-            "tendwired_bootstrap_complete": True,
-        }
-        with (
-            _OutboundNetworkGuard() as network_guard,
-            _SubprocessResourceObserver() as subprocess_observer,
-        ):
-            results = [source_sync.sync_once(private_store, runtime)]
-            settled = copy.deepcopy(private_store)
-            settled_digest = hashlib.sha256(
-                _canonical_json(settled).encode("utf-8")
-            ).hexdigest()
-            results.append(source_sync.sync_once(private_store, runtime))
-            second_unchanged = private_store == settled
-            results.append(source_sync.sync_once(private_store, runtime))
-            third_unchanged = private_store == settled
-            final_digest = hashlib.sha256(
-                _canonical_json(private_store).encode("utf-8")
-            ).hexdigest()
+        resource_peak = _resource_counts()
+        with _OutboundNetworkGuard() as network_guard:
+            results = []
+            for _pass in range(2):
+                results.append(presenter.run_once(runtime))
+                _merge_resource_peak(resource_peak, _resource_counts())
+        state_after = state_path.stat()
+        socket_after = os.stat(socket_path)
+        final_digest = hashlib.sha256(state_path.read_bytes()).hexdigest()
     finally:
         sys.path[:] = previous_path
         for name in set(sys.modules) - before_modules:
             if name == "herdres_connector" or name.startswith("herdres_connector."):
                 sys.modules.pop(name, None)
-        os.environ.clear()
-        os.environ.update(environment)
-    records = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
-    def _normalized_client_call(argv: list[str]) -> list[str]:
-        # Watermark tokens are run-specific; validate their shape, then
-        # normalize so the sequence stays exactly comparable.
-        normalized = list(argv)
-        for index, value in enumerate(normalized):
-            if (
-                index > 0
-                and normalized[index - 1] == "--watermark"
-                and value.startswith("twdelta1.")
-            ):
-                normalized[index] = "<WATERMARK>"
-        return normalized
-
-    expected_commands = []
-    for pass_index in range(3):
-        delta_call = [
-            "--socket-path",
-            str(socket_path),
-            "turn",
-            "delta",
-            "--json",
-            "--limit",
-            "500",
-        ]
-        if pass_index > 0:
-            delta_call.extend(("--watermark", "<WATERMARK>"))
-        expected_commands.extend(
-            (["--socket-path", str(socket_path), "snapshot", "--json"],
-             delta_call,
-             ["--socket-path", str(socket_path), "pending", "--json"])
-        )
-    commands_exact = [
-        _normalized_client_call(record) for record in records
-    ] == expected_commands
-    noop_results = results[1:]
+    noop_valid = sum(
+        result.ok
+        and result.polled == 0
+        and result.acknowledged == 0
+        and result.prepared == 0
+        and result.deferred == 0
+        and result.failed == 0
+        for result in results
+    )
     return {
-        "mode": "source",
-        "dry_run": True,
-        "sync_passes": len(results),
-        "settling_passes": 1,
-        "noop_passes": 2,
-        "noop_passes_valid": sum(_noop_result(result) for result in noop_results),
-        "state_unchanged_noop_passes": int(second_unchanged) + int(third_unchanged),
-        "state_digest_unchanged": settled_digest == final_digest,
-        "production_sync_import": origin_ok,
-        "production_client_subprocesses": len(records),
-        "subprocesses_per_pass": 3,
-        "command_sequence_exact": commands_exact,
+        "mode": "daemon_socket_presenter",
+        "presenter_passes": len(results),
+        "noop_passes": len(results),
+        "noop_passes_valid": noop_valid,
+        "state_digest_unchanged": initial_digest == final_digest,
+        "state_file_identity_pinned": (
+            state_before.st_dev,
+            state_before.st_ino,
+        ) == (state_after.st_dev, state_after.st_ino),
+        "daemon_socket_identity_pinned": (
+            socket_before.st_dev,
+            socket_before.st_ino,
+        ) == (socket_after.st_dev, socket_after.st_ino),
+        "production_presenter_import": origin_ok,
+        # Presenter.run_once performs exactly one connector.poll before it can
+        # inspect or mutate an item; every result here proves an empty poll.
+        "connector_poll_requests": len(results),
         "direct_herdr_calls": 0,
         "external_network_attempts": network_guard.attempts,
-        "resource_peak_counts": subprocess_observer.peak,
-        "settling_changed": bool(results[0].get("changed")),
-        "settling_ok": results[0].get("ok") is True,
-        "noop_work_counts": {
-            field: sum(int(result.get(field, 0)) for result in noop_results)
-            for field in (
-                "created",
-                "updated",
-                "icon_updated",
-                "pinned_status_updated",
-                "feed_sent",
-                "sent",
-                "routing_repaired",
-                "turn_updates",
-                "message_bindings",
-                "content_pages",
-            )
+        "resource_peak_counts": resource_peak,
+        "presenter_totals": {
+            field: sum(int(getattr(result, field)) for result in results)
+            for field in ("polled", "acknowledged", "prepared", "deferred", "failed")
         },
     }
 
@@ -882,6 +801,10 @@ def _candidate_run(args: argparse.Namespace) -> dict[str, Any]:
             args.artifact_digest,
             args.source_revision,
             args.source_tree_digest,
+            args.herdres_revision,
+            args.herdres_tree,
+            args.herdres_source_digest,
+            args.herdres_tracked_files,
         )
     ):
         raise RuntimeError("candidate_arguments_missing")
@@ -892,6 +815,14 @@ def _candidate_run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("mutable_source_imported")
     if importlib.metadata.version("tendwire") != args.candidate_version:
         raise RuntimeError("candidate_version_mismatch")
+    herdres_binding = _clean_source_binding(args.herdres_root)
+    if herdres_binding != (
+        args.herdres_revision,
+        args.herdres_tree,
+        args.herdres_source_digest,
+        args.herdres_tracked_files,
+    ):
+        raise RuntimeError("paired_herdres_binding_changed")
     root = args.private_root / "run"
     root.mkdir(mode=0o700)
     baseline_fds = _fd_snapshot()
@@ -946,12 +877,14 @@ def _candidate_run(args: argparse.Namespace) -> dict[str, Any]:
     from tendwire.config import Config
     from tendwire.daemon import DaemonHooks, TendwireDaemon
 
+    paired_db_path = root / "paired.db"
+    _seed_paired_store(paired_db_path)
     herdres_supervisor = _NoopACPSupervisor()
     herdres_config = Config(
         host_id=FIXTURE_HOST,
         herdr_bin=str(herdr_trap),
         data_dir=root,
-        db_path=db_path,
+        db_path=paired_db_path,
         socket_path=socket_path,
         herdr_timeout_seconds=5.0,
     )
@@ -971,10 +904,7 @@ def _candidate_run(args: argparse.Namespace) -> dict[str, Any]:
         herdres_started = perf_counter_ns()
         herdres_metrics = _run_herdres_phase(
             root,
-            db_path,
             socket_path,
-            daemon,
-            args.candidate_python,
             args.herdres_root,
         )
         herdres_ns = perf_counter_ns() - herdres_started
@@ -1016,18 +946,23 @@ def _candidate_run(args: argparse.Namespace) -> dict[str, Any]:
         and herdres_supervisor.stopped,
         "sqlite_integrity_ok": daemon_metrics["integrity_ok"],
         "duplicate_revisions_zero": daemon_metrics["duplicate_revision_groups"] == 0,
-        "two_noop_syncs_exact": herdres_metrics["noop_passes"] == 2,
-        "two_noop_syncs_valid": herdres_metrics["noop_passes_valid"] == 2,
-        "noop_state_unchanged": herdres_metrics["state_unchanged_noop_passes"] == 2
-        and herdres_metrics["state_digest_unchanged"],
-        "production_herdres_sync_imported": herdres_metrics["production_sync_import"],
-        "production_client_calls_exact": herdres_metrics["production_client_subprocesses"] == 9
-        and herdres_metrics["command_sequence_exact"],
+        "two_noop_presenter_passes_exact": herdres_metrics["noop_passes"] == 2,
+        "two_noop_presenter_passes_valid": herdres_metrics["noop_passes_valid"] == 2,
+        "noop_state_unchanged": herdres_metrics["state_digest_unchanged"],
+        "state_file_identity_pinned": herdres_metrics["state_file_identity_pinned"],
+        "daemon_socket_identity_pinned": herdres_metrics[
+            "daemon_socket_identity_pinned"
+        ],
+        "production_herdres_presenter_imported": herdres_metrics[
+            "production_presenter_import"
+        ],
+        "production_client_calls_exact": herdres_metrics[
+            "connector_poll_requests"
+        ] == 2,
         "direct_herdr_calls_zero": trap_calls == 0,
         "external_network_calls_zero": herdres_metrics["external_network_attempts"] == 0,
         "live_fd_peak_observed": peak_fd_count > len(baseline_fds),
         "live_thread_peak_observed": peak_thread_count > len(baseline_threads),
-        "live_direct_child_peak_observed": peak_child_count > len(baseline_children),
         "fd_identity_set_restored": after_fds == baseline_fds,
         "thread_identity_set_restored": after_threads == baseline_threads,
         "direct_child_set_restored": after_children == baseline_children,
@@ -1039,7 +974,7 @@ def _candidate_run(args: argparse.Namespace) -> dict[str, Any]:
         "status": "validating",
         "parameters": {
             "requests_per_method": args.requests_per_method,
-            "herdres_sync_passes": args.herdres_sync_passes,
+            "herdres_presenter_passes": args.herdres_presenter_passes,
             "phase_timeout_seconds": args.phase_timeout_seconds,
         },
         "candidate": {
@@ -1050,6 +985,13 @@ def _candidate_run(args: argparse.Namespace) -> dict[str, Any]:
             "source_revision_binding": "base_revision_plus_source_tree_sha256",
             "installation": "private_versioned_wheel",
             "origin_verified": True,
+        },
+        "paired_herdres": {
+            "revision": args.herdres_revision,
+            "tree": args.herdres_tree,
+            "tracked_source_sha256": args.herdres_source_digest,
+            "tracked_files": args.herdres_tracked_files,
+            "clean_checkout_verified": True,
         },
         "environment": {
             "python_version": platform.python_version(),
@@ -1076,7 +1018,7 @@ def _candidate_run(args: argparse.Namespace) -> dict[str, Any]:
             "direct_children_before": len(baseline_children),
             "direct_children_peak_observed": peak_child_count,
             "direct_children_after": len(after_children),
-            "candidate_cli_subprocesses": herdres_metrics["production_client_subprocesses"],
+            "presenter_socket_requests": herdres_metrics["connector_poll_requests"],
             "socket_present_after": os.path.lexists(socket_path),
         },
         "checks": checks,
@@ -1093,6 +1035,9 @@ def _candidate_run(args: argparse.Namespace) -> dict[str, Any]:
 
 def _public_run(args: argparse.Namespace) -> dict[str, Any]:
     checkout = Path(__file__).resolve().parent.parent
+    herdres_revision, herdres_tree, herdres_digest, herdres_files = (
+        _clean_source_binding(args.herdres_root)
+    )
     baseline_fds = _fd_snapshot()
     baseline_threads = _thread_snapshot()
     baseline_children = _direct_children()
@@ -1131,12 +1076,20 @@ def _public_run(args: argparse.Namespace) -> dict[str, Any]:
             revision,
             "--source-tree-digest",
             source_tree_digest,
+            "--herdres-revision",
+            herdres_revision,
+            "--herdres-tree",
+            herdres_tree,
+            "--herdres-source-digest",
+            herdres_digest,
+            "--herdres-tracked-files",
+            str(herdres_files),
             "--herdres-root",
             str(args.herdres_root.resolve()),
             "--requests-per-method",
             str(args.requests_per_method),
-            "--herdres-sync-passes",
-            str(args.herdres_sync_passes),
+            "--herdres-presenter-passes",
+            str(args.herdres_presenter_passes),
             "--phase-timeout-seconds",
             str(args.phase_timeout_seconds),
             "--json",
