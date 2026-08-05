@@ -17,17 +17,15 @@ from tendwire.store import sqlite as store_sqlite
 from tendwire.store.sqlite import (
     cleanup_acknowledged_final_retention,
     init_store,
-    merge_turn_content,
     save_snapshot,
 )
+from .store_helpers import apply_test_turn_refresh
 
 
 HOST_ID = "recovery-host"
 FINAL_NAME = "turn-final"
 CREATED_AT = "2026-01-01T00:00:00+00:00"
 STABLE_KEY = "wsk1_" + ("d" * 64)
-RECOVERY_RAW_SOURCE = "legacy-recovery-backend-source"
-RECOVERY_LEGACY_SOURCE_TOKEN = "turnsrc-422ef48fec1cfb0720da05bd"
 PRIVATE_ROUTE_SENTINEL = "PRIVATE-RECOVERY-ROUTE-SENTINEL"
 
 
@@ -768,375 +766,10 @@ def test_repeated_recovery_history_is_hard_bounded_and_cumulative(
     assert source_status == "delivered"
 
 
-def _seed_v10_recovered_lineage(db_path: Path) -> tuple[str, str, str]:
-    turn_id = "turn-v10-recovered"
-    revision = _insert_revision(db_path, turn_id=turn_id, final_text="abcdefghijkl")
-    failed_token = "twplan1.legacy-failed"
-    recovered_token = "twplan1.legacy-recovered"
-    authoritative_route = {
-        "schema_version": 2,
-        "turn_id": turn_id,
-        "content_revision": revision,
-        "final_identity": store_sqlite.turn_final_delivery_identity(
-            HOST_ID,
-            turn_id,
-            revision,
-        ),
-        "stable_key": STABLE_KEY,
-        "stable_key_version": 1,
-    }
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute(
-            """
-            UPDATE turns
-            SET worker_id = 'worker-recovery-a',
-                worker_fingerprint = 'fingerprint-recovery-a',
-                space_id = 'space-recovery-a',
-                payload_json = ?
-            WHERE host_id = ? AND turn_id = ?
-            """,
-            (
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "id": turn_id,
-                        "host_id": HOST_ID,
-                        "worker_id": "worker-recovery-a",
-                        "worker_fingerprint": "fingerprint-recovery-a",
-                        "space_id": "space-recovery-a",
-                        "status": "complete",
-                        "kind": "turn",
-                        "source": "herdr-a",
-                        "source_turn_id": RECOVERY_LEGACY_SOURCE_TOKEN,
-                        "complete": True,
-                        "has_open_turn": False,
-                        "updated_at": CREATED_AT,
-                        "meta": {
-                            "stable_key": STABLE_KEY,
-                            "stable_key_version": 1,
-                        },
-                        "chat_id": PRIVATE_ROUTE_SENTINEL,
-                    },
-                    sort_keys=True,
-                ),
-                HOST_ID,
-                turn_id,
-            ),
-        )
-        failed_cursor = conn.execute(
-            """
-            INSERT INTO turn_presentation_plans (
-                host_id, name, plan_token, turn_id, content_revision,
-                presentation_version, generation, part_count, state,
-                created_at, activated_at
-            ) VALUES (?, ?, ?, ?, ?, 'legacy-recovery-v10', 1, 3, 'failed', ?, ?)
-            """,
-            (HOST_ID, FINAL_NAME, failed_token, turn_id, revision, CREATED_AT, CREATED_AT),
-        )
-        failed_plan_id = int(failed_cursor.lastrowid)
-        recovered_cursor = conn.execute(
-            """
-            INSERT INTO turn_presentation_plans (
-                host_id, name, plan_token, turn_id, content_revision,
-                presentation_version, generation, part_count, state,
-                replaces_plan_token, recovers_plan_token,
-                created_at, activated_at, completed_at
-            ) VALUES (
-                ?, ?, ?, ?, ?, 'legacy-recovery-v10', 2, 3, 'completed',
-                ?, ?, ?, ?, ?
-            )
-            """,
-            (
-                HOST_ID,
-                FINAL_NAME,
-                recovered_token,
-                turn_id,
-                revision,
-                failed_token,
-                failed_token,
-                CREATED_AT,
-                CREATED_AT,
-                CREATED_AT,
-            ),
-        )
-        recovered_plan_id = int(recovered_cursor.lastrowid)
-
-        def add_job(
-            plan_id: int,
-            sequence: int,
-            status: str,
-            key: str,
-        ) -> None:
-            outbox_cursor = conn.execute(
-                """
-                INSERT INTO connector_outbox (
-                    host_id, connector, delivery_key, status, payload_json,
-                    private_state_json, created_at, updated_at, next_attempt_at
-                ) VALUES (?, ?, ?, ?, ?, '{}', ?, ?, NULL)
-                """,
-                (
-                    HOST_ID,
-                    FINAL_NAME,
-                    key,
-                    status,
-                    json.dumps({"turn": authoritative_route}, sort_keys=True),
-                    CREATED_AT,
-                    CREATED_AT,
-                ),
-            )
-            outbox_id = int(outbox_cursor.lastrowid)
-            spans_json = json.dumps(
-                [
-                    {
-                        "field": "assistant_final_text",
-                        "start_char": sequence * 4,
-                        "end_char": (sequence + 1) * 4,
-                    }
-                ],
-                sort_keys=True,
-            )
-            conn.execute(
-                """
-                INSERT INTO turn_presentation_jobs (
-                    plan_id, sequence_index, operation, part_ordinal,
-                    spans_json, outbox_id, created_at
-                ) VALUES (?, ?, 'upsert', ?, ?, ?, ?)
-                """,
-                (
-                    plan_id,
-                    sequence,
-                    sequence,
-                    spans_json,
-                    outbox_id,
-                    CREATED_AT,
-                ),
-            )
-            if status in {"delivered", "dead_letter"}:
-                conn.execute(
-                    """
-                    INSERT INTO connector_deliveries (
-                        outbox_id, host_id, connector, delivery_key, attempt,
-                        status, response_json, private_state_json,
-                        created_at, delivered_at
-                    ) VALUES (?, ?, ?, ?, 1, ?, '{}', '{}', ?, ?)
-                    """,
-                    (
-                        outbox_id,
-                        HOST_ID,
-                        FINAL_NAME,
-                        key,
-                        "delivered" if status == "delivered" else "failed",
-                        CREATED_AT,
-                        CREATED_AT,
-                    ),
-                )
-
-        add_job(failed_plan_id, 0, "delivered", "turn-final:legacy-root:000000")
-        add_job(failed_plan_id, 1, "dead_letter", "turn-final:legacy-root:000001")
-        add_job(failed_plan_id, 2, "queued", "turn-final:legacy-root:000002")
-        add_job(recovered_plan_id, 1, "delivered", "turn-final:legacy-recovered:000001")
-        add_job(recovered_plan_id, 2, "delivered", "turn-final:legacy-recovered:000002")
-        conn.execute(
-            """
-            INSERT INTO turn_presentation_recoveries (
-                host_id, name, request_id, failed_plan_id, recovered_plan_id,
-                failed_plan_token, recovered_plan_token, generation,
-                source_job_count, delivered_prefix_count, fresh_job_count,
-                retained_failed_job_count, prior_attempt_count, outcome, created_at
-            ) VALUES (?, ?, 'legacy-request', ?, ?, ?, ?, 2, 3, 1, 2, 1, 2,
-                      'recovered', ?)
-            """,
-            (
-                HOST_ID,
-                FINAL_NAME,
-                failed_plan_id,
-                recovered_plan_id,
-                failed_token,
-                recovered_token,
-                CREATED_AT,
-            ),
-        )
-        conn.execute("PRAGMA user_version = 10")
-    return turn_id, revision, failed_token
 
 
-def test_v12_migration_uses_effective_recovery_lineage_without_repost_or_hold(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "v12-recovered-lineage.db"
-    turn_id, revision, failed_token = _seed_v10_recovered_lineage(db_path)
-
-    init_store(db_path)
-
-    key = _final_key(turn_id, revision)
-    api = ConnectorOutboxAPI(db_path, HOST_ID)
-    assert api.poll({"name": FINAL_NAME, "limit": 100})["items"] == []
-    with sqlite3.connect(str(db_path)) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == store_sqlite.STORE_SCHEMA_VERSION == 21
-        anchor = conn.execute(
-            """
-            SELECT delivery_kind, status
-            FROM connector_outbox
-            WHERE delivery_key = ?
-            """,
-            (key,),
-        ).fetchone()
-        failed_state = conn.execute(
-            "SELECT state FROM turn_presentation_plans WHERE plan_token = ?",
-            (failed_token,),
-        ).fetchone()[0]
-        linked_proof = conn.execute(
-            """
-            SELECT plans.state
-            FROM turn_presentation_plans AS plans
-            JOIN connector_outbox AS source ON source.id = plans.source_outbox_id
-            WHERE source.delivery_key = ?
-            """,
-            (key,),
-        ).fetchone()[0]
-    assert anchor == ("final_ready", "delivered")
-    assert failed_state == "superseded"
-    assert linked_proof == "completed"
-
-    cleanup = cleanup_acknowledged_final_retention(
-        db_path,
-        HOST_ID,
-        acknowledged_final_retention_days=1,
-        acknowledged_final_retention_count=1,
-        batch_size=100,
-        now="2099-01-01T00:00:00+00:00",
-    )
-    assert cleanup["deleted"] == 1
 
 
-def test_v12_recovery_history_stays_immutable_when_observed_turn_arrives(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "v12-recovered-lineage-owner-churn.db"
-    turn_id, revision, failed_token = _seed_v10_recovered_lineage(db_path)
-    init_store(db_path)
-
-    original_key = _final_key(turn_id, revision)
-    before = _turn_graph_snapshot(db_path, turn_id)
-    assert before["turn_identity"] == (
-        turn_id,
-        turn_id,
-        RECOVERY_LEGACY_SOURCE_TOKEN,
-        1,
-    )
-    assert len(before["attempts"]) == 3
-    assert [row[4] for row in before["attempts"]] == [
-        "delivered",
-        "delivered",
-        "delivered",
-    ]
-    recovered_plan = next(row for row in before["plans"] if row[6] == "completed")
-    root = next(row for row in before["outbox"] if row[1] == original_key)
-    assert recovered_plan[9] == root[0]
-    assert before["recoveries"][0][4:6] == (
-        failed_token,
-        recovered_plan[1],
-    )
-
-    worker_b = _owner_snapshot(
-        db_path,
-        worker_id="worker-recovery-b",
-        worker_name="Recovery Worker B",
-        space_id="space-recovery-b",
-        second=2,
-    )
-    assert save_snapshot(db_path, worker_b) is True
-    assert merge_turn_content(
-        db_path,
-        HOST_ID,
-        "worker-recovery-b",
-        {
-            "source_turn_id": RECOVERY_RAW_SOURCE,
-            "assistant_final_text": "abcdefghijkl",
-            "complete": True,
-            "has_open_turn": False,
-        },
-        observed_at="2026-01-01T00:00:03+00:00",
-    ) == 1
-
-    after_churn = _turn_graph_snapshot(db_path, turn_id)
-    assert after_churn == before
-    api = ConnectorOutboxAPI(db_path, HOST_ID)
-    observed_items = api.poll({"name": FINAL_NAME, "limit": 100})["items"]
-    assert len(observed_items) == 1
-    assert observed_items[0]["key"] != original_key
-    with sqlite3.connect(str(db_path)) as conn:
-        current = conn.execute(
-            """
-            SELECT worker_id, worker_fingerprint, space_id, payload_json
-            FROM turns
-            WHERE host_id = ? AND turn_id = ?
-            """,
-            (HOST_ID, turn_id),
-        ).fetchone()
-        assert current is not None
-        current_payload = json.loads(str(current[3]))
-        assert current[:3] == (
-            "worker-recovery-a",
-            "fingerprint-recovery-a",
-            "space-recovery-a",
-        )
-        assert current_payload["id"] == turn_id
-        assert current_payload["source_turn_id"] == RECOVERY_LEGACY_SOURCE_TOKEN
-        observed = conn.execute(
-            """
-            SELECT turn_id, worker_id, worker_fingerprint, space_id, payload_json
-            FROM turns
-            WHERE host_id = ? AND turn_id != ?
-            """,
-            (HOST_ID, turn_id),
-        ).fetchone()
-        assert observed is not None
-        observed_payload = json.loads(str(observed[4]))
-        assert tuple(observed[1:4]) == (
-            "worker-recovery-b",
-            worker_b.workers[0].fingerprint,
-            "space-recovery-b",
-        )
-        assert observed_payload["id"] == str(observed[0])
-        assert observed_payload["source_turn_id"] != RECOVERY_LEGACY_SOURCE_TOKEN
-        public_payloads = [
-            str(row[0])
-                for row in conn.execute(
-                    """
-                    SELECT payload_json FROM turns
-                    WHERE host_id = ? AND turn_id != ?
-                    UNION ALL
-                    SELECT payload_json FROM connector_outbox
-                    WHERE host_id = ? AND turn_id != ?
-                    """,
-                    (HOST_ID, turn_id, HOST_ID, turn_id),
-                ).fetchall()
-        ]
-        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
-    encoded_public = "\n".join(public_payloads)
-    assert PRIVATE_ROUTE_SENTINEL not in encoded_public
-    assert RECOVERY_RAW_SOURCE not in encoded_public
-
-    init_store(db_path)
-    assert save_snapshot(db_path, worker_b) is True
-    assert merge_turn_content(
-        db_path,
-        HOST_ID,
-        "worker-recovery-b",
-        {
-            "source_turn_id": RECOVERY_RAW_SOURCE,
-            "assistant_final_text": "abcdefghijkl",
-            "complete": True,
-            "has_open_turn": False,
-        },
-        observed_at="2026-01-01T00:00:03+00:00",
-    ) == 0
-    assert ConnectorOutboxAPI(db_path, HOST_ID).poll(
-        {"name": FINAL_NAME, "limit": 100}
-    )["items"] == []
-    assert _turn_graph_snapshot(db_path, turn_id) == before
 
 
 def test_known_incomplete_final_is_hold_then_complete_revision_drains(
@@ -1778,7 +1411,7 @@ def test_source_less_recovery_ids_survive_same_owner_worker_churn_and_ack_loss(
     )
     init_store(db_path)
     assert save_snapshot(db_path, worker_a) is True
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         "worker-source-less-a",
@@ -1843,7 +1476,7 @@ def test_source_less_recovery_ids_survive_same_owner_worker_churn_and_ack_loss(
     )
     assert worker_b.workers[0].fingerprint != worker_a.workers[0].fingerprint
     assert save_snapshot(db_path, worker_b) is True
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         "worker-source-less-b",
@@ -1936,7 +1569,7 @@ def test_source_less_recovery_ids_survive_same_owner_worker_churn_and_ack_loss(
     assert replayed_recovery["failed_plan_token"] == failed_plan["plan_token"]
     assert replayed_recovery["plan_token"] == recovered["plan_token"]
     assert save_snapshot(db_path, worker_b) is True
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         HOST_ID,
         "worker-source-less-b",

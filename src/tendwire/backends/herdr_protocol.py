@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -21,30 +21,6 @@ _SESSION_ENV_ORDER = (
     "TENDWIRE_HERDR_SESSION",
     "HERDR_SESSION",
 )
-
-HERDR_EVENTS_SUBSCRIBE_METHOD = "events.subscribe"
-HERDR_TURN_COMPLETED_EVENT_NAME = "pane.turn_completed"
-HERDR_OFFICIAL_EVENT_NAMES = (
-    "workspace.created",
-    "workspace.updated",
-    "workspace.renamed",
-    "workspace.closed",
-    "workspace.focused",
-    "pane.created",
-    "pane.closed",
-    "pane.updated",
-    "pane.focused",
-    "pane.moved",
-    "pane.exited",
-    "pane.agent_detected",
-    "pane.output_matched",
-    "pane.agent_status_changed",
-    "worktree.created",
-    "worktree.opened",
-    "worktree.removed",
-)
-HERDR_OFFICIAL_EVENT_NAME_SET = frozenset(HERDR_OFFICIAL_EVENT_NAMES)
-
 
 class HerdrProtocolError(Exception):
     """Base error for Herdr socket protocol failures."""
@@ -62,6 +38,10 @@ class HerdrEnvelopeError(HerdrProtocolError, ValueError):
     """Raised when a decoded JSON object is not a valid protocol envelope."""
 
 
+class HerdrFrameTooLargeError(HerdrProtocolError, ValueError):
+    """Raised when one JSON-line frame exceeds the fixed transport bound."""
+
+
 class HerdrRequestIdMismatchError(HerdrEnvelopeError):
     """Raised when a server envelope is not correlated to the expected id."""
 
@@ -73,12 +53,9 @@ class HerdrErrorResponse(HerdrProtocolError):
         self,
         error: Any,
         request_id: str,
-        *,
-        uncorrelated: bool = False,
     ) -> None:
         self.error = error
         self.request_id = request_id
-        self.uncorrelated = uncorrelated
         message = "Herdr returned an error response"
         if isinstance(error, Mapping):
             raw_message = error.get("message")
@@ -170,43 +147,6 @@ def build_request(
     return {"id": request_id, "method": method, "params": dict(params)}
 
 
-def _validate_event_subscription_name(name: Any) -> str:
-    if not isinstance(name, str):
-        raise HerdrEnvelopeError("Herdr event subscription names must be strings")
-    if not name:
-        raise HerdrEnvelopeError("Herdr event subscription names must not be empty")
-    if name.strip() != name or name not in HERDR_OFFICIAL_EVENT_NAME_SET:
-        raise HerdrEnvelopeError(f"unsupported Herdr event subscription {name!r}")
-    return name
-
-
-def build_events_subscribe_params(event_names: Iterable[str] | str | None = None) -> dict[str, Any]:
-    """Return official events.subscribe params for validated Herdr event names."""
-    if event_names is None:
-        names = HERDR_OFFICIAL_EVENT_NAMES
-    elif isinstance(event_names, str):
-        names = (event_names,)
-    else:
-        try:
-            names = tuple(event_names)
-        except TypeError as exc:
-            raise HerdrEnvelopeError("Herdr event subscriptions must be iterable") from exc
-    return {"subscriptions": [{"type": _validate_event_subscription_name(name)} for name in names]}
-
-
-def build_events_subscribe_request(
-    event_names: Iterable[str] | str | None = None,
-    *,
-    request_id: str | None = None,
-) -> dict[str, Any]:
-    """Build an official Herdr event subscription request envelope."""
-    return build_request(
-        HERDR_EVENTS_SUBSCRIBE_METHOD,
-        build_events_subscribe_params(event_names),
-        request_id=request_id,
-    )
-
-
 def frame_request(request: Mapping[str, Any]) -> bytes:
     """Encode one request object as UTF-8 JSON Lines."""
     try:
@@ -274,87 +214,20 @@ def is_response(envelope: Mapping[str, Any]) -> bool:
     return is_result_response(envelope) or is_error_response(envelope)
 
 
-def is_event(envelope: Mapping[str, Any]) -> bool:
-    return "event" in envelope and "result" not in envelope and "error" not in envelope
-
-
-def validate_response(
-    envelope: Mapping[str, Any],
-    *,
-    allow_uncorrelated_error: bool = False,
-    allow_uncorrelated_method_error: bool = False,
-) -> dict[str, Any]:
+def validate_response(envelope: Mapping[str, Any]) -> dict[str, Any]:
     """Validate a response envelope while tolerating unknown fields."""
     if not is_response(envelope):
         raise HerdrEnvelopeError("Herdr response must contain exactly one of result or error")
-    # Herdr 0.7.5 emits ``{"id":"", "error":...}`` when subscription
-    # parameters fail schema validation. Only the subscription negotiation
-    # path may opt into that compatibility exception; ordinary requests remain
-    # strictly correlated.
-    error = envelope.get("error")
-    uncorrelated_subscription_error = (
-        allow_uncorrelated_error
-        and is_error_response(envelope)
-        and envelope.get("id") == ""
-        and isinstance(error, Mapping)
-        and error.get("code") == "invalid_request"
-        and isinstance(error.get("message"), str)
-        and error["message"].startswith("invalid request:")
-    )
-    # Stock Herdr 0.7.5 omits the id entirely when an internally tagged RPC
-    # variant is unknown. Only an explicit capability probe may opt into this
-    # narrower exception; ordinary requests remain strictly correlated.
-    uncorrelated_method_error = (
-        allow_uncorrelated_method_error
-        and is_error_response(envelope)
-        and ("id" not in envelope or envelope.get("id") == "")
-        and isinstance(error, Mapping)
-        and error.get("code") == "invalid_request"
-        and isinstance(error.get("message"), str)
-        and error["message"].startswith("invalid request: unknown variant")
-        and "pane.turns" in error["message"]
-    )
-    if not (uncorrelated_subscription_error or uncorrelated_method_error):
-        _validated_id(envelope)
-    return dict(envelope)
-
-
-def validate_event(envelope: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate an event envelope while preserving its raw data.
-
-    The confirmed Herdr ``EventEnvelope`` consists of ``event`` and ``data``.
-    A generic ``id`` is tolerated as subscription correlation only; it is not
-    authoritative producer event identity. Unknown top-level fields remain
-    available for forward-compatible consumers.
-    """
-    request_id = envelope.get("id")
-    if request_id is not None and (not isinstance(request_id, str) or not request_id):
-        raise HerdrEnvelopeError("Herdr event id must be a non-empty string when present")
-    event_name = envelope.get("event")
-    if not isinstance(event_name, str) or not event_name:
-        raise HerdrEnvelopeError("Herdr event name must be a non-empty string")
-    if not is_event(envelope):
-        raise HerdrEnvelopeError("Herdr event must not contain result or error fields")
-    return dict(envelope)
-
-
-def validate_server_envelope(
-    envelope: Mapping[str, Any],
-    *,
-    allow_uncorrelated_error: bool = False,
-    allow_uncorrelated_method_error: bool = False,
-) -> dict[str, Any]:
-    """Validate a decoded server response or event envelope."""
-    if is_response(envelope):
-        return validate_response(
-            envelope,
-            allow_uncorrelated_error=allow_uncorrelated_error,
-            allow_uncorrelated_method_error=allow_uncorrelated_method_error,
-        )
-    if is_event(envelope):
-        return validate_event(envelope)
     _validated_id(envelope)
-    raise HerdrEnvelopeError("Herdr envelope is neither a response nor an event")
+    return dict(envelope)
+
+
+def validate_server_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a decoded server response envelope."""
+    if is_response(envelope):
+        return validate_response(envelope)
+    _validated_id(envelope)
+    raise HerdrEnvelopeError("Herdr envelope is not a response")
 
 
 def ensure_response_id(envelope: Mapping[str, Any], expected_id: str) -> None:

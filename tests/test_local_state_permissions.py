@@ -83,6 +83,29 @@ def _assert_path_free(value: object, *paths: Path) -> None:
     rendered = repr(value)
     for path in paths:
         assert str(path) not in rendered
+
+
+def _open_fd_identities() -> dict[int, tuple[int, int, int, int]]:
+    identities: dict[int, tuple[int, int, int, int]] = {}
+    for raw_fd in os.listdir("/proc/self/fd"):
+        fd = int(raw_fd)
+        try:
+            current = os.fstat(fd)
+        except OSError as exc:
+            # Listing /proc/self/fd briefly exposes the directory descriptor
+            # used by listdir itself; it is closed before fstat can inspect it.
+            if exc.errno == errno.EBADF:
+                continue
+            raise
+        identities[fd] = (
+            current.st_dev,
+            current.st_ino,
+            current.st_mode,
+            current.st_rdev,
+        )
+    return identities
+
+
 def _sqlite_replacement_source(
     tmp_path: Path, *, mode: int = 0o600
 ) -> tuple[Path, Path, int]:
@@ -527,7 +550,7 @@ def test_sqlite_family_optional_sidecar_disappears_after_capture(
         assert results[result_index].mode is None
         assert not sidecar.exists()
         assert _mode(db_path) == 0o600
-        assert set(os.listdir("/proc/self/fd")) == before_fds
+        assert set(os.listdir("/proc/self/fd")) <= before_fds
     finally:
         os.close(parent_fd)
 
@@ -806,7 +829,7 @@ def test_sqlite_family_sidecar_replacement_fails_without_target_mutation(
     unexpected_uid = os.geteuid() + 100_000
     replacement_active = False
     replacement_identity = None
-    before_fds = set(os.listdir("/proc/self/fd"))
+    before_fds = _open_fd_identities()
     preflight_calls = 0
 
     def owner_aware_lstat_at(dir_fd: int, name: str):
@@ -876,7 +899,11 @@ def test_sqlite_family_sidecar_replacement_fails_without_target_mutation(
         else:
             assert sidecar.read_bytes() == b"hostile-replacement"
             assert _mode(sidecar) == 0o644
-        assert set(os.listdir("/proc/self/fd")) == before_fds
+        # The full suite can finish background subprocess cleanup while this
+        # test runs, legitimately closing descriptors owned by pytest.  Require
+        # every remaining descriptor to retain its original identity, which
+        # still catches both new descriptors and reuse of a closed fd number.
+        assert _open_fd_identities().items() <= before_fds.items()
     finally:
         os.close(parent_fd)
 

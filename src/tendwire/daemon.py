@@ -47,6 +47,15 @@ def _nonnegative_float(value: Any) -> float | None:
     return converted
 
 
+def _public_failure_type(value: Any) -> str | None:
+    """Return a bounded exception type label, never arbitrary failure text."""
+    if not isinstance(value, str) or not value or len(value) > 128:
+        return None
+    if any(not (character.isalnum() or character in "._") for character in value):
+        return None
+    return value
+
+
 _STORE_COUNT_FIELDS = (
     "snapshots",
     "events",
@@ -385,41 +394,6 @@ def _command_requests_health(
     }, True
 
 
-def _turn_ingestion_health(config: Config, scheduler: Any | None) -> dict[str, Any]:
-    raw: Mapping[str, Any] = {}
-    if scheduler is not None:
-        try:
-            status_value = scheduler.operational_status()
-        except Exception:
-            status_value = {}
-        if isinstance(status_value, Mapping):
-            raw = status_value
-    status = raw.get("status")
-    if status not in {"healthy", "stale", "degraded", "stopping"}:
-        status = "stale" if scheduler is None else "degraded"
-    return {
-        "status": status,
-        "queue": _nonnegative_int(raw.get("queue_depth")),
-        "active": _nonnegative_int(raw.get("active")),
-        "refreshed": _nonnegative_int(raw.get("refreshed")),
-        "failed": _nonnegative_int(raw.get("failed")),
-        "timed_out": _nonnegative_int(raw.get("timed_out")),
-        "coalesced": _nonnegative_int(raw.get("coalesced")),
-        "queue_full": _nonnegative_int(raw.get("queue_full")),
-        "last_success": _valid_observation_timestamp(
-            raw.get("last_success") if isinstance(raw.get("last_success"), str) else None
-        ),
-        "last_duration_ms": _nonnegative_float(raw.get("last_duration_ms")),
-        "stale_age": _nonnegative_float(raw.get("stale_age_seconds")),
-        "bounds": {
-            "refresh_interval_seconds": config.turn_refresh_interval_seconds,
-            "max_workers": config.turn_refresh_workers,
-            "queue_capacity": _nonnegative_int(raw.get("queue_capacity")),
-            "adapter_timeout_seconds": config.herdr_timeout_seconds,
-        },
-    }
-
-
 def _pending_ingestion_health(config: Config) -> dict[str, Any]:
     """Return the fixed durable pending aggregate without exposing row identity."""
     unavailable = {
@@ -475,37 +449,16 @@ def default_socket_path(config: Config) -> Path:
     return Path(config.data_dir) / "tendwire.sock"
 
 
-def _default_init_store(
-    db_path: Path,
-    *,
-    connector_ack_ttl_seconds: int | None = None,
-) -> None:
+def _default_init_store(db_path: Path) -> None:
     from .store.sqlite import init_store
 
-    kwargs = (
-        {"connector_ack_ttl_seconds": connector_ack_ttl_seconds}
-        if connector_ack_ttl_seconds is not None
-        else {}
-    )
-    init_store(db_path, **kwargs)
+    init_store(db_path)
 
 
-def _default_observe_initial_snapshot(config: Config) -> Snapshot:
-    from .cli import observe_public_snapshot
+def _default_acp_supervisor_factory(config: Config, stop_event: threading.Event) -> Any:
+    from .backends.acp_coordinator import production_acp_supervisor_factory
 
-    return observe_public_snapshot(config, store_snapshot=True)
-
-
-def _default_submit_command(config: Config, payload: str) -> CommandEnvelope:
-    from .command_submission import submit_command
-
-    return submit_command(config, payload)
-
-
-def _default_turn_scheduler_factory(config: Config) -> Any:
-    from .backends.herdr_turns import TurnIngestionScheduler
-
-    return TurnIngestionScheduler(config)
+    return production_acp_supervisor_factory(config, stop_event)
 
 
 @dataclass(frozen=True)
@@ -513,10 +466,9 @@ class DaemonHooks:
     """Dependency injection points for deterministic daemon tests."""
 
     init_store: Callable[[Path], None] = _default_init_store
-    observe_initial_snapshot: Callable[[Config], Snapshot] = _default_observe_initial_snapshot
-    submit_command: Callable[[Config, str], CommandEnvelope | Mapping[str, Any]] = _default_submit_command
-    event_backend_factory: Callable[[Config, threading.Event], Any] | None = None
-    turn_scheduler_factory: Callable[[Config], Any] = _default_turn_scheduler_factory
+    acp_supervisor_factory: Callable[[Config, threading.Event], Any | None] | None = (
+        _default_acp_supervisor_factory
+    )
 
 
 class TendwireDaemon:
@@ -538,8 +490,8 @@ class TendwireDaemon:
         self.started_at = utc_timestamp()
         self._snapshot: Snapshot | None = None
         self._server: UnixSocketJSONServer | None = None
-        self._event_backend: Any | None = None
-        self._turn_scheduler: Any | None = None
+        self._acp_supervisor: Any | None = None
+        self._acp_startup_failure_type: str | None = None
         self._stop_lock = threading.Lock()
         self._automatic_maintenance_status: dict[str, Any] | None = None
 
@@ -575,24 +527,9 @@ class TendwireDaemon:
                 socket_group=self.config.socket_group,
             )
             if self.hooks.init_store is _default_init_store:
-                _default_init_store(
-                    Path(self.config.db_path),
-                    connector_ack_ttl_seconds=(
-                        self.config.connector_ack_ttl_seconds
-                    ),
-                )
+                _default_init_store(Path(self.config.db_path))
             else:
                 self.hooks.init_store(Path(self.config.db_path))
-            self._connector_periodic_tick()
-            if self.config.herdr_backend == "socket":
-                self._snapshot = self._start_socket_event_backend()
-            else:
-                self._snapshot = self.hooks.observe_initial_snapshot(self.config)
-                self._after_snapshot_saved()
-
-            scheduler = self.hooks.turn_scheduler_factory(self.config)
-            self._turn_scheduler = scheduler
-
             api = TendwireDaemonAPI(
                 get_snapshot=self.get_snapshot,
                 get_health=self.get_health,
@@ -612,51 +549,27 @@ class TendwireDaemon:
                 prepare_parent=self._prepare_socket_parent,
                 periodic_callback=self._connector_periodic_tick,
             )
-            self._server = server
-            # Bind before ingestion starts. Managed store connections and the
-            # socket publisher lock the same parent directory, so allowing an
-            # initial refresh first can make the daemon deadlock with itself.
-            # Requests are not served until start() returns successfully.
+            # Bind before ACP runtime/consumer threads can take store locks.
+            # No connections are accepted until serve_forever(), after
+            # this startup transaction has succeeded.
             server.start()
+            self._connector_periodic_tick()
+            self._start_acp_supervisor()
+            from .store.sqlite import latest_snapshot
 
-            backend = self._event_backend
-            callback_setter = (
-                getattr(backend, "set_turn_refresh_callback", None)
-                if backend is not None
-                else None
+            self._snapshot = latest_snapshot(
+                Path(self.config.db_path), self.config.host_id
             )
-            if callable(callback_setter):
-                callback_setter(scheduler.request_refresh)
-            scheduler.start()
-            scheduler.request_refresh()
+            if self._snapshot is None:
+                raise RuntimeError("ACP supervisor did not publish a lifecycle snapshot")
+            self._after_snapshot_saved()
+            self._server = server
+
         except Exception:
             self.stop_event.set()
-            backend = self._event_backend
-            callback_setter = (
-                getattr(backend, "set_turn_refresh_callback", None)
-                if backend is not None
-                else None
-            )
-            if callable(callback_setter):
-                try:
-                    callback_setter(None)
-                except Exception:
-                    pass
-            scheduler = self._turn_scheduler
-            self._turn_scheduler = None
-            if scheduler is not None:
-                try:
-                    scheduler.stop(
-                        flush_timeout_seconds=self.config.herdr_timeout_seconds + 1.0
-                    )
-                except Exception:
-                    pass
-            self._event_backend = None
-            if backend is not None:
-                try:
-                    backend.stop()
-                except Exception:
-                    pass
+            supervisor = self._acp_supervisor
+            self._acp_supervisor = None
+            self._stop_acp_supervisor(supervisor)
             self._server = None
             if server is not None:
                 try:
@@ -690,11 +603,9 @@ class TendwireDaemon:
         with self._stop_lock:
             self.stop_event.set()
             server = self._server
-            backend = self._event_backend
-            scheduler = self._turn_scheduler
+            supervisor = self._acp_supervisor
             self._server = None
-            self._event_backend = None
-            self._turn_scheduler = None
+            self._acp_supervisor = None
 
         if server is not None:
             try:
@@ -702,33 +613,121 @@ class TendwireDaemon:
             except Exception:
                 pass
 
-        if backend is not None:
-            flush = getattr(backend, "flush", None)
-            if callable(flush):
-                try:
-                    flush()
-                except Exception:
-                    pass
-            callback_setter = getattr(backend, "set_turn_refresh_callback", None)
-            if callable(callback_setter):
-                try:
-                    callback_setter(None)
-                except Exception:
-                    pass
+        self._stop_acp_supervisor(supervisor)
 
-        if scheduler is not None:
+    def _start_acp_supervisor(self) -> None:
+        """Start the required ACP supervisor and fail the daemon closed."""
+        self._acp_startup_failure_type = None
+
+        factory = self.hooks.acp_supervisor_factory
+        if factory is None:
+            raise RuntimeError("ACP supervisor is required but unavailable")
+
+        supervisor: Any | None = None
+        try:
+            supervisor = factory(self.config, self.stop_event)
+            if supervisor is None:
+                raise RuntimeError("ACP supervisor is required but unavailable")
+            self._acp_supervisor = supervisor
+            supervisor.start()
+            health = self._acp_supervisor_health()
+            if health["healthy"] is not True:
+                failure_type = health.get("failure_type")
+                self._acp_startup_failure_type = _public_failure_type(failure_type)
+                raise RuntimeError("ACP supervisor did not become healthy")
+        except Exception as exc:
+            self._acp_startup_failure_type = (
+                self._acp_startup_failure_type or type(exc).__name__
+            )
+            if supervisor is not None:
+                self._stop_acp_supervisor(supervisor)
+            self._acp_supervisor = None
+            raise RuntimeError(
+                "ACP supervisor is required but failed to start "
+                f"({self._acp_startup_failure_type})"
+            ) from None
+
+    def _stop_acp_supervisor(self, supervisor: Any | None) -> None:
+        """Best-effort bounded shutdown for the ACP supervisor."""
+        if supervisor is None:
+            return
+        timeout = self.config.acp_shutdown_timeout_seconds
+        stop = getattr(supervisor, "stop", None)
+        if callable(stop):
             try:
-                scheduler.stop(
-                    flush_timeout_seconds=self.config.herdr_timeout_seconds + 1.0
-                )
+                stop(timeout=timeout)
+            except Exception:
+                pass
+        join = getattr(supervisor, "join", None)
+        if callable(join):
+            try:
+                join(timeout=timeout)
             except Exception:
                 pass
 
-        if backend is not None:
-            try:
-                backend.stop()
-            except Exception:
-                pass
+    def _acp_supervisor_health(self) -> dict[str, Any]:
+        """Return a fixed, public-safe ACP lifecycle aggregate."""
+        counters = {
+            "updates_ingested": 0,
+            "permissions_ingested": 0,
+            "permissions_selected": 0,
+            "permissions_cancelled": 0,
+            "invalid_permission_selections": 0,
+            "prompts_started": 0,
+            "prompts_completed": 0,
+            "prompts_failed": 0,
+            "cancellation_requests": 0,
+        }
+        supervisor = self._acp_supervisor
+        if supervisor is None:
+            return {
+                "required": True,
+                "status": "unavailable",
+                "healthy": False,
+                "state": "unavailable",
+                "failure_type": self._acp_startup_failure_type,
+                "counters": counters,
+            }
+
+        status_method = getattr(supervisor, "status", None)
+        try:
+            raw = status_method() if callable(status_method) else None
+        except Exception as exc:
+            return {
+                "required": True,
+                "status": "degraded",
+                "healthy": False,
+                "state": "failed",
+                "failure_type": type(exc).__name__,
+                "counters": counters,
+            }
+
+        def field(name: str) -> Any:
+            if isinstance(raw, Mapping):
+                return raw.get(name)
+            return getattr(raw, name, None)
+
+        state_value = field("state")
+        state = getattr(state_value, "value", state_value)
+        if state not in {"new", "starting", "running", "stopping", "stopped", "failed"}:
+            state = "unknown"
+        healthy = field("healthy") is True and state == "running"
+        for key in counters:
+            counters[key] = _nonnegative_int(field(key))
+        failure_type_value = field("failure_type")
+        failure_type = _public_failure_type(failure_type_value)
+        return {
+            "required": True,
+            "status": "healthy" if healthy else "degraded",
+            "healthy": healthy,
+            "state": state,
+            "failure_type": failure_type,
+            "last_reconcile_at": _valid_observation_timestamp(
+                field("last_reconcile_at")
+            ),
+            "worker_count": _nonnegative_int(field("worker_count")),
+            "counters": counters,
+        }
 
     def _after_snapshot_saved(self) -> None:
         if self.config.db_path is None:
@@ -748,7 +747,8 @@ class TendwireDaemon:
             result = maybe_run_automatic_store_maintenance(
                 Path(self.config.db_path),
                 policy=policy,
-                turn_model=self.config.turn_model,
+                agent_event_host_id=self.config.host_id,
+                agent_event_retention_days=self.config.event_retention_days,
                 acknowledged_final_retention_days=(
                     self.config.acknowledged_final_retention_days
                 ),
@@ -777,6 +777,12 @@ class TendwireDaemon:
                 )
             snapshot_result = result.get("snapshot")
             snapshot_counts = snapshot_result if isinstance(snapshot_result, Mapping) else {}
+            agent_event_result = result.get("agent_events")
+            agent_event_counts = (
+                agent_event_result
+                if isinstance(agent_event_result, Mapping)
+                else {}
+            )
             maintenance_status = {
                 "ok": bool(result.get("ok")) and bool(turn_change_result.get("ok")),
                 "status": (
@@ -788,6 +794,15 @@ class TendwireDaemon:
                 "examined": int(snapshot_counts.get("examined") or 0),
                 "deleted": int(snapshot_counts.get("deleted") or 0),
                 "remaining_candidates": bool(snapshot_counts.get("remaining_candidates")),
+                "agent_events_examined": int(
+                    agent_event_counts.get("examined") or 0
+                ),
+                "agent_events_deleted": int(
+                    agent_event_counts.get("deleted") or 0
+                ),
+                "agent_events_remaining_candidates": bool(
+                    agent_event_counts.get("remaining_candidates")
+                ),
             }
         except Exception:
             self._automatic_maintenance_status = {
@@ -797,47 +812,12 @@ class TendwireDaemon:
                 "examined": 0,
                 "deleted": 0,
                 "remaining_candidates": False,
+                "agent_events_examined": 0,
+                "agent_events_deleted": 0,
+                "agent_events_remaining_candidates": False,
             }
         else:
             self._automatic_maintenance_status = maintenance_status
-
-    def _start_socket_event_backend(self) -> Snapshot:
-        if self.hooks.event_backend_factory is None:
-            from .backends.herdr_events import HerdrEventBackend
-
-            backend = HerdrEventBackend(self.config, stop_event=self.stop_event)
-        else:
-            backend = self.hooks.event_backend_factory(self.config, self.stop_event)
-        self._event_backend = backend
-        backend.start(wait_for_reconcile=True)
-        from .store.sqlite import SnapshotObservationContext, latest_snapshot, save_snapshot
-
-        snapshot = latest_snapshot(Path(self.config.db_path), self.config.host_id)
-        if snapshot is not None:
-            return snapshot
-        from .backends.herdr_cli import herdr_backend_health
-        from .core.projector import project_from_observations
-
-        backend_health = (
-            backend.health.to_backend_health()
-            if hasattr(backend, "health")
-            else herdr_backend_health("unknown")
-        )
-        snapshot = project_from_observations(
-            self.config,
-            backend_health=[backend_health],
-        )
-        save_snapshot(
-            Path(self.config.db_path),
-            snapshot,
-            turn_model=self.config.turn_model,
-            observation=SnapshotObservationContext(
-                authority="none",
-                observed_at=_valid_observation_timestamp(backend_health.observed_at),
-            ),
-        )
-        self._after_snapshot_saved()
-        return snapshot
 
     def get_snapshot(self) -> Snapshot:
         if self.config.db_path is not None:
@@ -955,11 +935,15 @@ class TendwireDaemon:
             and command_requests_valid
             and maintenance_valid
         )
-        backend_runtime: dict[str, Any] = {}
-        if self._event_backend is not None and hasattr(self._event_backend, "operational_status"):
-            status_value = getattr(self._event_backend, "operational_status")
-            if isinstance(status_value, Mapping):
-                backend_runtime = dict(status_value)
+        acp_health = self._acp_supervisor_health()
+        backend_runtime: dict[str, Any] = {
+            "status": "healthy" if acp_health["healthy"] else "degraded",
+            "outcome": "healthy_non_empty" if acp_health.get("worker_count", 0) else "empty_healthy",
+            "ready": acp_health["healthy"],
+            "running": acp_health.get("state") == "running",
+            "last_reconcile_at": acp_health.get("last_reconcile_at"),
+            "reconcile_enabled": True,
+        }
         backend_maintenance = backend_runtime.get("automatic_maintenance")
         runtime_maintenance = (
             backend_maintenance
@@ -1006,10 +990,10 @@ class TendwireDaemon:
                 if store_ok
                 and not maintenance_degraded
                 and pending_ingestion["status"] == "healthy"
+                and acp_health["healthy"] is True
                 else "degraded"
             ),
             "host_id": self.config.host_id,
-            "turn_model": self.config.turn_model,
             "daemon": {
                 "status": "healthy",
                 "started_at": self.started_at,
@@ -1044,21 +1028,13 @@ class TendwireDaemon:
                 "outcome": backend_runtime.get("outcome"),
                 "ready": backend_runtime.get("ready"),
                 "running": backend_runtime.get("running"),
-                "reconcile_enabled": backend_runtime.get(
-                    "reconcile_enabled",
-                    self.config.reconcile_interval_seconds > 0,
-                ),
+                "reconcile_enabled": backend_runtime["reconcile_enabled"],
             },
-            "turn_ingestion": _turn_ingestion_health(
-                self.config,
-                self._turn_scheduler,
-            ),
+            "acp": acp_health,
             "pending_ingestion": pending_ingestion,
             "limits": {
-                "event_debounce_seconds": self.config.event_debounce_seconds,
                 "reconcile_interval_seconds": self.config.reconcile_interval_seconds,
                 "event_retention_days": self.config.event_retention_days,
-                "output_excerpt_chars": self.config.output_excerpt_chars,
                 "max_workers": self.config.max_workers,
                 "max_outbox_attempts": self.config.max_outbox_attempts,
                 "outbox_claim_ttl_seconds": self.config.connector_claim_ttl_seconds,
@@ -1138,8 +1114,6 @@ class TendwireDaemon:
             limit=limit,
             cursor=cursor,
             since=since,
-            turn_refresh_interval_seconds=self.config.turn_refresh_interval_seconds,
-            turn_model=self.config.turn_model,
         )
 
     def get_turn_content(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1164,7 +1138,6 @@ class TendwireDaemon:
             field=params.get("field"),
             cursor=params.get("cursor"),
             schema_version=params.get("schema_version", 1),
-            turn_model=self.config.turn_model,
         )
 
     def get_turn_delta(
@@ -1191,7 +1164,6 @@ class TendwireDaemon:
             watermark=watermark,
             cursor=cursor,
             limit=limit,
-            turn_model=self.config.turn_model,
         )
 
     def connector_call(self, method: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1216,7 +1188,6 @@ class TendwireDaemon:
             max_lease_seconds=self.config.connector_max_claim_ttl_seconds,
             ack_ttl_seconds=self.config.connector_ack_ttl_seconds,
             max_attempts=self.config.max_outbox_attempts,
-            turn_model=self.config.turn_model,
         ).dispatch(method, params)
 
     def _connector_periodic_tick(self) -> None:
@@ -1254,7 +1225,21 @@ class TendwireDaemon:
             sort_keys=True,
             separators=(",", ":"),
         )
-        return self.hooks.submit_command(self.config, payload)
+        supervisor = self._acp_supervisor
+        route = getattr(supervisor, "prompt_route", None)
+        permission_router = (
+            supervisor
+            if callable(getattr(supervisor, "answer_permission_decision", None))
+            else None
+        )
+        from .command_submission import submit_command
+
+        return submit_command(
+            self.config,
+            payload,
+            acp_prompt_router=route if callable(route) else None,
+            acp_permission_router=permission_router,
+        )
 
 
 def run_daemon(

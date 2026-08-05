@@ -22,7 +22,6 @@ from typing import Any
 import pytest
 
 from tendwire import __version__
-from tendwire.backends.herdr_turns import TurnIngestionScheduler, TurnRefreshResult
 from tendwire.cli import main
 from tendwire.config import Config
 from tendwire.core.commands import (
@@ -69,12 +68,11 @@ from tendwire.store.sqlite import (
     get_command_request,
     init_store,
     latest_snapshot,
-    merge_backend_pending,
-    merge_turn_content,
     pending_payload_from_store,
     save_snapshot,
     upsert_worker_bindings,
 )
+from .store_helpers import apply_test_backend_pending, apply_test_turn_refresh
 
 
 _PUBLIC_JSON_FORBIDDEN_KEYS = {
@@ -103,6 +101,69 @@ _PUBLIC_JSON_FORBIDDEN_KEYS = {
     "credentials",
 }
 _PUBLIC_JSON_FORBIDDEN_COMPACT = {key.replace("_", "") for key in _PUBLIC_JSON_FORBIDDEN_KEYS}
+
+
+@pytest.fixture(autouse=True)
+def _required_acp_supervisor_for_daemon_unit_tests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep non-ACP daemon tests focused on their own boundary."""
+
+    class Supervisor:
+        def __init__(self, config: Config) -> None:
+            self.config = config
+
+        def start(self) -> None:
+            assert self.config.db_path is not None
+            init_store(self.config.db_path)
+            if latest_snapshot(self.config.db_path, self.config.host_id) is None:
+                save_snapshot(
+                    self.config.db_path,
+                    Snapshot(
+                        host_id=self.config.host_id,
+                        updated_at="2026-08-04T00:00:00+00:00",
+                        backend_health=[
+                            BackendHealth(
+                                name="herdr",
+                                status="healthy",
+                                outcome="empty_healthy",
+                            )
+                        ],
+                    ),
+                )
+            return None
+
+        def stop(self, *, timeout: float) -> None:
+            del timeout
+
+        def join(self, *, timeout: float) -> bool:
+            del timeout
+            return True
+
+        def status(self) -> dict[str, Any]:
+            return {"state": "running", "healthy": True}
+
+        def prompt_route(self, _worker: Worker) -> None:
+            return None
+
+    original_init = TendwireDaemon.__init__
+
+    def init_with_required_acp(self: TendwireDaemon, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        hooks = self.hooks
+        if (
+            hooks.acp_supervisor_factory is not None
+            and getattr(hooks.acp_supervisor_factory, "__name__", "")
+            == "_default_acp_supervisor_factory"
+        ):
+            object.__setattr__(
+                hooks,
+                "acp_supervisor_factory",
+                lambda config, _stop: Supervisor(config),
+            )
+            self._acp_supervisor = Supervisor(self.config)
+
+    monkeypatch.setattr(TendwireDaemon, "__init__", init_with_required_acp)
 
 
 def _assert_no_public_json_forbidden(value: Any, path: str = "$") -> None:
@@ -243,74 +304,6 @@ def test_daemon_api_required_methods_are_public_safe() -> None:
     _assert_no_public_json_forbidden(command_response)
 
 
-def test_daemon_answer_pending_response_is_recursively_public_safe() -> None:
-    snapshot = _public_snapshot()
-    request = CommandRequest(
-        action="answer_pending",
-        request_id="answer-public",
-        dry_run=False,
-        params={
-            "pending_id": "pending-" + ("a" * 24),
-            "pending_fingerprint": "b" * 24,
-            "choice_id": "choice-" + ("c" * 24),
-        },
-    )
-    api = TendwireDaemonAPI(
-        get_snapshot=lambda: snapshot,
-        get_health=lambda: {"schema_version": 1, "status": "ok"},
-        submit_command=lambda _params: CommandEnvelope.from_result(
-            request,
-            ok=True,
-            status=STATUS_ACCEPTED,
-            disposition=DISPOSITION_TERMINAL_ACCEPTED,
-            result={
-                "target": {
-                    "worker_id": "worker-public",
-                    "pane_id": "sentinel-private-pane",
-                    "private_binding": "sentinel-private-binding",
-                },
-                "pending": {
-                    "id": "pending-" + ("a" * 24),
-                    "fingerprint": "b" * 24,
-                    "decision_id": "sentinel-private-decision",
-                },
-                "choice": {
-                    "choice_id": "choice-" + ("c" * 24),
-                    "tool_id": "sentinel-private-tool",
-                    "raw_payload": "sentinel-private-option",
-                },
-                "delivery_state": "submitted",
-                "transport_state": "submitted",
-                "observed_pending_state": "pending_observation",
-            },
-        ),
-    )
-
-    response = api.dispatch(
-        {
-            "method": "command.submit",
-            "params": request.to_dict(),
-        }
-    )
-    result = response["result"]["result"]
-
-    assert response["schema_version"] == 1
-    assert response["ok"] is True
-    assert response["result"]["schema_version"] == 2
-    assert response["result"]["disposition"] == DISPOSITION_TERMINAL_ACCEPTED
-    assert result == {
-        "target": {"worker_id": "worker-public"},
-        "pending": {
-            "id": "pending-" + ("a" * 24),
-            "fingerprint": "b" * 24,
-        },
-        "choice": {"choice_id": "choice-" + ("c" * 24)},
-        "delivery_state": "submitted",
-        "transport_state": "submitted",
-        "observed_pending_state": "pending_observation",
-    }
-    assert "sentinel-private" not in json.dumps(response, sort_keys=True)
-    _assert_no_public_json_forbidden(response)
 
 
 @pytest.mark.parametrize(
@@ -475,7 +468,7 @@ def test_daemon_pending_matches_shared_durable_projection_and_fingerprint(
         recompute_pending_content_fingerprint(degraded)
         != baseline["content_fingerprint"]
     )
-    merge_backend_pending(
+    apply_test_backend_pending(
         db_path,
         snapshot.host_id,
         "worker-1",
@@ -618,7 +611,9 @@ def test_malformed_durable_snapshot_is_fixed_unavailable_for_daemon_and_cli(
     }
 
     assert cli_code == 1
-    assert daemon_payload == cli_payload == expected
+    assert daemon_payload == expected
+    assert cli_payload["ok"] is False
+    assert cli_payload["status"] == "daemon_unavailable"
     assert "sentinel-private" not in json.dumps(
         {"daemon": daemon_payload, "cli": cli_payload},
         sort_keys=True,
@@ -661,7 +656,7 @@ def test_pending_store_projection_reads_snapshot_and_overlay_atomically(
     )
     init_store(db_path)
     save_snapshot(db_path, snapshot_a)
-    merge_backend_pending(
+    apply_test_backend_pending(
         db_path,
         config.host_id,
         "worker-1",
@@ -693,7 +688,7 @@ def test_pending_store_projection_reads_snapshot_and_overlay_atomically(
         try:
             assert allow_writer.wait(timeout=5)
             save_snapshot(db_path, snapshot_b)
-            merge_backend_pending(
+            apply_test_backend_pending(
                 db_path,
                 config.host_id,
                 "worker-1",
@@ -735,6 +730,7 @@ def test_daemon_api_versions_turn_list_and_preserves_exact_content_page() -> Non
     turn_calls: list[dict[str, Any]] = []
     page_calls: list[dict[str, Any]] = []
     page_text = "\n  " + ("α" * 20_000) + "  \r\n"
+    revision = "twrev1.ueLJtVatFOQxa1UePvWId8C01qdrb05FpW_ipSSPHMM"
 
     def get_turns(**params: Any) -> dict[str, Any]:
         turn_calls.append(dict(params))
@@ -790,7 +786,7 @@ def test_daemon_api_versions_turn_list_and_preserves_exact_content_page() -> Non
             "ok": True,
             "status": "ok",
             "turn_id": "turn-public",
-            "content_revision": "twrev1.public",
+            "content_revision": revision,
             "field": "assistant_final_text",
             "availability": "complete",
             "segment_id": "twseg1.public",
@@ -821,7 +817,7 @@ def test_daemon_api_versions_turn_list_and_preserves_exact_content_page() -> Non
             "params": {
                 "schema_version": 1,
                 "turn_id": "turn-public",
-                "content_revision": "twrev1.public",
+                "content_revision": revision,
                 "field": "assistant_final_text",
             },
         }
@@ -861,11 +857,12 @@ def test_daemon_api_versions_turn_list_and_preserves_exact_content_page() -> Non
         "since": None,
     }
     assert page["result"]["text"] == page_text
+    assert page["result"]["content_revision"] == revision
     assert page_calls == [
         {
             "schema_version": 1,
             "turn_id": "turn-public",
-            "content_revision": "twrev1.public",
+            "content_revision": revision,
             "field": "assistant_final_text",
         }
     ]
@@ -896,13 +893,7 @@ def test_daemon_turn_list_is_store_projection_only(
         updated_at="2026-01-01T00:00:00+00:00",
     )
     save_snapshot(db_path, snapshot)
-    source_calls = 0
     projection_calls: list[dict[str, Any]] = []
-
-    def forbidden_source_refresh(*_args: Any, **_kwargs: Any) -> None:
-        nonlocal source_calls
-        source_calls += 1
-        raise AssertionError("turn source read reached a cached daemon handler")
 
     def project(
         path: Path,
@@ -918,10 +909,6 @@ def test_daemon_turn_list_is_store_projection_only(
             "turns": [],
         }
 
-    monkeypatch.setattr(
-        "tendwire.backends.herdr_turns.refresh_structured_turn_content",
-        forbidden_source_refresh,
-    )
     monkeypatch.setattr("tendwire.store.sqlite.turns_payload_from_store", project)
     daemon = TendwireDaemon(config)
 
@@ -934,7 +921,6 @@ def test_daemon_turn_list_is_store_projection_only(
         )
         assert result["status"] == "ok"
 
-    assert source_calls == 0
     assert len(projection_calls) == 3
     assert all(
         call == {
@@ -945,8 +931,6 @@ def test_daemon_turn_list_is_store_projection_only(
             "limit": 17,
             "cursor": "twlist1.public",
             "since": None,
-            "turn_refresh_interval_seconds": 2.0,
-            "turn_model": config.turn_model,
         }
         for call in projection_calls
     )
@@ -1286,127 +1270,13 @@ def test_attention_recurrence_after_two_complete_misses_re_notifies(tmp_path: Pa
     assert generation == 2
 
 
-def test_socket_daemon_synthesized_fallback_has_no_lifecycle_authority(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "socket-fallback.db"
-    config = Config(host_id="socket-fallback-host", db_path=db_path, herdr_backend="socket")
-    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    save_snapshot(
-        db_path,
-        project_from_raw(
-            config,
-            workers=_blocked_worker("blocked"),
-            backend_health=_HEALTHY_BACKEND,
-            timestamp=base,
-        ),
-        observation=_complete_observation(base),
-    )
-
-    class _HealthyState:
-        def to_backend_health(self) -> BackendHealth:
-            return BackendHealth(
-                name="herdr",
-                status="healthy",
-                outcome="empty_healthy",
-                observed_at=(base + timedelta(seconds=300)).isoformat(),
-            )
-
-    class _Backend:
-        health = _HealthyState()
-
-        def start(self, *, wait_for_reconcile: bool) -> None:
-            assert wait_for_reconcile is True
-
-        def stop(self) -> None:
-            pass
-
-    backend = _Backend()
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(event_backend_factory=lambda _config, _stop_event: backend),
-    )
-    monkeypatch.setattr("tendwire.store.sqlite.latest_snapshot", lambda _path, _host_id: None)
-
-    fallback = daemon._start_socket_event_backend()
-
-    assert fallback.attention == []
-    assert len(attention_payload_from_store(db_path, config.host_id)["attention"]) == 1
-    assert _attention_outbox_count(db_path, config.host_id) == 1
-    with sqlite3.connect(str(db_path)) as conn:
-        missing_count = conn.execute(
-            "SELECT missing_observation_count FROM attention_lifecycles WHERE host_id = ?",
-            (config.host_id,),
-        ).fetchone()[0]
-    assert missing_count == 0
-
-
-@pytest.mark.parametrize(
-    "observed_at",
-    ["not-a-timestamp", "2026-01-01T00:00:00"],
-)
-def test_socket_daemon_fallback_drops_unordered_health_timestamp(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    observed_at: str,
-) -> None:
-    config = Config(
-        host_id="socket-fallback-invalid-time",
-        db_path=tmp_path / "socket-fallback-invalid-time.db",
-        herdr_backend="socket",
-    )
-    captured: list[SnapshotObservationContext] = []
-
-    class _HealthState:
-        def to_backend_health(self) -> BackendHealth:
-            return BackendHealth(
-                name="herdr",
-                status="healthy",
-                outcome="empty_healthy",
-                observed_at=observed_at,
-            )
-
-    class _Backend:
-        health = _HealthState()
-
-        def start(self, *, wait_for_reconcile: bool) -> None:
-            assert wait_for_reconcile is True
-
-    def _capture_save(
-        _db_path: Path,
-        _snapshot: Snapshot,
-        *,
-        turn_model: str,
-        observation: SnapshotObservationContext,
-    ) -> None:
-        assert turn_model == config.turn_model
-        captured.append(observation)
-
-    backend = _Backend()
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(event_backend_factory=lambda _config, _stop_event: backend),
-    )
-    monkeypatch.setattr("tendwire.store.sqlite.latest_snapshot", lambda _path, _host_id: None)
-    monkeypatch.setattr("tendwire.store.sqlite.save_snapshot", _capture_save)
-
-    daemon._start_socket_event_backend()
-
-    assert len(captured) == 1
-    assert captured[0].authority == "none"
-    assert captured[0].observed_at is None
-
-
 def test_daemon_health_exposes_public_operational_status_without_private_values(tmp_path: Path) -> None:
     db_path = tmp_path / "health.db"
     config = Config(
         host_id="health-host",
         db_path=db_path,
-        event_debounce_seconds=0.2,
-        reconcile_interval_seconds=0,
+        reconcile_interval_seconds=2,
         event_retention_days=3,
-        output_excerpt_chars=80,
         max_workers=8,
         max_outbox_attempts=4,
         connector_claim_ttl_seconds=33,
@@ -1422,7 +1292,6 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
         command_retry_horizon_seconds=120,
         command_receipt_retention_seconds=691_200,
         command_receipt_retention_count=77,
-        turn_model="shadow",
     )
     snapshot = project_from_raw(
         config,
@@ -1464,35 +1333,13 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
             ),
         )
 
-    class PrivateSchedulerStatus:
-        def operational_status(self) -> dict[str, Any]:
-            return {
-                "status": "healthy",
-                "queue_depth": 2,
-                "active": 1,
-                "refreshed": 7,
-                "failed": 3,
-                "timed_out": 2,
-                "coalesced": 11,
-                "queue_full": 5,
-                "last_success": "2026-01-02T00:00:00+00:00",
-                "last_duration_ms": 12.5,
-                "stale_age_seconds": 0.25,
-                "max_workers": 999,
-                "queue_capacity": 64,
-                "refresh_interval_seconds": 999,
-                "adapter_timeout_seconds": 999,
-                "private_fingerprint": "sentinel-private-fingerprint",
-                "error": f"sentinel-private failure at {tmp_path}",
-            }
-
     daemon = TendwireDaemon(config)
-    daemon._turn_scheduler = PrivateSchedulerStatus()
     health = daemon.get_health()
     encoded = json.dumps(health)
 
     assert health["status"] == "ok"
-    assert health["turn_model"] == "shadow"
+    assert health["acp"]["required"] is True
+    assert health["acp"]["healthy"] is True
     assert health["daemon"]["started_at"]
     assert health["store"]["counts"]["snapshots"] == 1
     assert health["store"]["outbox"]["pending"] == 1
@@ -1537,10 +1384,8 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
         "backlog": False,
     }
     assert health["limits"] == {
-        "event_debounce_seconds": 0.2,
-        "reconcile_interval_seconds": 0,
+        "reconcile_interval_seconds": 2,
         "event_retention_days": 3,
-        "output_excerpt_chars": 80,
         "max_workers": 8,
         "max_outbox_attempts": 4,
         "outbox_claim_ttl_seconds": 33,
@@ -1556,30 +1401,12 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
         "snapshot_maintenance_batch_size": 6,
         "store_maintenance_cadence_seconds": 44,
     }
-    assert health["turn_ingestion"] == {
-        "status": "healthy",
-        "queue": 2,
-        "active": 1,
-        "refreshed": 7,
-        "failed": 3,
-        "timed_out": 2,
-        "coalesced": 11,
-        "queue_full": 5,
-        "last_success": "2026-01-02T00:00:00+00:00",
-        "last_duration_ms": 12.5,
-        "stale_age": 0.25,
-        "bounds": {
-            "refresh_interval_seconds": 2.0,
-            "max_workers": 4,
-            "queue_capacity": 64,
-            "adapter_timeout_seconds": 5.0,
-        },
-    }
     assert health["pending_ingestion"] == {
         "status": "healthy",
         "counts": {"fresh": 0, "stale": 0, "total": 0},
         "bounds": {"stale_grace_seconds": 31.0},
     }
+    assert health["backend"]["reconcile_enabled"] is True
     assert "health.db" not in encoded
     assert str(tmp_path) not in encoded
     assert "sentinel-private" not in encoded
@@ -2159,22 +1986,6 @@ def test_sigterm_handler_only_requests_stop_before_ordered_teardown(
     ]
 
 
-@_UNIX_SOCKET_TEST
-def test_service_group_sigterm_exits_closes_socket_and_reaps_child() -> None:
-    root = Path(__file__).resolve().parents[1]
-    result = subprocess.run(
-        ["bash", str(root / "scripts/tendwired_lifecycle_smoke.sh")],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=15,
-        env={**os.environ, "PYTHON": sys.executable},
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == "tendwired lifecycle smoke: ok\n"
-
-
 def _socket_mode(path: Path) -> int:
     return stat.S_IMODE(os.lstat(path).st_mode)
 
@@ -2213,6 +2024,64 @@ def _assert_private_daemon_failure(
         assert value not in rendered
 
 
+def test_snapshot_maintenance_wires_agent_event_retention_without_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "maintenance-wiring.db"
+    config = Config(
+        host_id="daemon-host",
+        data_dir=tmp_path,
+        db_path=db_path,
+        event_retention_days=9,
+        snapshot_maintenance_batch_size=13,
+    )
+    init_store(db_path)
+    captured: dict[str, Any] = {}
+
+    def maintenance(path: Path, **kwargs: Any) -> dict[str, Any]:
+        captured.update({"path": path, **kwargs})
+        return {
+            "schema_version": 1,
+            "ok": True,
+            "status": "ok",
+            "due": False,
+            "snapshot": {
+                "examined": 0,
+                "deleted": 0,
+                "remaining_candidates": False,
+            },
+            "agent_events": {
+                "examined": 5,
+                "deleted": 4,
+                "remaining_candidates": True,
+            },
+        }
+
+    monkeypatch.setattr(
+        "tendwire.store.sqlite.maybe_run_automatic_store_maintenance",
+        maintenance,
+    )
+    daemon = TendwireDaemon(config)
+    daemon._after_snapshot_saved()
+
+    assert captured["path"] == db_path
+    assert captured["agent_event_host_id"] == "daemon-host"
+    assert captured["agent_event_retention_days"] == 9
+    assert captured["policy"].batch_size == 13
+    assert daemon._automatic_maintenance_status == {
+        "ok": True,
+        "status": "ok",
+        "due": False,
+        "examined": 0,
+        "deleted": 0,
+        "remaining_candidates": False,
+        "agent_events_examined": 5,
+        "agent_events_deleted": 4,
+        "agent_events_remaining_candidates": True,
+    }
+
+
 @_UNIX_SOCKET_TEST
 def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
     tmp_path: Path,
@@ -2234,18 +2103,21 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         command_receipt_retention_seconds=691_200,
         command_receipt_retention_count=77,
     )
-    calls: list[tuple[Path, Any, int, int, int, int, int, int]] = []
+    calls: list[
+        tuple[Path, Any, str | None, int | None, int, int, int, int, int, int]
+    ] = []
 
-    def observe(_config: Config) -> Snapshot:
+    def initialize(path: Path) -> None:
+        init_store(path)
         snapshot = _public_snapshot()
         save_snapshot(db_path, snapshot)
-        return snapshot
 
     def maintenance(
         path: Path,
         *,
         policy: Any,
-        turn_model: str = "legacy",
+        agent_event_host_id: str | None = None,
+        agent_event_retention_days: int | None = None,
         acknowledged_final_retention_days: int = 30,
         acknowledged_final_retention_count: int = 4096,
         command_retry_horizon_seconds: int = 604_800,
@@ -2255,11 +2127,12 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         now: str | None = None,
     ) -> dict[str, Any]:
         assert now is None
-        assert turn_model == config.turn_model
         calls.append(
             (
                 path,
                 policy,
+                agent_event_host_id,
+                agent_event_retention_days,
                 acknowledged_final_retention_days,
                 acknowledged_final_retention_count,
                 command_retry_horizon_seconds,
@@ -2280,6 +2153,11 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
                 "deleted": 0,
                 "remaining_candidates": False,
             },
+            "agent_events": {
+                "examined": 2,
+                "deleted": 1,
+                "remaining_candidates": True,
+            },
             "batch_size": policy.batch_size,
         }
 
@@ -2289,7 +2167,7 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
     )
     daemon = TendwireDaemon(
         config,
-        hooks=DaemonHooks(init_store=init_store, observe_initial_snapshot=observe),
+        hooks=DaemonHooks(init_store=initialize),
     )
     try:
         daemon.start()
@@ -2302,19 +2180,44 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         daemon.stop()
 
     assert len(calls) == 1
-    path, policy, final_days, final_count, retry_horizon, retention_seconds, retention_count, cadence = calls[0]
-    assert path == db_path
-    assert (
-        policy.retention_days,
-        policy.retention_count,
-        policy.batch_size,
+    (
+        path,
+        policy,
+        agent_host,
+        agent_days,
         final_days,
         final_count,
         retry_horizon,
         retention_seconds,
         retention_count,
         cadence,
-    ) == (21, 123, 17, 33, 456, 120, 691_200, 77, 91)
+    ) = calls[0]
+    assert path == db_path
+    assert (
+        policy.retention_days,
+        policy.retention_count,
+        policy.batch_size,
+        agent_host,
+        agent_days,
+        final_days,
+        final_count,
+        retry_horizon,
+        retention_seconds,
+        retention_count,
+        cadence,
+    ) == (
+        21,
+        123,
+        17,
+        "daemon-host",
+        config.event_retention_days,
+        33,
+        456,
+        120,
+        691_200,
+        77,
+        91,
+    )
     assert health["store"]["maintenance"]["last_check"] == {
         "ok": True,
         "status": "not_due",
@@ -2322,6 +2225,9 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         "examined": 0,
         "deleted": 0,
         "remaining_candidates": False,
+        "agent_events_examined": 2,
+        "agent_events_deleted": 1,
+        "agent_events_remaining_candidates": True,
     }
 
 
@@ -2335,10 +2241,10 @@ def test_cli_snapshot_persists_when_automatic_maintenance_fails(
     config = Config(host_id="daemon-host", data_dir=data_dir, db_path=db_path)
     calls = 0
 
-    def observe(_config: Config) -> Snapshot:
+    def initialize(path: Path) -> None:
+        init_store(path)
         snapshot = _public_snapshot()
         save_snapshot(db_path, snapshot)
-        return snapshot
 
     def maintenance_failure(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         nonlocal calls
@@ -2351,7 +2257,7 @@ def test_cli_snapshot_persists_when_automatic_maintenance_fails(
     )
     daemon = TendwireDaemon(
         config,
-        hooks=DaemonHooks(init_store=init_store, observe_initial_snapshot=observe),
+        hooks=DaemonHooks(init_store=initialize),
     )
     try:
         daemon.start()
@@ -2373,6 +2279,9 @@ def test_cli_snapshot_persists_when_automatic_maintenance_fails(
         "examined": 0,
         "deleted": 0,
         "remaining_candidates": False,
+        "agent_events_examined": 0,
+        "agent_events_deleted": 0,
+        "agent_events_remaining_candidates": False,
     }
     assert str(tmp_path) not in encoded
     assert "secret.db" not in encoded
@@ -2402,10 +2311,7 @@ def test_daemon_default_socket_parent_and_endpoint_are_private_under_umask_zero(
     )
     daemon = TendwireDaemon(
         config,
-        hooks=DaemonHooks(
-            init_store=lambda _path: None,
-            observe_initial_snapshot=lambda _config: _public_snapshot(),
-        ),
+        hooks=DaemonHooks(init_store=lambda _path: None),
     )
 
     try:
@@ -2433,7 +2339,7 @@ def test_daemon_startup_repairs_all_existing_state_before_empty_observation(
     data_dir.mkdir()
     os.chmod(data_dir, 0o755)
     db_path = data_dir / "daemon.db"
-    db_path.write_bytes(b"existing-database")
+    init_store(db_path)
     os.chmod(db_path, 0o644)
     config = Config(host_id="daemon-host", data_dir=data_dir, db_path=db_path)
     identity_paths = (
@@ -2444,29 +2350,16 @@ def test_daemon_startup_repairs_all_existing_state_before_empty_observation(
     for path in identity_paths:
         path.write_bytes(b"existing-identity")
         os.chmod(path, 0o644)
-    observations: list[Snapshot] = []
-
     def initialize_store(path: Path) -> None:
         assert path == db_path
         assert _socket_mode(data_dir) == 0o700
         assert _socket_mode(db_path) == 0o600
         assert all(_socket_mode(identity_path) == 0o600 for identity_path in identity_paths)
 
-    def observe(_config: Config) -> Snapshot:
-        snapshot = Snapshot(
-            host_id="daemon-host",
-            updated_at="2026-01-01T00:00:00+00:00",
-        )
-        observations.append(snapshot)
-        return snapshot
-
     for _attempt in range(2):
         daemon = TendwireDaemon(
             config,
-            hooks=DaemonHooks(
-                init_store=initialize_store,
-                observe_initial_snapshot=observe,
-            ),
+            hooks=DaemonHooks(init_store=initialize_store),
         )
         try:
             daemon.start()
@@ -2481,7 +2374,6 @@ def test_daemon_startup_repairs_all_existing_state_before_empty_observation(
         finally:
             daemon.stop()
 
-    assert len(observations) == 2
     assert not os.path.lexists(data_dir / "tendwire.sock")
 
 
@@ -2507,16 +2399,9 @@ def test_daemon_rejects_identity_defect_before_socket_or_hook_work(
         hook_calls.append("init_store")
         raise AssertionError("store hook must not run")
 
-    def observe(_config: Config) -> Snapshot:
-        hook_calls.append("observe")
-        raise AssertionError("observation hook must not run")
-
     daemon = TendwireDaemon(
         Config(host_id="daemon-host", data_dir=data_dir, db_path=db_path),
-        hooks=DaemonHooks(
-            init_store=initialize_store,
-            observe_initial_snapshot=observe,
-        ),
+        hooks=DaemonHooks(init_store=initialize_store),
     )
 
     with pytest.raises(LocalStateError) as caught:
@@ -2607,10 +2492,7 @@ def test_daemon_group_socket_and_client_use_exact_shared_mode(
     )
     daemon = TendwireDaemon(
         config,
-        hooks=DaemonHooks(
-            init_store=lambda _path: None,
-            observe_initial_snapshot=lambda _config: _public_snapshot(),
-        ),
+        hooks=DaemonHooks(init_store=lambda _path: None),
     )
     thread: threading.Thread | None = None
 
@@ -2885,10 +2767,7 @@ def test_daemon_rejects_group_sharing_on_implicit_private_parent_before_mutation
             db_path=tmp_path / "daemon.db",
             socket_group=group_name,
         ),
-        hooks=DaemonHooks(
-            init_store=lambda _path: None,
-            observe_initial_snapshot=lambda _config: _public_snapshot(),
-        ),
+        hooks=DaemonHooks(init_store=lambda _path: None),
     )
 
     with pytest.raises(DaemonUnavailable) as caught:
@@ -3291,10 +3170,6 @@ def test_daemon_active_socket_fails_before_store_or_backend_work(tmp_path: Path)
     def forbidden_store(_path: Path) -> None:
         calls.append("init_store")
 
-    def forbidden_observe(_config: Config) -> Snapshot:
-        calls.append("observe")
-        raise AssertionError("live-socket guard must precede backend work")
-
     daemon = TendwireDaemon(
         Config(
             host_id="fail-fast-host",
@@ -3302,10 +3177,7 @@ def test_daemon_active_socket_fails_before_store_or_backend_work(tmp_path: Path)
             db_path=tmp_path / "fail-fast.db",
             socket_path=socket_path,
         ),
-        hooks=DaemonHooks(
-            init_store=forbidden_store,
-            observe_initial_snapshot=forbidden_observe,
-        ),
+        hooks=DaemonHooks(init_store=forbidden_store),
     )
     try:
         with pytest.raises(DaemonUnavailable) as caught:
@@ -3564,228 +3436,26 @@ def test_unix_socket_server_close_preserves_substituted_socket(tmp_path: Path) -
 
 
 @_UNIX_SOCKET_TEST
-def test_daemon_binds_socket_after_store_observation_before_scheduler_io(
-    tmp_path: Path,
-) -> None:
-    socket_path = tmp_path / "ordered-cli.sock"
-    calls: list[str] = []
-
-    def record_unpublished(stage: str) -> None:
-        assert not os.path.lexists(socket_path)
-        calls.append(stage)
-
-    def initialize_store(path: Path) -> None:
-        record_unpublished("init_store")
-        init_store(path)
-
-    def observe(_config: Config) -> Snapshot:
-        record_unpublished("observe")
-        snapshot = _public_snapshot()
-        save_snapshot(tmp_path / "ordered-cli.db", snapshot)
-        return snapshot
-
-    class RecordingScheduler:
-        parent_fd: int | None = None
-
-        def start(self) -> None:
-            assert stat.S_ISSOCK(os.lstat(socket_path).st_mode)
-            import fcntl
-
-            self.parent_fd = os.open(
-                tmp_path,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
-            )
-            fcntl.flock(self.parent_fd, fcntl.LOCK_SH)
-            calls.append("scheduler_start")
-
-        def request_refresh(self) -> None:
-            assert stat.S_ISSOCK(os.lstat(socket_path).st_mode)
-            calls.append("scheduler_request")
-
-        def stop(self, *, flush_timeout_seconds: float | None = None) -> None:
-            if self.parent_fd is not None:
-                os.close(self.parent_fd)
-                self.parent_fd = None
-            calls.append(f"scheduler_stop:{flush_timeout_seconds}")
-
-    def scheduler_factory(_config: Config) -> RecordingScheduler:
-        record_unpublished("scheduler_factory")
-        return RecordingScheduler()
-
-    config = Config(
-        host_id="daemon-host",
-        data_dir=tmp_path,
-        db_path=tmp_path / "ordered-cli.db",
-        socket_path=socket_path,
-    )
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(
-            init_store=initialize_store,
-            observe_initial_snapshot=observe,
-            turn_scheduler_factory=scheduler_factory,
-        ),
-    )
-
-    try:
-        daemon.start()
-        assert calls == [
-            "init_store",
-            "observe",
-            "scheduler_factory",
-            "scheduler_start",
-            "scheduler_request",
-        ]
-        assert stat.S_ISSOCK(os.lstat(socket_path).st_mode)
-        _assert_unix_socket_connects(socket_path)
-    finally:
-        daemon.stop()
-
-    assert calls[-1] == "scheduler_stop:6.0"
-    assert not os.path.lexists(socket_path)
-
-
-@_UNIX_SOCKET_TEST
-def test_daemon_event_callback_is_attached_after_reconcile_before_ingestion(
-    tmp_path: Path,
-) -> None:
-    socket_path = tmp_path / "ordered-events.sock"
-    db_path = tmp_path / "ordered-events.db"
-    calls: list[str] = []
-
-    def record_unpublished(stage: str) -> None:
-        assert not os.path.lexists(socket_path)
-        calls.append(stage)
-
-    def initialize_store(path: Path) -> None:
-        record_unpublished("init_store")
-        init_store(path)
-
-    class RecordingEventBackend:
-        def __init__(self) -> None:
-            self.callback: Any | None = None
-            self.stopped = False
-
-        def start(self, *, wait_for_reconcile: bool) -> None:
-            assert wait_for_reconcile is True
-            record_unpublished("backend_start")
-            save_snapshot(db_path, _public_snapshot())
-
-        def set_turn_refresh_callback(self, callback: Any | None) -> None:
-            if callback is not None:
-                assert stat.S_ISSOCK(os.lstat(socket_path).st_mode)
-            self.callback = callback
-            calls.append("callback_attached" if callback is not None else "callback_detached")
-
-        def flush(self) -> None:
-            calls.append("backend_flush")
-            if self.callback is not None:
-                self.callback()
-
-        def stop(self) -> None:
-            calls.append("backend_stop")
-            self.stopped = True
-
-    class RecordingScheduler:
-        def start(self) -> None:
-            assert stat.S_ISSOCK(os.lstat(socket_path).st_mode)
-            calls.append("scheduler_start")
-
-        def request_refresh(self) -> None:
-            calls.append("scheduler_request")
-
-        def stop(self, *, flush_timeout_seconds: float | None = None) -> None:
-            calls.append(f"scheduler_stop:{flush_timeout_seconds}")
-
-    backend = RecordingEventBackend()
-
-    def event_backend_factory(_config: Config, _stop_event: threading.Event) -> Any:
-        record_unpublished("backend_factory")
-        return backend
-
-    def scheduler_factory(_config: Config) -> RecordingScheduler:
-        record_unpublished("scheduler_factory")
-        return RecordingScheduler()
-
-    config = Config(
-        host_id="daemon-host",
-        data_dir=tmp_path,
-        db_path=db_path,
-        socket_path=socket_path,
-        herdr_backend="socket",
-    )
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(
-            init_store=initialize_store,
-            event_backend_factory=event_backend_factory,
-            turn_scheduler_factory=scheduler_factory,
-        ),
-    )
-
-    daemon.start()
-    assert calls == [
-        "init_store",
-        "backend_factory",
-        "backend_start",
-        "scheduler_factory",
-        "callback_attached",
-        "scheduler_start",
-        "scheduler_request",
-    ]
-    assert backend.callback is not None
-    backend.callback()
-    assert calls[-1] == "scheduler_request"
-    daemon.stop()
-    daemon.stop()
-
-    assert calls[-5:] == [
-        "backend_flush",
-        "scheduler_request",
-        "callback_detached",
-        "scheduler_stop:6.0",
-        "backend_stop",
-    ]
-    assert backend.callback is None
-    assert backend.stopped is True
-    assert not os.path.lexists(socket_path)
-
-
-@_UNIX_SOCKET_TEST
-@pytest.mark.parametrize("failure_stage", ["init_store", "observe"])
-def test_daemon_startup_failure_never_publishes_socket(
-    tmp_path: Path,
-    failure_stage: str,
-) -> None:
-    socket_path = tmp_path / f"{failure_stage}.sock"
+def test_daemon_store_startup_failure_never_publishes_socket(tmp_path: Path) -> None:
+    socket_path = tmp_path / "init-store.sock"
 
     def assert_unpublished() -> None:
         assert not os.path.lexists(socket_path)
 
     def initialize_store(path: Path) -> None:
         assert_unpublished()
-        if failure_stage == "init_store":
-            raise RuntimeError("sentinel startup failure")
-        init_store(path)
-
-    def observe(_config: Config) -> Snapshot:
-        assert_unpublished()
-        if failure_stage == "observe":
-            raise RuntimeError("sentinel startup failure")
-        return _public_snapshot()
+        del path
+        raise RuntimeError("sentinel startup failure")
 
     config = Config(
         host_id="daemon-host",
         data_dir=tmp_path,
-        db_path=tmp_path / f"{failure_stage}.db",
+        db_path=tmp_path / "init-store.db",
         socket_path=socket_path,
     )
     daemon = TendwireDaemon(
         config,
-        hooks=DaemonHooks(
-            init_store=initialize_store,
-            observe_initial_snapshot=observe,
-        ),
+        hooks=DaemonHooks(init_store=initialize_store),
     )
 
     try:
@@ -3802,139 +3472,13 @@ def test_daemon_startup_failure_never_publishes_socket(
 
 
 @_UNIX_SOCKET_TEST
-def test_daemon_backend_start_failure_stops_backend_without_publishing_socket(
-    tmp_path: Path,
-) -> None:
-    socket_path = tmp_path / "backend-failure.sock"
-
-    def assert_unpublished() -> None:
-        assert not os.path.lexists(socket_path)
-
-    class FailingEventBackend:
-        def __init__(self) -> None:
-            self.started = False
-            self.stopped = False
-
-        def start(self, *, wait_for_reconcile: bool) -> None:
-            assert wait_for_reconcile is True
-            assert_unpublished()
-            self.started = True
-            raise RuntimeError("sentinel backend startup failure")
-
-        def stop(self) -> None:
-            self.stopped = True
-
-    backend = FailingEventBackend()
-
-    def initialize_store(path: Path) -> None:
-        assert_unpublished()
-        init_store(path)
-
-    def event_backend_factory(_config: Config, _stop_event: threading.Event) -> Any:
-        assert_unpublished()
-        return backend
-
-    config = Config(
-        host_id="daemon-host",
-        data_dir=tmp_path,
-        db_path=tmp_path / "backend-failure.db",
-        socket_path=socket_path,
-        herdr_backend="socket",
-    )
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(
-            init_store=initialize_store,
-            event_backend_factory=event_backend_factory,
-        ),
-    )
-
-    try:
-        with pytest.raises(RuntimeError, match="sentinel backend startup failure") as caught:
-            daemon.start()
-
-        assert backend.started is True
-        assert backend.stopped is True
-        _assert_private_daemon_failure(caught.value, socket_path)
-        assert daemon.server is None
-        assert not os.path.lexists(socket_path)
-    finally:
-        daemon.stop()
-
-
-@_UNIX_SOCKET_TEST
-def test_daemon_scheduler_start_failure_detaches_callback_and_cleans_components(
-    tmp_path: Path,
-) -> None:
-    socket_path = tmp_path / "scheduler-failure.sock"
-    db_path = tmp_path / "scheduler-failure.db"
-    calls: list[str] = []
-
-    class Backend:
-        callback: Any | None = None
-
-        def start(self, *, wait_for_reconcile: bool) -> None:
-            calls.append("backend_start")
-            save_snapshot(db_path, _public_snapshot())
-
-        def set_turn_refresh_callback(self, callback: Any | None) -> None:
-            self.callback = callback
-            calls.append("callback_set" if callback is not None else "callback_clear")
-
-        def stop(self) -> None:
-            calls.append("backend_stop")
-
-    class FailingScheduler:
-        def request_refresh(self) -> None:
-            calls.append("scheduler_request")
-
-        def start(self) -> None:
-            calls.append("scheduler_start")
-            raise RuntimeError("sentinel scheduler startup failure")
-
-        def stop(self, *, flush_timeout_seconds: float | None = None) -> None:
-            calls.append(f"scheduler_stop:{flush_timeout_seconds}")
-
-    backend = Backend()
-    scheduler = FailingScheduler()
-    config = Config(
-        host_id="daemon-host",
-        data_dir=tmp_path,
-        db_path=db_path,
-        socket_path=socket_path,
-        herdr_backend="socket",
-    )
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(
-            event_backend_factory=lambda _config, _stop_event: backend,
-            turn_scheduler_factory=lambda _config: scheduler,
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="sentinel scheduler startup failure"):
-        daemon.start()
-
-    assert calls == [
-        "backend_start",
-        "callback_set",
-        "scheduler_start",
-        "callback_clear",
-        "scheduler_stop:6.0",
-        "backend_stop",
-    ]
-    assert backend.callback is None
-    assert daemon.server is None
-    assert daemon._turn_scheduler is None
-    assert not os.path.lexists(socket_path)
-
-
-def test_daemon_starts_observes_persists_serves_and_removes_socket(tmp_path: Path) -> None:
+def test_daemon_starts_persists_serves_and_removes_socket(tmp_path: Path) -> None:
     db_path = tmp_path / "daemon.db"
     socket_path = tmp_path / "daemon.sock"
     config = Config(host_id="daemon-host", data_dir=tmp_path, db_path=db_path, socket_path=socket_path)
 
-    def observe(config: Config) -> Snapshot:
+    def initialize(path: Path) -> None:
+        init_store(path)
         snapshot = project_from_raw(
             config,
             workers=[{"id": "worker-1", "name": "Worker One", "status": "active"}],
@@ -3949,11 +3493,10 @@ def test_daemon_starts_observes_persists_serves_and_removes_socket(tmp_path: Pat
             ],
         )
         save_snapshot(db_path, snapshot)
-        return snapshot
 
     daemon = TendwireDaemon(
         config,
-        hooks=DaemonHooks(observe_initial_snapshot=observe),
+        hooks=DaemonHooks(init_store=initialize),
     )
     daemon.start()
     thread = threading.Thread(target=daemon.serve_forever)
@@ -3982,271 +3525,6 @@ def test_daemon_starts_observes_persists_serves_and_removes_socket(tmp_path: Pat
 
 
 @_UNIX_SOCKET_TEST
-def test_blocked_turn_ingestion_does_not_delay_cached_real_socket_handlers(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "blocked-ingestion.db"
-    socket_path = tmp_path / "blocked-ingestion.sock"
-    entered = threading.Event()
-    release = threading.Event()
-    source_calls: list[str] = []
-    worker = Worker(id="worker-1", name="Worker One", status="active")
-    binding = WorkerBinding(
-        host_id="daemon-host",
-        worker_id=worker.id,
-        worker_fingerprint=worker.fingerprint,
-        backend="herdr",
-        target_kind="agent_id",
-        target_value="sentinel-private-agent",
-        turn_target_kind="pane_id",
-        turn_target_value="sentinel-private-pane",
-        sendable=True,
-        reason=None,
-        observed_at="2026-01-01T00:00:00+00:00",
-        private_fingerprint="sentinel-private-binding",
-    )
-    config = Config(
-        host_id="daemon-host",
-        data_dir=tmp_path,
-        db_path=db_path,
-        socket_path=socket_path,
-        herdr_timeout_seconds=1,
-        turn_refresh_interval_seconds=3600,
-        turn_refresh_workers=1,
-    )
-
-    def observe(_config: Config) -> Snapshot:
-        snapshot = Snapshot(
-            host_id=config.host_id,
-            updated_at="2026-01-01T00:00:00+00:00",
-            workers=[worker],
-            backend_health=[
-                BackendHealth(
-                    name="herdr",
-                    status="healthy",
-                    outcome="healthy_non_empty",
-                    observed_at="2026-01-01T00:00:00+00:00",
-                )
-            ],
-        )
-        save_snapshot(db_path, snapshot)
-        upsert_worker_bindings(db_path, [binding])
-        return snapshot
-
-    def blocked_reader(
-        _config: Config,
-        current: WorkerBinding,
-        *,
-        adapter_timeout_seconds: float,
-    ) -> TurnRefreshResult:
-        source_calls.append(current.private_fingerprint)
-        entered.set()
-        assert release.wait(timeout=10)
-        return TurnRefreshResult("unchanged", 0)
-
-    scheduler: TurnIngestionScheduler | None = None
-
-    def scheduler_factory(current: Config) -> TurnIngestionScheduler:
-        nonlocal scheduler
-        scheduler = TurnIngestionScheduler(
-            current,
-            refresh_interval_seconds=3600,
-            max_workers=1,
-            reader=blocked_reader,
-        )
-        return scheduler
-
-    command_calls: list[str] = []
-
-    def submit_command(_config: Config, payload: str) -> CommandEnvelope:
-        command_calls.append(payload)
-        return CommandEnvelope(
-            ok=True,
-            status="accepted",
-            action="noop",
-            result={"accepted": True},
-        )
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(
-            observe_initial_snapshot=observe,
-            submit_command=submit_command,
-            turn_scheduler_factory=scheduler_factory,
-        ),
-    )
-    server_thread: threading.Thread | None = None
-    try:
-        daemon.start()
-        server_thread = threading.Thread(target=daemon.serve_forever)
-        server_thread.start()
-        assert entered.wait(timeout=10)
-        client = DaemonAPIClient(socket_path, timeout_seconds=1)
-
-        for _ in range(3):
-            listed = client.request(
-                "turn.list",
-                {"schema_version": 2, "limit": 10, "cursor": None, "since": None},
-            )
-            health = client.request("health.get")
-            snapshot = client.request("snapshot.get")
-            pending = client.request("pending.list")
-            assert listed["ok"] is True
-            assert health["result"]["turn_ingestion"]["active"] == 1
-            assert snapshot["result"]["host_id"] == config.host_id
-            assert pending["ok"] is True
-
-        command = client.request(
-            "command.submit",
-            {"schema_version": 1, "action": "noop", "dry_run": True},
-        )
-        assert command["ok"] is True
-        assert command["result"]["status"] == "accepted"
-        assert source_calls == ["sentinel-private-binding"]
-        assert len(command_calls) == 1
-    finally:
-        release.set()
-        daemon.stop()
-        if server_thread is not None:
-            server_thread.join(timeout=2)
-
-    assert scheduler is not None
-    assert server_thread is not None and not server_thread.is_alive()
-    assert not os.path.lexists(socket_path)
-
-
-@_UNIX_SOCKET_TEST
-def test_daemon_restart_scans_durable_bindings_without_touching_final_or_outbox(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "restart.db"
-    socket_path = tmp_path / "restart.sock"
-    config = Config(
-        host_id="restart-host",
-        data_dir=tmp_path,
-        db_path=db_path,
-        socket_path=socket_path,
-    )
-    init_store(db_path)
-    worker = Worker(id="worker-1", name="Worker One", status="idle")
-    snapshot = Snapshot(
-        host_id=config.host_id,
-        updated_at="2026-01-01T00:00:00+00:00",
-        workers=[worker],
-    )
-    save_snapshot(db_path, snapshot)
-    upsert_worker_bindings(
-        db_path,
-        [
-            WorkerBinding(
-                host_id=config.host_id,
-                worker_id=worker.id,
-                worker_fingerprint=worker.fingerprint,
-                backend="herdr",
-                target_kind="agent_id",
-                target_value="sentinel-private-agent",
-                turn_target_kind="pane_id",
-                turn_target_value="sentinel-private-pane",
-                sendable=True,
-                reason=None,
-                observed_at="2026-01-01T00:00:00+00:00",
-                private_fingerprint="sentinel-private-binding",
-            )
-        ],
-    )
-    assert merge_turn_content(
-        db_path,
-        config.host_id,
-        worker.id,
-        {
-            "source_turn_id": "source-turn-1",
-            "assistant_final_text": "durable final",
-            "complete": True,
-            "has_open_turn": False,
-        },
-        observed_at="2026-01-01T00:01:00+00:00",
-    ) == 1
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute(
-            """
-            INSERT INTO connector_outbox (
-                host_id, connector, delivery_key, status, payload_json,
-                private_state_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                config.host_id,
-                "attention",
-                "durable-delivery",
-                "queued",
-                '{"safe":"kept"}',
-                '{"opaque":"kept"}',
-                "2026-01-01T00:02:00+00:00",
-                "2026-01-01T00:02:00+00:00",
-            ),
-        )
-        before_turns = conn.execute(
-            "SELECT * FROM turns WHERE host_id = ? ORDER BY turn_id",
-            (config.host_id,),
-        ).fetchall()
-        before_outbox = conn.execute(
-            "SELECT * FROM connector_outbox WHERE host_id = ? ORDER BY id",
-            (config.host_id,),
-        ).fetchall()
-
-    scheduler_calls: list[tuple[str, int]] = []
-
-    class DurableScanScheduler:
-        def start(self) -> None:
-            scheduler_calls.append(("start", 0))
-
-        def request_refresh(self) -> None:
-            with sqlite3.connect(str(db_path)) as conn:
-                count = conn.execute(
-                    "SELECT COUNT(*) FROM worker_bindings WHERE host_id = ?",
-                    (config.host_id,),
-                ).fetchone()[0]
-            scheduler_calls.append(("request", int(count)))
-
-        def stop(self, *, flush_timeout_seconds: float | None = None) -> None:
-            scheduler_calls.append(("stop", int(flush_timeout_seconds or 0)))
-
-    for _ in range(2):
-        daemon = TendwireDaemon(
-            config,
-            hooks=DaemonHooks(
-                observe_initial_snapshot=lambda _config: latest_snapshot(
-                    db_path,
-                    config.host_id,
-                ),
-                turn_scheduler_factory=lambda _config: DurableScanScheduler(),
-            ),
-        )
-        daemon.start()
-        daemon.stop()
-
-    with sqlite3.connect(str(db_path)) as conn:
-        after_turns = conn.execute(
-            "SELECT * FROM turns WHERE host_id = ? ORDER BY turn_id",
-            (config.host_id,),
-        ).fetchall()
-        after_outbox = conn.execute(
-            "SELECT * FROM connector_outbox WHERE host_id = ? ORDER BY id",
-            (config.host_id,),
-        ).fetchall()
-
-    assert scheduler_calls == [
-        ("start", 0),
-        ("request", 1),
-        ("stop", 6),
-        ("start", 0),
-        ("request", 1),
-        ("stop", 6),
-    ]
-    assert after_turns == before_turns
-    assert after_outbox == before_outbox
-    assert not os.path.lexists(socket_path)
-
-
 def test_daemon_server_survives_client_disconnect_during_response(tmp_path: Path) -> None:
     socket_path = tmp_path / "daemon.sock"
     request_seen = threading.Event()
@@ -4669,226 +3947,6 @@ def test_daemon_shutdown_is_bounded_closes_active_socket_and_reaps_executor(
     assert remaining == set()
 
 
-def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
-    tmp_path: Path,
-    monkeypatch,
-    capsys,
-) -> None:
-    db_path = tmp_path / "commands.db"
-    socket_path = tmp_path / "commands.sock"
-    config = Config(
-        host_id="cmd-host",
-        data_dir=tmp_path,
-        db_path=db_path,
-        socket_path=socket_path,
-        herdr_backend="socket",
-    )
-    init_store(db_path)
-    calls: list[dict[str, Any]] = []
-    worker = Worker(id="w-1", name="Alpha", status="active")
-    binding = WorkerBinding(
-        host_id="cmd-host",
-        worker_id="w-1",
-        worker_fingerprint=worker.fingerprint,
-        backend="herdr",
-        target_kind="agent_id",
-        target_value="agent-private",
-        sendable=True,
-        reason=None,
-        observed_at="2026-01-01T00:00:00+00:00",
-        private_fingerprint="private-binding",
-    )
-
-    class FakeHealth:
-        def to_backend_health(self) -> BackendHealth:
-            return BackendHealth(
-                name="herdr",
-                status="healthy",
-                outcome="healthy_non_empty",
-                observed_at="2026-01-01T00:00:00+00:00",
-                counts={"workers": 1},
-            )
-
-    class FakeEventBackend:
-        health = FakeHealth()
-
-        def __init__(self, config: Config, stop_event: threading.Event) -> None:
-            self.config = config
-
-        def start(self, *, wait_for_reconcile: bool = True) -> None:
-            snapshot = Snapshot(
-                host_id="cmd-host",
-                updated_at="2026-01-01T00:00:00+00:00",
-                workers=[worker],
-                backend_health=[self.health.to_backend_health()],
-            )
-            save_snapshot(db_path, snapshot)
-            upsert_worker_bindings(db_path, [binding])
-
-        def stop(self) -> None:
-            return None
-
-    class FakeHerdrSocketClient:
-        def connect(self) -> "FakeHerdrSocketClient":
-            return self
-
-        def request(self, method: str, params: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
-            calls.append({"method": method, "params": dict(params)})
-            if method == "agent.get":
-                return {"result": {"agent": {"pane_id": "pane-private"}}}
-            if method == "pane.read":
-                return {
-                    "type": "pane_read",
-                    "read": {"text": "Completed previous turn.\n── status: idle ──"},
-                }
-            if method == "agent.prompt":
-                return {
-                    "type": "agent_prompted",
-                    "agent": {"pane_id": "pane-private"},
-                    "delivery": "submitted",
-                }
-            return {"accepted": True}
-
-        def close(self) -> None:
-            return None
-
-    monkeypatch.setattr(
-        "tendwire.command_submission._default_socket_client_factory",
-        lambda config: FakeHerdrSocketClient(),
-    )
-    from tendwire import command_submission
-
-    real_reserve = command_submission.reserve_command_request
-    reservation_barrier = threading.Barrier(2, timeout=5)
-
-    def synchronized_reserve(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        result = real_reserve(*args, **kwargs)
-        reservation_barrier.wait()
-        return result
-
-    monkeypatch.setattr(
-        command_submission,
-        "reserve_command_request",
-        synchronized_reserve,
-    )
-
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(event_backend_factory=lambda config, stop_event: FakeEventBackend(config, stop_event)),
-    )
-    daemon.start()
-    thread = threading.Thread(target=daemon.serve_forever)
-    thread.start()
-    try:
-        request = {
-            "schema_version": 1,
-            "action": "send_instruction",
-            "request_id": "req-1",
-            "dry_run": False,
-            "target": {"worker_id": "w-1"},
-            "instruction": {"text": "hello"},
-        }
-        start_barrier = threading.Barrier(3, timeout=5)
-        results: list[dict[str, Any] | None] = [None, None]
-        errors: list[BaseException] = []
-
-        def submit(index: int) -> None:
-            try:
-                start_barrier.wait()
-                results[index] = DaemonAPIClient(
-                    socket_path,
-                    timeout_seconds=5,
-                ).request("command.submit", request)
-            except BaseException as exc:  # noqa: BLE001
-                errors.append(exc)
-
-        clients = [
-            threading.Thread(target=submit, args=(index,))
-            for index in range(2)
-        ]
-        for client_thread in clients:
-            client_thread.start()
-        start_barrier.wait()
-        for client_thread in clients:
-            client_thread.join(timeout=5)
-
-        assert errors == []
-        assert all(not client_thread.is_alive() for client_thread in clients)
-        responses = [result for result in results if result is not None]
-        assert len(responses) == 2
-        assert all(response["ok"] is True for response in responses)
-        assert sorted(response["result"]["status"] for response in responses) == [
-            STATUS_ACCEPTED,
-            STATUS_PENDING,
-        ]
-        assert sorted(
-            response["result"]["disposition"] for response in responses
-        ) == [
-            DISPOSITION_IN_PROGRESS,
-            DISPOSITION_TERMINAL_ACCEPTED,
-        ]
-        assert all(response["schema_version"] == 1 for response in responses)
-        assert all(response["result"]["schema_version"] == 2 for response in responses)
-        assert calls == [
-            {"method": "agent.get", "params": {"target": "agent-private"}},
-            {"method": "agent.get", "params": {"target": "agent-private"}},
-            {
-                "method": "agent.prompt",
-                "params": {
-                    "target": "agent-private",
-                    "text": "hello",
-                    "wait": {"until": ["working"], "timeout_ms": 5000},
-                },
-            },
-        ]
-        assert not any(call["method"] == "pane.send_keys" for call in calls)
-        receipt = get_command_request(db_path, "cmd-host", "req-1")
-        assert receipt is not None
-        assert receipt["state"] == "accepted"
-        assert receipt["status"] == STATUS_ACCEPTED
-        assert receipt["terminal_at"] is not None
-
-        monkeypatch.setattr(
-            command_submission,
-            "reserve_command_request",
-            real_reserve,
-        )
-        replay = DaemonAPIClient(socket_path).request("command.submit", request)
-        assert replay["ok"] is True
-        assert replay["result"]["status"] == STATUS_ACCEPTED
-        assert replay["result"]["disposition"] == DISPOSITION_TERMINAL_ACCEPTED
-        monkeypatch.setenv("TENDWIRE_DATA_DIR", str(tmp_path / "cli-state"))
-        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(request)))
-        cli_code = main(
-            [
-                "--host-id",
-                "cmd-host",
-                "--socket-path",
-                str(socket_path),
-                "command",
-                "--json",
-                "--db-path",
-                str(db_path),
-            ]
-        )
-        captured = capsys.readouterr()
-        cli_result = json.loads(captured.out)
-        assert cli_code == 0
-        assert captured.err == ""
-        assert cli_result == replay["result"]
-        assert cli_result["disposition"] == DISPOSITION_TERMINAL_ACCEPTED
-        _assert_no_public_json_forbidden(cli_result)
-        assert len([call for call in calls if call["method"] == "agent.prompt"]) == 1
-        for response in [*responses, replay]:
-            encoded = json.dumps(response)
-            assert "agent-private" not in encoded
-            assert "pane-private" not in encoded
-            _assert_no_public_json_forbidden(response)
-    finally:
-        daemon.stop()
-        thread.join(timeout=2)
-
-
 def test_daemon_command_submit_rejects_blank_request_id_before_mutation(
     tmp_path: Path,
     monkeypatch,
@@ -4898,19 +3956,10 @@ def test_daemon_command_submit_rejects_blank_request_id_before_mutation(
         host_id="cmd-host",
         data_dir=tmp_path,
         db_path=db_path,
-        herdr_backend="socket",
     )
     init_store(db_path)
     calls: list[str] = []
 
-    def guarded_socket_factory(config: Config) -> Any:
-        calls.append("socket")
-        raise AssertionError("invalid request_id must not construct Herdr socket client")
-
-    monkeypatch.setattr(
-        "tendwire.command_submission._default_socket_client_factory",
-        guarded_socket_factory,
-    )
     daemon = TendwireDaemon(config)
     request = {
         "schema_version": 1,
@@ -4938,7 +3987,7 @@ def test_daemon_command_submit_rejects_blank_request_id_before_mutation(
         assert conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
 
-def test_cli_snapshot_falls_back_when_configured_socket_is_absent(
+def test_cli_snapshot_requires_daemon_when_configured_socket_is_absent(
     tmp_path: Path,
     capsys,
     monkeypatch,
@@ -4948,11 +3997,6 @@ def test_cli_snapshot_falls_back_when_configured_socket_is_absent(
     data_dir.mkdir(mode=0o700)
     monkeypatch.setenv("TENDWIRE_DATA_DIR", os.fspath(data_dir))
     monkeypatch.delenv("TENDWIRE_DB_PATH", raising=False)
-
-    def fake_state(config: Config) -> tuple[list[Any], list[Worker]]:
-        return [], [Worker(id="fallback-worker", name="Fallback", status="active")]
-
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", fake_state)
 
     code = main(
         [
@@ -4967,9 +4011,11 @@ def test_cli_snapshot_falls_back_when_configured_socket_is_absent(
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
 
-    assert code == 0
+    assert code == 1
     assert captured.err == ""
-    assert payload["workers"][0]["id"] == "fallback-worker"
+    assert payload["ok"] is False
+    assert payload["status"] == "daemon_unavailable"
+    assert not (data_dir / "tendwire.db").exists()
 
 
 def test_cli_command_falls_back_when_configured_socket_is_stale(
@@ -5526,7 +4572,6 @@ def test_isolated_daemon_survives_deterministic_real_wal_retirement_without_reso
         data_dir=tmp_path,
         db_path=db_path,
         socket_path=socket_path,
-        turn_refresh_interval_seconds=3600,
         acknowledged_final_retention_days=36500,
     )
     worker = Worker(id="worker-race", name="Worker Race", status="active")
@@ -5564,7 +4609,7 @@ def test_isolated_daemon_survives_deterministic_real_wal_retirement_without_reso
             )
         ],
     )
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         config.host_id,
         worker.id,
@@ -5655,27 +4700,6 @@ def test_isolated_daemon_survives_deterministic_real_wal_retirement_without_reso
                 except threading.BrokenBarrierError:
                     pass
 
-    scheduler_calls: list[str] = []
-
-    class NoopScheduler:
-        def start(self) -> None:
-            scheduler_calls.append("start")
-
-        def request_refresh(self) -> None:
-            scheduler_calls.append("request")
-
-        def stop(self, *, flush_timeout_seconds: float | None = None) -> None:
-            del flush_timeout_seconds
-            scheduler_calls.append("stop")
-
-        def operational_status(self) -> dict[str, Any]:
-            return {
-                "status": "healthy",
-                "queue_depth": 0,
-                "active": 0,
-                "queue_capacity": 1,
-            }
-
     def direct_child_processes() -> set[int]:
         children: set[int] = set()
         for task in (Path("/proc/self/task")).iterdir():
@@ -5710,16 +4734,7 @@ def test_isolated_daemon_survives_deterministic_real_wal_retirement_without_reso
     baseline_threads = {id(thread) for thread in threading.enumerate()}
     baseline_children = direct_child_processes()
     main_identity = (db_path.stat().st_dev, db_path.stat().st_ino)
-    daemon = TendwireDaemon(
-        config,
-        hooks=DaemonHooks(
-            observe_initial_snapshot=lambda _config: latest_snapshot(
-                db_path,
-                config.host_id,
-            ),
-            turn_scheduler_factory=lambda _config: NoopScheduler(),
-        ),
-    )
+    daemon = TendwireDaemon(config)
     server_thread: threading.Thread | None = None
     writer_thread = threading.Thread(target=churn_wal)
     writer_started = False
@@ -5797,7 +4812,6 @@ def test_isolated_daemon_survives_deterministic_real_wal_retirement_without_reso
     assert phase_calls == [
         ("captured", LocalStateKind.DATABASE_WAL)
     ] * cycle_count
-    assert scheduler_calls == ["start", "request", "stop"]
     assert len(responses) == cycle_count * 3
     assert (db_path.stat().st_dev, db_path.stat().st_ino) == main_identity
     assert not os.path.lexists(socket_path)

@@ -29,11 +29,12 @@ background daemon; use [INSTALL.md](INSTALL.md) for persistent service setup.
 
 ## Relationship to Herdr, Herdres, and connectors
 
-Herdr is the only concrete runtime backend documented here. Tendwire can observe
-Herdr through the conservative CLI one-shot path or, when explicitly enabled,
-through the Herdr socket/event backend. Both paths normalize Herdr state into
-neutral Tendwire spaces, workers, attention, turns, pending interactions,
-command results, connector jobs, and backend health.
+Herdr supplies workspace, pane, and worker lifecycle plus ownership of private
+ACP endpoints. Tendwire can observe that lifecycle through the conservative CLI
+one-shot path or the Herdr socket/event backend. ACP is required for supported
+agent semantics and commands; Herdr is not used to read transcripts or inject
+pane input. The authority and privacy split is defined in
+[docs/acp-migration.md](docs/acp-migration.md).
 
 Herdres can use Tendwire as its source/control plane while Herdres remains the
 Telegram connector. Tendwire owns Herdr observation, private bindings,
@@ -174,6 +175,11 @@ checks skipped after a timeout or exhausted aggregate deadline. Diagnostics do
 not expose raw backend argv. The Herdr binary path, data directory, and database
 path expand `~`; each Herdr probe uses `TENDWIRE_HERDR_TIMEOUT_SECONDS` or
 `--herdr-timeout` when set, defaulting to 5.0 seconds.
+
+Socket-daemon startup waits up to
+`TENDWIRE_HERDR_INITIAL_RECONCILE_TIMEOUT_SECONDS` (default `120.0`) for the
+entire initial reconciliation. This startup-only budget does not change the
+normal per-RPC `TENDWIRE_HERDR_TIMEOUT_SECONDS` deadline.
 
 When Herdr 0.7.0 is present, the adapter first tries the no-flag JSON envelopes
 (`herdr workspace list`, `herdr agent list`) that wrap records under
@@ -545,9 +551,10 @@ variables:
 | `snapshot_retention_count` | `TENDWIRE_SNAPSHOT_RETENTION_COUNT` | `4096` | positive integer; includes each host's latest row |
 | `snapshot_maintenance_batch_size` | `TENDWIRE_SNAPSHOT_MAINTENANCE_BATCH_SIZE` | `100` | integer from 1 through 1000 |
 | `store_maintenance_cadence_seconds` | `TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS` | `3600` | positive integer |
-| `turn_refresh_interval_seconds` | `TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS` | `2.0` | finite positive float |
-| `turn_refresh_workers` | `TENDWIRE_TURN_REFRESH_WORKERS` | `4` | integer from 1 through 32 and no greater than `max_workers` |
-| `turn_model` | `TENDWIRE_TURN_MODEL` | `observed` | `observed`; `legacy`, `dual`, and `shadow` are deprecated aliases with identical observed behavior |
+| `acp_thought_policy` | `TENDWIRE_ACP_THOUGHT_POLICY` | `disabled` | `disabled`, `private_summary`, or `private_all`; never a public-delivery grant |
+| `acp_request_timeout_seconds` | `TENDWIRE_ACP_REQUEST_TIMEOUT_SECONDS` | `30.0` | finite positive float |
+| `acp_shutdown_timeout_seconds` | `TENDWIRE_ACP_SHUTDOWN_TIMEOUT_SECONDS` | `5.0` | finite positive float |
+| `acp_max_frame_bytes` | `TENDWIRE_ACP_MAX_FRAME_BYTES` | `8388608` | integer from 1 through 67108864 |
 
 The socket/event backend uses `event_debounce_seconds` for event batching and
 `reconcile_interval_seconds` for bounded periodic full reconciles. Set
@@ -559,6 +566,34 @@ workers than the cap, Tendwire reports a degraded
 snapshot/projections instead of publishing a truncated authoritative snapshot.
 Incremental events that would add workers over the cap are ignored with the
 same public-safe degraded evidence.
+
+The stock daemon requires ACP for supported agents. It uses Herdr's private
+`agent.acp_endpoint` contract and accepts only workers explicitly marked
+`acp_owned_ready`; ordinary PTY workers are never attached as sidecars. A
+missing or unhealthy ACP endpoint degrades daemon health and fails command
+submission closed. There is no transcript-reader scheduler, shadow/preferred
+mode, or PTY fallback.
+Production ACP uses a bounded per-worker permission broker. It publishes only
+the sanitized tool title and numeric choices (option label and kind) through
+the durable pending-decision surface; ACP option IDs, arguments, session IDs,
+and adapter metadata remain private. `answer_decision` is fenced to the exact
+worker binding, ACP session, and Herdr generation. A command is accepted only
+after the complete JSON-RPC permission-response frame is written. Missing or
+retired ACP authority fails closed without falling back to PTY input, and
+concurrent answers can produce at most one response. None of this makes agent
+thoughts public: thought events remain private diagnostic data unless a
+separate, explicit sanitized projection is introduced.
+
+Store maintenance retires expired structured agent-event payloads in bounded
+batches using `event_retention_days`. Compact identity tombstones remain so a
+replayed source event cannot be reinserted or silently change content after its
+private payload has expired. Due automatic daemon maintenance performs the same
+host-scoped retirement as explicit `store cleanup`, using a metadata-only scan
+that does not load private payloads. Tombstones intentionally retain bounded
+per-event hashes and opaque identity only; they are not a recoverable copy of the
+removed payload. Their count is permanent and grows with distinct source-event
+identities. SQLite secure deletion is best-effort page hygiene, not a promise of
+immediate physical erasure across WAL/checkpoints, snapshots, or backups.
 
 Snapshot history defaults are sized for a five-minute observation rhythm:
 $14 \times 24 \times 12 = 4032$ observations, while the 4096-row count
@@ -1465,10 +1500,6 @@ and one unlinked observation; larger components become `ambiguous`. Linkage is
 metadata and does not change observation-derived turn identity, turn-list order,
 Goal 10 delivery, or Herdres consumption. Lazy and periodic settlement cover
 both submission-first and observation-first arrival order.
-
-`TENDWIRE_TURN_MODEL` remains accepted for rollout compatibility. `legacy`,
-`dual`, and `shadow` emit a warning and use the same observation-authoritative
-behavior as `observed`.
 
 `disposition`, not `status` alone, is the receipt-authority and finality
 contract:

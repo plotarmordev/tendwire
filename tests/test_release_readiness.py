@@ -17,8 +17,6 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from tendwire.backends import herdr_cli
-from tendwire.backends.herdr_cli import diagnose_herdr
 from tendwire.daemon import TendwireDaemon
 
 from tendwire.config import Config
@@ -244,24 +242,6 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
     )
     health = TendwireDaemon(config).get_health()
 
-    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _value: "/usr/bin/herdr")
-    monkeypatch.setattr(
-        herdr_cli.subprocess,
-        "run",
-        lambda args, **_kwargs: subprocess.CompletedProcess(
-            args=args,
-            returncode=0,
-            stdout='{"items":[]}',
-            stderr="",
-        ),
-    )
-    monkeypatch.setattr(
-        herdr_cli,
-        "utc_timestamp",
-        lambda *_args, **_kwargs: "2026-01-10T00:30:00+00:00",
-    )
-    doctor = diagnose_herdr(config)
-
     before_compaction = db_path.read_bytes()
     compaction = compact_store(
         db_path,
@@ -286,6 +266,15 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
             "deleted": 0,
             "remaining_candidates": False,
         },
+        "agent_events": {
+            "host_id": None,
+            "retention_days": 36500,
+            "cutoff_at": "1926-02-04T00:00:00+00:00",
+            "batch_size": 5,
+            "examined": 0,
+            "deleted": 0,
+            "remaining_candidates": False,
+        },
         "final_retention": {
             "examined": 0,
             "deleted": 0,
@@ -305,23 +294,6 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
             "examined": 0,
             "stale_active": 0,
             "deleted": 0,
-            "remaining_candidates": False,
-        },
-        "herdr_turns": {
-            "schema_version": 1,
-            "ok": True,
-            "status": "ok",
-            "scope": "database",
-            "host_id": None,
-            "dry_run": False,
-            "retention_days": 36500,
-            "retention_count": 100,
-            "cutoff_at": "1926-02-04T00:00:00+00:00",
-            "batch_size": 5,
-            "examined": 0,
-            "deleted": 0,
-            "deleted_completions": 0,
-            "deleted_watermarks": 0,
             "remaining_candidates": False,
         },
         "batch_size": 5,
@@ -387,18 +359,6 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
     assert cleanup["snapshots"]["examined"] == 0
     assert cleanup["outbox"]["updated"] == 0
     assert cleanup["turn_content"]["examined"] == 0
-    assert cleanup["herdr_turns"] == {
-        "dry_run": True,
-        "retention_days": 30,
-        "retention_count": 4096,
-        "cutoff_at": "2025-12-11T00:00:00+00:00",
-        "batch_size": 100,
-        "examined": 0,
-        "deleted": 0,
-        "deleted_completions": 0,
-        "deleted_watermarks": 0,
-        "remaining_candidates": False,
-    }
     assert cleanup["command_requests"] == {
         "ok": True,
         "status": "ok",
@@ -438,23 +398,6 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
     assert health["limits"]["acknowledged_final_retention_days"] == 36500
     assert health["limits"]["acknowledged_final_retention_count"] == 100
     assert health["store"]["final_retention"] == status["final_retention"]
-    maintenance_checks = [
-        check for check in doctor["checks"] if check["name"] == "store_maintenance"
-    ]
-    assert maintenance_checks == [
-        {
-            "name": "store_maintenance",
-            "ok": True,
-            "outcome": "ok",
-            "remediation": "No action required.",
-            "snapshot_retention_days": 36500,
-            "snapshot_retention_count": 100,
-            "maintenance_batch_size": 5,
-            "maintenance_cadence_seconds": 3600,
-            "snapshot_count": 1,
-            "last_completed_at": "2026-01-10T00:00:00+00:00",
-        }
-    ]
     assert compaction["command"] == "store.compact"
     assert compaction["scope"] == "database"
     assert compaction["dry_run"] is True
@@ -463,7 +406,7 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
     assert compaction["snapshots"]["deleted"] == 0
     assert db_path.read_bytes() == before_compaction
 
-    public_surfaces = [status, automatic, cleanup, health, doctor, compaction]
+    public_surfaces = [status, automatic, cleanup, health, compaction]
     for surface in public_surfaces:
         _assert_public_clean(surface)
     serialized = json.dumps(public_surfaces, sort_keys=True)

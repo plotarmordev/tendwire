@@ -6,7 +6,6 @@ No external config-file parser is required.
 
 from __future__ import annotations
 
-import logging
 import math
 import os
 import platform
@@ -14,16 +13,16 @@ import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 
-HERDR_BACKENDS = frozenset({"cli", "socket"})
-TURN_MODELS = frozenset({"legacy", "dual", "shadow", "observed"})
-DEFAULT_TURN_MODEL = "observed"
-DEFAULT_EVENT_DEBOUNCE_SECONDS = 0.05
-DEFAULT_RECONCILE_INTERVAL_SECONDS = 300.0
+ACP_THOUGHT_POLICIES = frozenset({"disabled", "private_summary", "private_all"})
+ACP_CONSOLE_INPUT_POLICIES = frozenset({"preserve", "live_only"})
+DEFAULT_ACP_THOUGHT_POLICY = "disabled"
+DEFAULT_ACP_CONSOLE_INPUT_POLICY = "preserve"
+DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS = 30.0
+DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+DEFAULT_ACP_MAX_FRAME_BYTES = 8 * 1024 * 1024
+DEFAULT_RECONCILE_INTERVAL_SECONDS = 15.0
 DEFAULT_EVENT_RETENTION_DAYS = 7
-DEFAULT_OUTPUT_EXCERPT_CHARS = 200
 DEFAULT_MAX_WORKERS = 512
-DEFAULT_TURN_REFRESH_INTERVAL_SECONDS = 2.0
-DEFAULT_TURN_REFRESH_WORKERS = 4
 DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS = 60
 DEFAULT_SUBMISSION_HARD_TTL_SECONDS = 86_400
 DEFAULT_PENDING_STALE_GRACE_SECONDS = 30.0
@@ -49,7 +48,6 @@ MAX_SNAPSHOT_MAINTENANCE_BATCH_SIZE = 1000
 MAX_RETENTION_DAYS = 365_000
 MAX_SQLITE_INTEGER = (1 << 63) - 1
 MAX_MAINTENANCE_CADENCE_SECONDS = MAX_RETENTION_DAYS * 24 * 60 * 60
-_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -62,15 +60,14 @@ class Config:
     db_path: Path | None = None
     socket_path: Path | None = None
     herdr_timeout_seconds: float = 5.0
-    herdr_backend: str = "cli"
-    turn_model: str = DEFAULT_TURN_MODEL
-    event_debounce_seconds: float = DEFAULT_EVENT_DEBOUNCE_SECONDS
+    acp_thought_policy: str = DEFAULT_ACP_THOUGHT_POLICY
+    acp_console_input_policy: str = DEFAULT_ACP_CONSOLE_INPUT_POLICY
+    acp_request_timeout_seconds: float = DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS
+    acp_shutdown_timeout_seconds: float = DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS
+    acp_max_frame_bytes: int = DEFAULT_ACP_MAX_FRAME_BYTES
     reconcile_interval_seconds: float = DEFAULT_RECONCILE_INTERVAL_SECONDS
     event_retention_days: int = DEFAULT_EVENT_RETENTION_DAYS
-    output_excerpt_chars: int = DEFAULT_OUTPUT_EXCERPT_CHARS
     max_workers: int = DEFAULT_MAX_WORKERS
-    turn_refresh_interval_seconds: float = DEFAULT_TURN_REFRESH_INTERVAL_SECONDS
-    turn_refresh_workers: int = DEFAULT_TURN_REFRESH_WORKERS
     submission_link_window_seconds: int = DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS
     submission_hard_ttl_seconds: int = DEFAULT_SUBMISSION_HARD_TTL_SECONDS
     pending_stale_grace_seconds: float = DEFAULT_PENDING_STALE_GRACE_SECONDS
@@ -109,32 +106,64 @@ class Config:
             normalized_socket_group = str(self.socket_group).strip()
             object.__setattr__(self, "socket_group", normalized_socket_group or None)
 
-        if self.herdr_timeout_seconds <= 0:
-            raise ValueError("herdr_timeout_seconds must be positive")
-        backend = str(self.herdr_backend or "").strip().lower()
-        if backend not in HERDR_BACKENDS:
-            allowed = ", ".join(sorted(HERDR_BACKENDS))
-            raise ValueError(f"herdr_backend must be one of: {allowed}")
-        object.__setattr__(self, "herdr_backend", backend)
-        turn_model = str(self.turn_model or "").strip().lower()
-        if turn_model not in TURN_MODELS:
-            allowed = ", ".join(sorted(TURN_MODELS))
-            raise ValueError(f"turn_model must be one of: {allowed}")
-        object.__setattr__(self, "turn_model", turn_model)
-        if turn_model != "observed":
-            _LOGGER.warning(
-                "turn_model=%s is a compatibility alias and behaves as observed",
-                turn_model,
+        object.__setattr__(
+            self,
+            "herdr_timeout_seconds",
+            _positive_finite_float(
+                self.herdr_timeout_seconds,
+                "herdr_timeout_seconds",
+            ),
+        )
+        acp_thought_policy = str(self.acp_thought_policy or "").strip().lower()
+        if acp_thought_policy not in ACP_THOUGHT_POLICIES:
+            allowed = ", ".join(sorted(ACP_THOUGHT_POLICIES))
+            raise ValueError(f"acp_thought_policy must be one of: {allowed}")
+        object.__setattr__(self, "acp_thought_policy", acp_thought_policy)
+        acp_console_input_policy = str(
+            self.acp_console_input_policy or ""
+        ).strip().lower()
+        if acp_console_input_policy not in ACP_CONSOLE_INPUT_POLICIES:
+            allowed = ", ".join(sorted(ACP_CONSOLE_INPUT_POLICIES))
+            raise ValueError(
+                f"acp_console_input_policy must be one of: {allowed}"
             )
         object.__setattr__(
             self,
-            "event_debounce_seconds",
-            _non_negative_float(self.event_debounce_seconds, "event_debounce_seconds"),
+            "acp_console_input_policy",
+            acp_console_input_policy,
+        )
+        object.__setattr__(
+            self,
+            "acp_request_timeout_seconds",
+            _positive_finite_float(
+                self.acp_request_timeout_seconds,
+                "acp_request_timeout_seconds",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "acp_shutdown_timeout_seconds",
+            _positive_finite_float(
+                self.acp_shutdown_timeout_seconds,
+                "acp_shutdown_timeout_seconds",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "acp_max_frame_bytes",
+            _bounded_positive_int(
+                self.acp_max_frame_bytes,
+                "acp_max_frame_bytes",
+                maximum=64 * 1024 * 1024,
+            ),
         )
         object.__setattr__(
             self,
             "reconcile_interval_seconds",
-            _non_negative_float(self.reconcile_interval_seconds, "reconcile_interval_seconds"),
+            _positive_finite_float(
+                self.reconcile_interval_seconds,
+                "reconcile_interval_seconds",
+            ),
         )
         object.__setattr__(
             self,
@@ -147,33 +176,9 @@ class Config:
         )
         object.__setattr__(
             self,
-            "output_excerpt_chars",
-            _positive_int(self.output_excerpt_chars, "output_excerpt_chars", minimum=1),
-        )
-        object.__setattr__(
-            self,
             "max_workers",
             _positive_int(self.max_workers, "max_workers", minimum=1),
         )
-        object.__setattr__(
-            self,
-            "turn_refresh_interval_seconds",
-            _positive_finite_float(
-                self.turn_refresh_interval_seconds,
-                "turn_refresh_interval_seconds",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "turn_refresh_workers",
-            _bounded_positive_int(
-                self.turn_refresh_workers,
-                "turn_refresh_workers",
-                maximum=32,
-            ),
-        )
-        if self.turn_refresh_workers > self.max_workers:
-            raise ValueError("turn_refresh_workers must be <= max_workers")
         object.__setattr__(
             self,
             "submission_link_window_seconds",
@@ -441,15 +446,14 @@ def load_config(
     socket_path: str | Path | None = None,
     socket_group: str | None = None,
     herdr_timeout_seconds: float | str | None = None,
-    herdr_backend: str | None = None,
-    turn_model: str | None = None,
-    event_debounce_seconds: float | str | None = None,
+    acp_thought_policy: str | None = None,
+    acp_console_input_policy: str | None = None,
+    acp_request_timeout_seconds: float | str | None = None,
+    acp_shutdown_timeout_seconds: float | str | None = None,
+    acp_max_frame_bytes: int | str | None = None,
     reconcile_interval_seconds: float | str | None = None,
     event_retention_days: int | str | None = None,
-    output_excerpt_chars: int | str | None = None,
     max_workers: int | str | None = None,
-    turn_refresh_interval_seconds: float | str | None = None,
-    turn_refresh_workers: int | str | None = None,
     submission_link_window_seconds: int | str | None = None,
     submission_hard_ttl_seconds: int | str | None = None,
     pending_stale_grace_seconds: float | str | None = None,
@@ -478,7 +482,6 @@ def load_config(
     env_socket_path = os.environ.get("TENDWIRE_SOCKET_PATH")
     env_socket_group = os.environ.get("TENDWIRE_SOCKET_GROUP")
     env_herdr_timeout_seconds = os.environ.get("TENDWIRE_HERDR_TIMEOUT_SECONDS")
-    env_herdr_backend = os.environ.get("TENDWIRE_HERDR_BACKEND")
 
     resolved_host_id = host_id or env_host_id or (platform.node() or "unknown")
     resolved_herdr_bin = herdr_bin or env_herdr_bin or "herdr"
@@ -519,12 +522,6 @@ def load_config(
         except (TypeError, ValueError) as exc:
             raise ValueError("herdr timeout must be a positive number") from exc
 
-    resolved_herdr_backend = herdr_backend
-    if resolved_herdr_backend is None:
-        resolved_herdr_backend = env_herdr_backend
-    if resolved_herdr_backend is None:
-        resolved_herdr_backend = "cli"
-
     return Config(
         host_id=resolved_host_id,
         herdr_bin=resolved_herdr_bin,
@@ -532,16 +529,30 @@ def load_config(
         db_path=resolved_db_path,
         socket_path=resolved_socket_path,
         herdr_timeout_seconds=resolved_herdr_timeout_seconds,
-        herdr_backend=resolved_herdr_backend,
-        turn_model=_resolve_value(
-            turn_model,
-            "TENDWIRE_TURN_MODEL",
-            DEFAULT_TURN_MODEL,
+        acp_thought_policy=_resolve_value(
+            acp_thought_policy,
+            "TENDWIRE_ACP_THOUGHT_POLICY",
+            DEFAULT_ACP_THOUGHT_POLICY,
         ),
-        event_debounce_seconds=_resolve_value(
-            event_debounce_seconds,
-            "TENDWIRE_EVENT_DEBOUNCE_SECONDS",
-            DEFAULT_EVENT_DEBOUNCE_SECONDS,
+        acp_console_input_policy=_resolve_value(
+            acp_console_input_policy,
+            "TENDWIRE_ACP_CONSOLE_INPUT_POLICY",
+            DEFAULT_ACP_CONSOLE_INPUT_POLICY,
+        ),
+        acp_request_timeout_seconds=_resolve_value(
+            acp_request_timeout_seconds,
+            "TENDWIRE_ACP_REQUEST_TIMEOUT_SECONDS",
+            DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS,
+        ),
+        acp_shutdown_timeout_seconds=_resolve_value(
+            acp_shutdown_timeout_seconds,
+            "TENDWIRE_ACP_SHUTDOWN_TIMEOUT_SECONDS",
+            DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS,
+        ),
+        acp_max_frame_bytes=_resolve_value(
+            acp_max_frame_bytes,
+            "TENDWIRE_ACP_MAX_FRAME_BYTES",
+            DEFAULT_ACP_MAX_FRAME_BYTES,
         ),
         reconcile_interval_seconds=_resolve_value(
             reconcile_interval_seconds,
@@ -553,25 +564,10 @@ def load_config(
             "TENDWIRE_EVENT_RETENTION_DAYS",
             DEFAULT_EVENT_RETENTION_DAYS,
         ),
-        output_excerpt_chars=_resolve_value(
-            output_excerpt_chars,
-            "TENDWIRE_OUTPUT_EXCERPT_CHARS",
-            DEFAULT_OUTPUT_EXCERPT_CHARS,
-        ),
         max_workers=_resolve_value(
             max_workers,
             "TENDWIRE_MAX_WORKERS",
             DEFAULT_MAX_WORKERS,
-        ),
-        turn_refresh_interval_seconds=_resolve_value(
-            turn_refresh_interval_seconds,
-            "TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS",
-            DEFAULT_TURN_REFRESH_INTERVAL_SECONDS,
-        ),
-        turn_refresh_workers=_resolve_value(
-            turn_refresh_workers,
-            "TENDWIRE_TURN_REFRESH_WORKERS",
-            DEFAULT_TURN_REFRESH_WORKERS,
         ),
         submission_link_window_seconds=_resolve_value(
             submission_link_window_seconds,

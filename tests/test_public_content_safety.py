@@ -39,11 +39,11 @@ from tendwire.store.sqlite import (
     attention_payload_from_store,
     init_store,
     get_turn_content,
-    merge_turn_content,
     save_snapshot,
     tail_event_metadata,
     turns_payload_from_store,
 )
+from .store_helpers import apply_test_turn_refresh
 
 
 def _sentinel_corpus() -> dict[str, str]:
@@ -374,6 +374,9 @@ def test_public_submission_verdict_is_closed_vocabulary() -> None:
     }
     assert sanitize_public_value({"submission_verdict": "agent_not_ready"}) == {
         "submission_verdict": "agent_not_ready"
+    }
+    assert sanitize_public_value({"submission_verdict": "steering_failed"}) == {
+        "submission_verdict": "steering_failed"
     }
     assert sanitize_public_value(
         {"submission_verdict": "agent_target_ambiguous"}
@@ -890,36 +893,20 @@ def test_store_feed_outbox_and_connector_facade_resanitize_before_delivery(tmp_p
         {"name": "attention", "limit": 10}
     )
 
-    # Copy the leased lifecycle jobs into a v4-shaped fixture. Migration must
-    # preserve live refs privately without putting its grouping markers into
-    # either the public attention projection or the connector payload.
-    migration_db_path = tmp_path / "migration-public-boundaries.db"
-    with (
-        sqlite3.connect(str(db_path)) as source,
-        sqlite3.connect(str(migration_db_path)) as destination,
-    ):
-        source.backup(destination)
-    with sqlite3.connect(str(migration_db_path)) as conn:
-        conn.execute("DROP TABLE attention_lifecycles")
-        conn.execute("PRAGMA user_version = 4")
-
-    init_store(migration_db_path)
-    migrated_feed = attention_payload_from_store(migration_db_path, host_id)
-    with sqlite3.connect(str(migration_db_path)) as conn:
-        migrated_attention_rows = [
+    # Re-open the exact current schema and prove that every store-backed public
+    # edge re-sanitizes persisted data after initialization as well as in the
+    # original process.
+    init_store(db_path)
+    reloaded_feed = attention_payload_from_store(db_path, host_id)
+    with sqlite3.connect(str(db_path)) as conn:
+        reloaded_attention_rows = [
             json.loads(row[0])
             for row in conn.execute("SELECT payload_json FROM attention_items")
         ]
-        migrated_outbox_rows = [
+        reloaded_outbox_rows = [
             json.loads(row[0])
             for row in conn.execute(
                 "SELECT payload_json FROM connector_outbox ORDER BY id"
-            )
-        ]
-        migration_private_states = [
-            json.loads(row[0])
-            for row in conn.execute(
-                "SELECT private_state_json FROM connector_outbox ORDER BY id"
             )
         ]
 
@@ -941,9 +928,9 @@ def test_store_feed_outbox_and_connector_facade_resanitize_before_delivery(tmp_p
         "attention_created",
     ]
 
-    assert migrated_feed is not None
-    assert len(migrated_feed["attention"]) == 1
-    assert migrated_feed["attention"][0]["reason"] == "Review the safe public result"
+    assert reloaded_feed is not None
+    assert len(reloaded_feed["attention"]) == 1
+    assert reloaded_feed["attention"][0]["reason"] == "Review the safe public result"
     assert connector_payload["ok"] is True
     assert connector_payload["items"]
     assert all(
@@ -953,9 +940,8 @@ def test_store_feed_outbox_and_connector_facade_resanitize_before_delivery(tmp_p
     assert snapshot_rows
     assert event_rows
     assert attention_rows
-    assert migrated_attention_rows
-    assert migrated_outbox_rows
-    assert any("migration_group" in state for state in migration_private_states)
+    assert reloaded_attention_rows
+    assert reloaded_outbox_rows
 
     public_attention_surfaces = (
         initial_feed,
@@ -963,13 +949,13 @@ def test_store_feed_outbox_and_connector_facade_resanitize_before_delivery(tmp_p
         pending_feed,
         resolved_feed,
         recurrence_feed,
-        migrated_feed,
+        reloaded_feed,
         attention_rows,
-        migrated_attention_rows,
+        reloaded_attention_rows,
     )
     outbox_payload_surfaces = (
         pre_migration_outbox_rows,
-        migrated_outbox_rows,
+        reloaded_outbox_rows,
         [item["payload"] for item in connector_payload["items"]],
     )
     for surface in public_attention_surfaces + outbox_payload_surfaces:
@@ -1099,7 +1085,7 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
     )
     init_store(db_path)
     save_snapshot(db_path, snapshot)
-    assert merge_turn_content(
+    assert apply_test_turn_refresh(
         db_path,
         host_id,
         worker_id,

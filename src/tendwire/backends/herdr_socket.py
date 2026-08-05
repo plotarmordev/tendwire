@@ -1,31 +1,22 @@
-"""Inactive stdlib Herdr Unix socket client.
-
-This module is additive and is not imported by Tendwire's production
-observation or CLI paths. It exposes a low-level JSON-line client plus thin
-wrappers for the PR8-allowed Herdr methods only.
-"""
+"""Synchronous client for Herdr lifecycle discovery and ACP ownership."""
 
 from __future__ import annotations
 
 import socket
 import time
-from collections import deque
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from .herdr_protocol import (
     HerdrEnvelopeError,
     HerdrErrorResponse,
+    HerdrFrameTooLargeError,
     HerdrProtocolError,
-    HerdrRequestIdMismatchError,
-    HERDR_EVENTS_SUBSCRIBE_METHOD,
-    build_events_subscribe_params,
     build_request,
     ensure_response_id,
     error_payload,
     frame_request,
     is_error_response,
-    is_event,
     is_result_response,
     parse_json_line,
     resolve_socket_path,
@@ -35,7 +26,7 @@ from .herdr_protocol import (
 
 _DEFAULT_TIMEOUT_SECONDS = 5.0
 _RECV_SIZE = 4096
-_MAX_PENDING_EVENTS = 1024
+_MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 
 class HerdrSocketError(HerdrProtocolError):
@@ -54,39 +45,6 @@ class HerdrSocketConnectionError(HerdrSocketError, ConnectionError):
     """Raised when the Unix socket cannot be opened."""
 
 
-class HerdrEventStream(Iterator[dict[str, Any]]):
-    """Iterator over events correlated to a subscription request id."""
-
-    def __init__(
-        self,
-        client: "HerdrSocketClient",
-        subscription_id: str,
-        ack: Any,
-        *,
-        timeout: float | None = None,
-    ) -> None:
-        self.client = client
-        self.subscription_id = subscription_id
-        self.ack = ack
-        self.timeout = timeout
-        self._closed = False
-
-    def __iter__(self) -> "HerdrEventStream":
-        return self
-
-    def __next__(self) -> dict[str, Any]:
-        if self._closed:
-            raise StopIteration
-        try:
-            return self.client.read_event(self.subscription_id, timeout=self.timeout)
-        except HerdrSocketDisconnectedError:
-            self._closed = True
-            raise StopIteration from None
-
-    def close(self) -> None:
-        self._closed = True
-
-
 class HerdrSocketClient:
     """Synchronous Herdr JSON-line client over a Unix domain socket."""
 
@@ -100,7 +58,6 @@ class HerdrSocketClient:
         self.timeout = self._validate_timeout(timeout)
         self._socket: socket.socket | None = None
         self._buffer = bytearray()
-        self._pending_events: deque[dict[str, Any]] = deque()
 
     def __enter__(self) -> "HerdrSocketClient":
         self.connect()
@@ -137,7 +94,6 @@ class HerdrSocketClient:
         sock = self._socket
         self._socket = None
         self._buffer.clear()
-        self._pending_events.clear()
         if sock is None:
             return
         try:
@@ -152,75 +108,17 @@ class HerdrSocketClient:
         params: Mapping[str, Any] | None = None,
         *,
         timeout: float | None = None,
-        allow_uncorrelated: bool = False,
     ) -> Any:
-        """Send one request and return its raw result payload.
-
-        ``allow_uncorrelated`` is reserved for an inert method-capability
-        probe; the default keeps every ordinary request strictly correlated.
-        """
-        request_id, deadline = self._send_request(method, params, timeout=timeout)
-        response = self._read_response(
-            request_id,
-            deadline=deadline,
-            allow_uncorrelated_error=False,
-            allow_uncorrelated_method_error=allow_uncorrelated,
-        )
-        if is_error_response(response):
-            raise HerdrErrorResponse(error_payload(response), request_id)
-        return result_payload(response)
-
-    def subscribe(
-        self,
-        method: str,
-        params: Mapping[str, Any] | None = None,
-        *,
-        timeout: float | None = None,
-        event_timeout: float | None = None,
-    ) -> HerdrEventStream:
-        """Send a subscription request and return an iterator over its events."""
-        request_id, deadline = self._send_request(method, params, timeout=timeout)
-        response = self._read_response(
-            request_id,
-            deadline=deadline,
-            allow_uncorrelated_error=True,
-            allow_uncorrelated_method_error=False,
-        )
-        if is_error_response(response):
-            raise HerdrErrorResponse(error_payload(response), request_id)
-        return HerdrEventStream(
-            self,
-            request_id,
-            result_payload(response),
-            timeout=self.timeout if event_timeout is None else event_timeout,
-        )
-
-    def events_subscribe(
-        self,
-        event_names: Iterable[str] | str | None = None,
-        *,
-        timeout: float | None = None,
-        event_timeout: float | None = None,
-    ) -> HerdrEventStream:
-        """Subscribe to the official Herdr event stream."""
-        return self.subscribe(
-            HERDR_EVENTS_SUBSCRIBE_METHOD,
-            build_events_subscribe_params(event_names),
-            timeout=timeout,
-            event_timeout=event_timeout,
-        )
-
-    def read_event(self, subscription_id: str, *, timeout: float | None = None) -> dict[str, Any]:
-        envelope = (
-            self._pending_events.popleft()
-            if self._pending_events
-            else self._read_server_envelope(deadline=self._deadline(timeout))
-        )
-        if not is_event(envelope):
-            raise HerdrEnvelopeError("expected Herdr event envelope")
-        if envelope.get("id") is not None:
-            ensure_response_id(envelope, subscription_id)
-        return envelope
+        """Send one strictly correlated request and return its raw result payload."""
+        try:
+            request_id, deadline = self._send_request(method, params, timeout=timeout)
+            response = self._read_response(request_id, deadline=deadline)
+            if is_error_response(response):
+                raise HerdrErrorResponse(error_payload(response), request_id)
+            return result_payload(response)
+        finally:
+            # Herdr accepts exactly one request on each Unix connection.
+            self.close()
 
     def workspace_list(
         self,
@@ -229,14 +127,6 @@ class HerdrSocketClient:
         timeout: float | None = None,
     ) -> Any:
         return self.request("workspace.list", params, timeout=timeout)
-
-    def tab_list(
-        self,
-        params: Mapping[str, Any] | None = None,
-        *,
-        timeout: float | None = None,
-    ) -> Any:
-        return self.request("tab.list", params, timeout=timeout)
 
     def pane_list(
         self,
@@ -254,51 +144,56 @@ class HerdrSocketClient:
     ) -> Any:
         return self.request("agent.list", params, timeout=timeout)
 
-    def pane_get(
+    def agent_acp_endpoint(
         self,
-        params: Mapping[str, Any] | None = None,
+        target: str,
         *,
         timeout: float | None = None,
     ) -> Any:
-        return self.request("pane.get", params, timeout=timeout)
-
-    def agent_get(
-        self,
-        params: Mapping[str, Any] | None = None,
-        *,
-        timeout: float | None = None,
-    ) -> Any:
-        return self.request("agent.get", params, timeout=timeout)
-
-    def pane_read(
-        self,
-        params: Mapping[str, Any] | None = None,
-        *,
-        timeout: float | None = None,
-    ) -> Any:
-        return self.request("pane.read", params, timeout=timeout)
-
-    def pane_turns(
-        self,
-        params: Mapping[str, Any] | None = None,
-        *,
-        timeout: float | None = None,
-        allow_uncorrelated: bool = False,
-    ) -> Any:
+        """Mint a one-shot, private ACP attach endpoint for one live agent."""
         return self.request(
-            "pane.turns",
-            params,
+            "agent.acp_endpoint",
+            {"target": target},
             timeout=timeout,
-            allow_uncorrelated=allow_uncorrelated,
         )
 
-    def agent_send(
+    def agent_acp_status(
         self,
-        params: Mapping[str, Any] | None = None,
+        target: str,
         *,
         timeout: float | None = None,
     ) -> Any:
-        return self.request("agent.send", params, timeout=timeout)
+        """Read ACP ownership/generation without minting an attach ticket."""
+        return self.request(
+            "agent.acp_status",
+            {"target": target},
+            timeout=timeout,
+        )
+
+    def agent_acp_console_exchange(
+        self,
+        target: str,
+        *,
+        generation: int,
+        lease: str,
+        after_input_sequence: int = 0,
+        output: Iterable[Mapping[str, Any]] = (),
+        timeout: float | None = None,
+    ) -> Any:
+        """Exchange pane input and idempotent ACP output as coordinator."""
+        return self.request(
+            "agent.acp_console_exchange",
+            {
+                "target": target,
+                "generation": generation,
+                "lease": lease,
+                "role": "coordinator",
+                "output": [dict(item) for item in output],
+                "after_input_sequence": after_input_sequence,
+                "after_output_sequence": 0,
+            },
+            timeout=timeout,
+        )
 
     def _send_request(
         self,
@@ -311,7 +206,10 @@ class HerdrSocketClient:
         request = build_request(method, params)
         request_id = str(request["id"])
         deadline = self._deadline(timeout)
-        self._write(frame_request(request), deadline=deadline)
+        frame = frame_request(request)
+        if len(frame) > _MAX_FRAME_BYTES:
+            raise HerdrFrameTooLargeError("Herdr request frame is too large")
+        self._write(frame, deadline=deadline)
         return request_id, deadline
 
     def _deadline(self, timeout: float | None) -> float:
@@ -335,18 +233,6 @@ class HerdrSocketClient:
         try:
             sock.settimeout(self._remaining(deadline))
             sock.sendall(payload)
-        except (BrokenPipeError, ConnectionResetError) as exc:
-            self.close()
-            try:
-                self.connect()
-                sock = self._active_socket()
-                sock.settimeout(self._remaining(deadline))
-                sock.sendall(payload)
-            except socket.timeout as retry_exc:
-                raise HerdrSocketTimeoutError("Herdr socket write timed out") from retry_exc
-            except OSError as retry_exc:
-                self.close()
-                raise HerdrSocketDisconnectedError("Herdr socket disconnected during write") from retry_exc
         except socket.timeout as exc:
             raise HerdrSocketTimeoutError("Herdr socket write timed out") from exc
         except OSError as exc:
@@ -358,74 +244,25 @@ class HerdrSocketClient:
         request_id: str,
         *,
         deadline: float,
-        allow_uncorrelated_error: bool,
-        allow_uncorrelated_method_error: bool,
     ) -> dict[str, Any]:
-        while True:
-            envelope = self._read_server_envelope(
-                deadline=deadline,
-                allow_uncorrelated_error=allow_uncorrelated_error,
-                allow_uncorrelated_method_error=allow_uncorrelated_method_error,
-            )
-            if is_event(envelope):
-                if len(self._pending_events) >= _MAX_PENDING_EVENTS:
-                    raise HerdrEnvelopeError(
-                        "too many Herdr events arrived before the response"
-                    )
-                self._pending_events.append(envelope)
-                continue
-            if (
-                (allow_uncorrelated_error or allow_uncorrelated_method_error)
-                and is_error_response(envelope)
-                and (
-                    (
-                        allow_uncorrelated_error
-                        and envelope.get("id") == ""
-                    )
-                    or (
-                        allow_uncorrelated_method_error
-                        and (
-                            "id" not in envelope
-                            or envelope.get("id") == ""
-                        )
-                    )
-                )
-            ):
-                # These narrowly validated Herdr 0.7.5 errors belong to the
-                # only in-flight synchronous request and must reach the caller
-                # as server errors rather than poison the connection.
-                payload = envelope.get("error")
-                if not isinstance(payload, Mapping):
-                    raise HerdrEnvelopeError("Herdr error payload must be an object")
-                raise HerdrErrorResponse(
-                    dict(payload),
-                    request_id,
-                    uncorrelated=True,
-                )
-            ensure_response_id(envelope, request_id)
-            if not (is_result_response(envelope) or is_error_response(envelope)):
-                raise HerdrEnvelopeError("expected Herdr response envelope")
-            return envelope
+        envelope = self._read_server_envelope(deadline=deadline)
+        ensure_response_id(envelope, request_id)
+        if not (is_result_response(envelope) or is_error_response(envelope)):
+            raise HerdrEnvelopeError("expected Herdr response envelope")
+        return envelope
 
-    def _read_server_envelope(
-        self,
-        *,
-        deadline: float,
-        allow_uncorrelated_error: bool = False,
-        allow_uncorrelated_method_error: bool = False,
-    ) -> dict[str, Any]:
+    def _read_server_envelope(self, *, deadline: float) -> dict[str, Any]:
         line = self._read_line(deadline=deadline)
         envelope = parse_json_line(line)
-        return validate_server_envelope(
-            envelope,
-            allow_uncorrelated_error=allow_uncorrelated_error,
-            allow_uncorrelated_method_error=allow_uncorrelated_method_error,
-        )
+        return validate_server_envelope(envelope)
 
     def _read_line(self, *, deadline: float) -> bytes:
         while True:
             newline_index = self._buffer.find(b"\n")
             if newline_index >= 0:
+                if newline_index + 1 > _MAX_FRAME_BYTES:
+                    self.close()
+                    raise HerdrFrameTooLargeError("Herdr response frame is too large")
                 line = bytes(self._buffer[: newline_index + 1])
                 del self._buffer[: newline_index + 1]
                 return line
@@ -446,3 +283,6 @@ class HerdrSocketClient:
                     "Herdr socket disconnected before a complete line was received"
                 )
             self._buffer.extend(chunk)
+            if len(self._buffer) > _MAX_FRAME_BYTES:
+                self.close()
+                raise HerdrFrameTooLargeError("Herdr response frame is too large")

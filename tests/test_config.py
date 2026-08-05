@@ -9,16 +9,18 @@ import sys
 import pytest
 
 from tendwire.config import (
+    DEFAULT_ACP_MAX_FRAME_BYTES,
+    DEFAULT_ACP_CONSOLE_INPUT_POLICY,
+    DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS,
+    DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS,
+    DEFAULT_ACP_THOUGHT_POLICY,
     DEFAULT_COMMAND_RECEIPT_RETENTION_COUNT,
     DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS,
     DEFAULT_COMMAND_RETRY_HORIZON_SECONDS,
     DEFAULT_SUBMISSION_HARD_TTL_SECONDS,
     DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS,
-    DEFAULT_TURN_MODEL,
     MAX_COMMAND_RETRY_HORIZON_SECONDS,
     MIN_COMMAND_RECEIPT_RETENTION_SECONDS,
-    DEFAULT_TURN_REFRESH_INTERVAL_SECONDS,
-    DEFAULT_TURN_REFRESH_WORKERS,
     MAX_MAINTENANCE_CADENCE_SECONDS,
     MAX_RETENTION_DAYS,
     MAX_SQLITE_INTEGER,
@@ -27,24 +29,94 @@ from tendwire.config import (
 )
 
 
-def test_turn_model_defaults_to_observed_and_accepts_compatibility_aliases(
+def test_acp_defaults_are_required_runtime_settings_with_thoughts_disabled(
     monkeypatch,
-    caplog,
 ) -> None:
+    for name in (
+        "TENDWIRE_AGENT_EVENT_SOURCE",
+        "TENDWIRE_ACP_THOUGHT_POLICY",
+        "TENDWIRE_ACP_REQUEST_TIMEOUT_SECONDS",
+        "TENDWIRE_ACP_SHUTDOWN_TIMEOUT_SECONDS",
+        "TENDWIRE_ACP_MAX_FRAME_BYTES",
+        "TENDWIRE_ACP_CONSOLE_INPUT_POLICY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    config = load_config()
+
+    assert not hasattr(config, "agent_event_source")
+    assert config.acp_thought_policy == DEFAULT_ACP_THOUGHT_POLICY == "disabled"
+    assert config.acp_request_timeout_seconds == DEFAULT_ACP_REQUEST_TIMEOUT_SECONDS == 30.0
+    assert config.acp_shutdown_timeout_seconds == DEFAULT_ACP_SHUTDOWN_TIMEOUT_SECONDS == 5.0
+    assert config.acp_max_frame_bytes == DEFAULT_ACP_MAX_FRAME_BYTES == 8 * 1024 * 1024
+    assert config.acp_console_input_policy == DEFAULT_ACP_CONSOLE_INPUT_POLICY == "preserve"
+
+
+def test_acp_configuration_uses_explicit_before_environment(monkeypatch) -> None:
+    monkeypatch.setenv("TENDWIRE_AGENT_EVENT_SOURCE", "acp_shadow")
+    monkeypatch.setenv("TENDWIRE_ACP_THOUGHT_POLICY", "private_all")
+    monkeypatch.setenv("TENDWIRE_ACP_REQUEST_TIMEOUT_SECONDS", "11")
+    monkeypatch.setenv("TENDWIRE_ACP_SHUTDOWN_TIMEOUT_SECONDS", "3")
+    monkeypatch.setenv("TENDWIRE_ACP_MAX_FRAME_BYTES", "4096")
+    monkeypatch.setenv("TENDWIRE_ACP_CONSOLE_INPUT_POLICY", "live_only")
+
+    environment = load_config()
+    explicit = load_config(
+        acp_thought_policy="disabled",
+        acp_request_timeout_seconds="7.5",
+        acp_shutdown_timeout_seconds="2.5",
+        acp_max_frame_bytes="8192",
+        acp_console_input_policy="preserve",
+    )
+
+    assert not hasattr(environment, "agent_event_source")
+    assert environment.acp_thought_policy == "private_all"
+    assert environment.acp_request_timeout_seconds == 11.0
+    assert environment.acp_shutdown_timeout_seconds == 3.0
+    assert environment.acp_max_frame_bytes == 4096
+    assert environment.acp_console_input_policy == "live_only"
+    assert explicit.acp_thought_policy == "disabled"
+    assert explicit.acp_request_timeout_seconds == 7.5
+    assert explicit.acp_shutdown_timeout_seconds == 2.5
+    assert explicit.acp_max_frame_bytes == 8192
+    assert explicit.acp_console_input_policy == "preserve"
+
+
+@pytest.mark.parametrize("value", ["", "drop", "future"])
+def test_acp_console_input_policy_rejects_unknown_values(value: str) -> None:
+    with pytest.raises(ValueError, match="acp_console_input_policy must be one of"):
+        Config(acp_console_input_policy=value)
+
+
+@pytest.mark.parametrize("value", ["", "public", "summary", "future"])
+def test_acp_thought_policy_rejects_unknown_values(value: str) -> None:
+    with pytest.raises(ValueError, match="acp_thought_policy must be one of"):
+        Config(acp_thought_policy=value)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("acp_request_timeout_seconds", 0),
+        ("acp_request_timeout_seconds", float("inf")),
+        ("acp_shutdown_timeout_seconds", -1),
+        ("acp_shutdown_timeout_seconds", "invalid"),
+        ("acp_max_frame_bytes", 0),
+        ("acp_max_frame_bytes", True),
+        ("acp_max_frame_bytes", 64 * 1024 * 1024 + 1),
+    ],
+)
+def test_acp_bounds_reject_invalid_values(field: str, value: object) -> None:
+    with pytest.raises(ValueError):
+        Config(**{field: value})
+
+
+def test_runtime_turn_model_modes_are_removed(monkeypatch) -> None:
     monkeypatch.delenv("TENDWIRE_TURN_MODEL", raising=False)
-    assert DEFAULT_TURN_MODEL == "observed"
-    assert load_config().turn_model == "observed"
+    assert not hasattr(load_config(), "turn_model")
 
     monkeypatch.setenv("TENDWIRE_TURN_MODEL", "shadow")
-    assert load_config().turn_model == "shadow"
-    assert load_config(turn_model="dual").turn_model == "dual"
-    assert "behaves as observed" in caplog.text
-
-
-@pytest.mark.parametrize("value", ["", "future", "legacy,dual"])
-def test_turn_model_rejects_unknown_values(value: str) -> None:
-    with pytest.raises(ValueError, match="turn_model must be one of"):
-        Config(turn_model=value)
+    assert not hasattr(load_config(), "turn_model")
 
 
 def test_submission_windows_have_defaults_and_explicit_precedence(monkeypatch) -> None:
@@ -101,10 +173,8 @@ def test_submission_hard_ttl_must_cover_link_window() -> None:
 
 def test_pr16_runtime_knobs_have_documented_defaults(monkeypatch) -> None:
     for name in (
-        "TENDWIRE_EVENT_DEBOUNCE_SECONDS",
         "TENDWIRE_RECONCILE_INTERVAL_SECONDS",
         "TENDWIRE_EVENT_RETENTION_DAYS",
-        "TENDWIRE_OUTPUT_EXCERPT_CHARS",
         "TENDWIRE_MAX_WORKERS",
         "TENDWIRE_MAX_OUTBOX_ATTEMPTS",
         "TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS",
@@ -118,10 +188,8 @@ def test_pr16_runtime_knobs_have_documented_defaults(monkeypatch) -> None:
 
     config = load_config()
 
-    assert config.event_debounce_seconds == 0.05
-    assert config.reconcile_interval_seconds == 300.0
+    assert config.reconcile_interval_seconds == 15.0
     assert config.event_retention_days == 7
-    assert config.output_excerpt_chars == 200
     assert config.max_workers == 512
     assert config.max_outbox_attempts == 10
     assert config.connector_claim_ttl_seconds == 60
@@ -133,10 +201,8 @@ def test_pr16_runtime_knobs_have_documented_defaults(monkeypatch) -> None:
 
 
 def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
-    monkeypatch.setenv("TENDWIRE_EVENT_DEBOUNCE_SECONDS", "0.25")
-    monkeypatch.setenv("TENDWIRE_RECONCILE_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("TENDWIRE_RECONCILE_INTERVAL_SECONDS", "2")
     monkeypatch.setenv("TENDWIRE_EVENT_RETENTION_DAYS", "14")
-    monkeypatch.setenv("TENDWIRE_OUTPUT_EXCERPT_CHARS", "123")
     monkeypatch.setenv("TENDWIRE_MAX_WORKERS", "64")
     monkeypatch.setenv("TENDWIRE_MAX_OUTBOX_ATTEMPTS", "3")
     monkeypatch.setenv("TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS", "45")
@@ -148,10 +214,8 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
 
     env_config = load_config()
     explicit = load_config(
-        event_debounce_seconds="0.1",
         reconcile_interval_seconds="5",
         event_retention_days="2",
-        output_excerpt_chars="50",
         max_workers="9",
         max_outbox_attempts="4",
         connector_claim_ttl_seconds="15",
@@ -161,10 +225,8 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
         command_receipt_retention_seconds="691200",
         command_receipt_retention_count="12",
     )
-    assert env_config.event_debounce_seconds == 0.25
-    assert env_config.reconcile_interval_seconds == 0
+    assert env_config.reconcile_interval_seconds == 2
     assert env_config.event_retention_days == 14
-    assert env_config.output_excerpt_chars == 123
     assert env_config.max_workers == 64
     assert env_config.max_outbox_attempts == 3
     assert env_config.connector_claim_ttl_seconds == 45
@@ -173,10 +235,8 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
     assert env_config.command_retry_horizon_seconds == 120
     assert env_config.command_receipt_retention_seconds == 691_200
     assert env_config.command_receipt_retention_count == 99
-    assert explicit.event_debounce_seconds == 0.1
     assert explicit.reconcile_interval_seconds == 5
     assert explicit.event_retention_days == 2
-    assert explicit.output_excerpt_chars == 50
     assert explicit.max_workers == 9
     assert explicit.max_outbox_attempts == 4
     assert explicit.connector_claim_ttl_seconds == 15
@@ -190,10 +250,17 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("event_debounce_seconds", -0.1, "event_debounce_seconds must be non-negative"),
-        ("reconcile_interval_seconds", -1, "reconcile_interval_seconds must be non-negative"),
+        (
+            "reconcile_interval_seconds",
+            0,
+            "reconcile_interval_seconds must be a finite positive number",
+        ),
+        (
+            "reconcile_interval_seconds",
+            -1,
+            "reconcile_interval_seconds must be a finite positive number",
+        ),
         ("event_retention_days", 0, "event_retention_days must be >= 1"),
-        ("output_excerpt_chars", 0, "output_excerpt_chars must be >= 1"),
         ("max_workers", 0, "max_workers must be >= 1"),
         ("max_outbox_attempts", 0, "max_outbox_attempts must be >= 1"),
         ("connector_claim_ttl_seconds", 0, "connector_claim_ttl_seconds must be >= 1"),
@@ -208,6 +275,15 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
 def test_pr16_runtime_knobs_reject_invalid_values(field: str, value: object, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         Config(**{field: value})
+
+
+def test_reconcile_interval_rejects_disabled_environment(monkeypatch) -> None:
+    monkeypatch.setenv("TENDWIRE_RECONCILE_INTERVAL_SECONDS", "0")
+    with pytest.raises(
+        ValueError,
+        match="reconcile_interval_seconds must be a finite positive number",
+    ):
+        load_config()
 
 
 ACKNOWLEDGED_FINAL_RETENTION_ENV_NAMES = (
@@ -399,83 +475,6 @@ def test_command_receipt_retention_must_strictly_exceed_retry_horizon(
         )
 
 
-TURN_REFRESH_ENV_NAMES = (
-    "TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS",
-    "TENDWIRE_TURN_REFRESH_WORKERS",
-)
-
-
-def test_turn_refresh_knobs_have_documented_defaults(monkeypatch) -> None:
-    for name in TURN_REFRESH_ENV_NAMES:
-        monkeypatch.delenv(name, raising=False)
-
-    config = load_config()
-
-    assert DEFAULT_TURN_REFRESH_INTERVAL_SECONDS == 2.0
-    assert DEFAULT_TURN_REFRESH_WORKERS == 4
-    assert config.turn_refresh_interval_seconds == 2.0
-    assert config.turn_refresh_workers == 4
-
-
-def test_turn_refresh_knobs_use_explicit_before_environment(monkeypatch) -> None:
-    monkeypatch.setenv("TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS", "3.5")
-    monkeypatch.setenv("TENDWIRE_TURN_REFRESH_WORKERS", "8")
-
-    env_config = load_config(max_workers=16)
-    explicit = load_config(
-        max_workers=16,
-        turn_refresh_interval_seconds="0.25",
-        turn_refresh_workers="6",
-    )
-
-    assert env_config.turn_refresh_interval_seconds == 3.5
-    assert env_config.turn_refresh_workers == 8
-    assert explicit.turn_refresh_interval_seconds == 0.25
-    assert explicit.turn_refresh_workers == 6
-
-
-@pytest.mark.parametrize("value", [0, -0.01, "nan", "inf", "-inf"])
-def test_turn_refresh_interval_rejects_nonpositive_or_nonfinite(value: object) -> None:
-    with pytest.raises(
-        ValueError,
-        match="turn_refresh_interval_seconds must be a finite positive number",
-    ):
-        Config(turn_refresh_interval_seconds=value)
-
-
-@pytest.mark.parametrize(
-    ("value", "message"),
-    [
-        (True, "turn_refresh_workers must be an integer >= 1"),
-        (0, "turn_refresh_workers must be >= 1"),
-        (-1, "turn_refresh_workers must be >= 1"),
-        (33, "turn_refresh_workers must be <= 32"),
-        (1.5, "turn_refresh_workers must be an integer >= 1"),
-    ],
-)
-def test_turn_refresh_workers_reject_invalid_bounds(
-    value: object,
-    message: str,
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        Config(turn_refresh_workers=value)
-
-
-def test_turn_refresh_workers_cannot_exceed_observed_worker_max(monkeypatch) -> None:
-    with pytest.raises(
-        ValueError,
-        match="turn_refresh_workers must be <= max_workers",
-    ):
-        Config(max_workers=3, turn_refresh_workers=4)
-
-    monkeypatch.setenv("TENDWIRE_TURN_REFRESH_WORKERS", "5")
-    with pytest.raises(
-        ValueError,
-        match="turn_refresh_workers must be <= max_workers",
-    ):
-        load_config(max_workers=4)
-
-
 SNAPSHOT_MAINTENANCE_ENV_NAMES = (
     "TENDWIRE_SNAPSHOT_RETENTION_DAYS",
     "TENDWIRE_SNAPSHOT_RETENTION_COUNT",
@@ -577,43 +576,7 @@ def test_socket_group_defaults_private_and_normalizes_without_lookup(monkeypatch
     assert load_config(socket_group="   ").socket_group is None
 
 
-def test_herdr_backend_defaults_to_cli(monkeypatch) -> None:
-    monkeypatch.delenv("TENDWIRE_HERDR_BACKEND", raising=False)
-
-    assert Config().herdr_backend == "cli"
-    assert load_config().herdr_backend == "cli"
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        ("cli", "cli"),
-        ("socket", "socket"),
-        (" CLI ", "cli"),
-        ("SOCKET", "socket"),
-    ],
-)
-def test_herdr_backend_accepts_explicit_values(monkeypatch, raw: str, expected: str) -> None:
-    monkeypatch.delenv("TENDWIRE_HERDR_BACKEND", raising=False)
-
-    assert Config(herdr_backend=raw).herdr_backend == expected
-    assert load_config(herdr_backend=raw).herdr_backend == expected
-
-
-def test_herdr_backend_reads_environment(monkeypatch) -> None:
-    monkeypatch.setenv("TENDWIRE_HERDR_BACKEND", "socket")
-
-    assert load_config().herdr_backend == "socket"
-
-
-def test_herdr_backend_invalid_value_fails_clearly(monkeypatch) -> None:
-    monkeypatch.setenv("TENDWIRE_HERDR_BACKEND", "events")
-
-    with pytest.raises(ValueError, match="herdr_backend must be one of: cli, socket"):
-        load_config()
-
-
-def test_cli_default_import_does_not_load_socket_event_backend() -> None:
+def test_cli_default_import_does_not_load_socket_transport() -> None:
     code = """
 import sys
 before = set(sys.modules)
@@ -621,7 +584,6 @@ import tendwire.cli
 loaded = set(sys.modules) - before
 for name in sorted(loaded):
     if name in {
-        "tendwire.backends.herdr_events",
         "tendwire.backends.herdr_socket",
         "tendwire.backends.herdr_protocol",
     }:

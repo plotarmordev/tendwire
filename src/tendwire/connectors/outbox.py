@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ..config import DEFAULT_CONNECTOR_ACK_TTL_SECONDS, DEFAULT_TURN_MODEL
+from ..config import DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 from ..core.models import sanitize_public_mapping, sanitize_public_value
 from ..store.sqlite import (
     ack_connector_delivery,
@@ -124,6 +124,9 @@ def _restore_plan_tokens(clean: dict[str, Any], original: Mapping[str, Any]) -> 
     )
     if final_identity:
         clean["final_identity"] = final_identity
+    content_revision = _revision(original.get("content_revision"))
+    if content_revision:
+        clean["content_revision"] = content_revision
     turn_id = _text(original.get("turn_id"))
     if (
         turn_id.startswith("turn-")
@@ -131,15 +134,17 @@ def _restore_plan_tokens(clean: dict[str, Any], original: Mapping[str, Any]) -> 
         and all(char in _CONNECTOR_NAME_CHARS for char in turn_id)
     ):
         clean["turn_id"] = turn_id
-    nested_turn = original.get("turn")
-    if isinstance(nested_turn, Mapping):
-        clean_nested = clean.get("turn")
+    for nested_key in ("turn", "content"):
+        nested_turn = original.get(nested_key)
+        if not isinstance(nested_turn, Mapping):
+            continue
+        clean_nested = clean.get(nested_key)
         if not isinstance(clean_nested, dict):
             clean_nested = sanitize_public_mapping(
                 nested_turn,
                 backend_neutral=True,
             )
-            clean["turn"] = clean_nested
+            clean[nested_key] = clean_nested
         _restore_plan_tokens(clean_nested, nested_turn)
     return clean
 
@@ -212,7 +217,6 @@ class ConnectorOutboxAPI:
         max_lease_seconds: int = 300,
         ack_ttl_seconds: int = DEFAULT_CONNECTOR_ACK_TTL_SECONDS,
         max_attempts: int = 10,
-        turn_model: str = DEFAULT_TURN_MODEL,
     ) -> None:
         self.db_path = Path(db_path) if db_path is not None else None
         self.host_id = str(host_id)
@@ -220,7 +224,6 @@ class ConnectorOutboxAPI:
         self.max_lease_seconds = max(1, int(max_lease_seconds))
         self.ack_ttl_seconds = max(1, int(ack_ttl_seconds))
         self.max_attempts = max(1, int(max_attempts))
-        self.turn_model = str(turn_model or DEFAULT_TURN_MODEL).strip().lower()
 
     def _require_store(self, name: str = "") -> dict[str, Any] | None:
         if self.db_path is None:
@@ -288,7 +291,6 @@ class ConnectorOutboxAPI:
                 presentation_version=version,
                 part_count=part_count,
                 source_ref=source_ref,
-                turn_model=self.turn_model,
             )
 
         if action == "recover":
@@ -432,16 +434,18 @@ class ConnectorOutboxAPI:
             if not ref:
                 continue
             clean_payload = _clean_mapping(item.get("payload"))
-            clean_item = sanitize_public_value(
-                {
-                    "ref": ref,
-                    "key": str(item.get("key") or ""),
-                    "attempt": int(item.get("attempt") or 0),
-                    "leased_until": str(item.get("leased_until") or ""),
-                    "available_at": str(item.get("available_at") or ""),
-                    "payload": clean_payload,
-                }
-            )
+            public_item = {
+                "ref": ref,
+                "key": str(item.get("key") or ""),
+                "attempt": int(item.get("attempt") or 0),
+                "leased_until": str(item.get("leased_until") or ""),
+                "available_at": str(item.get("available_at") or ""),
+                "payload": clean_payload,
+            }
+            created_at = str(item.get("created_at") or "")
+            if name == _TURN_FINAL_NAME and created_at:
+                public_item["created_at"] = created_at
+            clean_item = sanitize_public_value(public_item)
             if isinstance(clean_item, dict):
                 item_key = str(item.get("key") or "")
                 if item_key.startswith(_FINAL_KEY_PREFIX):

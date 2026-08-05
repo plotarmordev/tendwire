@@ -81,6 +81,7 @@ def _insert_turn(
     summary: str | None = None,
     updated_at: str = TS,
     extra: Mapping[str, Any] | None = None,
+    with_revision: bool = True,
 ) -> None:
     payload = _payload(
         turn_id,
@@ -113,6 +114,84 @@ def _insert_turn(
             sequence,
         ),
     )
+    if with_revision:
+        store_sqlite._insert_turn_content_revision_conn(
+            conn,
+            host_id=host_id,
+            turn_id=turn_id,
+            user_text=None,
+            assistant_final_text=None,
+            user_state="absent",
+            final_state="absent",
+            created_at=updated_at,
+            is_current=True,
+        )
+
+
+def _seed_current_store(db_path: Path, count: int) -> None:
+    init_store(db_path)
+    turns: list[tuple[object, ...]] = []
+    revisions: list[tuple[object, ...]] = []
+    for index in range(count):
+        turn_id = f"historical-{index:05d}"
+        worker_id = f"worker-{index % 8}"
+        status = "working" if index < 8 else "complete"
+        payload = _payload(
+            turn_id,
+            worker_id=worker_id,
+            status=status,
+            summary=f"retained public result {index}",
+        )
+        turns.append(
+            (
+                HOST,
+                turn_id,
+                worker_id,
+                status,
+                TS,
+                f"fingerprint-{index}",
+                f"snapshot-{index}",
+                TS,
+                stable_json_dumps(payload),
+                index + 1,
+            )
+        )
+        revisions.append(
+            (
+                HOST,
+                turn_id,
+                f"empty-revision-{index}",
+                "absent",
+                "absent",
+                TS,
+            )
+        )
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executemany(
+            """
+            INSERT INTO turns (
+                host_id, turn_id, worker_id, status, kind, updated_at,
+                fingerprint, snapshot_content_fingerprint, observed_at,
+                payload_json, list_sequence
+            ) VALUES (?, ?, ?, ?, 'prompt', ?, ?, ?, ?, ?, ?)
+            """,
+            turns,
+        )
+        conn.executemany(
+            """
+            INSERT INTO turn_content_revisions (
+                host_id, turn_id, content_revision,
+                user_text, assistant_final_text, user_state, final_state,
+                user_char_length, user_byte_length,
+                final_char_length, final_byte_length,
+                user_page_count, final_page_count,
+                is_current, created_at, superseded_at
+            ) VALUES (?, ?, ?, NULL, NULL, ?, ?, 0, 0, 0, 0, 0, 0, 1, ?, NULL)
+            """,
+            revisions,
+        )
+        conn.execute("DELETE FROM turn_change_journal")
+        conn.commit()
 
 
 def _mutate_turn(
@@ -160,47 +239,6 @@ def _tombstone_turn(db_path: Path, turn_id: str, replacement: str | None = None)
         conn.commit()
 
 
-def _seed_pre_v18_store(db_path: Path, count: int) -> None:
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute("PRAGMA foreign_keys=ON")
-        store_sqlite._run_migrations(conn, target_version=17)
-        rows = []
-        for index in range(count):
-            turn_id = f"historical-{index:05d}"
-            worker_id = f"worker-{index % 8}"
-            status = "working" if index < 8 else "complete"
-            payload = _payload(
-                turn_id,
-                worker_id=worker_id,
-                status=status,
-                summary=f"retained public result {index}",
-            )
-            rows.append(
-                (
-                    HOST,
-                    turn_id,
-                    worker_id,
-                    status,
-                    TS,
-                    f"fingerprint-{index}",
-                    f"snapshot-{index}",
-                    TS,
-                    stable_json_dumps(payload),
-                    index + 1,
-                )
-            )
-        conn.executemany(
-            """
-            INSERT INTO turns (
-                host_id, turn_id, worker_id, status, kind, updated_at,
-                fingerprint, snapshot_content_fingerprint, observed_at,
-                payload_json, list_sequence
-            ) VALUES (?, ?, ?, ?, 'prompt', ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
-        conn.commit()
-    init_store(db_path)
 
 
 def _bootstrap_checkpoint(db_path: Path, *, limit: int = 100) -> str:
@@ -259,7 +297,7 @@ def test_goal13_acceptance_1_to_3_ten_thousand_bootstrap_and_unchanged_polls(
 ) -> None:
     """10k bootstrap is stable/bounded; unchanged polls traverse no list/content."""
     db_path = tmp_path / "ten-thousand.db"
-    _seed_pre_v18_store(db_path, 10_000)
+    _seed_current_store(db_path, 10_000)
     with sqlite3.connect(str(db_path)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM turn_change_journal").fetchone() == (0,)
 
@@ -331,7 +369,7 @@ def test_goal13_acceptance_1_to_3_ten_thousand_bootstrap_and_unchanged_polls(
 
 def test_bootstrap_size_gate_is_independent_of_client_limit_two(tmp_path: Path) -> None:
     db_path = tmp_path / "limit-two-bootstrap.db"
-    _seed_pre_v18_store(db_path, 5_000)
+    _seed_current_store(db_path, 5_000)
 
     first = turn_delta_payload_from_store(
         db_path,
@@ -397,6 +435,13 @@ def test_goal13_acceptance_4_working_mutation_is_one_upsert_and_revision_only_ch
         ).fetchone()[0]
         conn.execute(
             """
+            UPDATE turn_content_revisions SET is_current = 0, superseded_at = ?
+            WHERE host_id = ? AND turn_id = ? AND is_current = 1
+            """,
+            (TS, HOST, "working-turn"),
+        )
+        conn.execute(
+            """
             UPDATE turn_content_revisions SET is_current = 1
             WHERE host_id = ? AND turn_id = ? AND content_revision = ?
             """,
@@ -421,7 +466,7 @@ def test_current_revision_insert_alone_emits_one_upsert(tmp_path: Path) -> None:
     db_path = tmp_path / "revision-insert.db"
     init_store(db_path)
     with sqlite3.connect(str(db_path)) as conn:
-        _insert_turn(conn, "revision-insert", 1)
+        _insert_turn(conn, "revision-insert", 1, with_revision=False)
         conn.commit()
     checkpoint = _bootstrap_checkpoint(db_path)
 
@@ -489,6 +534,7 @@ def test_single_oversized_change_degrades_and_advances_checkpoint(tmp_path: Path
             1,
             summary="large public descriptor",
             extra={"meta": {"items": ["x" * 12_000 for _ in range(100)]}},
+            with_revision=False,
         )
         store_sqlite._insert_turn_content_revision_conn(
             conn,
@@ -708,7 +754,7 @@ def test_goal13_acceptance_9_token_outcomes_compaction_and_store_epoch_rebuild(
         batch_size=10,
         now="2030-07-18T12:00:00+00:00",
     )
-    assert compacted["deleted"] == 2
+    assert compacted["deleted"] == 5
     assert turn_delta_payload_from_store(
         db_path, HOST, watermark=checkpoint
     )["status"] == "expired_watermark"
@@ -745,42 +791,6 @@ def test_goal13_acceptance_9_token_outcomes_compaction_and_store_epoch_rebuild(
     )["status"] == "invalid_watermark"
 
 
-@pytest.mark.parametrize("source_version", range(18))
-def test_goal13_acceptance_11_every_prior_migration_installs_empty_v18_journal(
-    tmp_path: Path,
-    source_version: int,
-) -> None:
-    db_path = tmp_path / f"migration-{source_version}.db"
-    with sqlite3.connect(str(db_path)) as conn:
-        store_sqlite._run_migrations(conn, target_version=source_version)
-        assert conn.execute("PRAGMA user_version").fetchone() == (source_version,)
-        store_sqlite._run_migrations(conn, target_version=18)
-        assert conn.execute("PRAGMA user_version").fetchone() == (18,)
-        assert conn.execute("SELECT COUNT(*) FROM turn_change_journal").fetchone() == (0,)
-        columns = tuple(
-            row[1] for row in conn.execute("PRAGMA table_info(turn_change_journal)")
-        )
-        assert columns == ("seq", "host_id", "turn_id", "op", "changed_at")
-        epoch = conn.execute(
-            "SELECT store_epoch FROM turn_change_state WHERE scope = 'turn-delta'"
-        ).fetchone()
-        assert epoch is not None and len(str(epoch[0])) >= 32
-        trigger_names = {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
-            )
-        }
-        assert {
-            "trg_turn_change_after_insert",
-            "trg_turn_change_after_update",
-            "trg_turn_change_after_delete",
-            "trg_turn_change_revision_current",
-            "trg_turn_change_revision_insert_current",
-            "trg_turn_change_journal_no_update",
-        } <= trigger_names
-        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_goal13_capture_is_trigger_backed_immutable_and_public_minimal(tmp_path: Path) -> None:
@@ -821,7 +831,13 @@ def test_delta_page_bytes_do_not_change_when_submission_sweep_fires_mid_request(
 ) -> None:
     db_path = tmp_path / "sweep-byte-stability.db"
     init_store(db_path)
-    worker = {"id": "worker-0"}
+    worker = {
+        "id": "worker-0",
+        "meta": {
+            "stable_key": "wsk1_" + ("a" * 64),
+            "stable_key_version": 1,
+        },
+    }
     with sqlite3.connect(str(db_path)) as conn:
         store_sqlite._insert_turn_submission_conn(
             conn,
@@ -861,7 +877,6 @@ def test_delta_page_bytes_do_not_change_when_submission_sweep_fires_mid_request(
             db_path,
             HOST,
             now=current,
-            turn_model="observed",
         )
     ).encode("utf-8")
     during = stable_json_dumps(
@@ -869,7 +884,6 @@ def test_delta_page_bytes_do_not_change_when_submission_sweep_fires_mid_request(
             db_path,
             HOST,
             now=current,
-            turn_model="observed",
         )
     ).encode("utf-8")
 
@@ -922,7 +936,7 @@ def test_real_turn_writers_all_capture_journal_changes(tmp_path: Path) -> None:
             ]
 
     before = journal_high()
-    assert store_sqlite.merge_turn_content(
+    assert store_sqlite.apply_turn_refresh(
         db_path,
         HOST,
         "worker-0",
@@ -934,7 +948,7 @@ def test_real_turn_writers_all_capture_journal_changes(tmp_path: Path) -> None:
             "has_open_turn": True,
         },
         observed_at="2026-01-01T00:01:00+00:00",
-    ) == 1
+    ).updated == 1
     first_rows = journal_since(before)
     assert first_rows and all(op == "upsert" for _turn_id, op in first_rows)
 
@@ -976,7 +990,7 @@ def test_turn_delta_rpc_advertises_feature_and_cannot_invoke_delivery(tmp_path: 
     assert delivery_calls == []
 
 
-def test_turn_delta_cli_bootstrap_and_incremental_read(tmp_path: Path, capsys) -> None:
+def test_turn_delta_cli_requires_daemon_and_does_not_read_store(tmp_path: Path, capsys) -> None:
     db_path = tmp_path / "cli.db"
     socket_path = tmp_path / "missing.sock"
     init_store(db_path)
@@ -994,15 +1008,11 @@ def test_turn_delta_cli_bootstrap_and_incremental_read(tmp_path: Path, capsys) -
         "--db-path",
         str(db_path),
     ]
-    assert main(base_args) == 0
-    bootstrap = json.loads(capsys.readouterr().out)
-    assert bootstrap["changes"][0]["turn"]["summary"] == "first CLI projection"
-    checkpoint = str(bootstrap["checkpoint"])
-
-    _mutate_turn(db_path, "cli-turn", summary="second CLI projection")
-    assert main([*base_args, "--watermark", checkpoint]) == 0
-    changed = json.loads(capsys.readouterr().out)
-    assert changed["changes"][0]["turn"]["summary"] == "second CLI projection"
+    assert main(base_args) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["status"] == "daemon_unavailable"
+    assert "changes" not in payload
 
 
 def test_turn_change_retention_config_defaults_env_and_bounds(

@@ -727,6 +727,13 @@ def _restore_content_page_text(
     result = response.get("result")
     if isinstance(result, dict):
         result["text"] = text
+        content_revision = original_result.get("content_revision")
+        if (
+            isinstance(content_revision, str)
+            and re.fullmatch(r"twrev1\.[A-Za-z0-9_-]+", content_revision)
+            is not None
+        ):
+            result["content_revision"] = content_revision
 
 
 def _restore_turn_delta_text(
@@ -784,6 +791,13 @@ def _restore_plan_token(
             is not None
         ):
             target["final_identity"] = final_identity
+        content_revision = original.get("content_revision")
+        if (
+            isinstance(content_revision, str)
+            and re.fullmatch(r"twrev1\.[A-Za-z0-9_-]+", content_revision)
+            is not None
+        ):
+            target["content_revision"] = content_revision
         delivery_key = original.get("key")
         if (
             isinstance(delivery_key, str)
@@ -794,7 +808,7 @@ def _restore_plan_token(
             is not None
         ):
             target["key"] = delivery_key
-        for nested_key in ("turn", "final", "payload"):
+        for nested_key in ("turn", "final", "payload", "content"):
             nested_original = original.get(nested_key)
             nested_target = target.get(nested_key)
             if isinstance(nested_original, Mapping) and isinstance(nested_target, dict):

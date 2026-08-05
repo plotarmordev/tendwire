@@ -64,20 +64,15 @@ def _turn_content() -> dict[str, object]:
     }
 
 
-@pytest.mark.parametrize("turn_model", ["legacy", "observed"])
-@pytest.mark.parametrize("compatibility_source_token", [False, True])
 def test_unchanged_turn_reobservation_performs_no_forbidden_phrase_scans(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    turn_model: str,
-    compatibility_source_token: bool,
 ) -> None:
-    db_path = tmp_path / f"unchanged-turn-{turn_model}.db"
+    db_path = tmp_path / "unchanged-turn.db"
     store_sqlite.init_store(db_path)
     store_sqlite.save_snapshot(
         db_path,
         _snapshot(1, [_worker(1)]),
-        turn_model=turn_model,
     )
     content = _turn_content()
     first = store_sqlite.apply_turn_refresh(
@@ -86,42 +81,8 @@ def test_unchanged_turn_reobservation_performs_no_forbidden_phrase_scans(
         "worker-1",
         content,
         observed_at="2026-07-20T00:00:02+00:00",
-        turn_model=turn_model,
     )
     assert first.updated == 1
-
-    if compatibility_source_token:
-        with sqlite3.connect(db_path) as conn:
-            row = conn.execute(
-                """
-                SELECT turn_id, payload_json
-                FROM turns
-                WHERE host_id = ?
-                  AND json_extract(payload_json, '$.source_turn_id') != ''
-                """,
-                (HOST_ID,),
-            ).fetchone()
-            assert row is not None
-            payload = store_sqlite._json_object(row[1])
-            candidates = store_sqlite.turn_source_id_candidates(
-                content["source_turn_id"],
-                meta=payload["meta"],
-                source=payload["source"],
-                kind=payload["kind"],
-            )
-            assert len(candidates) == 2
-            payload["source_turn_id"] = candidates[1]
-            conn.execute(
-                """
-                UPDATE turns SET payload_json = ?
-                WHERE host_id = ? AND turn_id = ?
-                """,
-                (
-                    store_sqlite._canonical_json(payload),
-                    HOST_ID,
-                    str(row[0]),
-                ),
-            )
 
     scans = 0
     original_scan = models._is_forbidden_public_text_phrase
@@ -142,7 +103,6 @@ def test_unchanged_turn_reobservation_performs_no_forbidden_phrase_scans(
         "worker-1",
         content,
         observed_at="2026-07-20T00:00:03+00:00",
-        turn_model=turn_model,
     )
 
     assert second.updated == 0
@@ -158,7 +118,6 @@ def test_unchanged_observed_turn_still_attempts_submission_settlement(
     store_sqlite.save_snapshot(
         db_path,
         _snapshot(1, [_worker(1)]),
-        turn_model="observed",
     )
     content = _turn_content()
     store_sqlite.apply_turn_refresh(
@@ -167,11 +126,10 @@ def test_unchanged_observed_turn_still_attempts_submission_settlement(
         "worker-1",
         content,
         observed_at="2026-07-20T00:00:02+00:00",
-        turn_model="observed",
     )
 
     settle_calls = 0
-    original_settle = store_sqlite.settle_submission_links_conn
+    original_settle = store_sqlite._settle_submission_links_conn
 
     def recording_settle(*args, **kwargs):
         nonlocal settle_calls
@@ -180,7 +138,7 @@ def test_unchanged_observed_turn_still_attempts_submission_settlement(
 
     monkeypatch.setattr(
         store_sqlite,
-        "settle_submission_links_conn",
+        "_settle_submission_links_conn",
         recording_settle,
     )
     second = store_sqlite.apply_turn_refresh(
@@ -189,7 +147,6 @@ def test_unchanged_observed_turn_still_attempts_submission_settlement(
         "worker-1",
         content,
         observed_at="2026-07-20T00:00:03+00:00",
-        turn_model="observed",
     )
 
     assert second.updated == 0

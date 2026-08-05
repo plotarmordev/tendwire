@@ -15,18 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from .backends.herdr_cli import (
-    bindings_from_workers,
-    diagnose_herdr,
-    fetch_herdr_snapshot_observation,
-    fetch_herdr_state,
-    herdr_backend_health,
-    rehydrate_workers_from_bindings,
-)
-from .backends.herdr_turns import refresh_structured_turn_content
 from .config import Config, load_config
 from .core.actions import CommandContext, execute_command
-from .core.attention import attention_payload_from_snapshot
 from .core.commands import (
     STATUS_BACKEND_UNAVAILABLE,
     CommandEnvelope,
@@ -34,42 +24,26 @@ from .core.commands import (
     parse_command_request,
     validate_request,
 )
-from .core.projector import project_from_observations
 from .core.models import (
-    BackendHealth,
-    WorkerBinding,
     public_json_dumps,
     sanitize_public_mapping,
-    separate_duplicate_worker_bindings,
 )
 from .core.turns import (
     TURN_DELTA_DEFAULT_LIMIT,
     TURN_DELTA_MAX_LIMIT,
     TURN_LIST_DEFAULT_LIMIT,
     TURN_LIST_MAX_LIMIT,
-    turns_payload_from_snapshot,
 )
 from .local_state import repair_config_state
 from .store.sqlite import (
     CompactionOptions,
-    attention_payload_from_store,
     compact_store,
-    expire_stale_worker_bindings,
-    latest_healthy_backend_snapshot,
-    latest_snapshot,
-    list_worker_bindings,
-    pending_payload_from_store,
     run_store_maintenance,
     store_status,
     tail_event_metadata,
-    turns_payload_from_store,
-    turn_delta_payload_from_store,
-    upsert_worker_bindings,
 )
 
 
-_HERDR_BACKEND = "herdr"
-_DEFAULT_FETCH_HERDR_STATE = fetch_herdr_state
 _DAEMON_FAST_CLIENT_TIMEOUT_SECONDS = 2.0
 _DAEMON_CONTENT_CLIENT_TIMEOUT_SECONDS = 10.0
 _DAEMON_CONNECTOR_CLIENT_TIMEOUT_SECONDS = 30.0
@@ -153,13 +127,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--herdr-timeout",
         dest="herdr_timeout_seconds",
         default=None,
-        help="Seconds to wait for each Herdr CLI probe (default: 5.0).",
+        help="Seconds to wait for each Herdr socket request (default: 5.0).",
     )
     parser.add_argument(
         "--socket-path",
         dest="socket_path",
         default=None,
-        help="Unix socket path for daemon-backed requests when explicitly enabled.",
+        help="Unix socket path for daemon requests (default: data-dir/tendwire.sock).",
     )
 
     subparsers = parser.add_subparsers(dest="command")
@@ -175,19 +149,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Print snapshot as JSON (default).",
     )
-    snapshot_parser.add_argument(
-        "--store",
-        dest="store_snapshot",
-        action="store_true",
-        default=False,
-        help="Persist the snapshot to the sqlite store without changing stdout.",
-    )
-    snapshot_parser.add_argument(
-        "--db-path",
-        dest="db_path",
-        default=None,
-        help="SQLite database path to use with --store (default: config path).",
-    )
 
     attention_parser = subparsers.add_parser(
         "attention",
@@ -199,19 +160,6 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=True,
         help="Print attention as JSON (default).",
-    )
-    attention_parser.add_argument(
-        "--store",
-        dest="store_snapshot",
-        action="store_true",
-        default=False,
-        help="Persist a fresh snapshot before listing store-backed attention.",
-    )
-    attention_parser.add_argument(
-        "--db-path",
-        dest="db_path",
-        default=None,
-        help="SQLite database path for store-backed attention (default: config path).",
     )
 
     turns_parser = subparsers.add_parser(
@@ -538,184 +486,6 @@ def _add_connector_parser(subparsers: argparse._SubParsersAction[argparse.Argume
             action_parser.add_argument("--lease-seconds", dest="lease_seconds", type=int, default=None)
 
 
-def _load_worker_bindings(config: Config) -> list[WorkerBinding]:
-    if config.db_path is None:
-        return []
-    return list_worker_bindings(
-        config.db_path,
-        config.host_id,
-        backend=_HERDR_BACKEND,
-    )
-
-
-def _fetch_state_with_bindings(
-    config: Config,
-    stored_bindings: list[WorkerBinding],
-) -> tuple[list[Any], list[Any], list[WorkerBinding]]:
-    try:
-        result = fetch_herdr_state(
-            config,
-            stored_bindings=stored_bindings,
-            include_bindings=True,
-        )
-    except TypeError:
-        spaces, workers = fetch_herdr_state(config)
-        return spaces, workers, bindings_from_workers(config, workers)
-
-    if len(result) == 3:
-        spaces, workers, bindings = result
-        return spaces, workers, bindings
-    spaces, workers = result
-    return spaces, workers, bindings_from_workers(config, workers)
-
-
-def _legacy_backend_health(spaces: list[Any], workers: list[Any]) -> list[BackendHealth]:
-    return [
-        herdr_backend_health(
-            "healthy_non_empty" if spaces or workers else "unknown",
-            spaces=spaces,
-            workers=workers,
-        )
-    ]
-
-
-def _fetch_snapshot_observation_with_bindings(
-    config: Config,
-    stored_bindings: list[WorkerBinding],
-) -> tuple[list[Any], list[Any], list[WorkerBinding], list[BackendHealth], bool]:
-    complete_barrier = False
-    if fetch_herdr_state is not _DEFAULT_FETCH_HERDR_STATE:
-        spaces, workers, bindings = _fetch_state_with_bindings(config, stored_bindings)
-        backend_health = _legacy_backend_health(spaces, workers)
-    else:
-        try:
-            observation = fetch_herdr_snapshot_observation(
-                config,
-                stored_bindings=stored_bindings,
-            )
-        except TypeError:
-            spaces, workers, bindings = _fetch_state_with_bindings(config, stored_bindings)
-            backend_health = _legacy_backend_health(spaces, workers)
-        else:
-            spaces = list(getattr(observation, "spaces", []) or [])
-            workers = list(getattr(observation, "workers", []) or [])
-            bindings = list(getattr(observation, "bindings", []) or [])
-            backend_health = list(getattr(observation, "backend_health", []) or [])
-            complete_barrier = bool(backend_health)
-            if not backend_health:
-                backend_health = _legacy_backend_health(spaces, workers)
-
-    health = _herdr_health_from_items(backend_health)
-    if health.status == "healthy":
-        return spaces, workers, bindings, backend_health, complete_barrier
-
-    # Failed observations are not an authority for routing or continuity.
-    # Never persist their bindings, and retain the last authenticated public
-    # state when one has already been stored.
-    bindings = []
-    if config.db_path is None:
-        return spaces, workers, bindings, backend_health, complete_barrier
-
-    db_path = Path(config.db_path)
-    latest = latest_snapshot(db_path, config.host_id)
-    if latest is not None:
-        latest_health = _herdr_health_from_items(list(latest.backend_health))
-        if latest_health.outcome == "continuity_unavailable":
-            health = latest_health
-
-    previous = latest_healthy_backend_snapshot(
-        db_path,
-        config.host_id,
-        backend=_HERDR_BACKEND,
-    )
-    if previous is not None:
-        spaces = list(previous.spaces)
-        workers = list(previous.workers)
-
-    retained_health = herdr_backend_health(
-        health.outcome,
-        observed_at=health.observed_at,
-        message=health.message,
-        spaces=spaces,
-        workers=workers,
-    )
-    backend_health = [
-        retained_health if item.name == _HERDR_BACKEND else item
-        for item in backend_health
-    ]
-    if not any(item.name == _HERDR_BACKEND for item in backend_health):
-        backend_health.append(retained_health)
-    return spaces, workers, bindings, backend_health, complete_barrier
-
-
-
-
-def _herdr_health_from_items(items: list[BackendHealth]) -> BackendHealth:
-    for item in items:
-        if getattr(item, "name", "") == _HERDR_BACKEND:
-            return item
-    return herdr_backend_health("unknown")
-
-
-
-
-def observe_public_snapshot(
-    config: Config,
-    *,
-    store_snapshot: bool = False,
-) -> Any:
-    """Build the public snapshot through the existing one-shot observation path."""
-    # Always seed observation with stored bindings: they are what keeps public
-    # worker ids stable across snapshots. Skipping them re-letters duplicate
-    # worker names (claude, claude-1, ...) from scratch on every observation.
-    stored_bindings = _load_worker_bindings(config)
-    spaces, workers, bindings, backend_health, complete_barrier = (
-        _fetch_snapshot_observation_with_bindings(
-            config,
-            stored_bindings,
-        )
-    )
-    snapshot = project_from_observations(
-        config,
-        spaces=spaces,
-        workers=workers,
-        backend_health=backend_health,
-    )
-
-    if store_snapshot:
-        from .store.sqlite import SnapshotObservationContext, save_snapshot
-
-        if config.db_path is None:
-            raise RuntimeError("snapshot persistence requires a db path")
-        health = _herdr_health_from_items(backend_health)
-        authority = (
-            "complete"
-            if complete_barrier
-            and health.status == "healthy"
-            and health.outcome in {"healthy_non_empty", "empty_healthy"}
-            else "none"
-        )
-        save_snapshot(
-            config.db_path,
-            snapshot,
-            turn_model=config.turn_model,
-            observation=SnapshotObservationContext(
-                authority=authority,
-                observed_at=health.observed_at,
-            ),
-            worker_bindings=bindings,
-            binding_backend=_HERDR_BACKEND,
-            binding_observation_authoritative=health.status == "healthy",
-            binding_workers_present=bool(workers),
-        )
-
-    return snapshot
-
-
-def _current_public_snapshot(config: Config) -> Any:
-    return observe_public_snapshot(config)
-
-
 def _try_daemon_attempt(
     config: Config,
     method: str,
@@ -723,10 +493,10 @@ def _try_daemon_attempt(
     *,
     preserve_content_text: bool = False,
 ) -> _DaemonAttempt:
-    """Return a daemon result only when a daemon socket was explicitly selected."""
-    if config.socket_path is None:
-        return _DaemonAttempt(error_kind="unavailable", request_started=False)
-    socket_path = config.socket_path
+    """Return one result from the daemon's authoritative socket API."""
+    from .daemon import default_socket_path
+
+    socket_path = default_socket_path(config)
 
     try:
         from .daemon_api import (
@@ -801,61 +571,20 @@ def _try_daemon_attempt(
     return _DaemonAttempt(error_kind="protocol", request_started=True)
 
 
-def _try_daemon_result(
-    config: Config,
-    method: str,
-    params: dict[str, Any] | None = None,
-) -> dict[str, Any] | None:
-    """Return only a daemon result, preserving read-only fallback behavior."""
-    return _try_daemon_attempt(config, method, params).result
-
-
-def _persist_binding_observation(
-    config: Config,
-    bindings: list[WorkerBinding],
-    *,
-    observed_at: str,
-    workers_present: bool,
-    authoritative: bool = True,
-) -> list[WorkerBinding]:
-    bindings = separate_duplicate_worker_bindings(bindings)
-    if config.db_path is None:
-        return bindings
-    if bindings:
-        upsert_worker_bindings(config.db_path, bindings)
-    if authoritative and (bindings or not workers_present):
-        expire_stale_worker_bindings(
-            config.db_path,
-            config.host_id,
-            backend=_HERDR_BACKEND,
-            current_private_fingerprints=[binding.private_fingerprint for binding in bindings],
-            now=observed_at,
-        )
-    return bindings
-
-
 def cmd_snapshot(
     config: Config,
     *,
     json_output: bool = True,
-    store_snapshot: bool = False,
 ) -> int:
-    """Build and print a neutral snapshot."""
+    """Read the daemon's current neutral snapshot."""
     if json_output:
-        daemon_attempt = (
-            _DaemonAttempt(error_kind="unavailable", request_started=False)
-            if store_snapshot
-            else _try_daemon_attempt(config, "snapshot.get")
-        )
+        daemon_attempt = _try_daemon_attempt(config, "snapshot.get")
         if daemon_attempt.result is not None:
             payload = daemon_attempt.result
             code = 0
         elif daemon_attempt.response_error is not None:
             payload = daemon_attempt.response_error
             code = 1
-        elif daemon_attempt.request_started is False:
-            payload = observe_public_snapshot(config, store_snapshot=store_snapshot).to_dict()
-            code = 0
         elif daemon_attempt.error_kind == "timeout":
             payload = {
                 "schema_version": 2,
@@ -871,10 +600,22 @@ def cmd_snapshot(
             payload = {
                 "schema_version": 2,
                 "ok": False,
-                "status": "daemon_protocol_error",
+                "status": (
+                    "daemon_unavailable"
+                    if daemon_attempt.request_started is False
+                    else "daemon_protocol_error"
+                ),
                 "error": {
-                    "code": "daemon_protocol_error",
-                    "message": "Tendwire daemon returned an invalid response",
+                    "code": (
+                        "daemon_unavailable"
+                        if daemon_attempt.request_started is False
+                        else "daemon_protocol_error"
+                    ),
+                    "message": (
+                        "Tendwire daemon is unavailable"
+                        if daemon_attempt.request_started is False
+                        else "Tendwire daemon returned an invalid response"
+                    ),
                 },
             }
             code = 1
@@ -984,6 +725,11 @@ def _restore_cli_content_text(
         and original.get("availability") == "complete"
     ):
         sanitized["text"] = text
+        content_revision = original.get("content_revision")
+        if isinstance(content_revision, str) and re.fullmatch(
+            r"twrev1\.[A-Za-z0-9_-]+", content_revision
+        ):
+            sanitized["content_revision"] = content_revision
 
 
 def _restore_cli_plan_token(
@@ -1007,12 +753,17 @@ def _restore_cli_plan_token(
         r"twfinal1\.[A-Za-z0-9_-]+", final_identity
     ):
         sanitized["final_identity"] = final_identity
+    content_revision = original.get("content_revision")
+    if isinstance(content_revision, str) and re.fullmatch(
+        r"twrev1\.[A-Za-z0-9_-]+", content_revision
+    ):
+        sanitized["content_revision"] = content_revision
     delivery_key = original.get("key")
     if isinstance(delivery_key, str) and re.fullmatch(
         r"turn-final:revision:twfinal1\.[A-Za-z0-9_-]+", delivery_key
     ):
         sanitized["key"] = delivery_key
-    for nested_key in ("turn", "final", "payload"):
+    for nested_key in ("turn", "final", "payload", "content"):
         nested_original = original.get(nested_key)
         nested_sanitized = sanitized.get(nested_key)
         if isinstance(nested_original, dict) and isinstance(nested_sanitized, dict):
@@ -1053,6 +804,41 @@ def _content_payload_json(payload: dict[str, Any], *, indent: int | None = None)
     )
 
 
+def _daemon_read_payload(
+    attempt: _DaemonAttempt,
+    *,
+    schema_version: int = 1,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if attempt.result is not None:
+        return attempt.result
+    if attempt.response_error is not None:
+        return attempt.response_error
+    status = (
+        "daemon_timeout"
+        if attempt.error_kind == "timeout"
+        else "daemon_unavailable"
+        if attempt.request_started is False
+        else "daemon_protocol_error"
+    )
+    payload: dict[str, Any] = {
+        "schema_version": schema_version,
+        "ok": False,
+        "status": status,
+        "error": {
+            "code": status,
+            "message": {
+                "daemon_timeout": "Tendwire daemon request timed out",
+                "daemon_unavailable": "Tendwire daemon is unavailable",
+                "daemon_protocol_error": "Tendwire daemon returned an invalid response",
+            }[status],
+        },
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
 def cmd_turns(
     config: Config,
     *,
@@ -1072,66 +858,17 @@ def cmd_turns(
         "cursor": cursor,
         "since": since,
     }
-    daemon_attempt = _try_daemon_attempt(config, "turn.list", params)
-    if daemon_attempt.result is not None:
-        payload = daemon_attempt.result
-    elif daemon_attempt.response_error is not None:
-        payload = daemon_attempt.response_error
-    elif (
-        daemon_attempt.error_kind in {"unavailable", "timeout"}
-        and daemon_attempt.request_started is False
-    ):
-        if config.db_path is None:
-            payload = {
-                "schema_version": schema_version,
-                "host_id": config.host_id,
-                "ok": False,
-                "status": "store_unavailable",
-            }
-        else:
-            if cursor is None and since is None:
-                refresh_structured_turn_content(
-                    config,
-                    adapter_timeout_seconds=config.herdr_timeout_seconds,
-                    max_workers=config.turn_refresh_workers,
-                    total_timeout_seconds=config.herdr_timeout_seconds + 1.0,
-                )
-            payload = turns_payload_from_store(
-                config.db_path,
-                config.host_id,
-                schema_version=schema_version,
-                limit=limit,
-                cursor=cursor,
-                since=since,
-                turn_refresh_interval_seconds=config.turn_refresh_interval_seconds,
-                turn_model=config.turn_model,
-            )
-    elif daemon_attempt.error_kind == "timeout":
-        payload = {
-            "schema_version": 1,
-            "ok": False,
-            "status": "daemon_timeout",
-            "error": {
-                "code": "daemon_timeout",
-                "message": "Tendwire daemon request timed out",
-            },
-        }
-    else:
-        payload = {
-            "schema_version": 1,
-            "ok": False,
-            "status": "daemon_protocol_error",
-            "error": {
-                "code": "daemon_protocol_error",
-                "message": "Tendwire daemon returned an invalid response",
-            },
-        }
+    payload = _daemon_read_payload(
+        _try_daemon_attempt(config, "turn.list", params),
+        schema_version=schema_version,
+        extra={"host_id": config.host_id},
+    )
     print(_turn_list_payload_json(payload, indent=2))
     return 0 if payload.get("ok") is not False else 1
 
 
 def cmd_turn_content_get(config: Config, args: argparse.Namespace) -> int:
-    """Fetch one bounded canonical content page with daemon/store parity."""
+    """Fetch one bounded canonical content page from the daemon."""
     params: dict[str, Any] = {
         "schema_version": 1,
         "turn_id": args.turn_id,
@@ -1140,53 +877,14 @@ def cmd_turn_content_get(config: Config, args: argparse.Namespace) -> int:
     }
     if args.cursor is not None:
         params["cursor"] = args.cursor
-    daemon_attempt = _try_daemon_attempt(
-        config,
-        "turn.content.get",
-        params,
-        preserve_content_text=True,
+    payload = _daemon_read_payload(
+        _try_daemon_attempt(
+            config,
+            "turn.content.get",
+            params,
+            preserve_content_text=True,
+        )
     )
-    if daemon_attempt.result is not None:
-        payload = daemon_attempt.result
-    elif daemon_attempt.response_error is not None:
-        payload = daemon_attempt.response_error
-    elif daemon_attempt.error_kind not in {"unavailable", "timeout"}:
-        payload = {
-            "schema_version": 1,
-            "ok": False,
-            "status": "daemon_protocol_error",
-            "error": {
-                "code": "daemon_protocol_error",
-                "message": "daemon returned an invalid response",
-            },
-        }
-    elif config.db_path is None:
-        payload = {
-            "schema_version": 1,
-            "ok": False,
-            "status": "store_unavailable",
-            "error": {
-                "code": "store_unavailable",
-                "message": "command requires --db-path or a reachable daemon",
-            },
-        }
-    else:
-        from .store.sqlite import get_turn_content, init_store
-
-        init_store(
-            config.db_path,
-            connector_ack_ttl_seconds=config.connector_ack_ttl_seconds,
-        )
-        payload = get_turn_content(
-            config.db_path,
-            config.host_id,
-            turn_id=args.turn_id,
-            content_revision=args.content_revision,
-            field=args.field,
-            cursor=args.cursor,
-            schema_version=1,
-            turn_model=config.turn_model,
-        )
     print(_content_payload_json(payload, indent=2))
     return 0 if payload.get("ok") is not False and isinstance(payload.get("text"), str) else 1
 
@@ -1195,27 +893,14 @@ def cmd_attention(
     config: Config,
     *,
     json_output: bool = True,
-    store_snapshot: bool = False,
 ) -> int:
     """Print neutral public attention items."""
     if not json_output:
         print("error: only --json output is supported", file=sys.stderr)
         return 2
-    if not store_snapshot:
-        daemon_result = _try_daemon_result(config, "attention.list")
-        if daemon_result is not None:
-            print(public_json_dumps(daemon_result, indent=2))
-            return 0
-    if store_snapshot:
-        observe_public_snapshot(config, store_snapshot=True)
-    if config.db_path is not None:
-        payload = attention_payload_from_store(config.db_path, config.host_id)
-        if payload is not None:
-            print(public_json_dumps(payload, indent=2))
-            return 0
-    snapshot = _current_public_snapshot(config)
-    print(public_json_dumps(attention_payload_from_snapshot(snapshot), indent=2))
-    return 0
+    payload = _daemon_read_payload(_try_daemon_attempt(config, "attention.list"))
+    print(public_json_dumps(payload, indent=2))
+    return 0 if payload.get("ok") is not False else 1
 
 
 def cmd_pending(
@@ -1223,84 +908,27 @@ def cmd_pending(
     *,
     json_output: bool = True,
 ) -> int:
-    """Print pending interactions from one daemon attempt or durable fallback."""
+    """Print pending interactions from the daemon."""
     if not json_output:
         print("error: only --json output is supported", file=sys.stderr)
         return 2
 
-    daemon_attempt = _try_daemon_attempt(config, "pending.list")
-    if daemon_attempt.result is not None:
-        payload = daemon_attempt.result
-    elif daemon_attempt.response_error is not None:
-        payload = daemon_attempt.response_error
-    elif (
-        daemon_attempt.error_kind == "unavailable"
-        and daemon_attempt.request_started is False
-    ):
-        payload = pending_payload_from_store(config.db_path, config.host_id)
-    elif daemon_attempt.error_kind == "timeout":
-        payload = {
-            "schema_version": 1,
-            "ok": False,
-            "status": "daemon_timeout",
-            "error": {
-                "code": "daemon_timeout",
-                "message": "Tendwire daemon request timed out",
-            },
-        }
-    else:
-        payload = {
-            "schema_version": 1,
-            "ok": False,
-            "status": "daemon_protocol_error",
-            "error": {
-                "code": "daemon_protocol_error",
-                "message": "Tendwire daemon returned an invalid response",
-            },
-        }
+    payload = _daemon_read_payload(_try_daemon_attempt(config, "pending.list"))
     print(public_json_dumps(payload, indent=2))
     return 0 if payload.get("ok") is not False else 1
 
 
 def cmd_turn_delta(config: Config, args: argparse.Namespace) -> int:
-    """Read one delta page via daemon, with read-only store fallback."""
+    """Read one delta page from the daemon."""
     params = {
         "limit": args.limit,
         "watermark": args.watermark,
         "cursor": args.cursor,
     }
-    daemon_attempt = _try_daemon_attempt(config, "turn.delta", params)
-    if daemon_attempt.result is not None:
-        payload = daemon_attempt.result
-    elif daemon_attempt.response_error is not None:
-        payload = daemon_attempt.response_error
-    elif (
-        daemon_attempt.error_kind in {"unavailable", "timeout"}
-        and daemon_attempt.request_started is False
-        and config.db_path is not None
-    ):
-        payload = turn_delta_payload_from_store(
-            config.db_path,
-            config.host_id,
-            watermark=args.watermark,
-            cursor=args.cursor,
-            limit=args.limit,
-            turn_model=config.turn_model,
-        )
-    elif daemon_attempt.error_kind == "timeout":
-        payload = {
-            "schema_version": 1,
-            "projection_schema_version": 2,
-            "ok": False,
-            "status": "daemon_timeout",
-        }
-    else:
-        payload = {
-            "schema_version": 1,
-            "projection_schema_version": 2,
-            "ok": False,
-            "status": "store_unavailable" if config.db_path is None else "daemon_protocol_error",
-        }
+    payload = _daemon_read_payload(
+        _try_daemon_attempt(config, "turn.delta", params),
+        extra={"projection_schema_version": 2},
+    )
     print(_turn_delta_payload_json(payload, indent=2))
     return 0 if payload.get("ok") is not False else 1
 
@@ -1310,13 +938,13 @@ def cmd_doctor(
     *,
     json_output: bool = True,
 ) -> int:
-    """Run read-only backend diagnostics and print a JSON result."""
+    """Read daemon and lifecycle diagnostics."""
     if not json_output:
         print("error: only --json output is supported", file=sys.stderr)
         return 2
-    payload = diagnose_herdr(config)
+    payload = _daemon_read_payload(_try_daemon_attempt(config, "health.get"))
     print(json.dumps(payload, indent=2, sort_keys=True))
-    return 0 if payload.get("status") == "ok" else 1
+    return 0 if payload.get("status") == "ok" and payload.get("ok") is not False else 1
 
 
 def command_envelope_from_payload(config: Config, payload: str) -> CommandEnvelope:
@@ -1334,7 +962,7 @@ def command_envelope_from_payload(config: Config, payload: str) -> CommandEnvelo
     if validation_error is not None:
         return CommandEnvelope.from_error(request, validation_error)
 
-    if request.action in {"send_instruction", "answer_pending", "answer_decision"}:
+    if request.action in {"send_instruction", "answer_decision"}:
         from .command_submission import submit_command
 
         return submit_command(config, payload)
@@ -1345,54 +973,14 @@ def command_envelope_from_payload(config: Config, payload: str) -> CommandEnvelo
             CommandContext(host_id=config.host_id, workers=[]),
         )
 
-    stored_bindings = _load_worker_bindings(config)
-    spaces, workers, current_bindings, backend_health, _complete_barrier = (
-        _fetch_snapshot_observation_with_bindings(
-            config,
-            stored_bindings,
-        )
-    )
-    workers = rehydrate_workers_from_bindings(
-        workers,
-        current_bindings,
-        stored_bindings,
-    )
-    snapshot = project_from_observations(
-        config,
-        spaces=spaces,
-        workers=workers,
-        backend_health=backend_health,
-    )
-    return execute_command(
+    return CommandEnvelope.from_error(
         request,
-        CommandContext(
-            host_id=config.host_id,
-            workers=workers,
-            snapshot=snapshot,
-        ),
+        error_value(STATUS_BACKEND_UNAVAILABLE, "Tendwire daemon backend is unavailable"),
     )
 
 
 def _command_exit_code(envelope: CommandEnvelope) -> int:
     return 0 if envelope.ok else 1
-
-
-def _requires_daemon_for_mutating_command(config: Config, payload: str) -> Any | None:
-    """Return a live mutating request that must not fall back from the daemon."""
-    if config.socket_path is None and config.herdr_backend != "socket":
-        return None
-    request, parse_error = parse_command_request(payload)
-    if parse_error is not None or request is None:
-        return None
-    validation_error = validate_request(request)
-    if validation_error is not None:
-        return None
-    if (
-        request.action in {"send_instruction", "answer_pending", "answer_decision"}
-        and not request.dry_run
-    ):
-        return request
-    return None
 
 
 def _daemon_backend_failure_envelope(
@@ -1427,15 +1015,6 @@ def _strict_daemon_command_envelope(
     return envelope
 
 
-def _replay_daemon_command_receipt(
-    config: Config,
-    payload: str,
-) -> CommandEnvelope | None:
-    from .command_submission import replay_command_receipt
-
-    return replay_command_receipt(config, payload)
-
-
 def cmd_command(
     config: Config,
     *,
@@ -1459,10 +1038,9 @@ def cmd_command(
             and validation_error is None
             and parsed_request is not None
             and parsed_request.action
-            in {"send_instruction", "answer_pending", "answer_decision"}
+            in {"send_instruction", "answer_decision"}
             and parsed_request.dry_run
         )
-        daemon_required_request = _requires_daemon_for_mutating_command(config, payload)
         daemon_eligible = (
             isinstance(request_payload, dict)
             and parse_error is None
@@ -1484,16 +1062,12 @@ def cmd_command(
                     error_kind="protocol",
                     request_started=True,
                 )
-            if daemon_required_request is not None:
+            if parsed_request is not None and not parsed_request.dry_run:
                 if daemon_attempt.request_started is False:
                     envelope = _daemon_backend_failure_envelope(
-                        daemon_required_request,
+                        parsed_request,
                         daemon_attempt,
                     )
-                    print(envelope.to_json(indent=2))
-                    return _command_exit_code(envelope)
-                envelope = _replay_daemon_command_receipt(config, payload)
-                if envelope is not None:
                     print(envelope.to_json(indent=2))
                     return _command_exit_code(envelope)
                 print(
@@ -1609,38 +1183,12 @@ def cmd_connector(config: Config, args: argparse.Namespace) -> int:
         }
         print(_connector_payload_json(payload, indent=2))
         return 1
-    if config.db_path is None:
-        payload = {
-            "schema_version": 1,
-            "ok": False,
-            "status": "store_unavailable",
-            "host_id": config.host_id,
-            "name": params.get("name", ""),
-            "error": {
-                "code": "store_unavailable",
-                "message": "command requires --db-path or a reachable daemon",
-            },
-        }
-        print(public_json_dumps(payload, indent=2))
-        return 1
-    from .connectors import ConnectorOutboxAPI
-    from .store.sqlite import init_store
-
-    init_store(
-        config.db_path,
-        connector_ack_ttl_seconds=config.connector_ack_ttl_seconds,
+    payload = _daemon_read_payload(
+        daemon_attempt,
+        extra={"host_id": config.host_id, "name": params.get("name", "")},
     )
-    payload = ConnectorOutboxAPI(
-        config.db_path,
-        config.host_id,
-        default_lease_seconds=config.connector_claim_ttl_seconds,
-        max_lease_seconds=config.connector_max_claim_ttl_seconds,
-        ack_ttl_seconds=config.connector_ack_ttl_seconds,
-        max_attempts=config.max_outbox_attempts,
-        turn_model=config.turn_model,
-    ).dispatch(method, params)
     print(_connector_payload_json(payload, indent=2))
-    return 0 if payload.get("ok") is not False else 1
+    return 1
 
 
 def cmd_store(config: Config, args: argparse.Namespace) -> int:
@@ -1787,7 +1335,7 @@ def main(argv: list[str] | None = None) -> int:
         socket_group=getattr(args, "socket_group", None),
         herdr_timeout_seconds=args.herdr_timeout_seconds,
     )
-    if args.command not in {"daemon", "doctor"} and not (
+    if args.command in {"daemon", "store"} and not (
         args.command == "store" and args.store_action == "compact"
     ):
         repair_config_state(
@@ -1804,14 +1352,12 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_snapshot(
             config,
             json_output=args.json_output,
-            store_snapshot=args.store_snapshot,
         )
 
     if args.command == "attention":
         return cmd_attention(
             config,
             json_output=args.json_output,
-            store_snapshot=args.store_snapshot,
         )
 
     if args.command == "turns":

@@ -176,6 +176,55 @@ def test_poll_leases_sanitized_item_and_skips_duplicate_live_lease(tmp_path: Pat
     _assert_no_forbidden(first)
 
 
+def test_final_ready_poll_exposes_durable_source_age(tmp_path: Path) -> None:
+    db_path = tmp_path / "final-created-at.db"
+    key = _enqueue_final_root(
+        db_path,
+        key_suffix="created_at",
+        ordering_key="wsk1_created_at",
+    )
+    api = ConnectorOutboxAPI(db_path, "host-a")
+
+    item = api.poll({"name": "turn-final", "limit": 1})["items"][0]
+
+    assert item["key"] == key
+    assert item["created_at"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_poll_preserves_strict_content_revision_tokens(tmp_path: Path) -> None:
+    db_path = tmp_path / "revision-token.db"
+    revision = "twrev1.ueLJtVatFOQxa1UePvWId8C01qdrb05FpW_ipSSPHMM"
+    _enqueue_final_root(
+        db_path,
+        key_suffix="public",
+        ordering_key="wsk1_public",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "UPDATE connector_outbox SET payload_json = ?",
+            (
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "content_revision": revision,
+                        "content": {
+                            "schema_version": 1,
+                            "content_revision": revision,
+                        },
+                    }
+                ),
+            ),
+        )
+
+    item = ConnectorOutboxAPI(db_path, "host-a").poll(
+        {"name": "turn-final", "limit": 1}
+    )["items"][0]
+
+    assert item["payload"]["content_revision"] == revision
+    assert item["payload"]["content"]["content_revision"] == revision
+    _assert_no_forbidden(item)
+
+
 def test_poll_uses_configured_default_lease_and_explicit_lease_wins(tmp_path: Path) -> None:
     db_path = tmp_path / "lease-default.db"
     _enqueue(db_path, key="default-lease")
@@ -1232,165 +1281,6 @@ def test_lifecycle_delivery_key_survives_fail_defer_reclaim_and_ack(tmp_path: Pa
     assert [row[2] for row in delivery_rows] == ["failed", "deferred", "expired", "delivered"]
 
 
-def test_migration_terminalizes_noncanonical_live_leases_through_public_helpers(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "leased-duplicate-migration.db"
-    host_id = "host-migration-leases"
-    observed_at = "2026-01-01T00:00:00+00:00"
-    snapshot = Snapshot(
-        host_id=host_id,
-        updated_at=observed_at,
-        attention=[
-            AttentionSignal(
-                kind="worker_status",
-                severity="warning",
-                status="waiting",
-                reason="Review the worker",
-                source="worker:worker-1",
-                updated_at=observed_at,
-                host_id=host_id,
-            )
-        ],
-    )
-    save_snapshot(
-        db_path,
-        snapshot,
-        observation=SnapshotObservationContext(
-            authority="complete",
-            observed_at=observed_at,
-        ),
-    )
-
-    with sqlite3.connect(str(db_path)) as conn:
-        for suffix in range(1, 4):
-            conn.execute(
-                """
-                INSERT INTO connector_outbox (
-                    host_id, connector, delivery_key, status, payload_json,
-                    private_state_json, created_at, updated_at, next_attempt_at
-                )
-                SELECT
-                    host_id, connector, ?, 'queued', payload_json,
-                    '{}', created_at, updated_at, NULL
-                FROM connector_outbox
-                WHERE host_id = ? AND connector = 'attention'
-                ORDER BY id
-                LIMIT 1
-                """,
-                (f"legacy-duplicate-{suffix}", host_id),
-            )
-
-    canonical = poll_connector_outbox(
-        db_path,
-        host_id,
-        "attention",
-        lease_seconds=100,
-        now="2026-01-01T00:00:01+00:00",
-    )["items"][0]
-    failed_lease = poll_connector_outbox(
-        db_path,
-        host_id,
-        "attention",
-        lease_seconds=100,
-        now="2026-01-01T00:00:02+00:00",
-    )["items"][0]
-    deferred_lease = poll_connector_outbox(
-        db_path,
-        host_id,
-        "attention",
-        lease_seconds=100,
-        now="2026-01-01T00:00:03+00:00",
-    )["items"][0]
-    expiring_lease = poll_connector_outbox(
-        db_path,
-        host_id,
-        "attention",
-        lease_seconds=5,
-        now="2026-01-01T00:00:04+00:00",
-    )["items"][0]
-
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute("PRAGMA user_version = 4")
-    init_store(db_path)
-
-    failed = fail_connector_delivery(
-        db_path,
-        host_id=host_id,
-        name="attention",
-        ref=failed_lease["ref"],
-        delay_seconds=0,
-        now="2026-01-01T00:00:05+00:00",
-    )
-    deferred = defer_connector_delivery(
-        db_path,
-        host_id=host_id,
-        name="attention",
-        ref=deferred_lease["ref"],
-        delay_seconds=0,
-        now="2026-01-01T00:00:06+00:00",
-    )
-    reclaimed = reclaim_expired_connector_leases(
-        db_path,
-        host_id,
-        "attention",
-        now="2026-01-01T00:00:09+00:00",
-    )
-    acknowledged = ack_connector_delivery(
-        db_path,
-        host_id=host_id,
-        name="attention",
-        ref=canonical["ref"],
-        now="2026-01-01T00:00:10+00:00",
-    )
-    after = poll_connector_outbox(
-        db_path,
-        host_id,
-        "attention",
-        now="2026-01-01T00:00:11+00:00",
-    )
-
-    assert failed["status"] == "superseded"
-    assert failed["key"] == failed_lease["key"]
-    assert deferred["status"] == "superseded"
-    assert deferred["key"] == deferred_lease["key"]
-    assert reclaimed["reclaimed"] == 1
-    assert acknowledged["status"] == "acknowledged"
-    assert acknowledged["key"] == canonical["key"]
-    assert after["items"] == []
-
-    with sqlite3.connect(str(db_path)) as conn:
-        outbox_rows = conn.execute(
-            """
-            SELECT delivery_key, status
-            FROM connector_outbox
-            WHERE host_id = ? AND connector = 'attention'
-            ORDER BY id
-            """,
-            (host_id,),
-        ).fetchall()
-        delivery_rows = conn.execute(
-            """
-            SELECT delivery_key, status
-            FROM connector_deliveries
-            WHERE host_id = ? AND connector = 'attention'
-            ORDER BY id
-            """,
-            (host_id,),
-        ).fetchall()
-
-    assert outbox_rows == [
-        (canonical["key"], "delivered"),
-        (failed_lease["key"], "superseded"),
-        (deferred_lease["key"], "superseded"),
-        (expiring_lease["key"], "superseded"),
-    ]
-    assert delivery_rows == [
-        (canonical["key"], "delivered"),
-        (failed_lease["key"], "failed"),
-        (deferred_lease["key"], "deferred"),
-        (expiring_lease["key"], "expired"),
-    ]
 
 
 def _canonical_turn(
@@ -1716,83 +1606,6 @@ def _downgrade_presentation_schema_to_v6(db_path: Path) -> None:
         )
 
 
-def test_v6_to_current_plan_migration_is_bounded_atomic_and_preserves_jobs(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "presentation-v6.db"
-    turn_id, revision = _canonical_turn(db_path, final_text="abcdefgh")
-    api = ConnectorOutboxAPI(db_path, "host-a")
-    plan = _stage_final_plan(
-        api,
-        turn_id=turn_id,
-        revision=revision,
-        ranges=[(0, 4), (4, 8)],
-    )
-    _downgrade_presentation_schema_to_v6(db_path)
-
-    init_store(db_path)
-    init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
-        plan_row = conn.execute(
-            """
-            SELECT plan_token, generation, recovers_plan_token, state
-            FROM turn_presentation_plans
-            """
-        ).fetchone()
-        job_count = conn.execute(
-            "SELECT COUNT(*) FROM turn_presentation_jobs"
-        ).fetchone()[0]
-        outbox_count = conn.execute(
-            "SELECT COUNT(*) FROM connector_outbox WHERE connector = 'turn-final'"
-        ).fetchone()[0]
-        audit_columns = {
-            row[1]
-            for row in conn.execute(
-                "PRAGMA table_info(turn_presentation_recoveries)"
-            ).fetchall()
-        }
-        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
-    assert version == store_sqlite.STORE_SCHEMA_VERSION == 21
-    assert plan_row == (plan["plan_token"], 1, None, "active")
-    assert job_count == 2
-    assert outbox_count == 3
-    assert {
-        "request_id",
-        "failed_plan_id",
-        "recovered_plan_id",
-        "generation",
-        "delivered_prefix_count",
-        "fresh_job_count",
-        "retained_failed_job_count",
-        "prior_attempt_count",
-    } <= audit_columns
-    assert foreign_keys == []
-
-    _downgrade_presentation_schema_to_v6(db_path)
-
-    def fail_rebuild(_conn: sqlite3.Connection) -> None:
-        raise RuntimeError("controlled v7 migration failure")
-
-    monkeypatch.setattr(
-        store_sqlite,
-        "_rebuild_v6_presentation_plans_conn",
-        fail_rebuild,
-    )
-    with pytest.raises(RuntimeError, match="controlled v7 migration failure"):
-        init_store(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
-        assert "generation" not in {
-            row[1]
-            for row in conn.execute(
-                "PRAGMA table_info(turn_presentation_plans)"
-            ).fetchall()
-        }
-        assert conn.execute(
-            "SELECT COUNT(*) FROM turn_presentation_jobs"
-        ).fetchone()[0] == 2
 
 
 def test_prepare_stages_idempotently_and_rejects_conflicts_or_incomplete_coverage(
@@ -1924,6 +1737,92 @@ def test_prepare_commit_rolls_back_all_materialization_on_injected_failure(
         ).fetchone()[0]
     assert state == "preparing"
     assert outbox_count == linked_count == 0
+
+
+def test_exhausted_source_fails_zero_job_preparing_plan_idempotently(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "prepare-source-exhausted.db"
+    turn_id, revision = _canonical_turn(db_path, final_text="abcdefgh")
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, delivery_kind,
+                turn_id, content_revision, ordering_key, status,
+                payload_json, private_state_json, created_at, updated_at
+            ) VALUES (
+                'host-a', 'turn-final', ?, 'final_ready', ?, ?,
+                'wsk1_source_exhausted', 'queued', '{}', '{}', ?, ?
+            )
+            """,
+            (
+                "turn-final:revision:twfinal1." + ("s" * 64),
+                turn_id,
+                revision,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+    api = ConnectorOutboxAPI(db_path, "host-a", max_attempts=1)
+    source = api.poll({"name": "turn-final", "limit": 1})["items"][0]
+    begun = api.prepare(
+        {
+            "schema_version": 1,
+            "action": "begin",
+            "name": "turn-final",
+            "turn_id": turn_id,
+            "content_revision": revision,
+            "presentation_version": "turn-present-v27",
+            "part_count": 1,
+            "source_ref": source["ref"],
+        }
+    )
+    token = begun["plan_token"]
+    assert _put_final_part(
+        api,
+        plan_token=token,
+        ordinal=0,
+        start=0,
+        end=8,
+    )["ok"] is True
+
+    exhausted = api.fail(
+        {
+            "name": "turn-final",
+            "ref": source["ref"],
+            "delay_seconds": 0,
+        }
+    )
+    repeated_commit = api.prepare(
+        {
+            "schema_version": 1,
+            "action": "commit",
+            "name": "turn-final",
+            "plan_token": token,
+            "source_ref": source["ref"],
+        }
+    )
+
+    assert exhausted["status"] == "attempts_exhausted"
+    assert repeated_commit["ok"] is True
+    assert repeated_commit["state"] == "failed"
+    assert repeated_commit["job_count"] == 0
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT state FROM turn_presentation_plans WHERE plan_token = ?",
+            (token,),
+        ).fetchone()[0] == "failed"
+        assert conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM turn_presentation_jobs
+            WHERE plan_id = (
+                SELECT id FROM turn_presentation_plans WHERE plan_token = ?
+            ) AND outbox_id IS NOT NULL
+            """,
+            (token,),
+        ).fetchone()[0] == 0
 
 
 def test_prepare_commit_rechecks_current_revision_and_creates_no_jobs_on_conflict(
@@ -2335,8 +2234,10 @@ def test_unrelated_plans_poll_concurrently_but_never_colease_siblings(
     assert {item["payload"]["sequence_index"] for item in items} == {0}
 
 
-def test_replacement_waits_for_old_lease_then_activates_without_requeue(
+@pytest.mark.parametrize("terminal_action", ["release", "fail", "defer"])
+def test_replacement_terminalizes_old_lease_then_activates_without_requeue(
     tmp_path: Path,
+    terminal_action: str,
 ) -> None:
     db_path = tmp_path / "prepare-replacement-barrier.db"
     turn_id, revision = _canonical_turn(db_path, final_text="abcdefgh")
@@ -2365,10 +2266,15 @@ def test_replacement_waits_for_old_lease_then_activates_without_requeue(
     assert new["state"] == "waiting_predecessor"
     assert api.poll({"name": "turn-final", "limit": 10})["items"] == []
 
-    terminalized = api.fail(
-        {"name": "turn-final", "ref": leased_old["ref"], "delay_seconds": 0}
-    )
+    terminal_params: dict[str, Any] = {
+        "name": "turn-final",
+        "ref": leased_old["ref"],
+    }
+    if terminal_action in {"fail", "defer"}:
+        terminal_params["delay_seconds"] = 0
+    terminalized = getattr(api, terminal_action)(terminal_params)
     assert terminalized["status"] == "superseded"
+    assert "available_at" not in terminalized
     activated = api.poll({"name": "turn-final", "limit": 10})["items"]
     assert len(activated) == 1
     assert activated[0]["payload"]["plan_token"] == new["plan_token"]
@@ -3504,162 +3410,3 @@ def test_awaiting_ack_without_plan_becomes_terminal_failed(tmp_path: Path) -> No
         "classification": "plan_unrecoverable",
         "terminalized_at": "2026-01-01T00:00:01+00:00",
     }
-
-
-def test_v16_migration_backfills_ordering_and_awaiting_ack_deadlines(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "connector-v16-migration.db"
-    stable_key = "wsk1_" + ("c" * 64)
-    enqueue_stable_key = "wsk1_" + ("d" * 64)
-    tombstoned_turn, _ = _canonical_turn(
-        db_path,
-        worker_id="worker-tombstoned",
-        source_turn_id="source-tombstoned",
-        stable_key=stable_key,
-        final_text="done",
-    )
-    fallback_turn, _ = _canonical_turn(
-        db_path,
-        worker_id="worker-fallback",
-        source_turn_id="source-fallback",
-        stable_key="invalid",
-        final_text="done",
-    )
-    deleted_turns = [
-        _canonical_turn(
-            db_path,
-            worker_id=f"worker-deleted-{suffix}",
-            source_turn_id=f"source-deleted-{suffix}",
-            final_text="done",
-        )[0]
-        for suffix in ("a", "b")
-    ]
-    with sqlite3.connect(str(db_path)) as conn:
-        assert store_sqlite._migrate_tombstone_command_turn_conn(
-            conn,
-            "host-a",
-            tombstoned_turn,
-            superseded_by_turn_id=None,
-            superseded_at="2026-01-02T00:00:00+00:00",
-        )
-        for turn_id, status in (
-            (tombstoned_turn, "awaiting_ack"),
-            (fallback_turn, "dead_letter"),
-            (fallback_turn, "superseded"),
-        ):
-            payload = (
-                {
-                    "stable_key": enqueue_stable_key,
-                    "stable_key_version": 1,
-                }
-                if status == "dead_letter"
-                else {}
-            )
-            cursor = conn.execute(
-                """
-                INSERT INTO connector_outbox (
-                    host_id, connector, delivery_key, delivery_kind, turn_id,
-                    ordering_key, status, payload_json, private_state_json,
-                    created_at, updated_at
-                ) VALUES (?, 'turn-final', ?, 'final_ready', ?, '', ?, ?, '{}', ?, ?)
-                """,
-                (
-                    "host-a",
-                    f"migration-{turn_id}-{status}",
-                    turn_id,
-                    status,
-                    json.dumps(payload),
-                    "2026-01-01T00:00:00+00:00",
-                    "2026-01-01T00:00:00+00:00",
-                ),
-            )
-            if status == "awaiting_ack":
-                conn.execute(
-                    """
-                    INSERT INTO connector_deliveries (
-                        outbox_id, host_id, connector, delivery_key, attempt,
-                        status, response_json, private_state_json, created_at
-                    ) VALUES (?, 'host-a', 'turn-final', 'migration-awaiting', 1,
-                              'awaiting_ack', '{}', '{}', ?)
-                    """,
-                    (cursor.lastrowid, "2026-01-01T00:00:00+00:00"),
-                )
-        for deleted_turn in deleted_turns:
-            conn.execute(
-                "DELETE FROM turn_content_revisions WHERE host_id = ? AND turn_id = ?",
-                ("host-a", deleted_turn),
-            )
-            conn.execute(
-                "DELETE FROM turns WHERE host_id = ? AND turn_id = ?",
-                ("host-a", deleted_turn),
-            )
-        orphan_ids: list[int] = []
-        for suffix, deleted_turn in zip(("a", "b"), deleted_turns, strict=True):
-            cursor = conn.execute(
-                """
-                INSERT INTO connector_outbox (
-                    host_id, connector, delivery_key, delivery_kind, turn_id,
-                    ordering_key, status, payload_json, private_state_json,
-                    created_at, updated_at
-                ) VALUES (
-                    'host-a', 'turn-final', ?, 'final_ready', ?, '',
-                    'dead_letter', '{}', '{}', ?, ?
-                )
-                """,
-                (
-                    f"migration-deleted-{suffix}",
-                    deleted_turn,
-                    "2026-01-01T00:00:00+00:00",
-                    "2026-01-01T00:00:00+00:00",
-                ),
-            )
-            orphan_ids.append(int(cursor.lastrowid))
-        conn.execute("DROP INDEX IF EXISTS idx_connector_outbox_final_ordering")
-        conn.execute("ALTER TABLE connector_outbox DROP COLUMN ordering_key")
-        conn.execute("PRAGMA user_version = 15")
-    migration_now = "2026-01-03T00:00:00+00:00"
-    monkeypatch.setenv("TENDWIRE_CONNECTOR_ACK_TTL_SECONDS", "999")
-    monkeypatch.setattr(store_sqlite, "utc_timestamp", lambda: migration_now)
-    init_store(db_path, connector_ack_ttl_seconds=123)
-    with sqlite3.connect(str(db_path)) as conn:
-        rows = conn.execute(
-            """
-            SELECT delivery_key, turn_id, status, ordering_key, private_state_json
-            FROM connector_outbox
-            WHERE delivery_key LIKE 'migration-%'
-            ORDER BY id
-            """
-        ).fetchall()
-        delivery_private = conn.execute(
-            "SELECT private_state_json FROM connector_deliveries WHERE status = 'awaiting_ack'"
-        ).fetchone()[0]
-    by_key = {row[0]: row[1:] for row in rows}
-    tombstoned_key = f"migration-{tombstoned_turn}-awaiting_ack"
-    dead_letter_key = f"migration-{fallback_turn}-dead_letter"
-    superseded_key = f"migration-{fallback_turn}-superseded"
-    assert by_key[tombstoned_key][0:3] == (
-        tombstoned_turn,
-        "awaiting_ack",
-        stable_key,
-    )
-    ack_deadline = json.loads(by_key[tombstoned_key][3])["ack_deadline_at"]
-    assert (
-        datetime.fromisoformat(ack_deadline)
-        - datetime.fromisoformat(migration_now)
-    ).total_seconds() == 123
-    assert by_key[dead_letter_key][0:3] == (
-        fallback_turn,
-        "dead_letter",
-        enqueue_stable_key,
-    )
-    assert by_key[superseded_key][0:3] == (
-        fallback_turn,
-        "superseded",
-        "worker-fallback",
-    )
-    assert by_key["migration-deleted-a"][2] == f"orphan:{orphan_ids[0]}"
-    assert by_key["migration-deleted-b"][2] == f"orphan:{orphan_ids[1]}"
-    assert by_key["migration-deleted-a"][2] != by_key["migration-deleted-b"][2]
-    assert json.loads(delivery_private)["ack_deadline_at"] == ack_deadline

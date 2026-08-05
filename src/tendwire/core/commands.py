@@ -43,7 +43,6 @@ ALLOWED_ACTIONS = frozenset(
         "read_snapshot",
         "resolve_target",
         "send_instruction",
-        "answer_pending",
         "answer_decision",
     }
 )
@@ -189,7 +188,16 @@ DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES = frozenset(
 )
 
 # Neutral target fields permitted in command requests.
-TARGET_ALLOWED_FIELDS = frozenset({"worker_id", "worker_fingerprint", "space_id", "name"})
+TARGET_ALLOWED_FIELDS = frozenset(
+    {
+        "worker_id",
+        "worker_fingerprint",
+        "space_id",
+        "name",
+        "stable_key",
+        "stable_key_version",
+    }
+)
 
 # Selectors that name a worker durably. A worker_fingerprint is a mutable
 # observation precondition -- "proceed only if the worker still looks like this"
@@ -197,11 +205,10 @@ TARGET_ALLOWED_FIELDS = frozenset({"worker_id", "worker_fingerprint", "space_id"
 # fingerprints would then be indistinguishable to any identity-based idempotency
 # key, letting one request ID claim another worker's stored result. Every target
 # must carry at least one of these.
-TARGET_STABLE_SELECTOR_FIELDS = frozenset({"worker_id", "space_id", "name"})
-INSTRUCTION_ALLOWED_FIELDS = frozenset({"text"})
-ANSWER_PENDING_PARAM_FIELDS = frozenset(
-    {"pending_id", "pending_fingerprint", "choice_id"}
+TARGET_STABLE_SELECTOR_FIELDS = frozenset(
+    {"worker_id", "space_id", "name", "stable_key"}
 )
+INSTRUCTION_ALLOWED_FIELDS = frozenset({"text"})
 ANSWER_DECISION_PARAM_FIELDS = frozenset({"decision_ref", "selection"})
 
 # Connector, low-level terminal, routing, and private fields rejected anywhere in a request.
@@ -212,6 +219,7 @@ _FORBIDDEN_REQUEST_COMPACT = frozenset(name.replace("_", "") for name in FORBIDD
 
 MAX_INSTRUCTION_LENGTH = 4096
 _REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}", re.ASCII)
+_STABLE_WORKER_KEY_RE = re.compile(r"wsk1_[0-9a-f]{64}", re.ASCII)
 _TURN_SUBMISSION_ID_RE = re.compile(r"twsub1\.[0-9a-f]{64}", re.ASCII)
 _INSTRUCTION_FINGERPRINT_DOMAIN = b"tendwire.instruction-fingerprint.v1"
 _TURN_SUBMISSION_ID_DOMAIN = b"tendwire.turn-submission-id.v1"
@@ -376,8 +384,8 @@ def instruction_fingerprint(text: Any) -> str:
 
     Valid instruction text can consist entirely of whitespace even though its
     normalized form is empty. Preserve the normalized matching behavior for
-    ordinary text, but fingerprint the raw text in that edge case so shadow
-    ledger bookkeeping can never reject an otherwise valid legacy send.
+    ordinary text, but fingerprint the raw text in that edge case so submission
+    bookkeeping can never reject an otherwise valid send.
     """
     normalized = normalize_instruction_text(text)
     fingerprint_text = normalized or str(text or "")
@@ -421,6 +429,27 @@ def _validate_target_shape(target: dict[str, Any] | None) -> dict[str, Any] | No
             STATUS_INVALID_REQUEST,
             f"target contains disallowed fields: {sorted(extra)}",
             details={"field": "target", "disallowed": sorted(extra)},
+        )
+    stable_key_present = "stable_key" in target
+    stable_version_present = "stable_key_version" in target
+    stable_key = target.get("stable_key")
+    stable_version = target.get("stable_key_version")
+    if stable_key_present != stable_version_present:
+        return error_value(
+            STATUS_INVALID_REQUEST,
+            "target stable_key and stable_key_version must be supplied together",
+            details={"field": "target"},
+        )
+    if stable_key_present and (
+        not isinstance(stable_key, str)
+        or _STABLE_WORKER_KEY_RE.fullmatch(stable_key) is None
+        or type(stable_version) is not int
+        or stable_version != 1
+    ):
+        return error_value(
+            STATUS_INVALID_REQUEST,
+            "target stable worker identity is invalid or unsupported",
+            details={"field": "target"},
         )
     if _string_value(target.get("worker_fingerprint")) and not _target_has_stable_selector(
         target
@@ -505,16 +534,6 @@ class CommandRequest:
             payload["response_schema_version"] = self.response_schema_version
         return payload
 
-    def payload_fingerprint(self) -> str:
-        """Return the legacy raw-request fingerprint used by compatibility callers.
-
-        This includes request identity and unresolved selector spelling, so it is
-        not authoritative for mutating-command idempotency.  New mutation
-        persistence must use :func:`build_canonical_mutation` after resolving the
-        public worker identity.
-        """
-        return stable_fingerprint(self.to_dict())
-
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CommandRequest":
         return cls(
@@ -559,10 +578,8 @@ def build_canonical_mutation(
     """
     if not isinstance(request, CommandRequest):
         raise TypeError("request must be a CommandRequest")
-    if request.action not in {"send_instruction", "answer_pending", "answer_decision"}:
-        raise ValueError(
-            "canonical mutations require send_instruction, answer_pending, or answer_decision"
-        )
+    if request.action not in {"send_instruction", "answer_decision"}:
+        raise ValueError("canonical mutations require send_instruction or answer_decision")
     if request.dry_run is not False:
         raise ValueError("canonical mutations require a non-dry-run request")
     request_error = validate_request(request)
@@ -578,19 +595,6 @@ def build_canonical_mutation(
             "action": "send_instruction",
             "target": {"worker_id": public_worker_id},
             "instruction": {"text": request.instruction["text"]},
-            "options": {},
-        }
-    elif request.action == "answer_pending":
-        assert request.params is not None
-        canonical_payload = {
-            "canonical_version": CANONICAL_MUTATION_VERSION,
-            "action": "answer_pending",
-            "target": {"worker_id": public_worker_id},
-            "pending": {
-                "pending_id": request.params["pending_id"],
-                "pending_fingerprint": request.params["pending_fingerprint"],
-                "choice_id": request.params["choice_id"],
-            },
             "options": {},
         }
     else:
@@ -661,10 +665,8 @@ def build_selector_proof(request: CommandRequest) -> str:
     """
     if not isinstance(request, CommandRequest):
         raise TypeError("request must be a CommandRequest")
-    if request.action not in {"send_instruction", "answer_pending", "answer_decision"}:
-        raise ValueError(
-            "selector proofs require send_instruction, answer_pending, or answer_decision"
-        )
+    if request.action not in {"send_instruction", "answer_decision"}:
+        raise ValueError("selector proofs require send_instruction or answer_decision")
     if request.dry_run is not False:
         raise ValueError("selector proofs require a non-dry-run request")
     request_error = validate_request(request)
@@ -684,6 +686,8 @@ def build_selector_proof(request: CommandRequest) -> str:
             "worker_id": _string_value(target.get("worker_id")),
             "name": _string_value(target.get("name")),
             "space_id": _optional_string(target.get("space_id")),
+            "stable_key": _string_value(target.get("stable_key")),
+            "stable_key_version": target.get("stable_key_version"),
         }
     payload = {
         "proof_version": SELECTOR_PROOF_VERSION,
@@ -745,7 +749,7 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
             details={"field": "action", "allowed": sorted(ALLOWED_ACTIONS)},
         )
     if (
-        request.action in {"send_instruction", "answer_pending", "answer_decision"}
+        request.action in {"send_instruction", "answer_decision"}
         and request.dry_run is False
         and not is_valid_request_id(request.request_id)
     ):
@@ -793,46 +797,6 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
                 "send_instruction requires instruction.text",
                 details={"field": "instruction.text"},
             )
-
-    if request.action == "answer_pending":
-        if request.target is not None:
-            return error_value(
-                STATUS_INVALID_REQUEST,
-                "answer_pending does not accept a target",
-                details={"field": "target"},
-            )
-        if request.instruction is not None:
-            return error_value(
-                STATUS_INVALID_REQUEST,
-                "answer_pending does not accept an instruction",
-                details={"field": "instruction"},
-            )
-        if not isinstance(request.params, dict):
-            return error_value(
-                STATUS_INVALID_REQUEST,
-                "answer_pending requires params",
-                details={"field": "params"},
-            )
-        actual_fields = set(request.params)
-        if actual_fields != ANSWER_PENDING_PARAM_FIELDS:
-            return error_value(
-                STATUS_INVALID_REQUEST,
-                "answer_pending params must contain exactly pending_id, pending_fingerprint, and choice_id",
-                details={
-                    "field": "params",
-                    "required": sorted(ANSWER_PENDING_PARAM_FIELDS),
-                    "missing": sorted(ANSWER_PENDING_PARAM_FIELDS - actual_fields),
-                    "disallowed": sorted(actual_fields - ANSWER_PENDING_PARAM_FIELDS),
-                },
-            )
-        for field in sorted(ANSWER_PENDING_PARAM_FIELDS):
-            value = request.params.get(field)
-            if not isinstance(value, str) or not value.strip():
-                return error_value(
-                    STATUS_INVALID_REQUEST,
-                    f"answer_pending requires nonblank params.{field}",
-                    details={"field": f"params.{field}"},
-                )
 
     if request.action == "answer_decision":
         if request.target is None or set(request.target) != {"worker_id"}:
@@ -1030,7 +994,6 @@ class CommandEnvelope:
 
         mutating = self.action in {
             "send_instruction",
-            "answer_pending",
             "answer_decision",
         }
         live_mutation = mutating and self.dry_run is False
@@ -1234,7 +1197,6 @@ class CommandEnvelope:
             )
         mutating = request.action in {
             "send_instruction",
-            "answer_pending",
             "answer_decision",
         }
         valid_mutation_id = is_valid_request_id(request.request_id)
@@ -1296,6 +1258,8 @@ def resolve_target(
     name = _string_value(target.get("name"))
     space_id = _optional_string(target.get("space_id"))
     fingerprint = _optional_string(target.get("worker_fingerprint"))
+    stable_key = _string_value(target.get("stable_key"))
+    stable_key_version = target.get("stable_key_version")
 
     # First match by identity/name/space, excluding fingerprint.
     identity_matches: list[Worker] = []
@@ -1305,6 +1269,11 @@ def resolve_target(
         if name and worker.name != name:
             continue
         if space_id is not None and worker.space_id != space_id:
+            continue
+        if stable_key and (
+            worker.meta.get("stable_key") != stable_key
+            or worker.meta.get("stable_key_version") != stable_key_version
+        ):
             continue
         identity_matches.append(worker)
 
