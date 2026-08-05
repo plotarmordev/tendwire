@@ -523,8 +523,7 @@ WORKER_BINDING_ACTIVE_EXPIRES_AT = "9999-12-31T23:59:59+00:00"
 
 def _is_forbidden_field_name(key: Any) -> bool:
     normalized = str(key).lower().replace("-", "_").replace(".", "_")
-    compact = normalized.replace("_", "")
-    return normalized in FORBIDDEN_FIELD_NAMES or compact in _FORBIDDEN_FIELD_COMPACT
+    return normalized in FORBIDDEN_FIELD_NAMES or normalized.replace("_", "") in _FORBIDDEN_FIELD_COMPACT
 
 
 def _is_forbidden_backend_message_label(value: str) -> bool:
@@ -691,10 +690,9 @@ def sanitize_forbidden_fields(value: Any) -> Any:
 
 
 def _public_text_tokens(value: str) -> list[str]:
-    separated = _CAMEL_CASE_BOUNDARY_RE.sub(" ", value)
     return [
         part.lower()
-        for part in re.split(r"[^A-Za-z0-9]+", separated)
+        for part in re.split(r"[^A-Za-z0-9]+", _CAMEL_CASE_BOUNDARY_RE.sub(" ", value))
         if part
     ]
 
@@ -853,7 +851,8 @@ def sanitize_public_value(
     _field: str = "",
     _nested: bool = False,
 ) -> Any:
-    normalized_field = str(_field).strip().lower().replace("-", "_")
+    field_text = str(_field)
+    normalized_field = field_text.strip().lower().replace("-", "_")
     if normalized_field == "composer_state":
         return _PUBLIC_DROP if _nested else None
     if normalized_field == "submission_verdict":
@@ -914,8 +913,6 @@ def sanitize_public_value(
         return result_list
     if isinstance(value, str):
         text = sanitize_public_text(value, max_chars=_PUBLIC_VALUE_TEXT_MAX_CHARS)
-        field_text = str(_field)
-        normalized_field = field_text.strip().lower().replace("-", "_")
         if backend_neutral and (
             "[redacted]" in text
             or _contains_connector_private_text(value)
@@ -974,9 +971,7 @@ def _string_value(value: Any, default: str = "") -> str:
 
 
 def _optional_string(value: Any) -> str | None:
-    if value is None:
-        return None
-    return str(value)
+    return None if value is None else str(value)
 
 
 def _optional_timestamp(value: Any) -> str | None:
@@ -990,8 +985,6 @@ def _optional_timestamp(value: Any) -> str | None:
 def _public_safe_backend_name(value: Any) -> str:
     text = _string_value(value, "unknown").strip().lower()
     clean = "".join(char for char in text if char.isalnum() or char in {"_", "-"})
-    if clean == "herdr" or clean.startswith(("herdr_", "herdr-")):
-        return clean[:40]
     compact = clean.replace("_", "").replace("-", "")
     if _is_forbidden_public_text_phrase(clean) or any(
         marker in clean or marker.replace("_", "") in compact
@@ -1052,11 +1045,7 @@ def _backend_health_counts(value: Any) -> dict[str, int]:
         key_text = str(key).lower().strip().replace("-", "_")
         if key_text not in BACKEND_HEALTH_COUNT_KEYS:
             continue
-        if isinstance(item, bool):
-            continue
-        if not isinstance(item, int):
-            continue
-        if item < 0:
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
             continue
         counts[key_text] = item
     return counts

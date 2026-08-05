@@ -998,6 +998,9 @@ def test_backend_health_name_buckets_private_names() -> None:
         "pane-id",
         "terminal-id",
         "backend-target",
+        "herdr-private",
+        "herdr_raw",
+        "herdr-token-store",
     ]
 
     for name in unsafe_names:
