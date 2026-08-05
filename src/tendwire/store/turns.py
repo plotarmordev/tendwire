@@ -50,7 +50,6 @@ from ..core.turns import (
 from .db import canonical_utc, read_transaction, utc_now, write_transaction
 from .events import _append
 from .outbox import OutboxInvariantError, _validate_polled_payload
-from .pending import apply_backend_pending_observation
 
 
 @dataclass(frozen=True)
@@ -707,60 +706,6 @@ def append_agent_event_and_apply_turn_for_binding(
     )
 
 
-def apply_turn_refresh(
-    db_path: Path | str,
-    host_id: str,
-    worker_id: str,
-    content: Mapping[str, Any],
-    *,
-    backend_pending_observation: Any = None,
-    expected_binding: WorkerBinding | None = None,
-    deadline_monotonic: float | None = None,
-    cancelled: Callable[[], bool] | None = None,
-    observed_at: str | None = None,
-    pending_stale_grace_seconds: float = 30.0,
-) -> TurnRefreshApplyResult:
-    if cancelled and cancelled():
-        return TurnRefreshApplyResult(0, False, cancelled=True)
-    with write_transaction(db_path) as conn:
-        if (
-            expected_binding
-            and _binding_row(conn, host_id, worker_id, expected_binding) is None
-        ):
-            return TurnRefreshApplyResult(0, False, stale_binding=True)
-        updated = (
-            _apply(
-                conn,
-                host_id,
-                worker_id,
-                content,
-                canonical_utc(observed_at) if observed_at else utc_now(),
-                complete=bool(content.get("complete")),
-                expected_binding=expected_binding,
-            )
-            if content
-            else 0
-        )
-    pending_changed = False
-    if backend_pending_observation is not None:
-        pending_changed = apply_backend_pending_observation(
-            db_path,
-            host_id,
-            worker_id,
-            backend_pending_observation,
-            observed_at=observed_at,
-            stale_grace_seconds=pending_stale_grace_seconds,
-            binding_private_fingerprint=(
-                expected_binding.private_fingerprint if expected_binding is not None else None
-            ),
-            observed_turn_target_value=(
-                expected_binding.turn_target_value if expected_binding is not None else None
-            ),
-            binding_authoritative=expected_binding is not None,
-        )
-    return TurnRefreshApplyResult(updated, pending_changed)
-
-
 def _store_epoch(db_path: Path | str) -> str:
     stat = Path(db_path).stat()
     return hashlib.sha256(
@@ -1361,7 +1306,6 @@ __all__ = (
     "AppendProjectedAgentEventResult",
     "TurnRefreshApplyResult",
     "append_agent_event_and_apply_turn_for_binding",
-    "apply_turn_refresh",
     "turns_payload_from_store",
     "turn_delta_payload_from_store",
     "get_turn_content",

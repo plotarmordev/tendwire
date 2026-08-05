@@ -10,7 +10,7 @@ import pytest
 from tendwire.core.models import Snapshot, Worker, WorkerBinding
 from tendwire.store.projection import latest_snapshot, save_snapshot
 from tendwire.store.schema import init_store
-from tendwire.store.turns import apply_turn_refresh
+from .store_helpers import append_test_turn
 
 
 def _workers(count: int) -> list[Worker]:
@@ -86,7 +86,7 @@ def test_large_turn_sanitization_and_paging_transaction_is_bounded(tmp_path: Pat
     workers = _workers(1)
     save_snapshot(db_path, Snapshot(host_id="host-a", updated_at="2026-08-05T00:00:00Z", workers=workers), worker_bindings=_bindings(workers), binding_backend="herdr")
     started = time.perf_counter()
-    result = apply_turn_refresh(
+    result = append_test_turn(
         db_path,
         "host-a",
         workers[0].id,

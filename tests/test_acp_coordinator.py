@@ -42,6 +42,7 @@ from tendwire.backends.acp_runtime import (
 from tendwire.backends.herdr_protocol import HerdrErrorResponse
 from tendwire.command_submission import submit_command
 from tendwire.config import Config
+from tendwire.core.agent_events import AgentEvent, agent_event
 from tendwire.core.models import (
     BackendHealth,
     Snapshot,
@@ -49,7 +50,9 @@ from tendwire.core.models import (
     WorkerBinding,
 )
 from tendwire.daemon import DaemonHooks, TendwireDaemon
-from tendwire.store.events import list_agent_events, record_agent_event
+from tendwire.store.db import write_transaction
+from tendwire.store.events import _append as append_agent_event
+from tendwire.store.events import list_agent_events
 from tendwire.store.projection import (
     expire_worker_bindings,
     latest_snapshot,
@@ -82,6 +85,11 @@ def _binding() -> WorkerBinding:
         sendable=True,
         private_fingerprint="herdr-private-binding",
     )
+
+
+def _append_console_event(db_path: Path, host_id: str, event: AgentEvent) -> None:
+    with write_transaction(db_path) as conn:
+        assert append_agent_event(conn, host_id, event).inserted
 
 
 @pytest.fixture
@@ -335,30 +343,34 @@ def test_new_console_slot_starts_at_live_tail_and_delivers_only_fresh_events(
     assert config.db_path is not None
     init_store(config.db_path)
     for source_id, text in (("old-1", "old one"), ("old-2", "old two")):
-        record_agent_event(
+        _append_console_event(
             config.db_path,
             config.host_id,
-            kind="agent_message",
-            source="acp",
-            worker_id="worker-1",
-            payload={"text_delta": text},
-            source_session_id="session-a",
-            source_event_id=source_id,
-            visibility="private",
+            agent_event(
+                kind="agent_message",
+                source="acp",
+                worker_id="worker-1",
+                payload={"text_delta": text},
+                source_session_id="session-a",
+                source_event_id=source_id,
+                visibility="private",
+            ),
         )
     baseline = _latest_console_event_sequence(
         config.db_path, config.host_id, "worker-1", "session-a"
     )
-    record_agent_event(
+    _append_console_event(
         config.db_path,
         config.host_id,
-        kind="agent_message",
-        source="acp",
-        worker_id="worker-1",
-        payload={"text_delta": "fresh"},
-        source_session_id="session-a",
-        source_event_id="fresh-1",
-        visibility="private",
+        agent_event(
+            kind="agent_message",
+            source="acp",
+            worker_id="worker-1",
+            payload={"text_delta": "fresh"},
+            source_session_id="session-a",
+            source_event_id="fresh-1",
+            visibility="private",
+        ),
     )
 
     class EndpointClient:
@@ -423,16 +435,18 @@ def test_console_bridge_byte_batches_and_advances_only_published_prefix(
     assert config.db_path is not None
     init_store(config.db_path)
     for index in range(10):
-        record_agent_event(
+        _append_console_event(
             config.db_path,
             config.host_id,
-            kind="agent_message",
-            source="acp",
-            worker_id="worker-1",
-            payload={"text_delta": "😀" * 40_000},
-            source_session_id="session-a",
-            source_event_id=f"large-agent-chunk-{index}",
-            visibility="private",
+            agent_event(
+                kind="agent_message",
+                source="acp",
+                worker_id="worker-1",
+                payload={"text_delta": "😀" * 40_000},
+                source_session_id="session-a",
+                source_event_id=f"large-agent-chunk-{index}",
+                visibility="private",
+            ),
         )
 
     class EndpointClient:

@@ -31,7 +31,7 @@ from tendwire.store.outbox import (
 from tendwire.store.pending import apply_backend_pending_observation
 from tendwire.store.projection import save_snapshot
 from tendwire.store.schema import init_store
-from tendwire.store.turns import apply_turn_refresh
+from .store_helpers import append_test_turn
 
 
 MAX_RESPONSE_BYTES = 850_000
@@ -78,7 +78,7 @@ def _final(db_path: Path, *, text: str = "a") -> dict[str, object]:
         worker_bindings=[binding],
         binding_backend="herdr",
     )
-    apply_turn_refresh(
+    append_test_turn(
         db_path,
         "host-a",
         worker.id,
@@ -264,7 +264,7 @@ def test_provider_uncertain_dead_letters_without_retrying(tmp_path: Path) -> Non
     worker = Worker(id="worker-a", name="codex", meta={"stable_key": "wsk1_" + "a" * 64, "stable_key_version": 1})
     binding = WorkerBinding(host_id="host-a", worker_id=worker.id, worker_fingerprint=worker.fingerprint, backend="herdr", target_kind="agent_id", target_value="private", private_fingerprint="private-a")
     save_snapshot(db_path, Snapshot(host_id="host-a", updated_at="2026-08-05T00:00:00Z", workers=[worker]), worker_bindings=[binding], binding_backend="herdr")
-    apply_turn_refresh(db_path, "host-a", worker.id, {"source_turn_id": "turn-a", "assistant_stream_text": "work", "complete": False}, observed_at="2026-08-05T00:00:00Z")
+    append_test_turn(db_path, "host-a", worker.id, {"source_turn_id": "turn-a", "assistant_stream_text": "work", "complete": False}, observed_at="2026-08-05T00:00:00Z")
     leased = poll_connector_outbox(db_path, "host-a", "turn-final")["items"][0]
     result = fail_connector_delivery(
         db_path,

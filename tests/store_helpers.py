@@ -3,40 +3,82 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-import hashlib
 from dataclasses import replace
+import hashlib
+from itertools import count
 from pathlib import Path
 from typing import Any
 
-from tendwire.core.agent_events import AgentEvent, AppendAgentEventResult
+from tendwire.core.agent_events import agent_event
 from tendwire.core.models import Snapshot, Worker, WorkerBinding, sanitize_public_mapping, stable_fingerprint
 from tendwire.core.turns import PendingObservation, PendingObservedChoice
-from tendwire.store.events import list_agent_events, record_agent_event
+from tendwire.store.events import list_agent_events
+from tendwire.store.pending import apply_backend_pending_observation
 from tendwire.store.projection import (
     attention_payload_from_store,
     latest_snapshot,
+    list_worker_bindings,
     save_snapshot,
     upsert_worker_bindings as _upsert_worker_bindings,
 )
 from tendwire.store.schema import init_store
-from tendwire.store.turns import apply_turn_refresh
+from tendwire.store.turns import (
+    TurnRefreshApplyResult,
+    append_agent_event_and_apply_turn_for_binding,
+)
 
 
-def apply_test_turn_refresh(
+_TEST_TURN_EVENT_SEQUENCE = count(1)
+
+
+def _current_test_binding(
+    db_path: Path | str,
+    host_id: str,
+    worker_id: str,
+) -> WorkerBinding:
+    matches = [
+        binding
+        for binding in list_worker_bindings(Path(db_path), host_id)
+        if binding.worker_id == worker_id
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def append_test_turn(
     db_path: Path | str,
     host_id: str,
     worker_id: str,
     content: Mapping[str, Any],
     *,
     observed_at: str | None = None,
-) -> int:
-    return apply_turn_refresh(
+    expected_updated: int = 1,
+) -> TurnRefreshApplyResult:
+    binding = _current_test_binding(db_path, host_id, worker_id)
+    source_turn_id = content.get("source_turn_id")
+    assert isinstance(source_turn_id, str) and source_turn_id
+    sequence = next(_TEST_TURN_EVENT_SEQUENCE)
+    event = agent_event(
+        kind="agent_message",
+        source=binding.backend,
+        worker_id=worker_id,
+        payload={"fixture": "turn_projection", "sequence": sequence},
+        source_session_id=binding.turn_target_value or binding.target_value,
+        source_turn_id=source_turn_id,
+        source_event_id=f"test-turn-event-{sequence}",
+        observed_at=observed_at,
+    )
+    result = append_agent_event_and_apply_turn_for_binding(
         db_path,
         host_id,
-        worker_id,
-        content,
-        observed_at=observed_at,
-    ).updated
+        event,
+        expected_binding=binding,
+        content=content,
+    )
+    assert result.event.status == "inserted"
+    assert result.turn is not None
+    assert result.turn.updated == expected_updated
+    return result.turn
 
 
 def apply_test_backend_pending(
@@ -48,6 +90,7 @@ def apply_test_backend_pending(
     expected_binding: WorkerBinding | None = None,
     observed_at: str | None = None,
 ) -> bool:
+    binding = expected_binding or _current_test_binding(db_path, host_id, worker_id)
     if pending is None:
         observation = PendingObservation("read_succeeded_no_prompt")
     else:
@@ -80,15 +123,16 @@ def apply_test_backend_pending(
                 {"domain": "test.pending-observation.v1", "payload": clean}
             ),
         )
-    return apply_turn_refresh(
+    return apply_backend_pending_observation(
         db_path,
         host_id,
         worker_id,
-        {},
-        backend_pending_observation=observation,
-        expected_binding=expected_binding,
+        observation,
         observed_at=observed_at,
-    ).pending_changed
+        binding_private_fingerprint=binding.private_fingerprint,
+        observed_turn_target_value=binding.turn_target_value,
+        binding_authoritative=True,
+    )
 
 
 def read_test_attention_items(
@@ -103,29 +147,6 @@ def read_test_attention_items(
         include_resolved=include_resolved,
     )
     return [] if payload is None else list(payload["attention"])
-
-
-def record_test_agent_event(
-    db_path: Path | str,
-    host_id: str,
-    event: AgentEvent,
-) -> AppendAgentEventResult:
-    return record_agent_event(
-        db_path,
-        host_id,
-        kind=event.kind,
-        source=event.source,
-        worker_id=event.worker_id,
-        payload=event.payload,
-        source_session_id=event.source_session_id,
-        source_turn_id=event.source_turn_id,
-        source_item_id=event.source_item_id,
-        source_message_id=event.source_message_id,
-        source_event_id=event.source_event_id,
-        source_sequence=event.source_sequence,
-        visibility=event.visibility,
-        observed_at=event.observed_at,
-    )
 
 
 def read_public_test_agent_events(

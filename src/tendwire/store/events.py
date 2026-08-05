@@ -13,10 +13,9 @@ from ..core.agent_events import (
     AgentEventIdentityConflict,
     AppendAgentEventResult,
     StoredAgentEvent,
-    agent_event,
     normalize_agent_event_identifier,
 )
-from .db import read_transaction, write_transaction
+from .db import read_transaction
 
 
 def _stored(row: Any) -> StoredAgentEvent:
@@ -93,13 +92,6 @@ def _append(conn: Any, host_id: str, event: AgentEvent) -> AppendAgentEventResul
     return AppendAgentEventResult(stored.sequence, event.event_id, cursor.rowcount == 1)
 
 
-def record_agent_event(db_path: Path | str, host_id: str, **event_fields: Any) -> AppendAgentEventResult:
-    normalized = normalize_agent_event_identifier(host_id, "host_id", required=True) or ""
-    event = agent_event(**event_fields)
-    with write_transaction(db_path) as conn:
-        return _append(conn, normalized, event)
-
-
 def list_agent_events(
     db_path: Path | str,
     host_id: str,
@@ -134,4 +126,4 @@ def list_agent_events(
     return tuple(_stored(row) for row in rows)
 
 
-__all__ = ("list_agent_events", "record_agent_event")
+__all__ = ("list_agent_events",)

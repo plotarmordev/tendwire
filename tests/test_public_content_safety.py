@@ -37,7 +37,7 @@ from tendwire.store.projection import (
 )
 from tendwire.store.schema import init_store
 from tendwire.store.turns import get_turn_content, turns_payload_from_store
-from .store_helpers import apply_test_turn_refresh, upsert_test_worker_bindings
+from .store_helpers import append_test_turn, upsert_test_worker_bindings
 
 
 def _sentinel_corpus() -> dict[str, str]:
@@ -866,7 +866,7 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
             )
         ],
     )
-    assert apply_test_turn_refresh(
+    assert append_test_turn(
         db_path,
         host_id,
         worker_id,
@@ -877,7 +877,7 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
             "has_open_turn": False,
         },
         observed_at="2026-07-11T00:00:01+00:00",
-    ) == 1
+    ).updated == 1
 
     listed = turns_payload_from_store(
         db_path,

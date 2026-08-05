@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from tendwire.core.agent_events import agent_event
 from tendwire.core.models import Snapshot, Worker, WorkerBinding
 from tendwire.store.projection import save_snapshot
 from tendwire.store.retention import RetentionPolicy, run_retention_cycle
@@ -20,7 +21,8 @@ from tendwire.store.receipts import (
     settle_submission_link_for_request,
 )
 from tendwire.store.schema import init_store
-from tendwire.store.turns import apply_turn_refresh
+from tendwire.store.turns import append_agent_event_and_apply_turn_for_binding
+from .store_helpers import append_test_turn
 
 
 NOW = "2026-08-05T00:00:00.000000Z"
@@ -206,12 +208,11 @@ def test_accepted_receipt_submission_can_link_later_turn(tmp_path: Path) -> None
         assert conn.execute(
             "SELECT state FROM turn_submissions WHERE request_id='request-a'"
         ).fetchone() == ("submitted",)
-    apply_turn_refresh(
+    append_test_turn(
         db_path,
         "host-a",
         worker.id,
         {"source_turn_id": "turn-after-ack", "user_text": "do it"},
-        expected_binding=_acp_binding(worker),
         observed_at="2026-08-05T00:00:01Z",
     )
     assert settle_submission_link_for_request(
@@ -362,15 +363,14 @@ def test_submission_links_only_one_matching_turn(tmp_path: Path) -> None:
         now=NOW,
     )
     assert started["status"] == "send_started"
-    apply_turn_refresh(
+    append_test_turn(
         db_path,
         "host-a",
         worker.id,
         {"source_turn_id": "turn-unrelated", "user_text": "different instruction"},
-        expected_binding=_acp_binding(worker),
         observed_at="2026-08-05T00:00:01Z",
     )
-    apply_turn_refresh(
+    append_test_turn(
         db_path,
         "host-a",
         worker.id,
@@ -380,7 +380,6 @@ def test_submission_links_only_one_matching_turn(tmp_path: Path) -> None:
             "assistant_final_text": "done",
             "complete": True,
         },
-        expected_binding=_acp_binding(worker),
         observed_at=NOW,
     )
     linked = settle_submission_link_for_request(
@@ -415,14 +414,24 @@ def test_submission_does_not_link_same_worker_on_another_route(
         target="session-other",
         private_fingerprint="private-other",
     )
-    apply_turn_refresh(
+    fenced = append_agent_event_and_apply_turn_for_binding(
         db_path,
         "host-a",
-        worker.id,
-        {"source_turn_id": "turn-other-route", "user_text": "do it"},
+        agent_event(
+            kind="agent_message",
+            source="acp",
+            worker_id=worker.id,
+            payload={"fixture": "stale-route"},
+            source_session_id=other_route.turn_target_value,
+            source_turn_id="turn-other-route",
+            source_event_id="stale-route-turn-event",
+            observed_at="2026-08-05T00:00:01Z",
+        ),
         expected_binding=other_route,
-        observed_at="2026-08-05T00:00:01Z",
+        content={"source_turn_id": "turn-other-route", "user_text": "do it"},
     )
+    assert fenced.event.status == "binding_changed"
+    assert fenced.turn is None
     settled = settle_submission_link_for_request(
         db_path, host_id="host-a", request_id="request-a", now="2026-08-05T00:00:02Z"
     )
@@ -452,12 +461,11 @@ def test_submission_link_scan_fails_closed_at_ambiguity_bound(
     )
     assert started["status"] == "send_started"
     for index, text in enumerate(("do it", "other one", "other two"), 1):
-        apply_turn_refresh(
+        append_test_turn(
             db_path,
             "host-a",
             worker.id,
             {"source_turn_id": f"turn-{index}", "user_text": text},
-            expected_binding=_acp_binding(worker),
             observed_at=f"2026-08-05T00:00:0{index}Z",
         )
     settled = settle_submission_link_for_request(
@@ -483,23 +491,21 @@ def test_linked_and_ambiguous_submission_states_are_terminal(
         instruction_text="do it",
         now=NOW,
     )
-    apply_turn_refresh(
+    append_test_turn(
         linked_db,
         "host-a",
         worker.id,
         {"source_turn_id": "linked-turn", "user_text": "do it"},
-        expected_binding=_acp_binding(worker),
         observed_at="2026-08-05T00:00:01Z",
     )
     assert settle_submission_link_for_request(
         linked_db, host_id="host-a", request_id="request-a", now="2026-08-05T00:00:02Z"
     )["state"] == "linked"
-    apply_turn_refresh(
+    append_test_turn(
         linked_db,
         "host-a",
         worker.id,
         {"source_turn_id": "linked-turn", "removed": True},
-        expected_binding=_acp_binding(worker),
         observed_at="2026-08-05T00:00:03Z",
     )
     assert settle_submission_link_for_request(
@@ -521,23 +527,21 @@ def test_linked_and_ambiguous_submission_states_are_terminal(
         now=NOW,
     )
     for index in (1, 2):
-        apply_turn_refresh(
+        append_test_turn(
             ambiguous_db,
             "host-a",
             worker.id,
             {"source_turn_id": f"match-{index}", "user_text": "do it"},
-            expected_binding=_acp_binding(worker),
             observed_at=f"2026-08-05T00:00:0{index}Z",
         )
     assert settle_submission_link_for_request(
         ambiguous_db, host_id="host-a", request_id="request-a", now="2026-08-05T00:00:03Z"
     )["state"] == "ambiguous"
-    apply_turn_refresh(
+    append_test_turn(
         ambiguous_db,
         "host-a",
         worker.id,
         {"source_turn_id": "match-2", "removed": True},
-        expected_binding=_acp_binding(worker),
         observed_at="2026-08-05T00:00:04Z",
     )
     assert settle_submission_link_for_request(
@@ -564,12 +568,11 @@ def test_submission_link_window_and_hard_deadline_are_enforced(
         submission_hard_ttl_seconds=20,
         now=NOW,
     )
-    apply_turn_refresh(
+    append_test_turn(
         db_path,
         "host-a",
         worker.id,
         {"source_turn_id": "late-turn", "user_text": "do it"},
-        expected_binding=_acp_binding(worker),
         observed_at="2026-08-05T00:00:11Z",
     )
     assert settle_submission_link_for_request(

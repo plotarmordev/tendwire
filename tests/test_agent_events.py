@@ -6,14 +6,27 @@ from pathlib import Path
 
 import pytest
 
-from tendwire.core.agent_events import AgentEventIdentityConflict, agent_event
-from tendwire.store.events import list_agent_events, record_agent_event
+from tendwire.core.agent_events import (
+    AgentEvent,
+    AgentEventIdentityConflict,
+    AppendAgentEventResult,
+    agent_event,
+)
+from tendwire.store.db import write_transaction
+from tendwire.store.events import _append as append_agent_event
+from tendwire.store.events import list_agent_events
 from tendwire.store.retention import RetentionPolicy, run_retention_cycle
 from tendwire.store.schema import init_store
 
 
-def _fields(*, event_id: str, text: str, observed_at: str, visibility: str = "private") -> dict[str, object]:
-    event = agent_event(
+def _event(
+    *,
+    event_id: str,
+    text: str,
+    observed_at: str,
+    visibility: str = "private",
+) -> AgentEvent:
+    return agent_event(
         kind="agent_message",
         source="acp",
         worker_id="worker-a",
@@ -24,28 +37,27 @@ def _fields(*, event_id: str, text: str, observed_at: str, visibility: str = "pr
         visibility=visibility,
         observed_at=observed_at,
     )
-    return {
-        "kind": event.kind,
-        "source": event.source,
-        "worker_id": event.worker_id,
-        "payload": event.payload,
-        "source_session_id": event.source_session_id,
-        "source_turn_id": event.source_turn_id,
-        "source_item_id": event.source_item_id,
-        "source_message_id": event.source_message_id,
-        "source_event_id": event.source_event_id,
-        "source_sequence": event.source_sequence,
-        "visibility": event.visibility,
-        "observed_at": event.observed_at,
-    }
+
+
+def _append(
+    db_path: Path,
+    host_id: str,
+    event: AgentEvent,
+) -> AppendAgentEventResult:
+    with write_transaction(db_path) as conn:
+        return append_agent_event(conn, host_id, event)
 
 
 def test_identical_authoritative_event_replays_without_second_row(tmp_path: Path) -> None:
     db_path = tmp_path / "events.db"
     init_store(db_path)
-    fields = _fields(event_id="event-a", text="hello", observed_at="2026-08-01T00:00:00Z")
-    first = record_agent_event(db_path, "host-a", **fields)
-    replay = record_agent_event(db_path, "host-a", **fields)
+    event = _event(
+        event_id="event-a",
+        text="hello",
+        observed_at="2026-08-01T00:00:00Z",
+    )
+    first = _append(db_path, "host-a", event)
+    replay = _append(db_path, "host-a", event)
     assert first.inserted is True
     assert replay.inserted is False
     assert replay.sequence == first.sequence
@@ -55,16 +67,24 @@ def test_identical_authoritative_event_replays_without_second_row(tmp_path: Path
 def test_same_identity_with_changed_payload_conflicts(tmp_path: Path) -> None:
     db_path = tmp_path / "events.db"
     init_store(db_path)
-    record_agent_event(
+    _append(
         db_path,
         "host-a",
-        **_fields(event_id="event-a", text="first", observed_at="2026-08-01T00:00:00Z"),
+        _event(
+            event_id="event-a",
+            text="first",
+            observed_at="2026-08-01T00:00:00Z",
+        ),
     )
     with pytest.raises(AgentEventIdentityConflict):
-        record_agent_event(
+        _append(
             db_path,
             "host-a",
-            **_fields(event_id="event-a", text="changed", observed_at="2026-08-01T00:00:00Z"),
+            _event(
+                event_id="event-a",
+                text="changed",
+                observed_at="2026-08-01T00:00:00Z",
+            ),
         )
 
 
@@ -72,20 +92,20 @@ def test_queries_are_host_scoped_filterable_and_paged(tmp_path: Path) -> None:
     db_path = tmp_path / "events.db"
     init_store(db_path)
     for index in range(4):
-        record_agent_event(
+        _append(
             db_path,
             "host-a",
-            **_fields(
+            _event(
                 event_id=f"event-{index}",
                 text=str(index),
                 observed_at=f"2026-08-01T00:00:0{index}Z",
                 visibility="public" if index % 2 else "private",
             ),
         )
-    record_agent_event(
+    _append(
         db_path,
         "host-b",
-        **_fields(event_id="other", text="other", observed_at="2026-08-01T00:00:05Z"),
+        _event(event_id="other", text="other", observed_at="2026-08-01T00:00:05Z"),
     )
     first = list_agent_events(db_path, "host-a", limit=2)
     second = list_agent_events(db_path, "host-a", after_sequence=first[-1].sequence, limit=2)
@@ -106,19 +126,19 @@ def test_retention_deletes_only_a_bounded_old_batch(tmp_path: Path) -> None:
     db_path = tmp_path / "events.db"
     init_store(db_path)
     for index in range(5):
-        record_agent_event(
+        _append(
             db_path,
             "host-a",
-            **_fields(
+            _event(
                 event_id=f"old-{index}",
                 text=f"old-{index}",
                 observed_at="2026-06-01T00:00:00Z",
             ),
         )
-    record_agent_event(
+    _append(
         db_path,
         "host-a",
-        **_fields(event_id="recent", text="recent", observed_at="2026-08-04T00:00:00Z"),
+        _event(event_id="recent", text="recent", observed_at="2026-08-04T00:00:00Z"),
     )
     result = run_retention_cycle(
         db_path,

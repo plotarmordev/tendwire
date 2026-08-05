@@ -26,7 +26,10 @@ from tendwire.core.commands import (
 )
 from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
 from tendwire.core.turns import PendingObservation
-from tendwire.store.pending import pending_payload_from_store
+from tendwire.store.pending import (
+    apply_backend_pending_observation,
+    pending_payload_from_store,
+)
 from tendwire.store.projection import (
     latest_snapshot,
     list_worker_bindings,
@@ -40,7 +43,6 @@ from tendwire.store.receipts import (
     reserve_command_request,
 )
 from tendwire.store.schema import init_store
-from tendwire.store.turns import apply_turn_refresh
 
 from .store_helpers import upsert_test_worker_bindings
 
@@ -982,12 +984,11 @@ def _pending_decision(config: Config) -> str:
         config.host_id,
         backend="acp",
     )[0]
-    applied = apply_turn_refresh(
+    applied = apply_backend_pending_observation(
         config.db_path,
         config.host_id,
         "worker-1",
-        {},
-        backend_pending_observation=PendingObservation(
+        PendingObservation(
             "open_prompt",
             question="Allow the exact operation?",
             pending_kind="choice",
@@ -996,9 +997,11 @@ def _pending_decision(config: Config) -> str:
             decision_options=("Allow", "Reject"),
             decision_question_count=1,
         ),
-        expected_binding=binding,
+        binding_private_fingerprint=binding.private_fingerprint,
+        observed_turn_target_value=binding.turn_target_value,
+        binding_authoritative=True,
     )
-    assert applied.pending_changed
+    assert applied
     payload = pending_payload_from_store(config.db_path, config.host_id)
     assert len(payload["pending_interactions"]) == 1
     return str(payload["pending_interactions"][0]["id"])

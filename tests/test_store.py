@@ -10,8 +10,9 @@ import pytest
 
 from tendwire.core.agent_events import AgentEventIdentityConflict, agent_event
 from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
-from tendwire.store.db import StorePathError, read_transaction
-from tendwire.store.events import list_agent_events, record_agent_event
+from tendwire.store.db import StorePathError, read_transaction, write_transaction
+from tendwire.store.events import _append as append_agent_event
+from tendwire.store.events import list_agent_events
 from tendwire.store.projection import (
     latest_snapshot,
     list_worker_bindings,
@@ -24,7 +25,8 @@ from tendwire.store.receipts import (
     reserve_command_request,
 )
 from tendwire.store.schema import STORE_SCHEMA_VERSION, init_store
-from tendwire.store.turns import apply_turn_refresh, get_turn_content, turns_payload_from_store
+from tendwire.store.turns import get_turn_content, turns_payload_from_store
+from .store_helpers import append_test_turn
 
 
 NOW = "2026-08-05T00:00:00.000000Z"
@@ -370,12 +372,19 @@ def test_agent_event_authoritative_dedupe_and_conflict(tmp_path: Path) -> None:
         "visibility": event.visibility,
         "observed_at": event.observed_at,
     }
-    first = record_agent_event(db_path, "host-a", **fields)
-    replay = record_agent_event(db_path, "host-a", **fields)
+    with write_transaction(db_path) as conn:
+        first = append_agent_event(conn, "host-a", event)
+    with write_transaction(db_path) as conn:
+        replay = append_agent_event(conn, "host-a", event)
     assert first.inserted is True
     assert replay.inserted is False
     with pytest.raises(AgentEventIdentityConflict):
-        record_agent_event(db_path, "host-a", **{**fields, "payload": {"text": "changed"}})
+        with write_transaction(db_path) as conn:
+            append_agent_event(
+                conn,
+                "host-a",
+                agent_event(**{**fields, "payload": {"text": "changed"}}),
+            )
     stored = list_agent_events(db_path, "host-a")
     assert len(stored) == 1 and stored[0].event.payload == {"text": "public"}
 
@@ -384,7 +393,7 @@ def test_turn_refresh_preserves_content_and_paging(tmp_path: Path) -> None:
     db_path = tmp_path / "store.db"
     init_store(db_path)
     _seed_route(db_path)
-    result = apply_turn_refresh(
+    result = append_test_turn(
         db_path,
         "host-a",
         "worker-a",

@@ -9,7 +9,8 @@ from tendwire.core.models import Snapshot, Worker, WorkerBinding
 from tendwire.store.projection import save_snapshot
 from tendwire.store.retention import RetentionPolicy, run_retention_cycle
 from tendwire.store.schema import init_store
-from tendwire.store.turns import apply_turn_refresh, get_turn_content, turns_payload_from_store
+from tendwire.store.turns import get_turn_content, turns_payload_from_store
+from .store_helpers import append_test_turn
 
 
 def test_current_content_and_route_correlation_survive_old_cutoff(tmp_path: Path) -> None:
@@ -18,7 +19,7 @@ def test_current_content_and_route_correlation_survive_old_cutoff(tmp_path: Path
     worker = Worker(id="worker-a", name="codex", meta={"stable_key": "wsk1_" + "a" * 64, "stable_key_version": 1})
     binding = WorkerBinding(host_id="host-a", worker_id=worker.id, worker_fingerprint=worker.fingerprint, backend="herdr", target_kind="agent_id", target_value="private", observed_at="2026-01-01T00:00:00Z", private_fingerprint="private")
     persisted = save_snapshot(db_path, Snapshot(host_id="host-a", updated_at="2026-01-01T00:00:00Z", workers=[worker]), worker_bindings=[binding], binding_backend="herdr")
-    result = apply_turn_refresh(db_path, "host-a", worker.id, {"source_turn_id": "turn-a", "user_text": "q", "assistant_final_text": "a", "complete": True}, observed_at="2026-01-01T00:00:00Z")
+    result = append_test_turn(db_path, "host-a", worker.id, {"source_turn_id": "turn-a", "user_text": "q", "assistant_final_text": "a", "complete": True}, observed_at="2026-01-01T00:00:00Z")
     assert result.updated == 1
     run_retention_cycle(db_path, policy=RetentionPolicy(), now="2026-08-05T00:00:00Z")
     turn = turns_payload_from_store(db_path, "host-a", schema_version=2)["turns"][0]

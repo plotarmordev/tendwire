@@ -434,10 +434,11 @@ def _write_herdr_trap(path: Path, marker: Path) -> None:
 
 
 def _seed_daemon_store(db_path: Path) -> None:
+    from tendwire.core.agent_events import agent_event
     from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
     from tendwire.store.projection import save_snapshot, upsert_worker_bindings
     from tendwire.store.schema import init_store
-    from tendwire.store.turns import apply_turn_refresh
+    from tendwire.store.turns import append_agent_event_and_apply_turn_for_binding
 
     init_store(db_path)
     worker = Worker(
@@ -479,20 +480,32 @@ def _seed_daemon_store(db_path: Path) -> None:
     save_snapshot(db_path, snapshot)
     if upsert_worker_bindings(db_path, [binding]) != 1:
         raise RuntimeError("binding_seed_failed")
-    applied = apply_turn_refresh(
+    applied = append_agent_event_and_apply_turn_for_binding(
         db_path,
         FIXTURE_HOST,
-        FIXTURE_WORKER,
-        {
+        agent_event(
+            kind="agent_message",
+            source="herdr",
+            worker_id=FIXTURE_WORKER,
+            payload={"fixture": "generated-sidecar-turn"},
+            source_session_id=FIXTURE_PANE,
+            source_turn_id="generated-sidecar-source-turn",
+            source_event_id="generated-sidecar-turn-event",
+            observed_at=FIXTURE_TIMESTAMP,
+        ),
+        expected_binding=binding,
+        content={
             "source_turn_id": "generated-sidecar-source-turn",
             "assistant_final_text": FIXTURE_FINAL,
             "complete": True,
             "has_open_turn": False,
         },
-        expected_binding=binding,
-        observed_at=FIXTURE_TIMESTAMP,
     )
-    if applied.updated != 1:
+    if (
+        applied.event.status != "inserted"
+        or applied.turn is None
+        or applied.turn.updated != 1
+    ):
         raise RuntimeError("turn_seed_failed")
 
 

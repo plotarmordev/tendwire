@@ -13,11 +13,11 @@ from tendwire.store.projection import save_snapshot
 from tendwire.store.retention import RetentionPolicy, run_retention_cycle
 from tendwire.store.schema import init_store
 from tendwire.store.turns import (
-    apply_turn_refresh,
     get_turn_content,
     turn_delta_payload_from_store,
     turns_payload_from_store,
 )
+from .store_helpers import append_test_turn
 
 
 NOW = "2026-08-05T00:00:00.000000Z"
@@ -56,7 +56,7 @@ def _turn(
     *,
     observed_at: str = "2026-01-01T00:00:00Z",
 ) -> None:
-    result = apply_turn_refresh(
+    result = append_test_turn(
         db_path,
         "host-a",
         "worker-a",
@@ -72,7 +72,7 @@ def _turn(
 
 
 def _remove(db_path: Path, turn_id: str, observed_at: str) -> None:
-    result = apply_turn_refresh(
+    result = append_test_turn(
         db_path,
         "host-a",
         "worker-a",
@@ -130,7 +130,7 @@ def test_older_projection_cannot_replace_newer_turn_or_outbox(
 ) -> None:
     db_path = tmp_path / "turns.db"
     _seed(db_path)
-    fresh = apply_turn_refresh(
+    fresh = append_test_turn(
         db_path,
         "host-a",
         "worker-a",
@@ -146,12 +146,13 @@ def test_older_projection_cannot_replace_newer_turn_or_outbox(
             """SELECT key,status,payload_json,partition_sequence
             FROM connector_outbox ORDER BY id"""
         ).fetchall()
-    stale = apply_turn_refresh(
+    stale = append_test_turn(
         db_path,
         "host-a",
         "worker-a",
         {"source_turn_id": "turn-a", field: "older", "complete": complete},
         observed_at="2026-08-05T00:00:09Z",
+        expected_updated=0,
     )
     assert stale.updated == 0
     with sqlite3.connect(db_path) as conn:
@@ -167,7 +168,7 @@ def test_older_projection_cannot_replace_newer_turn_or_outbox(
 def test_stale_removal_cannot_mutate_newer_turn_or_outbox(tmp_path: Path) -> None:
     db_path = tmp_path / "turns.db"
     _seed(db_path)
-    assert apply_turn_refresh(
+    assert append_test_turn(
         db_path,
         "host-a",
         "worker-a",
@@ -181,12 +182,13 @@ def test_stale_removal_cannot_mutate_newer_turn_or_outbox(tmp_path: Path) -> Non
         outbox = conn.execute(
             "SELECT key,status,payload_json FROM connector_outbox ORDER BY id"
         ).fetchall()
-    assert apply_turn_refresh(
+    assert append_test_turn(
         db_path,
         "host-a",
         "worker-a",
         {"source_turn_id": "turn-a", "removed": True},
         observed_at="2026-08-05T00:00:09Z",
+        expected_updated=0,
     ).updated == 0
     with sqlite3.connect(db_path) as conn:
         assert conn.execute(
