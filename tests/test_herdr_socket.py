@@ -11,6 +11,7 @@ from tendwire.backends.herdr_protocol import HerdrFrameTooLargeError, HerdrReque
 from tendwire.backends.herdr_socket import (
     HerdrSocketClient,
     HerdrSocketConnectionError,
+    HerdrSocketDisconnectedError,
     HerdrSocketTimeoutError,
     _MAX_FRAME_BYTES,
 )
@@ -36,6 +37,80 @@ def _serve(path, responses, requests) -> threading.Thread:
     thread.start()
     assert ready.wait(2)
     return thread
+
+
+class _ScriptedSocket:
+    def __init__(self, response: bytes) -> None:
+        self.response = response
+        self.sent = b""
+        self.closed = False
+        self.shutdown_calls = 0
+
+    def settimeout(self, _value) -> None:
+        return None
+
+    def sendall(self, payload: bytes) -> None:
+        self.sent += payload
+
+    def recv(self, _size: int) -> bytes:
+        response, self.response = self.response, b""
+        return response
+
+    def shutdown(self, _how: int) -> None:
+        self.shutdown_calls += 1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_exact_request_transcript_and_success_reap(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        "tendwire.backends.herdr_protocol.new_request_id",
+        lambda: "request-fixed",
+    )
+    sock = _ScriptedSocket(
+        b'{"id":"request-fixed","result":{"status":"ok"}}\n'
+    )
+    client = HerdrSocketClient(str(tmp_path / "unused.sock"), timeout=1)
+    client._socket = sock
+
+    assert client.request("pane.list", {"workspace_id": "workspace-a"}) == {
+        "status": "ok"
+    }
+    assert sock.sent == (
+        b'{"id":"request-fixed","method":"pane.list",'
+        b'"params":{"workspace_id":"workspace-a"}}\n'
+    )
+    assert client._socket is None
+    assert sock.shutdown_calls == 1
+    assert sock.closed is True
+
+
+@pytest.mark.parametrize(
+    ("response", "error"),
+    [
+        (b"", HerdrSocketDisconnectedError),
+        (b'{"id":"wrong","result":{}}\n', HerdrRequestIdMismatchError),
+    ],
+)
+def test_eof_and_correlation_faults_reap_connection(
+    monkeypatch,
+    tmp_path,
+    response: bytes,
+    error: type[Exception],
+) -> None:
+    monkeypatch.setattr(
+        "tendwire.backends.herdr_protocol.new_request_id",
+        lambda: "request-fixed",
+    )
+    sock = _ScriptedSocket(response)
+    client = HerdrSocketClient(str(tmp_path / "unused.sock"), timeout=1)
+    client._socket = sock
+
+    with pytest.raises(error):
+        client.request("agent.list")
+    assert client._socket is None
+    assert sock.closed is True
 
 
 def test_discovery_lists_use_one_request_per_connection(tmp_path) -> None:

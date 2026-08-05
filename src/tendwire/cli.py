@@ -102,10 +102,9 @@ def _json_subcommand(
     name: str,
     description: str,
     subject: str,
-) -> argparse.ArgumentParser:
+) -> None:
     parser = subparsers.add_parser(name, help=description)
     _json_flag(parser, f"Print {subject} as JSON (default).")
-    return parser
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -473,23 +472,20 @@ def _connector_params_from_args(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("connector prepare request must be a JSON object")
         params.update(parsed)
         params["name"] = args.name
-        return params
-    if args.connector_action in {"inspect", "retry"} and args.name != "turn-final":
+    elif args.connector_action in {"inspect", "retry"} and args.name != "turn-final":
         raise ValueError(f"{args.connector_action} requires --name turn-final")
-    if args.connector_action == "inspect":
+    elif args.connector_action == "inspect":
         params.update(schema_version=1, status=args.status, limit=args.limit)
-        return params
-    if args.connector_action == "retry":
+    elif args.connector_action == "retry":
         final_identity = str(args.final_identity).strip()
         if not final_identity:
             raise ValueError("retry requires a final identity")
         params.update(schema_version=1, final_identity=final_identity)
-        return params
-    if args.connector_action == "poll":
+    elif args.connector_action == "poll":
         params["limit"] = args.limit
         if args.lease_seconds is not None:
             params["lease_seconds"] = args.lease_seconds
-    if args.connector_action in {"ack", "fail", "defer", "renew", "release"}:
+    elif args.connector_action in {"ack", "fail", "defer", "renew", "release"}:
         params["ref"] = args.ref
         if getattr(args, "response_json", None):
             try:
@@ -561,10 +557,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.command == "snapshot":
-        return cmd_snapshot(
-            config,
-            json_output=args.json_output,
-        )
+        return cmd_snapshot(config, json_output=args.json_output)
 
     if args.command in {"attention", "pending"}:
         return _cmd_simple_read(
@@ -599,10 +592,6 @@ def main(argv: list[str] | None = None) -> int:
             require_ok_status=True,
             trusted_daemon_json=True,
         )
-
-    parser.print_help()
-    return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

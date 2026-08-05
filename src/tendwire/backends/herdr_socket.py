@@ -8,7 +8,6 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from .herdr_protocol import (
-    HerdrEnvelopeError,
     HerdrErrorResponse,
     HerdrFrameTooLargeError,
     HerdrProtocolError,
@@ -17,7 +16,6 @@ from .herdr_protocol import (
     error_payload,
     frame_request,
     is_error_response,
-    is_result_response,
     parse_json_line,
     resolve_socket_path,
     result_payload,
@@ -247,13 +245,10 @@ class HerdrSocketClient:
     ) -> dict[str, Any]:
         envelope = self._read_server_envelope(deadline=deadline)
         ensure_response_id(envelope, request_id)
-        if not (is_result_response(envelope) or is_error_response(envelope)):
-            raise HerdrEnvelopeError("expected Herdr response envelope")
         return envelope
 
     def _read_server_envelope(self, *, deadline: float) -> dict[str, Any]:
-        line = self._read_line(deadline=deadline)
-        envelope = parse_json_line(line)
+        envelope = parse_json_line(self._read_line(deadline=deadline))
         return validate_server_envelope(envelope)
 
     def _read_line(self, *, deadline: float) -> bytes:

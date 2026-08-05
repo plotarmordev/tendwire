@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
 import random
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -430,3 +432,92 @@ def test_cli_connector_uses_daemon_and_never_accepts_database_fallback(
     assert main(["connector", "poll", "--name", "turn-final"]) == 0
     assert json.loads(capsys.readouterr().out)["name"] == "turn-final"
     assert calls == [("connector.poll", {"name": "turn-final", "limit": 1})]
+
+
+def test_cli_connector_argv_maps_to_exact_request_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cases = (
+        (
+            ["prepare", "--name", "notice"],
+            '{"action":"begin","plan_token":"token"}',
+            {"name": "notice", "action": "begin", "plan_token": "token"},
+        ),
+        (
+            ["poll", "--name", "turn-final", "--limit", "2", "--lease-seconds", "9"],
+            "",
+            {"name": "turn-final", "limit": 2, "lease_seconds": 9},
+        ),
+        (
+            ["inspect", "--name", "turn-final", "--status", "dead_letter", "--limit", "3"],
+            "",
+            {
+                "name": "turn-final",
+                "schema_version": 1,
+                "status": "dead_letter",
+                "limit": 3,
+            },
+        ),
+        (
+            ["retry", "--name", "turn-final", "--final-identity", "final-a"],
+            "",
+            {"name": "turn-final", "schema_version": 1, "final_identity": "final-a"},
+        ),
+        (
+            ["ack", "--name", "turn-final", "--ref", "ref-a", "--response-json", '{"ok":true}'],
+            "",
+            {"name": "turn-final", "ref": "ref-a", "response": {"ok": True}},
+        ),
+        (
+            [
+                "fail", "--name", "turn-final", "--ref", "ref-b",
+                "--reason", "retry", "--delay-seconds", "4",
+            ],
+            "",
+            {"name": "turn-final", "ref": "ref-b", "reason": "retry", "delay_seconds": 4},
+        ),
+        (
+            [
+                "defer", "--name", "turn-final", "--ref", "ref-c",
+                "--available-at", "2026-08-06T00:00:00Z",
+            ],
+            "",
+            {
+                "name": "turn-final",
+                "ref": "ref-c",
+                "reason": "",
+                "available_at": "2026-08-06T00:00:00Z",
+            },
+        ),
+        (
+            ["renew", "--name", "turn-final", "--ref", "ref-d", "--lease-seconds", "8"],
+            "",
+            {"name": "turn-final", "ref": "ref-d", "lease_seconds": 8},
+        ),
+        (
+            ["release", "--name", "turn-final", "--ref", "ref-e"],
+            "",
+            {"name": "turn-final", "ref": "ref-e"},
+        ),
+        (["reclaim", "--name", "turn-final"], "", {"name": "turn-final"}),
+    )
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def attempt(_config, method: str, params: dict[str, Any]) -> SimpleNamespace:
+        calls.append((method, params))
+        return SimpleNamespace(
+            result={"schema_version": 1, "ok": True, "status": "ok"},
+            response_error=None,
+            error_kind=None,
+            request_started=True,
+        )
+
+    monkeypatch.setattr("tendwire.cli._try_daemon_attempt", attempt)
+    for argv, stdin, expected in cases:
+        monkeypatch.setattr("sys.stdin", io.StringIO(stdin))
+        assert main(["connector", *argv]) == 0
+        captured = capsys.readouterr()
+        assert json.loads(captured.out)["ok"] is True
+        assert captured.err == ""
+        assert calls.pop() == (f"connector.{argv[0]}", expected)

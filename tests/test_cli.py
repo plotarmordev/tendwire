@@ -7,6 +7,13 @@ from tendwire.cli import _daemon_client_timeout_seconds, main
 from tendwire.config import Config
 
 
+def test_no_subcommand_prints_help_and_exits_zero(capsys) -> None:
+    assert main([]) == 0
+    output = capsys.readouterr()
+    assert output.out.startswith("usage: tendwire")
+    assert output.err == ""
+
+
 def test_command_daemon_timeout_covers_preflight_and_acp_ack() -> None:
     config = Config(
         herdr_timeout_seconds=7,
