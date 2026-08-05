@@ -205,8 +205,6 @@ def normalize_agent_event_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise ValueError("agent event payload must be a mapping")
     normalized = _normalize_payload_value(payload)
-    if not isinstance(normalized, dict):  # Defensive; mappings normalize to dicts.
-        raise ValueError("agent event payload must be a mapping")
     payload_size = len(_canonical_json(normalized).encode("utf-8"))
     if payload_size > AGENT_EVENT_MAX_PAYLOAD_BYTES:
         raise ValueError("agent event payload is too large")

@@ -114,13 +114,9 @@ _PRIVATE_VALUE_RE = re.compile(
     r"(?:^|\s)/(?:home|root|etc|var|tmp|run|proc|sys|usr)/|"
     r"\b(?:sk-|gh[oprsu]_|xox[baprs]-|AKIA|AIza|glpat-|npm_|pypi-)[A-Za-z0-9_-]+)"
 )
-def _compact_public_text(value: str) -> str:
-    return "".join(char for char in value.lower() if char.isalnum())
-
-
 def _contains_forbidden_public_text(value: str) -> bool:
     lowered = value.lower()
-    compact = _compact_public_text(lowered)
+    compact = "".join(char for char in lowered if char.isalnum())
     return any(token in lowered or token.replace("_", "") in compact for token in _FORBIDDEN_PUBLIC_TEXT)
 
 
@@ -136,10 +132,6 @@ def _opaque_token(value: Any, prefix: str) -> str:
 
 def _plan_token(value: Any) -> str:
     return _opaque_token(value, _PLAN_TOKEN_PREFIX)
-
-
-def _revision(value: Any) -> str:
-    return _opaque_token(value, _REVISION_PREFIX)
 
 
 def _protocol_copy(
@@ -184,10 +176,7 @@ def _clean_mapping(value: Any) -> dict[str, Any]:
         return {}
     if not isinstance(value, Mapping):
         raise ValueError("protocol object must be a mapping")
-    copied = _protocol_copy(value)
-    if not isinstance(copied, dict):
-        raise ValueError("protocol object must be a mapping")
-    return copied
+    return _protocol_copy(value)
 
 
 def _bounded_int_or_default(
@@ -202,7 +191,7 @@ def _bounded_int_or_default(
     return _strict_int(value, minimum=minimum, maximum=maximum)
 
 
-def _error(status: str, *, host_id: str, name: str = "", ref: str | None = None) -> dict[str, Any]:
+def _error(status: str, *, host_id: str, name: str = "") -> dict[str, Any]:
     return {
         "schema_version": 1,
         "ok": False,
@@ -307,12 +296,12 @@ class ConnectorOutboxAPI:
                 "content_revision",
                 "presentation_version",
                 "part_count",
+                "source_ref",
             }
-            required.add("source_ref")
             if set(data) != required:
                 return _error("invalid_params", host_id=self.host_id, name=name)
             turn_id = _text(data.get("turn_id"))
-            revision = _revision(data.get("content_revision"))
+            revision = _opaque_token(data.get("content_revision"), _REVISION_PREFIX)
             version = _text(data.get("presentation_version"))
             part_count = data.get("part_count")
             source_ref = (
@@ -528,21 +517,15 @@ class ConnectorOutboxAPI:
         assert self.db_path is not None
         return reclaim_expired_connector_leases(self.db_path, self.host_id, name)
 
-    def _mutation_parts(self, params: Mapping[str, Any] | None) -> tuple[dict[str, Any], str, str | None]:
-        data = dict(params or {})
-        name = _name(data.get("name"))
-        ref = _ref(data.get("ref"))
-        if not name or not ref:
-            return data, name, None
-        return data, name, ref
-
     def _live_request(
         self,
         params: Mapping[str, Any] | None,
         required: set[str],
         optional: set[str] | frozenset[str] = frozenset(),
     ) -> tuple[dict[str, Any], str, str] | dict[str, Any]:
-        data, name, ref = self._mutation_parts(params)
+        data = dict(params or {})
+        name = _name(data.get("name"))
+        ref = _ref(data.get("ref")) or None
         if not _exact_fields(data, {"name", "ref"} | required, optional):
             return _error("invalid_params", host_id=self.host_id, name=name)
         if not name:
@@ -699,7 +682,7 @@ class ConnectorOutboxAPI:
         name = _name(data.get("name"))
         key = _text(data.get("key"))
         key_valid = bool(
-            _FINAL_KEY_PREFIX and key.startswith(_FINAL_KEY_PREFIX)
+            key.startswith(_FINAL_KEY_PREFIX)
             and _opaque_token(key[len("turn-final:revision:"):], _FINAL_ID_PREFIX)
         ) or bool(
             re.fullmatch(r"turn-final:decision:twdecision1\.[A-Za-z0-9_-]{43}", key)

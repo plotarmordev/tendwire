@@ -377,9 +377,6 @@ class AcpSessionIngestor:
         ],
     ) -> AcpIngestionResult:
         kind = str(canonical.get("kind") or "")
-        if kind == "thought" and self.config.acp_thought_policy == "disabled":
-            self._restore_speculation(checkpoint, prior_turn_state)
-            return AcpIngestionResult(kind, ignored_reason="thought_policy_disabled")
         try:
             payload = canonical.get("payload")
             if not isinstance(payload, Mapping):

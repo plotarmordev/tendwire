@@ -372,7 +372,7 @@ class AcpEventProjector:
         text_delta = content.get("text") if content.get("type") == "text" else None
         text_delta = text_delta if isinstance(text_delta, str) else ""
         public_text_delta = text_delta if _content_is_user_visible(content) else ""
-        content_copy = _content_payload(content)
+        content_copy = deepcopy(dict(content))
         previous_text = assembly.text if assembly is not None else ""
         assembled_text = previous_text + public_text_delta
         if len(assembled_text) > self._max_text_chars_per_message:
@@ -456,8 +456,7 @@ class AcpEventProjector:
             raise AcpProjectionError("ACP usage state field limit exceeded")
         self._reserve_state(state, _json_size(replacement) - _json_size(state.usage))
         state.usage = replacement
-        payload = deepcopy(state.usage)
-        return payload
+        return deepcopy(state.usage)
 
     def _normalize_session_info(
         self, state: _SessionState, update: Mapping[str, Any]
@@ -471,8 +470,7 @@ class AcpEventProjector:
             raise AcpProjectionError("ACP session info state field limit exceeded")
         self._reserve_state(state, _json_size(replacement) - _json_size(state.info))
         state.info = replacement
-        payload = deepcopy(state.info)
-        return payload
+        return deepcopy(state.info)
 
     def _pending_session(self, session_id: str) -> _SessionState:
         if self._session_id not in {None, session_id}:
@@ -605,12 +603,6 @@ def _merge_tool_snapshot(
     return snapshot
 
 
-def _content_payload(content: Mapping[str, Any]) -> dict[str, Any]:
-    """Retain a validated content block, including opaque standard ``_meta``."""
-
-    return deepcopy(dict(content))
-
-
 def _content_is_user_visible(content: Mapping[str, Any]) -> bool:
     annotations = content.get("annotations")
     if not isinstance(annotations, Mapping) or "audience" not in annotations:
@@ -683,7 +675,7 @@ def _permission_options(options: list[Any]) -> list[dict[str, Any]]:
 
 def _bounded_json(
     value: Any, *, label: str, max_bytes: int, max_depth: int
-) -> bytes:
+) -> None:
     _validate_json_depth(value, label=label, max_depth=max_depth)
     try:
         encoded = json.dumps(
@@ -697,7 +689,6 @@ def _bounded_json(
         raise AcpProjectionError(f"{label} must be bounded JSON data") from exc
     if len(encoded) > max_bytes:
         raise AcpProjectionError(f"{label} exceeds the size limit")
-    return encoded
 
 
 def _validate_json_depth(value: Any, *, label: str, max_depth: int) -> None:
