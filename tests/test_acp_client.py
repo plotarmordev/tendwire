@@ -250,6 +250,46 @@ def test_close_and_failure_wake_all_session_event_waiters() -> None:
     assert isinstance(failure[0], AcpTransportError)
 
 
+def test_terminal_signal_and_racing_event_wake_capacity_one_waiters() -> None:
+    acp = client(max_pending_events=1)
+    outcomes: list[object] = []
+
+    def consume() -> None:
+        try:
+            outcomes.append(acp.next_session_event())
+        except BaseException as exc:
+            outcomes.append(exc)
+
+    waiters = [threading.Thread(target=consume) for _ in range(3)]
+    for thread in waiters:
+        thread.start()
+    _wait_for_condition_waiters(acp, 3)
+
+    with acp._session_event_condition:
+        failure_thread = threading.Thread(
+            target=acp._set_failed,
+            args=(AcpTransportError("terminal"),),
+        )
+        failure_thread.start()
+        deadline = time.monotonic() + 1
+        while acp.state is not ClientState.FAILED and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert acp.state is ClientState.FAILED
+        event_thread = threading.Thread(
+            target=acp._put_session_event,
+            args=(_typed_update(1),),
+        )
+        event_thread.start()
+
+    failure_thread.join(timeout=1)
+    event_thread.join(timeout=1)
+    for thread in waiters:
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+    assert len(outcomes) == 3
+    assert all(isinstance(item, SessionUpdate | AcpTransportError) for item in outcomes)
+
+
 def test_ordered_consumer_stress_is_bounded_and_exactly_once() -> None:
     acp = client(max_pending_events=8)
     count = 200
@@ -367,6 +407,45 @@ def test_prewrite_callback_failure_emits_no_acp_frame(
 
         assert writes == []
         assert acp._pending == {}
+
+
+def test_submission_callback_timeout_keeps_its_own_taxonomy() -> None:
+    with opened_client() as acp:
+        acp.initialize()
+
+        def fail_after_write() -> None:
+            raise TimeoutError("receipt store timed out")
+
+        with pytest.raises(TimeoutError, match="receipt store timed out"):
+            acp.request("session/list", {}, on_written=fail_after_write)
+        assert acp._pending == {}
+
+
+def test_pending_failure_completion_is_atomic_with_detachment() -> None:
+    acp = client()
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingWaiter:
+        def set_exception(self, _failure: BaseException) -> None:
+            entered.set()
+            assert release.wait(timeout=1)
+
+    acp._pending[1] = BlockingWaiter()  # type: ignore[assignment]
+    thread = threading.Thread(
+        target=acp._fail_pending,
+        args=(AcpTransportError("boom"),),
+    )
+    thread.start()
+    assert entered.wait(timeout=1)
+    acquired = acp._pending_lock.acquire(timeout=0.02)
+    if acquired:
+        acp._pending_lock.release()
+    assert not acquired
+    release.set()
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert acp._pending == {}
 
 
 def test_write_lock_timeout_does_not_cross_prewrite_boundary() -> None:

@@ -14,10 +14,7 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, TypeAlias
 
-from acp.schema import (
-    RequestPermissionRequest as UpstreamRequestPermissionRequest,
-    SessionNotification as UpstreamSessionNotification,
-)
+from acp import schema as acp_schema
 from pydantic import ValidationError
 
 JSONRPC_VERSION = "2.0"
@@ -34,6 +31,8 @@ _SESSION_UPDATE_KINDS = frozenset({
     "current_mode_update", "config_option_update", "session_info_update",
     "usage_update",
 })
+
+
 class AcpProtocolError(Exception):
     """Base class for ACP framing and envelope errors."""
 
@@ -85,6 +84,7 @@ class JsonRpcRequest:
     request_id: RequestId
     method: str
     params: Mapping[str, Any]
+
 
 @dataclass(frozen=True, slots=True)
 class JsonRpcNotification:
@@ -143,14 +143,8 @@ def _freeze_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
 def _valid_request_id(value: Any) -> bool:
     # ACP v1 inherits JSON-RPC's String, integral Number, or Null request IDs.
     # The official schema represents Number as a signed 64-bit integer.
-    return (
-        value is None
-        or isinstance(value, str)
-        or (
-            isinstance(value, int)
-            and not isinstance(value, bool)
-            and _MIN_REQUEST_NUMBER <= value <= _MAX_REQUEST_NUMBER
-        )
+    return value is None or isinstance(value, str) or (
+        type(value) is int and _MIN_REQUEST_NUMBER <= value <= _MAX_REQUEST_NUMBER
     )
 
 
@@ -176,30 +170,24 @@ def decode_json_line(
     """Decode and validate exactly one newline-delimited JSON-RPC message."""
     if max_frame_bytes <= 0:
         raise ValueError("max_frame_bytes must be positive")
-    if isinstance(line, str):
-        try:
-            raw = line.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise AcpFramingError("ACP frame is not valid UTF-8") from exc
-    else:
-        raw = bytes(line)
+    try:
+        raw = line.encode("utf-8") if isinstance(line, str) else bytes(line)
+    except UnicodeEncodeError as exc:
+        raise AcpFramingError("ACP frame is not valid UTF-8") from exc
     if not raw:
         raise AcpFramingError("empty ACP frame")
     if len(raw) > max_frame_bytes:
         raise AcpFramingError("ACP frame exceeds configured size limit")
     if require_newline and not raw.endswith(b"\n"):
         raise AcpFramingError("ACP frame is not newline terminated")
-    payload = raw[:-1] if raw.endswith(b"\n") else raw
-    if payload.endswith(b"\r"):
-        payload = payload[:-1]
+    payload = raw.removesuffix(b"\n").removesuffix(b"\r")
     if b"\n" in payload or b"\r" in payload:
         raise AcpFramingError("ACP frame contains an embedded line break")
     if not payload:
         raise AcpFramingError("empty ACP JSON payload")
     try:
-        text = payload.decode("utf-8", errors="strict")
         value = json.loads(
-            text,
+            payload.decode("utf-8", errors="strict"),
             parse_constant=_reject_constant,
             object_pairs_hook=_object_without_duplicates,
         )
@@ -215,10 +203,8 @@ def validate_envelope(value: Any) -> JsonRpcMessage:
     if value.get("jsonrpc") != JSONRPC_VERSION:
         raise AcpEnvelopeError("ACP envelope must declare jsonrpc '2.0'")
 
-    has_method = "method" in value
-    has_id = "id" in value
-    has_result = "result" in value
-    has_error = "error" in value
+    has_method, has_id = "method" in value, "id" in value
+    has_result, has_error = "result" in value, "error" in value
 
     if has_method:
         if has_result or has_error:
@@ -229,19 +215,14 @@ def validate_envelope(value: Any) -> JsonRpcMessage:
         params = value.get("params", {})
         if not isinstance(params, Mapping):
             raise AcpEnvelopeError("ACP method params must be an object")
-        frozen_params = _freeze_mapping(params)
         if not has_id:
-            return JsonRpcNotification(method=method, params=frozen_params)
+            return JsonRpcNotification(method, _freeze_mapping(params))
         request_id = value["id"]
         if not _valid_request_id(request_id):
             raise AcpEnvelopeError(
                 "JSON-RPC request id must be a string, signed 64-bit integer, or null"
             )
-        return JsonRpcRequest(
-            request_id=request_id,
-            method=method,
-            params=frozen_params,
-        )
+        return JsonRpcRequest(request_id, method, _freeze_mapping(params))
 
     if not has_id:
         raise AcpEnvelopeError("JSON-RPC response must contain an id")
@@ -260,11 +241,8 @@ def validate_envelope(value: Any) -> JsonRpcMessage:
             raise AcpEnvelopeError("JSON-RPC error code must be an integer")
         if not isinstance(message, str):
             raise AcpEnvelopeError("JSON-RPC error message must be a string")
-        return JsonRpcResponse(
-            request_id=request_id,
-            error=_freeze_mapping(error),
-        )
-    return JsonRpcResponse(request_id=request_id, result=value["result"])
+        return JsonRpcResponse(request_id, error=_freeze_mapping(error))
+    return JsonRpcResponse(request_id, result=value["result"])
 
 
 def encode_message(
@@ -296,15 +274,12 @@ def parse_session_update(params: Mapping[str, Any]) -> SessionUpdate:
     kind_value = _required_string(update, "sessionUpdate")
     if kind_value in _SESSION_UPDATE_KINDS:
         try:
-            UpstreamSessionNotification.model_validate(dict(params))
+            acp_schema.SessionNotification.model_validate(dict(params))
         except ValidationError as exc:
             raise AcpEnvelopeError(
                 "session/update params do not match the upstream ACP schema"
             ) from exc
-    return SessionUpdate(
-        session_id=session_id,
-        raw=_freeze_mapping(params),
-    )
+    return SessionUpdate(session_id, _freeze_mapping(params))
 
 
 def parse_permission_request(request: JsonRpcRequest) -> PermissionRequest:
@@ -312,7 +287,9 @@ def parse_permission_request(request: JsonRpcRequest) -> PermissionRequest:
         raise AcpEnvelopeError("request is not session/request_permission")
     params = request.params
     try:
-        validated = UpstreamRequestPermissionRequest.model_validate(dict(params))
+        validated = acp_schema.RequestPermissionRequest.model_validate(
+            dict(params)
+        )
     except ValidationError as exc:
         fields = {error.get("loc", ())[-1] for error in exc.errors() if error.get("loc")}
         if "kind" in fields:
@@ -328,15 +305,15 @@ def parse_permission_request(request: JsonRpcRequest) -> PermissionRequest:
     if len(option_ids) != len(set(option_ids)):
         raise AcpEnvelopeError("permission option IDs must be unique")
     return PermissionRequest(
-        request_id=request.request_id,
-        session_id=raw["sessionId"],
-        tool_call=_freeze_mapping(raw["toolCall"]),
-        options=tuple(
+        request.request_id,
+        raw["sessionId"],
+        _freeze_mapping(raw["toolCall"]),
+        tuple(
             PermissionOption(option["optionId"], option["name"], option["kind"])
             for option in options
         ),
-        meta=_freeze_mapping(raw["_meta"]) if "_meta" in raw else None,
-        raw=_freeze_mapping(params),
+        _freeze_mapping(raw["_meta"]) if "_meta" in raw else None,
+        _freeze_mapping(params),
     )
 
 

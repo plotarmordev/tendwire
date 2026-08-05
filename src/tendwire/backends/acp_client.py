@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import math
 import os
-import queue
 import select
 import signal
 import subprocess
@@ -18,22 +17,17 @@ import threading
 import time
 from collections import deque
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from contextlib import suppress
+from concurrent.futures import (
+    Future,
+    InvalidStateError,
+    TimeoutError as FutureTimeout,
+)
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
-from acp.schema import (
-    HttpMcpServer,
-    InitializeResponse as UpstreamInitializeResponse,
-    LoadSessionResponse as UpstreamLoadSessionResponse,
-    McpServerStdio,
-    NewSessionResponse as UpstreamNewSessionResponse,
-    PromptRequest as UpstreamPromptRequest,
-    PromptResponse as UpstreamPromptResponse,
-    ResumeSessionResponse as UpstreamResumeSessionResponse,
-    SseMcpServer,
-)
+from acp import schema as acp_schema
 from pydantic import ValidationError
 
 from tendwire import __version__
@@ -50,8 +44,8 @@ from .acp_protocol import (
     PermissionRequest,
     RequestId,
     SessionUpdate,
-    StopReason,
     SteeringOutcome,
+    StopReason,
     decode_json_line,
     encode_message,
     parse_permission_request,
@@ -102,12 +96,8 @@ class ClientState(str, Enum):
     FAILED = "failed"
 
 
-@dataclass(slots=True)
-class _PendingRequest:
-    waiter: queue.Queue[JsonRpcResponse | BaseException]
-
-
 SessionEvent = SessionUpdate | PermissionRequest
+ResponseWaiter = Future[JsonRpcResponse]
 
 
 class BoundedAcpConnection:
@@ -147,9 +137,8 @@ class BoundedAcpConnection:
         self._state_lock = threading.RLock()
         self._write_lock = threading.Lock()
         self._initialize_lock = threading.Lock()
-        self._request_id_lock = threading.Lock()
         self._next_id = 1
-        self._pending: dict[RequestId, _PendingRequest] = {}
+        self._pending: dict[RequestId, ResponseWaiter] = {}
         self._pending_lock = threading.Lock()
         self._pending_permissions: dict[RequestId, PermissionRequest] = {}
         self._cancelled_sessions: set[str] = set()
@@ -161,7 +150,6 @@ class BoundedAcpConnection:
         self._session_events: deque[SessionEvent] = deque()
         self._session_event_condition = threading.Condition()
         self._reader_thread: threading.Thread | None = None
-        self._stderr_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._closed = threading.Event()
         self._failure: BaseException | None = None
@@ -179,8 +167,6 @@ class BoundedAcpConnection:
 
     @property
     def steering_supported(self) -> bool:
-        """Whether the agent explicitly advertised the steering extension."""
-
         return self._steering_supported
 
     def start(self) -> "BoundedAcpConnection":
@@ -194,7 +180,7 @@ class BoundedAcpConnection:
                     self.argv,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
                     cwd=self.cwd,
                     env=self.env,
                     bufsize=0,
@@ -215,9 +201,7 @@ class BoundedAcpConnection:
                 process.kill()
                 process.wait()
                 self._state = ClientState.FAILED
-                self._failure = AcpTransportError(
-                    "could not configure ACP agent stdin"
-                )
+                self._failure = AcpTransportError("could not configure ACP agent stdin")
                 raise self._failure from exc
             self._state = ClientState.RUNNING
             self._reader_thread = threading.Thread(
@@ -225,13 +209,7 @@ class BoundedAcpConnection:
                 name=f"acp-reader-{process.pid}",
                 daemon=True,
             )
-            self._stderr_thread = threading.Thread(
-                target=self._stderr_main,
-                name=f"acp-stderr-{process.pid}",
-                daemon=True,
-            )
             self._reader_thread.start()
-            self._stderr_thread.start()
         return self
 
     def initialize(
@@ -253,14 +231,11 @@ class BoundedAcpConnection:
         with self._initialize_lock:
             with self._state_lock:
                 if self._state is ClientState.INITIALIZED:
-                    assert self._capabilities is not None
-                    return self._capabilities
+                    assert self.capabilities is not None
+                    return self.capabilities
                 if self._state is not ClientState.RUNNING:
                     self._raise_unusable()
-            client_info: dict[str, Any] = {
-                "name": client_name,
-                "version": client_version,
-            }
+            client_info: dict[str, Any] = {"name": client_name, "version": client_version}
             if client_title:
                 client_info["title"] = client_title
             result = self.request(
@@ -273,18 +248,10 @@ class BoundedAcpConnection:
                 timeout=timeout,
                 require_initialized=False,
             )
-            raw = _require_mapping(result, "initialize result")
-            _validate_upstream(
-                UpstreamInitializeResponse,
-                raw,
-                "initialize result",
-            )
+            raw = _validate_upstream(acp_schema.InitializeResponse, result,
+                                     "initialize result")
             version = raw.get("protocolVersion")
-            if (
-                not isinstance(version, int)
-                or isinstance(version, bool)
-                or version != ACP_PROTOCOL_VERSION
-            ):
+            if type(version) is not int or version != ACP_PROTOCOL_VERSION:
                 failure = AcpProtocolVersionError(
                     f"agent selected unsupported ACP protocol version {version!r}"
                 )
@@ -292,10 +259,8 @@ class BoundedAcpConnection:
                 # ACP v1 says clients should close a connection after an
                 # unsupported selection.  Do the bounded cleanup here so direct
                 # callers cannot accidentally leave the adapter process alive.
-                try:
+                with suppress(BaseException):
                     self.close()
-                except BaseException:
-                    pass
                 raise failure
             capabilities_value = raw.get("agentCapabilities", {})
             if not isinstance(capabilities_value, Mapping):
@@ -332,10 +297,9 @@ class BoundedAcpConnection:
         )
         deadline = time.monotonic() + wait_timeout
         request_id = self._new_request_id()
-        waiter: queue.Queue[JsonRpcResponse | BaseException] = queue.Queue(maxsize=1)
-        pending = _PendingRequest(waiter)
+        waiter: ResponseWaiter = Future()
         with self._pending_lock:
-            self._pending[request_id] = pending
+            self._pending[request_id] = waiter
         try:
             self._write(
                 {
@@ -349,34 +313,20 @@ class BoundedAcpConnection:
             )
             if on_written is not None:
                 on_written()
-        except BaseException:
-            with self._pending_lock:
-                if self._pending.get(request_id) is pending:
-                    self._pending.pop(request_id, None)
-            raise
-        try:
-            response = waiter.get(timeout=max(0.0, deadline - time.monotonic()))
-        except queue.Empty as exc:
-            with self._pending_lock:
-                if self._pending.get(request_id) is pending:
-                    self._pending.pop(request_id, None)
-                try:
-                    response = waiter.get_nowait()
-                except queue.Empty:
-                    response = None
-            if response is not None:
-                if isinstance(response, BaseException):
-                    raise response
-                return response.result_or_raise()
-            raise AcpRequestTimeoutError(
-                f"ACP request {method!r} timed out after {wait_timeout:g}s"
-            ) from exc
-        with self._pending_lock:
-            if self._pending.get(request_id) is pending:
-                self._pending.pop(request_id, None)
-        if isinstance(response, BaseException):
-            raise response
-        return response.result_or_raise()
+            try:
+                response = waiter.result(timeout=max(0.0, deadline - time.monotonic()))
+            except FutureTimeout as exc:
+                with self._pending_lock:
+                    current = self._pending.pop(request_id, None)
+                    timed_out = current is waiter and not waiter.done()
+                    if timed_out:
+                        raise AcpRequestTimeoutError(
+                            f"ACP request {method!r} timed out after {wait_timeout:g}s"
+                        ) from exc
+                response = waiter.result()
+            return response.result_or_raise()
+        finally:
+            self._discard_pending(request_id, waiter)
 
     def new_session(
         self,
@@ -386,15 +336,9 @@ class BoundedAcpConnection:
         additional_directories: Sequence[str | os.PathLike[str]] = (),
         timeout: float | None = None,
     ) -> str:
-        params = self._session_setup_params(
-            cwd,
-            mcp_servers=mcp_servers,
-            additional_directories=additional_directories,
+        return self._open_session(
+            "new", None, cwd, mcp_servers, additional_directories, timeout
         )
-        result = self.request("session/new", params, timeout=timeout)
-        raw = _require_mapping(result, "session/new result")
-        _validate_upstream(UpstreamNewSessionResponse, raw, "session/new result")
-        return _parse_session_result(raw, require_session_id=True)
 
     def load_session(
         self,
@@ -405,7 +349,7 @@ class BoundedAcpConnection:
         additional_directories: Sequence[str | os.PathLike[str]] = (),
         timeout: float | None = None,
     ) -> str:
-        return self._open_existing_session(
+        return self._open_session(
             "load", session_id, cwd, mcp_servers, additional_directories, timeout
         )
 
@@ -418,40 +362,47 @@ class BoundedAcpConnection:
         additional_directories: Sequence[str | os.PathLike[str]] = (),
         timeout: float | None = None,
     ) -> str:
-        return self._open_existing_session(
+        return self._open_session(
             "resume", session_id, cwd, mcp_servers, additional_directories, timeout
         )
 
-    def _open_existing_session(
+    def _open_session(
         self,
         operation: str,
-        session_id: str,
+        session_id: str | None,
         cwd: str | os.PathLike[str],
         mcp_servers: Sequence[Mapping[str, Any]],
         additional_directories: Sequence[str | os.PathLike[str]],
         timeout: float | None,
     ) -> str:
-        self._require_capability(
-            "loadSession" if operation == "load" else "sessionResume"
-        )
+        if operation != "new":
+            capability = "loadSession" if operation == "load" else "sessionResume"
+            self._require_capability(capability)
         params = self._session_setup_params(
             cwd,
             mcp_servers=mcp_servers,
             additional_directories=additional_directories,
         )
-        params["sessionId"] = _nonempty(session_id, "session_id")
+        if session_id is not None:
+            params["sessionId"] = _nonempty(session_id, "session_id")
         method = f"session/{operation}"
         result = self.request(method, params, timeout=timeout)
+        if operation == "new":
+            raw = _validate_upstream(acp_schema.NewSessionResponse, result,
+                                     f"{method} result")
+            created_session = raw.get("sessionId")
+            if not isinstance(created_session, str) or not created_session:
+                raise AcpEnvelopeError("session/new result.sessionId must be a non-empty string")
+            return created_session
+        assert session_id is not None
         if operation == "load" and result is None:
             return session_id
-        raw = _require_mapping(result, f"{method} result")
         model = (
-            UpstreamLoadSessionResponse
+            acp_schema.LoadSessionResponse
             if operation == "load"
-            else UpstreamResumeSessionResponse
+            else acp_schema.ResumeSessionResponse
         )
-        _validate_upstream(model, raw, f"{method} result")
-        _parse_session_result(raw, require_session_id=False)
+        _validate_upstream(model, result, f"{method} result")
         return session_id
 
     def prompt(
@@ -473,11 +424,6 @@ class BoundedAcpConnection:
             self._active_prompts[session_id] = self._active_prompts.get(session_id, 0) + 1
         response_received = False
         try:
-            _validate_upstream(
-                UpstreamPromptRequest,
-                {"sessionId": session_id, "prompt": content},
-                "session/prompt params",
-            )
             result = self.request(
                 "session/prompt",
                 {"sessionId": session_id, "prompt": content},
@@ -495,8 +441,8 @@ class BoundedAcpConnection:
                     self._active_prompts.pop(session_id, None)
                     if response_received:
                         self._cancelled_sessions.discard(session_id)
-        raw = _require_mapping(result, "session/prompt result")
-        _validate_upstream(UpstreamPromptResponse, raw, "session/prompt result")
+        raw = _validate_upstream(acp_schema.PromptResponse, result,
+                                 "session/prompt result")
         stop_reason = raw.get("stopReason")
         try:
             parsed_reason = StopReason(stop_reason)
@@ -568,7 +514,8 @@ class BoundedAcpConnection:
             self._cancelled_sessions.add(session_id)
         try:
             self._require_running()
-            self._write({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session_id}})
+            self._write({"jsonrpc": "2.0", "method": "session/cancel",
+                         "params": {"sessionId": session_id}})
         except BaseException:
             with self._permission_lock:
                 self._cancelled_sessions.discard(session_id)
@@ -606,22 +553,14 @@ class BoundedAcpConnection:
             if request is None:
                 raise AcpClientStateError("permission request is not pending")
             if option_id is not None and option_id not in {
-                option.option_id for option in request.options
+                item.option_id for item in request.options
             }:
                 raise ValueError("option_id was not offered by this permission request")
             del self._pending_permissions[request_id]
-        if cancelled:
-            outcome = {"outcome": "cancelled"}
-        else:
-            outcome = {"outcome": "selected", "optionId": option_id}
-        try:
-            self._write(
-                {"jsonrpc": "2.0", "id": request_id, "result": {"outcome": outcome}}
-            )
-        except BaseException:
-            # A partial frame may have reached the peer.  Retrying the same
-            # JSON-RPC response is unsafe; transport failure is terminal.
-            raise
+        outcome = {"outcome": "cancelled"} if cancelled else {
+            "outcome": "selected", "optionId": option_id,
+        }
+        self._respond(request_id, "result", {"outcome": outcome})
 
     def next_session_event(self, *, timeout: float | None = None) -> SessionEvent:
         """Return the next update or permission request in exact reader order."""
@@ -650,75 +589,29 @@ class BoundedAcpConnection:
                 self._session_event_condition.wait(timeout=remaining)
 
     def close(self) -> None:
-        wait_for_other_close = False
-        closed_without_process = False
         with self._state_lock:
-            if self._state in {ClientState.CLOSED, ClientState.NEW}:
+            prior_state = self._state
+            if prior_state in {ClientState.CLOSED, ClientState.NEW}:
                 self._state = ClientState.CLOSED
                 self._closed.set()
-                closed_without_process = True
-            elif self._state is ClientState.CLOSING:
-                wait_for_other_close = True
-            else:
-                was_failed = self._state is ClientState.FAILED
+            elif prior_state is not ClientState.CLOSING:
                 self._state = ClientState.CLOSING
-        if closed_without_process:
+        if prior_state in {ClientState.CLOSED, ClientState.NEW}:
             self._signal_queues()
             return
-        if wait_for_other_close:
+        if prior_state is ClientState.CLOSING:
             self._closed.wait(timeout=self.close_timeout * 3)
             return
         process = self._process
         try:
             if process is not None:
-                acquired_write = self._write_lock.acquire(timeout=self.close_timeout)
-                if not acquired_write:
-                    # A blocked frame cannot be completed safely during close.
-                    # Terminating our private process group wakes the writer.
-                    self._signal_process(process, signal.SIGTERM)
-                    acquired_write = self._write_lock.acquire(
-                        timeout=self.close_timeout
-                    )
-                if not acquired_write:
-                    self._signal_process(process, signal.SIGKILL)
-                    acquired_write = self._write_lock.acquire(
-                        timeout=self.close_timeout
-                    )
-                if not acquired_write:
-                    raise AcpTransportError("timed out closing ACP agent stdin")
-                try:
-                    if process.stdin is not None:
-                        try:
-                            process.stdin.close()
-                        except OSError:
-                            pass
-                finally:
-                    self._write_lock.release()
-                try:
-                    process.wait(timeout=self.close_timeout)
-                except subprocess.TimeoutExpired:
-                    self._signal_process(process, signal.SIGTERM)
-                    try:
-                        process.wait(timeout=self.close_timeout)
-                    except subprocess.TimeoutExpired:
-                        self._signal_process(process, signal.SIGKILL)
-                        process.wait(timeout=self.close_timeout)
-                # The adapter can exit while leaving a spawned agent process
-                # holding its inherited stdio descriptors.  The private process
-                # group makes those descendants safe to terminate as one unit.
-                self._signal_process(process, signal.SIGTERM)
+                self._close_stdin(process)
+                self._reap_process(process)
             self._stop.set()
-            for thread in (self._reader_thread, self._stderr_thread):
-                if thread is not None and thread is not threading.current_thread():
-                    thread.join(timeout=self.close_timeout)
-            if process is not None and any(
-                thread is not None and thread.is_alive()
-                for thread in (self._reader_thread, self._stderr_thread)
-            ):
+            self._join_reader()
+            if process is not None and self._reader_alive():
                 self._signal_process(process, signal.SIGKILL)
-                for thread in (self._reader_thread, self._stderr_thread):
-                    if thread is not None and thread is not threading.current_thread():
-                        thread.join(timeout=self.close_timeout)
+                self._join_reader()
             self._fail_pending(AcpTransportError("ACP client closed"))
             with self._permission_lock:
                 self._pending_permissions.clear()
@@ -726,7 +619,11 @@ class BoundedAcpConnection:
                 self._active_prompts.clear()
             self._signal_queues()
             with self._state_lock:
-                self._state = ClientState.FAILED if was_failed else ClientState.CLOSED
+                self._state = (
+                    ClientState.FAILED
+                    if prior_state is ClientState.FAILED
+                    else ClientState.CLOSED
+                )
         except BaseException as exc:
             with self._state_lock:
                 if self._failure is None:
@@ -741,6 +638,44 @@ class BoundedAcpConnection:
             self._stop.set()
             self._closed.set()
 
+    def _close_stdin(self, process: subprocess.Popen[bytes]) -> None:
+        acquired = False
+        for signum in (None, signal.SIGTERM, signal.SIGKILL):
+            if signum is not None:
+                self._signal_process(process, signum)
+            if self._write_lock.acquire(timeout=self.close_timeout):
+                acquired = True
+                break
+        if not acquired:
+            raise AcpTransportError("timed out closing ACP agent stdin")
+        try:
+            if process.stdin is not None:
+                with suppress(OSError):
+                    process.stdin.close()
+        finally:
+            self._write_lock.release()
+
+    def _reap_process(self, process: subprocess.Popen[bytes]) -> None:
+        for signum in (None, signal.SIGTERM, signal.SIGKILL):
+            if signum is not None:
+                self._signal_process(process, signum)
+            try:
+                process.wait(timeout=self.close_timeout)
+                break
+            except subprocess.TimeoutExpired:
+                if signum == signal.SIGKILL:
+                    raise
+        # Reap descendants that inherited the private process group's stdio.
+        self._signal_process(process, signal.SIGTERM)
+
+    def _reader_alive(self) -> bool:
+        return self._reader_thread is not None and self._reader_thread.is_alive()
+
+    def _join_reader(self) -> None:
+        thread = self._reader_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=self.close_timeout)
+
     def _session_setup_params(
         self,
         cwd: str | os.PathLike[str],
@@ -751,46 +686,39 @@ class BoundedAcpConnection:
         self._require_initialized()
         params: dict[str, Any] = {
             "cwd": _absolute_path(cwd, "cwd"),
-            "mcpServers": [self._validated_mcp_server(server) for server in mcp_servers],
+            "mcpServers": [_validated_mcp_server(server, self.capabilities)
+                           for server in mcp_servers],
         }
-        directories = [
-            _absolute_path(directory, "additional directory")
-            for directory in additional_directories
-        ]
+        directories = [_absolute_path(item, "additional directory")
+                       for item in additional_directories]
         if directories:
             self._require_capability("additionalDirectories")
             params["additionalDirectories"] = directories
         return params
 
-    def _validated_mcp_server(self, server: Mapping[str, Any]) -> dict[str, Any]:
-        assert self.capabilities is not None
-        return _validated_mcp_server(server, self.capabilities)
-
     def _require_capability(self, name: str) -> None:
         self._require_initialized()
         assert self.capabilities is not None
-        supported = {
-            "loadSession": _capability(self.capabilities, "loadSession"),
-            "sessionResume": _capability(
-                self.capabilities, "sessionCapabilities", "resume", object_value=True
-            ),
-            "additionalDirectories": _capability(
-                self.capabilities,
-                "sessionCapabilities",
-                "additionalDirectories",
-                object_value=True,
-            ),
-        }.get(name, False)
-        if not supported:
+        path = {
+            "loadSession": ("loadSession",),
+            "sessionResume": ("sessionCapabilities", "resume"),
+            "additionalDirectories": ("sessionCapabilities", "additionalDirectories"),
+        }[name]
+        if not _capability(self.capabilities, *path, object_value=len(path) > 1):
             raise AcpCapabilityError(f"agent did not advertise {name} capability")
 
     def _new_request_id(self) -> int:
-        with self._request_id_lock:
+        with self._pending_lock:
             request_id = self._next_id
             if request_id > 2**63 - 1:
                 raise AcpClientStateError("ACP request ID space exhausted")
             self._next_id += 1
         return request_id
+
+    def _discard_pending(self, request_id: RequestId, waiter: ResponseWaiter) -> None:
+        with self._pending_lock:
+            if self._pending.get(request_id) is waiter:
+                self._pending.pop(request_id, None)
 
     def _write(
         self,
@@ -802,8 +730,9 @@ class BoundedAcpConnection:
         payload = encode_message(envelope, max_frame_bytes=self.max_frame_bytes)
         if deadline is None:
             deadline = time.monotonic() + self.request_timeout
-        remaining_timeout = max(0.0, deadline - time.monotonic())
-        if not self._write_lock.acquire(timeout=remaining_timeout):
+        if not self._write_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
             raise AcpRequestTimeoutError("timed out waiting to write ACP frame")
         try:
             self._require_running()
@@ -817,11 +746,7 @@ class BoundedAcpConnection:
                 write_started = False
                 while remaining:
                     wait = deadline - time.monotonic()
-                    if wait <= 0:
-                        raise AcpRequestTimeoutError(
-                            "timed out writing ACP frame to agent"
-                        )
-                    if not self._wait_writable(fd, wait):
+                    if wait <= 0 or not self._wait_writable(fd, wait):
                         raise AcpRequestTimeoutError(
                             "timed out writing ACP frame to agent"
                         )
@@ -858,6 +783,9 @@ class BoundedAcpConnection:
         finally:
             self._write_lock.release()
 
+    def _respond(self, request_id: RequestId, field: str, value: Any) -> None:
+        self._write({"jsonrpc": "2.0", "id": request_id, field: value})
+
     @staticmethod
     def _wait_writable(fd: int, timeout: float) -> bool:
         _, writable, _ = select.select([], [fd], [], timeout)
@@ -877,7 +805,7 @@ class BoundedAcpConnection:
             else:
                 process.kill()
         except ProcessLookupError:
-            pass
+            return
 
     def _reader_main(self) -> None:
         process = self._process
@@ -907,37 +835,26 @@ class BoundedAcpConnection:
                 del buffer[: newline + 1]
                 if len(line) > self.max_frame_bytes:
                     raise AcpFramingError("ACP stdout frame exceeds configured size limit")
-                message = decode_json_line(
-                    line,
-                    max_frame_bytes=self.max_frame_bytes,
+                self._dispatch(
+                    decode_json_line(line, max_frame_bytes=self.max_frame_bytes)
                 )
-                self._dispatch(message)
         except BaseException as exc:
             if not self._stop.is_set():
                 self._set_failed(exc)
 
-    def _stderr_main(self) -> None:
-        process = self._process
-        assert process is not None and process.stderr is not None
-        try:
-            while True:
-                if not os.read(process.stderr.fileno(), 4096):
-                    return
-        except OSError:
-            return
-
     def _dispatch(
-        self, message: JsonRpcRequest | JsonRpcNotification | JsonRpcResponse
+        self,
+        message: JsonRpcRequest | JsonRpcNotification | JsonRpcResponse,
     ) -> None:
         if isinstance(message, JsonRpcResponse):
             if message.request_id is None:
                 return
             with self._pending_lock:
-                pending = self._pending.get(message.request_id)
-                if pending is not None:
+                waiter = self._pending.get(message.request_id)
+                if waiter is not None:
                     try:
-                        pending.waiter.put_nowait(message)
-                    except queue.Full as exc:
+                        waiter.set_result(message)
+                    except InvalidStateError as exc:
                         raise AcpEnvelopeError(
                             "duplicate ACP response for one request ID"
                         ) from exc
@@ -951,16 +868,14 @@ class BoundedAcpConnection:
             try:
                 parsed = parse_permission_request(message)
             except AcpProtocolError as exc:
-                self._write(
+                self._respond(
+                    message.request_id,
+                    "error",
                     {
-                        "jsonrpc": "2.0",
-                        "id": message.request_id,
-                        "error": {
-                            "code": -32602,
-                            "message": "Invalid permission request",
-                            "data": str(exc),
-                        },
-                    }
+                        "code": -32602,
+                        "message": "Invalid permission request",
+                        "data": str(exc),
+                    },
                 )
                 return
             with self._permission_lock:
@@ -970,22 +885,18 @@ class BoundedAcpConnection:
                 if not cancelled:
                     self._pending_permissions[message.request_id] = parsed
             if cancelled:
-                self._write(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": message.request_id,
-                        "result": {"outcome": {"outcome": "cancelled"}},
-                    }
+                self._respond(
+                    message.request_id,
+                    "result",
+                    {"outcome": {"outcome": "cancelled"}},
                 )
             else:
                 self._put_session_event(parsed)
         else:
-            self._write(
-                {
-                    "jsonrpc": "2.0",
-                    "id": message.request_id,
-                    "error": {"code": _METHOD_NOT_FOUND, "message": "Method not found"},
-                }
+            self._respond(
+                message.request_id,
+                "error",
+                {"code": _METHOD_NOT_FOUND, "message": "Method not found"},
             )
 
     def _put_session_event(self, value: SessionEvent) -> None:
@@ -1017,11 +928,9 @@ class BoundedAcpConnection:
         with self._pending_lock:
             pending_requests = tuple(self._pending.values())
             self._pending.clear()
-        for pending in pending_requests:
-            try:
-                pending.waiter.put_nowait(failure)
-            except queue.Full:
-                pass
+            for waiter in pending_requests:
+                with suppress(InvalidStateError):
+                    waiter.set_exception(failure)
 
     def _signal_queues(self) -> None:
         with self._session_event_condition:
@@ -1068,7 +977,9 @@ def _absolute_path(value: str | os.PathLike[str], name: str) -> str:
 
 
 def _capability(
-    capabilities: Mapping[str, Any], *path: str, object_value: bool = False
+    capabilities: Mapping[str, Any],
+    *path: str,
+    object_value: bool = False,
 ) -> bool:
     value: Any = capabilities
     for key in path:
@@ -1086,23 +997,21 @@ def _validated_prompt_content_block(
     if kind not in {"text", "image", "audio", "resource_link", "resource"}:
         raise ValueError("prompt content block type is not valid ACP v1")
     capability = {
-        "image": (_capability(capabilities, "promptCapabilities", "image"), "image"),
-        "audio": (_capability(capabilities, "promptCapabilities", "audio"), "audio"),
-        "resource": (
-            _capability(capabilities, "promptCapabilities", "embeddedContext"),
-            "embeddedContext",
-        ),
+        "image": "image",
+        "audio": "audio",
+        "resource": "embeddedContext",
     }.get(kind)
-    if capability is not None and not capability[0]:
+    if capability and not _capability(
+        capabilities, "promptCapabilities", capability
+    ):
         raise AcpCapabilityError(
-            f"agent did not advertise prompt {capability[1]} capability"
+            f"agent did not advertise prompt {capability} capability"
         )
-    try:
-        prompt = UpstreamPromptRequest.model_validate(
-            {"sessionId": "validation", "prompt": [dict(value)]}
-        ).model_dump(by_alias=True, exclude_none=True)["prompt"]
-    except ValidationError as exc:
-        raise ValueError(f"{kind} content does not match the upstream ACP schema") from exc
+    prompt = _model_validate(
+        acp_schema.PromptRequest,
+        {"sessionId": "validation", "prompt": [dict(value)]},
+        ValueError(f"{kind} content does not match the upstream ACP schema"),
+    ).model_dump(by_alias=True, exclude_none=True)["prompt"]
     return prompt[0]
 
 
@@ -1113,24 +1022,25 @@ def _validated_mcp_server(
     if not isinstance(value, Mapping):
         raise ValueError("each MCP server must be an object")
     transport = value.get("type")
-    models = {None: McpServerStdio, "http": HttpMcpServer, "sse": SseMcpServer}
+    models = {
+        None: acp_schema.McpServerStdio,
+        "http": acp_schema.HttpMcpServer,
+        "sse": acp_schema.SseMcpServer,
+    }
     model = models.get(transport)
     if model is None:
         raise ValueError("MCP server type is not valid stable ACP v1")
-    capability = {
-        "http": _capability(capabilities, "mcpCapabilities", "http"),
-        "sse": _capability(capabilities, "mcpCapabilities", "sse"),
-    }.get(transport, True)
-    if not capability:
+    if transport in {"http", "sse"} and not _capability(
+        capabilities, "mcpCapabilities", transport
+    ):
         raise AcpCapabilityError(
             f"agent did not advertise MCP {str(transport).upper()} capability"
         )
-    try:
-        result = model.model_validate(dict(value)).model_dump(
-            by_alias=True, exclude_none=True
-        )
-    except ValidationError as exc:
-        raise ValueError("MCP server does not match the upstream ACP schema") from exc
+    result = _model_validate(
+        model,
+        value,
+        ValueError("MCP server does not match the upstream ACP schema"),
+    ).model_dump(by_alias=True, exclude_none=True)
     if transport is None:
         result["command"] = _absolute_path(result["command"], "MCP server.command")
     return result
@@ -1139,19 +1049,18 @@ def _validated_mcp_server(
 def _validated_env(env: Mapping[str, str] | None) -> dict[str, str] | None:
     if env is None:
         return None
-    result: dict[str, str] = {}
-    for key, value in env.items():
-        if (
-            not isinstance(key, str)
-            or not key
-            or "=" in key
-            or "\x00" in key
-            or not isinstance(value, str)
-            or "\x00" in value
-        ):
-            raise ValueError("env must contain valid string names and values")
-        result[key] = value
-    return result
+    invalid = any(
+        not isinstance(key, str)
+        or not key
+        or "=" in key
+        or "\x00" in key
+        or not isinstance(value, str)
+        or "\x00" in value
+        for key, value in env.items()
+    )
+    if invalid:
+        raise ValueError("env must contain valid string names and values")
+    return dict(env)
 
 
 def _require_mapping(value: Any, name: str) -> Mapping[str, Any]:
@@ -1160,21 +1069,20 @@ def _require_mapping(value: Any, name: str) -> Mapping[str, Any]:
     return value
 
 
-def _validate_upstream(model: Any, value: Mapping[str, Any], name: str) -> None:
+def _validate_upstream(model: Any, value: Any, name: str) -> Mapping[str, Any]:
     """Validate one stable ACP payload with the official generated schema."""
+    raw = _require_mapping(value, name)
+    _model_validate(
+        model,
+        raw,
+        AcpEnvelopeError(f"{name} does not match the upstream ACP schema"),
+    )
+    return raw
 
+
+def _model_validate(model: Any, value: Mapping[str, Any], error: Exception) -> Any:
+    """Validate one official ACP model through a shared error boundary."""
     try:
-        model.model_validate(dict(value))
+        return model.model_validate(dict(value))
     except ValidationError as exc:
-        raise AcpEnvelopeError(
-            f"{name} does not match the upstream ACP schema"
-        ) from exc
-
-
-def _parse_session_result(
-    raw: Mapping[str, Any], *, require_session_id: bool
-) -> str:
-    session_id = raw.get("sessionId", "")
-    if require_session_id and (not isinstance(session_id, str) or not session_id):
-        raise AcpEnvelopeError("session/new result.sessionId must be a non-empty string")
-    return session_id if isinstance(session_id, str) else ""
+        raise error from exc
