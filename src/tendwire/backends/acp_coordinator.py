@@ -811,10 +811,8 @@ class AcpSupervisor:
             return "cancelled"
         request: dict[str, Any] = {
             "schema_version": 1,
-            "response_schema_version": 3,
             "action": "send_instruction",
             "request_id": request_id,
-            "dry_run": False,
             "target": {
                 "stable_key": stable_key,
                 "stable_key_version": 1,
@@ -835,6 +833,7 @@ class AcpSupervisor:
                 )
             request.pop("instruction", None)
             request["action"] = "answer_decision"
+            request["target"] = {"worker_id": slot.continuity.worker_id}
             request["params"] = {
                 "decision_ref": decision_ref,
                 "selection": {"option_refs": [selected]},

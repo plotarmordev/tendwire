@@ -20,6 +20,7 @@ from tendwire.core.commands import (
     CommandEnvelope,
     CommandRequest,
     build_canonical_mutation,
+    build_selector_proof,
     error_value,
     parse_command_request,
 )
@@ -50,6 +51,31 @@ def _config(tmp_path: Path) -> Config:
         data_dir=tmp_path,
         db_path=tmp_path / "commands.db",
     )
+
+
+def _reserve_for_test(
+    config: Config,
+    request: CommandRequest,
+    canonical: Any,
+    pending: CommandEnvelope,
+    *,
+    owner_lease_seconds: float = 30.0,
+) -> Mapping[str, Any]:
+    outcome = reserve_command_request(
+        config.db_path,
+        host_id=config.host_id,
+        request_id=request.request_id or "",
+        action=canonical.action,
+        canonical_version=canonical.canonical_version,
+        canonical_fingerprint=canonical.fingerprint,
+        canonical_request_json=canonical.canonical_json,
+        public_worker_id=canonical.public_worker_id,
+        pending_result_json=envelope_to_receipt_json(pending),
+        selector_proof=build_selector_proof(request),
+        owner_lease_seconds=owner_lease_seconds,
+    )
+    assert isinstance(outcome, Mapping) and outcome.get("status") == "reserved"
+    return outcome
 
 
 def _continuity_binding(worker: Worker) -> WorkerBinding:
@@ -136,18 +162,14 @@ def _instruction(
     request_id: str,
     *,
     target: Mapping[str, Any] | None = None,
-    response_schema_version: int | None = None,
 ) -> dict[str, Any]:
     request: dict[str, Any] = {
         "schema_version": 1,
         "action": "send_instruction",
         "request_id": request_id,
-        "dry_run": False,
         "target": dict(target or {"worker_id": "worker-1"}),
         "instruction": {"text": "do the work"},
     }
-    if response_schema_version is not None:
-        request["response_schema_version"] = response_schema_version
     return request
 
 
@@ -159,7 +181,6 @@ def _answer(
         "schema_version": 1,
         "action": "answer_decision",
         "request_id": request_id,
-        "dry_run": False,
         "target": {"worker_id": "worker-1"},
         "params": {
             "decision_ref": decision_ref,
@@ -416,17 +437,7 @@ def test_live_receipt_replay_returns_exact_stored_pending_result(
     request = _request_object(request_data)
     canonical = build_canonical_mutation(request, public_worker_id=worker.id)
     pending = _pending_envelope(request)
-    reserved = reserve_command_request(
-        config.db_path,
-        host_id=config.host_id,
-        request_id=request.request_id or "",
-        action=canonical.action,
-        canonical_version=canonical.canonical_version,
-        canonical_fingerprint=canonical.fingerprint,
-        canonical_request_json=canonical.canonical_json,
-        public_worker_id=canonical.public_worker_id,
-        pending_result_json=envelope_to_receipt_json(pending),
-    )
+    reserved = _reserve_for_test(config, request, canonical, pending)
     if receipt_state == "send_started":
         started = mark_command_send_started(
             config.db_path,
@@ -463,16 +474,8 @@ def test_corrupt_live_status_precedes_malformed_pending_result(tmp_path: Path) -
     request_data = _instruction("corrupt-live")
     request = _request_object(request_data)
     canonical = build_canonical_mutation(request, public_worker_id=worker.id)
-    reserve_command_request(
-        config.db_path,
-        host_id=config.host_id,
-        request_id=request.request_id or "",
-        action=canonical.action,
-        canonical_version=canonical.canonical_version,
-        canonical_fingerprint=canonical.fingerprint,
-        canonical_request_json=canonical.canonical_json,
-        public_worker_id=canonical.public_worker_id,
-        pending_result_json=envelope_to_receipt_json(_pending_envelope(request)),
+    _reserve_for_test(
+        config, request, canonical, _pending_envelope(request)
     )
     assert config.db_path is not None
     with sqlite3.connect(config.db_path) as conn:
@@ -506,18 +509,8 @@ def test_expired_send_started_terminalizes_uncertain_once_without_acp(
     request = _request_object(request_data)
     canonical = build_canonical_mutation(request, public_worker_id=worker.id)
     pending = _pending_envelope(request)
-    reserved = reserve_command_request(
-        config.db_path,
-        host_id=config.host_id,
-        request_id=request.request_id or "",
-        action=canonical.action,
-        canonical_version=canonical.canonical_version,
-        canonical_fingerprint=canonical.fingerprint,
-        canonical_request_json=canonical.canonical_json,
-        public_worker_id=canonical.public_worker_id,
-        pending_result_json=envelope_to_receipt_json(pending),
-        owner_lease_seconds=1,
-        now="2026-01-01T00:00:00.000000Z",
+    reserved = _reserve_for_test(
+        config, request, canonical, pending, owner_lease_seconds=30
     )
     started = mark_command_send_started(
         config.db_path,
@@ -528,9 +521,15 @@ def test_expired_send_started_terminalizes_uncertain_once_without_acp(
         binding_fingerprint=binding.private_fingerprint,
         submission_worker=worker,
         instruction_text="do the work",
-        now="2026-01-01T00:00:00.000000Z",
     )
     assert started["status"] == "send_started"
+    assert config.db_path is not None
+    with sqlite3.connect(config.db_path) as conn:
+        conn.execute(
+            "UPDATE command_receipts SET owner_until='2026-01-01T00:00:00.000000Z' "
+            "WHERE request_id='expired-send-started'"
+        )
+        conn.commit()
     route = _Route()
 
     first = submit_command(
@@ -642,7 +641,9 @@ def test_boolean_canonical_version_cannot_claim_v1_receipt(
         assert receipt is not None
         return {**receipt, "canonical_version": True}
 
-    monkeypatch.setattr(command_submission, "get_command_request", boolean_version)
+    monkeypatch.setattr(
+        command_submission, "get_command_request", boolean_version
+    )
 
     replay = submit_command(
         config,
@@ -661,7 +662,10 @@ def test_stored_selector_evidence_precedes_snapshot_churn_and_changed_selector(
     config = _config(tmp_path)
     worker, _binding = _seed(config)
     request_id = "selector-proof"
-    request = _instruction(request_id, target={"name": "Coda"})
+    request = _instruction(
+        request_id,
+        target={"stable_key": "wsk1_" + "a" * 64, "stable_key_version": 1},
+    )
     route = _Route()
     accepted = submit_command(
         config,
@@ -681,9 +685,12 @@ def test_stored_selector_evidence_precedes_snapshot_churn_and_changed_selector(
     )
 
     exact = submit_command(config, request, acp_prompt_router=lambda _worker: route)
-    changed_name = submit_command(
+    changed_selector = submit_command(
         config,
-        _instruction(request_id, target={"name": "Other"}),
+        _instruction(
+            request_id,
+            target={"stable_key": "wsk1_" + "b" * 64, "stable_key_version": 1},
+        ),
         acp_prompt_router=lambda _worker: route,
     )
     changed_id = submit_command(
@@ -693,7 +700,7 @@ def test_stored_selector_evidence_precedes_snapshot_churn_and_changed_selector(
     )
 
     assert exact.to_dict() == accepted.to_dict()
-    assert changed_name.status == "request_state_uncertain"
+    assert changed_selector.status == "request_state_uncertain"
     assert changed_id.status == "duplicate_request"
     assert route.send_count == 1
     receipt = get_command_request(config.db_path, config.host_id, request_id)
@@ -738,6 +745,48 @@ def test_reserve_commit_then_exception_recovers_without_transport(
         "reserve-commit-loss",
     )
     assert receipt is not None and receipt["state"] == "reserved"
+
+
+def test_reserve_exception_readback_rejects_different_selector(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    worker, _binding = _seed(config)
+    request_id = "reserve-selector-race"
+    winner_data = _instruction(request_id)
+    contender_data = _instruction(
+        request_id,
+        target={
+            "stable_key": worker.meta["stable_key"],
+            "stable_key_version": worker.meta["stable_key_version"],
+        },
+    )
+    winner = _request_object(winner_data)
+    real_reserve = command_submission.reserve_command_request
+
+    def conflict_then_failed(*args: Any, **kwargs: Any) -> Any:
+        winner_kwargs = {**kwargs, "selector_proof": build_selector_proof(winner)}
+        assert real_reserve(*args, **winner_kwargs)["status"] == "reserved"
+        assert real_reserve(*args, **kwargs)["status"] == "request_id_conflict"
+        raise OSError("lost conflict reply")
+
+    monkeypatch.setattr(
+        command_submission,
+        "reserve_command_request",
+        conflict_then_failed,
+    )
+    route = _Route()
+
+    result = submit_command(
+        config,
+        contender_data,
+        acp_prompt_router=lambda candidate: route if candidate == worker else None,
+    )
+
+    assert result.status == "duplicate_request"
+    assert result.disposition == "terminal_rejected"
+    assert route.send_count == 0
 
 
 def test_send_start_commit_then_exception_is_never_replayed(
@@ -816,7 +865,8 @@ def test_finish_commit_then_exception_recovers_exact_terminal_receipt(
     )
 
     assert receipt is not None and receipt["state"] == "accepted"
-    assert envelope_to_receipt_json(first) == receipt["result_json"]
+    stored = CommandEnvelope.from_dict(json.loads(receipt["result_json"]))
+    assert stored.result is not None and "submission_id" not in stored.result
     assert second.to_dict() == first.to_dict()
     assert route.send_count == 1
 
@@ -851,7 +901,65 @@ def test_terminal_receipt_replays_exactly_without_resending(
     assert first.to_dict() == replay.to_dict()
     assert (first.status, first.disposition) == (status, disposition)
     assert stored == get_command_request(config.db_path, config.host_id, f"terminal-{verdict}")
-    assert stored is not None and stored["result_json"] == envelope_to_receipt_json(first)
+    assert stored is not None
+    if verdict == "accepted":
+        stored_envelope = CommandEnvelope.from_dict(json.loads(stored["result_json"]))
+        assert stored_envelope.result is not None
+        assert "submission_id" not in stored_envelope.result
+    else:
+        assert stored["result_json"] == envelope_to_receipt_json(first)
+    assert route.send_count == 1
+
+
+@pytest.mark.parametrize(
+    "legacy_status",
+    [
+        "stale_target",
+        "decision_not_pending",
+        "unknown_worker",
+        "invalid_selection",
+        "unsupported_decision",
+    ],
+)
+def test_preupgrade_terminal_rejection_status_replays_exactly(
+    tmp_path: Path,
+    legacy_status: str,
+) -> None:
+    config = _config(tmp_path)
+    worker, _binding = _seed(config)
+    route = _Route()
+    request = _instruction(f"legacy-{legacy_status}")
+    accepted = submit_command(
+        config,
+        request,
+        acp_prompt_router=lambda candidate: route if candidate == worker else None,
+    )
+    assert accepted.status == "accepted"
+    assert config.db_path is not None
+    receipt = get_command_request(config.db_path, config.host_id, request["request_id"])
+    assert receipt is not None
+    stored = json.loads(receipt["result_json"])
+    stored.update({
+        "ok": False,
+        "status": legacy_status,
+        "disposition": "terminal_rejected",
+        "error": {"code": legacy_status, "message": "pre-upgrade", "details": {}},
+    })
+    stored_json = json.dumps(stored, sort_keys=True, separators=(",", ":"))
+    with sqlite3.connect(config.db_path) as conn:
+        conn.execute(
+            "UPDATE command_receipts SET state='rejected',status=?,result_json=? "
+            "WHERE host_id=? AND request_id=?",
+            (legacy_status, stored_json, config.host_id, request["request_id"]),
+        )
+
+    replay = submit_command(config, request, acp_prompt_router=lambda _worker: route)
+
+    assert replay.status == legacy_status
+    assert replay.disposition == "terminal_rejected"
+    assert get_command_request(
+        config.db_path, config.host_id, request["request_id"]
+    )["result_json"] == stored_json
     assert route.send_count == 1
 
 
@@ -896,6 +1004,49 @@ class _DecisionRouter:
         self.answered += 1
 
 
+def test_expired_answer_send_started_terminalizes_without_permission_transport(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    worker, binding = _seed(config)
+    request_data = _answer("expired-answer", "decision-expired")
+    request = _request_object(request_data)
+    canonical = build_canonical_mutation(request, public_worker_id=worker.id)
+    reserved = _reserve_for_test(
+        config, request, canonical, _pending_envelope(request)
+    )
+    started = mark_command_send_started(
+        config.db_path,
+        host_id=config.host_id,
+        request_id=request.request_id or "",
+        canonical_fingerprint=canonical.fingerprint,
+        owner_token=str(reserved["owner_token"]),
+        binding_fingerprint=binding.private_fingerprint,
+    )
+    assert started["status"] == "send_started"
+    assert config.db_path is not None
+    with sqlite3.connect(config.db_path) as conn:
+        conn.execute(
+            "UPDATE command_receipts SET owner_until='2026-01-01T00:00:00.000000Z' "
+            "WHERE request_id='expired-answer'"
+        )
+        conn.commit()
+    router = _DecisionRouter()
+
+    first = submit_command(
+        config, request_data, acp_permission_router=router
+    )
+    replay = submit_command(
+        config, request_data, acp_permission_router=router
+    )
+
+    assert first.status == "request_state_uncertain"
+    assert first.disposition == "terminal_uncertain"
+    assert first.result is None
+    assert replay.to_dict() == first.to_dict()
+    assert router.answered == 0
+
+
 def _decision_rows(config: Config, decision_ref: str) -> tuple[str, str, str]:
     assert config.db_path is not None
     with sqlite3.connect(config.db_path) as conn:
@@ -925,7 +1076,7 @@ def test_permission_terminal_effect_failure_rolls_back_receipt_and_pending(
     decision_ref = _pending_decision(config)
     router = _DecisionRouter()
 
-    def failing_effect(**_kwargs: Any) -> Callable[[Any], None]:
+    def failing_effect(*_args: Any, **_kwargs: Any) -> Callable[[Any], None]:
         def fail(_conn: Any) -> None:
             raise RuntimeError("terminal effect failed")
 
@@ -993,7 +1144,7 @@ def test_permission_terminal_commit_loss_recovers_both_atomic_states(
     assert router.answered == 1
 
 
-def test_v2_receipt_is_immutable_and_v3_projection_runs_once_per_response(
+def test_v2_receipt_is_immutable_and_public_projection_runs_once_per_response(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1013,24 +1164,24 @@ def test_v2_receipt_is_immutable_and_v3_projection_runs_once_per_response(
         "settle_submission_link_for_request",
         counted_settle,
     )
-    request = _instruction("v3-once", response_schema_version=3)
+    request = _instruction("public-projection")
     first = submit_command(
         config,
         request,
         acp_prompt_router=lambda candidate: route if candidate == worker else None,
     )
-    receipt = get_command_request(config.db_path, config.host_id, "v3-once")
+    receipt = get_command_request(config.db_path, config.host_id, "public-projection")
     second = submit_command(
         config,
         request,
         acp_prompt_router=lambda _candidate: route,
     )
 
-    assert first.schema_version == second.schema_version == 3
+    assert first.schema_version == second.schema_version == 2
     assert first.result is not None and first.result["submission_id"].startswith("twsub1.")
     assert receipt is not None
     stored = json.loads(receipt["result_json"])
-    assert stored["schema_version"] == 2
+    assert stored["schema_version"] == 2 and stored["dry_run"] is False
     assert "submission_id" not in (stored.get("result") or {})
     assert settle_count == 2
     assert route.send_count == 1

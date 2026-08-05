@@ -10,7 +10,6 @@ from typing import Any, Protocol
 from .config import Config
 from .core.commands import (
     COMMAND_ENVELOPE_SCHEMA_VERSION,
-    COMMAND_ENVELOPE_V3_SCHEMA_VERSION,
     DISPOSITION_IN_PROGRESS,
     DISPOSITION_NO_RECEIPT,
     DISPOSITION_TERMINAL_ACCEPTED,
@@ -20,17 +19,13 @@ from .core.commands import (
     STATUS_ANSWER_IN_PROGRESS,
     STATUS_AMBIGUOUS_TARGET,
     STATUS_BACKEND_UNAVAILABLE,
-    STATUS_DRY_RUN,
     STATUS_DECISION_NOT_PENDING,
     STATUS_DUPLICATE_REQUEST,
     STATUS_INVALID_SELECTION,
     STATUS_NOT_FOUND,
-    STATUS_NOOP,
     STATUS_PENDING,
     STATUS_REJECTED,
     STATUS_REQUEST_STATE_UNCERTAIN,
-    STATUS_RESOLVED,
-    STATUS_SNAPSHOT,
     STATUS_STALE_TARGET,
     STATUS_UNKNOWN_WORKER,
     STATUS_UNSUPPORTED_DECISION,
@@ -44,11 +39,11 @@ from .core.commands import (
     turn_submission_id,
     parse_command_request,
     resolve_target,
-    snapshot_result,
+    validate_public_command_envelope,
     validate_request,
     worker_candidate,
 )
-from .core.models import Snapshot, Worker
+from .core.models import Worker
 from .store.pending import (
     abandon_backend_pending_decision_claim,
     backend_pending_decision_terminal_effect,
@@ -70,11 +65,7 @@ from .store.receipts import (
 )
 
 
-_MUTATING_ACTIONS = frozenset(
-    {"send_instruction", "answer_decision"}
-)
 _DISALLOWED_SEND_STATUSES = frozenset({"closed", "failed", "unknown"})
-_AMBIGUOUS_BINDING_REASONS = frozenset({"duplicate_backend_target", "not_unique"})
 _TERMINAL_DISPOSITIONS = {
     "accepted": DISPOSITION_TERMINAL_ACCEPTED,
     "rejected": DISPOSITION_TERMINAL_REJECTED,
@@ -103,8 +94,6 @@ _RECEIPT_MESSAGES = {
     "unreadable": "stored request result is unreadable; not retrying mutation",
     "result_malformed": "stored request result is malformed; not retrying mutation",
 }
-
-
 class AcpPromptRoute(Protocol):
     binding_fingerprint: str
     supports_steering: bool
@@ -127,13 +116,6 @@ def _attempt(call: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         return call(*args, **kwargs)
     except Exception:
         return None
-
-
-def _current_snapshot(config: Config) -> Snapshot:
-    snapshot = latest_snapshot(config.db_path, config.host_id)
-    if snapshot is None:
-        raise RuntimeError("persisted worker authority is unavailable")
-    return snapshot
 
 
 def _backend_unavailable(
@@ -161,25 +143,6 @@ def _target_resolution_error(
         result={"candidates": candidates},
         error=error_value(status, message),
     )
-
-
-def _resolve_authoritative_worker(
-    request: CommandRequest,
-    snapshot: Snapshot,
-) -> Worker | CommandEnvelope:
-    resolved, candidates, status = resolve_target(
-        request.target,
-        list(snapshot.workers),
-        allow_disallowed_status=True,
-    )
-    if status != STATUS_RESOLVED:
-        return _target_resolution_error(request, status, candidates)
-
-    worker_id = (resolved or {}).get("worker_id")
-    worker = next((item for item in snapshot.workers if item.id == worker_id), None)
-    if worker is None:
-        return _target_resolution_error(request, STATUS_NOT_FOUND, [])
-    return worker
 
 
 def _target_state_at_send(worker: Worker) -> str:
@@ -236,13 +199,14 @@ def _duplicate_request(request: CommandRequest) -> CommandEnvelope:
     return _failure_envelope(request, STATUS_DUPLICATE_REQUEST)
 
 
+PreSendFailure = tuple[CommandEnvelope, bool]
+
+
 def _decision_failure_envelope(
     request: CommandRequest,
     status: str,
 ) -> CommandEnvelope:
-    return _failure_envelope(
-        request, status, disposition=DISPOSITION_NO_RECEIPT
-    )
+    return _failure_envelope(request, status, disposition=DISPOSITION_NO_RECEIPT)
 
 
 def _decision_route(claim: Any) -> tuple[Any, ...] | None:
@@ -264,9 +228,6 @@ def _decision_route(claim: Any) -> tuple[Any, ...] | None:
         or isinstance(text, str) and bool(text) and not refs
     )
     return route if valid else None
-
-
-PreSendFailure = tuple[CommandEnvelope, bool]
 
 
 def _transition_payload(
@@ -298,14 +259,8 @@ def _decode_receipt(
     if not isinstance(receipt, Mapping):
         return _receipt_error(request, "missing")
     required = {
-        "request_id",
-        "action",
-        "canonical_version",
-        "canonical_fingerprint",
-        "canonical_request_json",
-        "public_worker_id",
-        "state",
-        "status",
+        "request_id", "action", "canonical_version", "canonical_fingerprint",
+        "canonical_request_json", "public_worker_id", "state", "status",
         "result_json",
     }
     if not required.issubset(receipt):
@@ -367,9 +322,11 @@ class ReservedCommandMutation:
     canonical: CanonicalMutation
     owner_token: str
 
+
 @dataclass(frozen=True)
 class _ReceiptTakeover:
     public_worker_id: str
+    selector_proof: str
 
 
 def _read_receipt(config: Config, request: CommandRequest) -> Mapping[str, Any] | None:
@@ -391,8 +348,13 @@ def _reserve_canonical_request(
     config: Config,
     request: CommandRequest,
     canonical: CanonicalMutation,
+    *,
+    selector_proof: str | None = None,
 ) -> ReservedCommandMutation | CommandEnvelope:
     pending = _request_in_progress(request)
+    expected_proof = (
+        _selector_proof(request) if selector_proof is None else selector_proof
+    )
     try:
         reservation = reserve_command_request(
             config.db_path,
@@ -404,25 +366,22 @@ def _reserve_canonical_request(
             canonical_request_json=canonical.canonical_json,
             public_worker_id=canonical.public_worker_id,
             pending_result_json=envelope_to_receipt_json(pending),
-            selector_proof=_selector_proof(request),
+            selector_proof=expected_proof,
         )
     except Exception:  # noqa: BLE001
         receipt = _read_receipt(config, request)
         if receipt is not None:
+            if receipt.get("selector_proof") != expected_proof:
+                return _duplicate_request(request)
             return _decode_receipt(request, canonical, receipt)
         return _backend_unavailable(request, "command receipt store is unavailable")
-
     if not isinstance(reservation, Mapping):
         return _readback(config, request, canonical)
     status = reservation.get("status")
     if status == "request_id_conflict":
         return _duplicate_request(request)
     if status != "reserved":
-        return _decode_receipt(
-            request,
-            canonical,
-            reservation.get("receipt"),
-        )
+        return _decode_receipt(request, canonical, reservation.get("receipt"))
     receipt = reservation.get("receipt")
     owner_token = reservation.get("owner_token")
     if (
@@ -433,7 +392,7 @@ def _reserve_canonical_request(
         or _decode_receipt(request, canonical, receipt).status != STATUS_PENDING
     ):
         return _readback(config, request, canonical)
-    return ReservedCommandMutation(canonical=canonical, owner_token=owner_token)
+    return ReservedCommandMutation(canonical, owner_token)
 
 
 def _recover_request(
@@ -467,7 +426,8 @@ def _finish_request(
             status=terminal.status,
             result_json=envelope_to_receipt_json(terminal),
             event_payload=_transition_payload(
-                request, worker_id=reservation.canonical.public_worker_id,
+                request,
+                worker_id=reservation.canonical.public_worker_id,
                 envelope=terminal,
             ),
             terminal_effect=terminal_effect,
@@ -604,35 +564,6 @@ def _linked_submission_turn(
     return turn if isinstance(turn, Mapping) else None
 
 
-def _accepted_send_envelope(
-    request: CommandRequest,
-    worker: Worker,
-    turn: Mapping[str, Any],
-) -> CommandEnvelope:
-    observed_turn_state = "pending_observation"
-    if str(turn.get("source_turn_id") or "").strip():
-        observed_turn_state = (
-            "complete" if turn.get("complete") is True else "observed"
-        )
-    raw_turn_id = turn.get("id")
-    turn_id = raw_turn_id if isinstance(raw_turn_id, str) and raw_turn_id else None
-    return CommandEnvelope.from_result(
-        request,
-        ok=True,
-        status=STATUS_ACCEPTED,
-        disposition=DISPOSITION_TERMINAL_ACCEPTED,
-        result={
-            "target": {"worker_id": worker.id},
-            "delivery_state": "submitted",
-            "transport_state": "submitted",
-            "target_state_at_send": _target_state_at_send(worker),
-            "turn_id": turn_id,
-            "observed_turn_state": observed_turn_state,
-            "submission_verdict": "submitted",
-        },
-    )
-
-
 def _instruction_failure_envelope(
     request: CommandRequest,
     *,
@@ -713,8 +644,7 @@ def _validate_pending_decision(
     if validated.status == "acp_authority_unavailable":
         return (
             _backend_unavailable(
-                request,
-                "ACP permission authority is temporarily unavailable",
+                request, "ACP permission authority is temporarily unavailable",
             ),
             True,
         )
@@ -736,13 +666,12 @@ def _claim_pending_decision(
         claim.status == "claimed"
         and isinstance(claim.claim_token, str)
         and claim.claim_token
+        and _decision_route(validated) == _decision_route(claim)
     ):
-        if _decision_route(validated) == _decision_route(claim):
-            return claim
+        return claim
     if claim.status == "acp_authority_unavailable":
         return _backend_unavailable(
-            request,
-            "ACP permission authority is temporarily unavailable",
+            request, "ACP permission authority is temporarily unavailable"
         )
     return _decision_failure_envelope(request, _pending_failure_status(claim.status))
 
@@ -798,7 +727,6 @@ def _answer_decision(
             )
         return _finish_before_send(config, request, reservation, claim)
     claim_token = claim.claim_token
-
     send_start_error = _mark_request_send_started(
         config,
         request,
@@ -821,9 +749,7 @@ def _answer_decision(
 
     try:
         started = start_backend_pending_decision_send(
-            config.db_path,
-            config.host_id,
-            claim_token,
+            config.db_path, config.host_id, claim_token
         )
     except Exception:
         _abandon_pending_claim(config, claim_token)
@@ -831,7 +757,10 @@ def _answer_decision(
             config, request, reservation, claim_token,
             "pending decision start state is uncertain",
         )
-    if getattr(started, "status", None) != "started" or _decision_route(claim) != _decision_route(started):
+    if (
+        getattr(started, "status", None) != "started"
+        or _decision_route(claim) != _decision_route(started)
+    ):
         _abandon_pending_claim(config, claim_token)
         return _finish_uncertain_decision(
             config, request, reservation, claim_token,
@@ -871,56 +800,6 @@ def _answer_decision(
     )
 
 
-def _execute_non_mutating(config: Config, request: CommandRequest) -> CommandEnvelope:
-    if request.action == "noop":
-        return CommandEnvelope.from_result(
-            request, ok=True, status=STATUS_NOOP, result={}
-        )
-    snapshot = _current_snapshot(config)
-    if request.action == "read_snapshot":
-        return CommandEnvelope.from_result(
-            request,
-            ok=True,
-            status=STATUS_SNAPSHOT,
-            result=snapshot_result(snapshot),
-        )
-    resolved, candidates, status = resolve_target(
-        request.target, list(snapshot.workers)
-    )
-    if status != STATUS_RESOLVED:
-        return _target_resolution_error(request, status, candidates)
-    return CommandEnvelope.from_result(
-        request,
-        ok=True,
-        status=STATUS_RESOLVED,
-        result={"target": resolved},
-    )
-
-
-def _mutation_dry_run(request: CommandRequest) -> CommandEnvelope:
-    if request.action == "send_instruction":
-        return CommandEnvelope.from_result(
-            request,
-            ok=True,
-            status=STATUS_DRY_RUN,
-            result={
-                "target": dict(request.target or {}),
-                "instruction": {"text": _instruction_text(request)},
-            },
-        )
-    params = request.params or {}
-    return CommandEnvelope.from_result(
-        request,
-        ok=True,
-        status=STATUS_DRY_RUN,
-        result={
-            "target": dict(request.target or {}),
-            "decision": {"decision_ref": params.get("decision_ref")},
-            "delivery_state": "not_submitted",
-        },
-    )
-
-
 def _selector_proof(request: CommandRequest) -> str:
     """Return the request's selector proof, or empty when none can be built."""
     try:
@@ -941,11 +820,10 @@ def _proven_replay_worker_id(
     authority, so a vanished or churned worker cannot hide a live receipt.
     """
     version = receipt.get("canonical_version")
-    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         return _receipt_error(request, "malformed")
     stored = receipt.get("public_worker_id")
     stored_worker_id = stored if isinstance(stored, str) and stored else ""
-
     if not stored_worker_id:
         return _receipt_error(request, "malformed")
     target = request.target or {}
@@ -963,8 +841,8 @@ def _proven_replay_worker_id(
             else _duplicate_request(request)
         )
 
-    # 2. An exact selector proof recognizes the original spelling of a name or
-    #    space alias even after the resolved worker left current authority.
+    # 2. An exact selector proof recognizes the original space/stable selector
+    #    even after the resolved worker left current authority.
     proof = receipt.get("selector_proof")
     stored_proof = proof if is_selector_proof(proof) else ""
     if stored_proof and stored_proof == _selector_proof(request):
@@ -1012,10 +890,16 @@ def _receipt_authority(
     if state == "send_started":
         if command_reservation_is_live(receipt):
             return replay
-        unknown = _instruction_failure_envelope(
-            request,
-            worker_id=proven,
-            verdict="unknown",
+        unknown = (
+            _instruction_failure_envelope(
+                request, worker_id=proven, verdict="unknown"
+            )
+            if request.action == "send_instruction"
+            else _backend_uncertain(
+                request,
+                "permission decision state is unknown after process recovery; "
+                "not retrying mutation",
+            )
         )
         try:
             recovered = recover_unresolved_command_send(
@@ -1026,9 +910,7 @@ def _receipt_authority(
                 unresolved_result_json=str(receipt.get("result_json") or ""),
                 uncertain_result_json=envelope_to_receipt_json(unknown),
                 event_payload=_transition_payload(
-                    request,
-                    worker_id=proven,
-                    envelope=unknown,
+                    request, worker_id=proven, envelope=unknown
                 ),
             )
         except Exception:  # noqa: BLE001
@@ -1040,7 +922,8 @@ def _receipt_authority(
         return replay
     # An abandoned reservation never reached a send. Re-driving it is the
     # existing state machine's recovery, not a replay of a finished mutation.
-    return _ReceiptTakeover(public_worker_id=proven)
+    proof = receipt.get("selector_proof")
+    return _ReceiptTakeover(proven, proof if isinstance(proof, str) else "")
 
 
 def _existing_command_authority(
@@ -1070,7 +953,12 @@ def _send_instruction_through_route(
         )
 
     canonical = build_canonical_mutation(request, public_worker_id=worker.id)
-    reservation = _reserve_canonical_request(config, request, canonical)
+    reservation = _reserve_canonical_request(
+        config,
+        request,
+        canonical,
+        selector_proof=takeover.selector_proof if takeover is not None else None,
+    )
     if isinstance(reservation, CommandEnvelope):
         return reservation
 
@@ -1160,10 +1048,24 @@ def _send_instruction_through_route(
 
     refreshed = _linked_submission_turn(config, request)
     observed_turn = refreshed if refreshed is not None else send_started
-    accepted = _accepted_send_envelope(
+    raw_turn_id = observed_turn.get("id")
+    observed_state = (
+        "complete" if observed_turn.get("complete") is True else "observed"
+    ) if str(observed_turn.get("source_turn_id") or "").strip() else "pending_observation"
+    accepted = CommandEnvelope.from_result(
         request,
-        worker,
-        observed_turn,
+        ok=True,
+        status=STATUS_ACCEPTED,
+        disposition=DISPOSITION_TERMINAL_ACCEPTED,
+        result={
+            "target": {"worker_id": worker.id},
+            "delivery_state": "submitted",
+            "transport_state": "submitted",
+            "target_state_at_send": _target_state_at_send(worker),
+            "turn_id": raw_turn_id if isinstance(raw_turn_id, str) and raw_turn_id else None,
+            "observed_turn_state": observed_state,
+            "submission_verdict": "submitted",
+        },
     )
     return _finish_request(
         config,
@@ -1188,7 +1090,9 @@ def _submit_instruction(
     takeover = existing
 
     try:
-        snapshot = _current_snapshot(config)
+        snapshot = latest_snapshot(config.db_path, config.host_id)
+        if snapshot is None:
+            raise RuntimeError("persisted worker authority is unavailable")
     except Exception:  # noqa: BLE001
         if takeover is not None:
             return _request_in_progress(request)
@@ -1197,11 +1101,20 @@ def _submit_instruction(
             "Current worker authority is temporarily unavailable",
         )
 
-    worker = _resolve_authoritative_worker(request, snapshot)
-    if isinstance(worker, CommandEnvelope):
+    resolved, candidates, status = resolve_target(
+        request.target, list(snapshot.workers), allow_disallowed_status=True
+    )
+    worker = next(
+        (item for item in snapshot.workers if item.id == (resolved or {}).get("worker_id")),
+        None,
+    )
+    if status != "resolved" or worker is None:
+        resolution_error = _target_resolution_error(
+            request, status if status != "resolved" else STATUS_NOT_FOUND, candidates
+        )
         if takeover is not None:
             return _request_in_progress(request)
-        return worker
+        return resolution_error
     if takeover is not None and worker.id != takeover.public_worker_id:
         return _duplicate_request(request)
 
@@ -1210,7 +1123,12 @@ def _submit_instruction(
             request, STATUS_REJECTED, [worker_candidate(worker)]
         )
         canonical = build_canonical_mutation(request, public_worker_id=worker.id)
-        reservation = _reserve_canonical_request(config, request, canonical)
+        reservation = _reserve_canonical_request(
+            config,
+            request,
+            canonical,
+            selector_proof=takeover.selector_proof if takeover is not None else None,
+        )
         if isinstance(reservation, CommandEnvelope):
             return reservation
         return _finish_before_send(config, request, reservation, status_error)
@@ -1261,8 +1179,17 @@ def _submit_answer_decision(
         return _request_in_progress(request)
     if takeover is not None and pre_send is not None and pre_send[0].status == STATUS_ANSWER_IN_PROGRESS:
         return _answer_in_progress(request)
-    worker_id = takeover.public_worker_id if takeover is not None else validated.worker_id
-    if takeover is not None and pre_send is None and validated.worker_id != worker_id:
+    validated_route = None if pre_send is not None else validated
+    worker_id = (
+        takeover.public_worker_id
+        if takeover is not None
+        else validated_route.worker_id
+    )
+    if (
+        takeover is not None
+        and validated_route is not None
+        and validated_route.worker_id != worker_id
+    ):
         pre_send = _duplicate_request(request), False
     canonical = build_canonical_mutation(request, public_worker_id=worker_id)
 
@@ -1270,7 +1197,7 @@ def _submit_answer_decision(
         try:
             owns_decision = bool(
                 acp_permission_router is not None
-                and acp_permission_router.owns_permission_decision(validated)
+                and acp_permission_router.owns_permission_decision(validated_route)
             )
         except Exception:
             owns_decision = False
@@ -1281,7 +1208,12 @@ def _submit_answer_decision(
                 )
             )
 
-    reservation = _reserve_canonical_request(config, request, canonical)
+    reservation = _reserve_canonical_request(
+        config,
+        request,
+        canonical,
+        selector_proof=takeover.selector_proof if takeover is not None else None,
+    )
     if isinstance(reservation, CommandEnvelope):
         return reservation
     if pre_send is not None:
@@ -1291,23 +1223,21 @@ def _submit_answer_decision(
     )
 
 
-def _negotiated_submission_envelope(
+def _public_submission_envelope(
     config: Config,
     request: CommandRequest,
     envelope: CommandEnvelope,
 ) -> CommandEnvelope:
-    """Project an accepted send into v3 only for an explicit client opt-in."""
+    """Add deterministic observation fields without changing stored receipt bytes."""
     if (
-        request.response_schema_version != COMMAND_ENVELOPE_V3_SCHEMA_VERSION
-        or request.action != "send_instruction"
+        request.action != "send_instruction"
         or envelope.disposition != DISPOSITION_TERMINAL_ACCEPTED
         or not isinstance(envelope.result, Mapping)
     ):
         return envelope
     result = dict(envelope.result)
     result["submission_id"] = turn_submission_id(
-        config.host_id,
-        request.request_id or "",
+        config.host_id, request.request_id or ""
     )
     linked_turn = _linked_submission_turn(config, request, settle=True)
     result["turn_id"] = linked_turn.get("id") if linked_turn is not None else None
@@ -1315,13 +1245,7 @@ def _negotiated_submission_envelope(
         "complete" if linked_turn is not None and linked_turn.get("complete") is True
         else "observed" if linked_turn is not None else "pending_observation"
     )
-    return replace(
-        envelope,
-        result=result,
-        schema_version=COMMAND_ENVELOPE_V3_SCHEMA_VERSION,
-    )
-
-
+    return replace(envelope, result=result)
 def submit_command(
     config: Config,
     params: Mapping[str, Any] | str,
@@ -1339,10 +1263,6 @@ def submit_command(
     validation_error = validate_request(request)
     if validation_error is not None:
         return CommandEnvelope.from_error(request, validation_error)
-    if request.action not in _MUTATING_ACTIONS:
-        return _execute_non_mutating(config, request)
-    if request.dry_run:
-        return _mutation_dry_run(request)
     if request.action == "send_instruction":
         envelope = _submit_instruction(
             config,
@@ -1355,4 +1275,6 @@ def submit_command(
             request,
             acp_permission_router=acp_permission_router,
         )
-    return _negotiated_submission_envelope(config, request, envelope)
+    return validate_public_command_envelope(
+        _public_submission_envelope(config, request, envelope), request
+    )

@@ -35,7 +35,6 @@ from tendwire.core.commands import (
     STATUS_ACCEPTED,
     STATUS_INVALID_REQUEST,
     STATUS_PENDING,
-    STATUS_RESOLVED,
     CommandEnvelope,
     CommandRequest,
 )
@@ -100,7 +99,6 @@ from tendwire.store.projection import (
     save_snapshot,
     upsert_worker_bindings,
 )
-from tendwire.store.receipts import get_command_request
 from tendwire.store.schema import init_store
 from .store_helpers import (
     apply_test_backend_pending,
@@ -797,7 +795,10 @@ def test_daemon_api_required_methods_are_public_safe() -> None:
             "method": "command.submit",
             "params": {
                 "schema_version": 1,
-                "action": "noop",
+                "action": "send_instruction",
+                "request_id": "invalid-private-field",
+                "target": {"worker_id": "worker-1"},
+                "instruction": {"text": "hello"},
                 "tty": "sentinel-private-tty",
             },
         }
@@ -850,15 +851,27 @@ def test_daemon_command_submit_preserves_exact_disposition(
     request = CommandRequest(
         action="send_instruction",
         request_id=f"daemon-{disposition}",
-        dry_run=False,
         target={"worker_id": "w-1"},
         instruction={"text": "hello"},
     )
+    result = None
+    if disposition == DISPOSITION_TERMINAL_ACCEPTED:
+        result = {
+            "target": {"worker_id": "w-1"},
+            "delivery_state": "submitted",
+            "transport_state": "submitted",
+            "target_state_at_send": "idle",
+            "turn_id": None,
+            "observed_turn_state": "pending_observation",
+            "submission_verdict": "submitted",
+            "submission_id": "twsub1." + "a" * 64,
+        }
     envelope = CommandEnvelope.from_result(
         request,
         ok=ok,
         status=status,
         disposition=disposition,
+        result=result,
         error=error,
     )
     api = TendwireDaemonAPI(
@@ -889,6 +902,7 @@ def test_daemon_command_submit_rejects_malformed_inner_envelope() -> None:
             "ok": True,
             "dry_run": False,
             "status": STATUS_ACCEPTED,
+            "disposition": DISPOSITION_TERMINAL_ACCEPTED,
             "result": {},
             "error": None,
             "warnings": [],
@@ -902,7 +916,6 @@ def test_daemon_command_submit_rejects_malformed_inner_envelope() -> None:
                 "schema_version": 1,
                 "action": "send_instruction",
                 "request_id": "malformed-inner",
-                "dry_run": False,
                 "target": {"worker_id": "w-1"},
                 "instruction": {"text": "hello"},
             },
@@ -3693,7 +3706,6 @@ def test_daemon_command_submit_rejects_blank_request_id_before_mutation(
         "schema_version": 1,
         "action": "send_instruction",
         "request_id": "   \t",
-        "dry_run": False,
         "target": {"worker_id": "w-1"},
         "instruction": {"text": "hello"},
     }
@@ -3714,70 +3726,6 @@ def test_daemon_command_submit_rejects_blank_request_id_before_mutation(
     with sqlite3.connect(str(db_path)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM agent_events").fetchone()[0] == 0
-
-
-def test_daemon_non_mutating_commands_use_persisted_public_snapshot(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "read-commands.db"
-    config = Config(host_id="daemon-host", data_dir=tmp_path, db_path=db_path)
-    init_store(db_path)
-    save_snapshot(db_path, _public_snapshot())
-    daemon = TendwireDaemon(config)
-
-    noop = daemon.submit_command({"schema_version": 1, "action": "noop"})
-    read = daemon.submit_command({"schema_version": 1, "action": "read_snapshot"})
-    resolved = daemon.submit_command(
-        {
-            "schema_version": 1,
-            "action": "resolve_target",
-            "target": {"worker_id": "worker-1"},
-        }
-    )
-
-    assert noop.ok is True and noop.status == "noop"
-    assert read.ok is True and read.status == "snapshot"
-    assert resolved.ok is True and resolved.status == STATUS_RESOLVED
-    assert resolved.result["target"]["worker_id"] == "worker-1"
-    _assert_no_public_json_forbidden(read.to_dict())
-    assert "sentinel-private" not in read.to_json()
-
-
-def test_daemon_resolve_target_preserves_public_failure_mapping(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "resolve-commands.db"
-    config = Config(host_id="daemon-host", data_dir=tmp_path, db_path=db_path)
-    init_store(db_path)
-    base = _public_snapshot()
-    snapshot = Snapshot(
-        host_id=base.host_id,
-        updated_at=base.updated_at,
-        workers=[
-            *base.workers,
-            Worker(id="worker-2", name="Worker One", status="active"),
-            Worker(id="worker-3", name="Closed", status="closed"),
-        ],
-    )
-    save_snapshot(db_path, snapshot)
-    daemon = TendwireDaemon(config)
-
-    requests = {
-        "not_found": {"worker_id": "missing"},
-        "ambiguous_target": {"name": "Worker One"},
-        "stale_target": {
-            "worker_id": "worker-1",
-            "worker_fingerprint": "0" * 64,
-        },
-        "rejected": {"worker_id": "worker-3"},
-    }
-    for status, target in requests.items():
-        envelope = daemon.submit_command(
-            {"schema_version": 1, "action": "resolve_target", "target": target}
-        )
-        assert envelope.ok is False
-        assert envelope.status == status
-        _assert_no_public_json_forbidden(envelope.to_dict())
 
 
 def test_cli_snapshot_requires_daemon_when_configured_socket_is_absent(

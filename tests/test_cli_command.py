@@ -1,3 +1,5 @@
+"""CLI boundary tests for the fixed ACP-only command protocol."""
+
 from __future__ import annotations
 
 import io
@@ -9,18 +11,61 @@ import pytest
 
 from tendwire.cli import main
 from tendwire.core.commands import (
+    DISPOSITION_TERMINAL_ACCEPTED,
+    STATUS_ACCEPTED,
+    STATUS_BACKEND_UNAVAILABLE,
     STATUS_INVALID_REQUEST,
+    STATUS_REJECTED,
     CommandEnvelope,
     CommandRequest,
     error_value,
 )
 
 
-def _run(monkeypatch, capsys, value: Any) -> tuple[int, dict[str, Any]]:
+def _send(request_id: str = "request-1") -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "action": "send_instruction",
+        "request_id": request_id,
+        "target": {"worker_id": "worker-1"},
+        "instruction": {"text": "do it"},
+    }
+
+
+def _answer(request_id: str = "request-1") -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "action": "answer_decision",
+        "request_id": request_id,
+        "target": {"worker_id": "worker-1"},
+        "params": {
+            "decision_ref": "decision-1",
+            "selection": {"option_refs": ["1"]},
+        },
+    }
+
+
+def _send_result(**changes: Any) -> dict[str, Any]:
+    result = {
+        "target": {"worker_id": "worker-1"},
+        "delivery_state": "submitted",
+        "transport_state": "submitted",
+        "target_state_at_send": "idle",
+        "turn_id": None,
+        "observed_turn_state": "pending_observation",
+        "submission_verdict": "submitted",
+        "submission_id": "twsub1." + "a" * 64,
+    }
+    result.update(changes)
+    return result
+
+
+def _run(monkeypatch, capsys, value: Any) -> tuple[int, dict[str, Any] | None]:
     raw = value if isinstance(value, str) else json.dumps(value)
     monkeypatch.setattr("sys.stdin", io.StringIO(raw))
     code = main(["command", "--json"])
-    return code, json.loads(capsys.readouterr().out)
+    output = capsys.readouterr()
+    return code, json.loads(output.out) if output.out else None
 
 
 def _attempt(**changes: Any) -> SimpleNamespace:
@@ -35,170 +80,247 @@ def _attempt(**changes: Any) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("raw", ["{", "[]", "null", '"text"'])
-def test_nonobject_command_is_rejected_locally_without_rpc(monkeypatch, capsys, raw: str) -> None:
-    def forbidden(*_args, **_kwargs):
-        raise AssertionError("invalid JSON roots must not reach the daemon")
-    monkeypatch.setattr("tendwire.cli._try_daemon_attempt", forbidden)
+def test_nonobject_command_is_rejected_locally_without_rpc(
+    monkeypatch,
+    capsys,
+    raw: str,
+) -> None:
+    monkeypatch.setattr(
+        "tendwire.cli._try_daemon_attempt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid JSON roots must not reach the daemon")
+        ),
+    )
     code, result = _run(monkeypatch, capsys, raw)
     assert code == 1
-    assert result["ok"] is False
+    assert result is not None
     assert result["status"] == STATUS_INVALID_REQUEST
-
-
-def _invalid_daemon_envelope(payload: dict[str, Any]) -> dict[str, Any]:
-    try:
-        request = CommandRequest.from_dict(payload)
-    except (TypeError, ValueError):
-        request = None
-    return CommandEnvelope.from_error(
-        request,
-        error_value(STATUS_INVALID_REQUEST, "daemon rejected command semantics"),
-    ).to_dict()
+    assert result["schema_version"] == 2 and result["dry_run"] is False
 
 
 @pytest.mark.parametrize(
     "payload",
     [
-        {"schema_version": 1, "action": "unknown"},
-        {"action": "noop"},
-        {"schema_version": 1, "action": "noop", "params": {"secret": "hidden"}},
-        {
-            "schema_version": 1,
-            "action": "answer_decision",
-            "request_id": "bad",
-            "dry_run": False,
-            "target": {"worker_id": "worker"},
-            "params": {"decision_ref": "decision", "selection": {}},
-        },
+        {"schema_version": 1, "action": "noop"},
+        {**_send(), "dry_run": False},
+        {**_send(), "response_schema_version": 3},
+        {**_send(), "params": {"ignored": True}},
     ],
 )
 def test_semantic_invalid_object_is_forwarded_once_and_daemon_wins(
-    monkeypatch, capsys, payload: dict[str, Any]
+    monkeypatch,
+    capsys,
+    payload: dict[str, Any],
 ) -> None:
-    expected = _invalid_daemon_envelope(payload)
+    expected = CommandEnvelope.from_error(
+        None,
+        error_value(STATUS_INVALID_REQUEST, "daemon rejected command semantics"),
+    ).to_dict()
     calls: list[tuple[str, dict[str, Any]]] = []
+
     def submit(_config, method, params):
         calls.append((method, params))
         return _attempt(result=expected)
+
     monkeypatch.setattr("tendwire.cli._try_daemon_attempt", submit)
     code, result = _run(monkeypatch, capsys, payload)
     assert code == 1
     assert calls == [("command.submit", payload)]
     assert result == expected
-    assert "hidden" not in json.dumps(result)
-
-
-@pytest.mark.parametrize(
-    ("payload", "identity"),
-    [
-        (
-            {
-                "action": {"nested": "secret"},
-                "request_id": ["secret"],
-                "dry_run": 1,
-                "target": {"secret": "hidden"},
-            },
-            ("", None, True),
-        ),
-        (
-            {"action": "unknown", "request_id": "opaque", "dry_run": False},
-            ("unknown", "opaque", False),
-        ),
-        (
-            {"action": "send_instruction", "request_id": [], "dry_run": False},
-            ("send_instruction", None, True),
-        ),
-        (
-            {"action": "answer_decision", "dry_run": False},
-            ("answer_decision", None, True),
-        ),
-    ],
-)
-def test_semantic_invalid_offline_uses_only_safe_scalar_identity(
-    monkeypatch, capsys, payload: dict[str, Any], identity: tuple[Any, ...]
-) -> None:
-    calls = []
-    def submit(_config, method, params):
-        calls.append((method, params))
-        return _attempt(error_kind="unavailable", request_started=False)
-    monkeypatch.setattr("tendwire.cli._try_daemon_attempt", submit)
-    code, result = _run(monkeypatch, capsys, payload)
-    assert code == 1
-    assert calls == [("command.submit", payload)]
-    assert result["status"] == "backend_unavailable"
-    assert (result["action"], result["request_id"], result["dry_run"]) == identity
-    assert "secret" not in json.dumps(result)
 
 
 @pytest.mark.parametrize("ok", [True, False])
-def test_online_command_returns_exact_daemon_envelope(monkeypatch, capsys, ok: bool) -> None:
-    payload = {"schema_version": 1, "action": "noop"}
-    request = CommandRequest(action="noop")
+def test_online_command_returns_exact_fixed_envelope(
+    monkeypatch,
+    capsys,
+    ok: bool,
+) -> None:
+    payload = _send()
+    request = CommandRequest.from_dict(payload)
     expected = (
-        CommandEnvelope.from_result(request, ok=True, status="noop", result={})
+        CommandEnvelope.from_result(
+            request,
+            ok=True,
+            status=STATUS_ACCEPTED,
+            disposition=DISPOSITION_TERMINAL_ACCEPTED,
+            result=_send_result(),
+        )
         if ok
         else CommandEnvelope.from_error(
-            request, error_value(STATUS_INVALID_REQUEST, "rejected")
+            request,
+            error_value(STATUS_REJECTED, "rejected"),
         )
     ).to_dict()
-    calls = []
-    def submit(_config, method, params):
-        calls.append((method, params))
-        return _attempt(result=expected)
-    monkeypatch.setattr("tendwire.cli._try_daemon_attempt", submit)
+    monkeypatch.setattr(
+        "tendwire.cli._try_daemon_attempt",
+        lambda *_args, **_kwargs: _attempt(result=expected),
+    )
     code, result = _run(monkeypatch, capsys, payload)
     assert code == (0 if ok else 1)
-    assert calls == [("command.submit", payload)]
     assert result == expected
 
 
-def test_valid_witness_rejects_daemon_identity_substitution(monkeypatch, capsys) -> None:
-    payload = {"schema_version": 1, "action": "noop", "request_id": "expected"}
+def test_valid_witness_rejects_daemon_identity_substitution(
+    monkeypatch,
+    capsys,
+) -> None:
+    payload = _send("expected")
     substituted = CommandEnvelope.from_result(
-        CommandRequest(action="noop", request_id="other"),
+        CommandRequest.from_dict(_send("other")),
         ok=True,
-        status="noop",
-        result={},
+        status=STATUS_ACCEPTED,
+        disposition=DISPOSITION_TERMINAL_ACCEPTED,
+        result=_send_result(),
     ).to_dict()
     monkeypatch.setattr(
-        "tendwire.cli._try_daemon_attempt", lambda *_args: _attempt(result=substituted)
+        "tendwire.cli._try_daemon_attempt",
+        lambda *_args, **_kwargs: _attempt(result=substituted),
     )
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
-    assert main(["command", "--json"]) == 2
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "unresolved" in captured.err
+    code, result = _run(monkeypatch, capsys, payload)
+    assert code == 2 and result is None
 
 
 @pytest.mark.parametrize(
-    "attempt",
+    "payload",
     [
-        _attempt(error_kind="timeout", request_started=True),
-        _attempt(error_kind="protocol", request_started=None),
-        _attempt(response_error={"ok": False}, error_kind="daemon_error"),
-        _attempt(result={"not": "an envelope"}),
+        {**_send("invalid-shape"), "dry_run": False},
+        {**_send("semantic-invalid"), "target": {"worker_id": 7}},
     ],
 )
-def test_ambiguous_command_is_unresolved_and_never_retried(
-    monkeypatch, capsys, attempt: SimpleNamespace
+def test_invalid_request_rejects_daemon_success_substitution(
+    monkeypatch,
+    capsys,
+    payload: dict[str, Any],
 ) -> None:
-    payload = {"schema_version": 1, "action": "noop"}
-    calls = []
-    def submit(_config, method, params):
-        calls.append((method, params))
-        return attempt
-    monkeypatch.setattr("tendwire.cli._try_daemon_attempt", submit)
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
-    assert main(["command", "--json"]) == 2
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "unresolved" in captured.err
-    assert calls == [("command.submit", payload)]
+    substituted = CommandEnvelope.from_result(
+        CommandRequest.from_dict(_send("other")),
+        ok=True,
+        status=STATUS_ACCEPTED,
+        disposition=DISPOSITION_TERMINAL_ACCEPTED,
+        result=_send_result(),
+    ).to_dict()
+    monkeypatch.setattr(
+        "tendwire.cli._try_daemon_attempt",
+        lambda *_args, **_kwargs: _attempt(result=substituted),
+    )
+    code, result = _run(monkeypatch, capsys, payload)
+    assert code == 2 and result is None
 
 
-def test_valid_command_offline_has_no_local_store(monkeypatch, capsys, tmp_path) -> None:
+def test_semantic_invalid_request_rejects_same_identity_daemon_success(
+    monkeypatch,
+    capsys,
+) -> None:
+    payload = {**_send("unsafe"), "instruction": {"text": "bad\x1b[A"}}
+    accepted = CommandEnvelope.from_result(
+        CommandRequest.from_dict(_send("unsafe")),
+        ok=True,
+        status=STATUS_ACCEPTED,
+        disposition=DISPOSITION_TERMINAL_ACCEPTED,
+        result=_send_result(),
+    ).to_dict()
+    monkeypatch.setattr(
+        "tendwire.cli._try_daemon_attempt",
+        lambda *_args, **_kwargs: _attempt(result=accepted),
+    )
+    code, result = _run(monkeypatch, capsys, payload)
+    assert code == 2 and result is None
+
+
+@pytest.mark.parametrize(
+    "payload,result",
+    [
+        (_send(), _send_result(submission_verdict="unknown")),
+        (_send(), _send_result(submission_id="twsub1.bad")),
+        (_send(), _send_result(target={"worker_id": "worker-2"})),
+        (
+            _answer(),
+            {
+                "target": {"worker_id": "worker-1"},
+                "decision": {"decision_ref": "other"},
+                "delivery_state": "submitted",
+                "transport_state": "submitted",
+                "observed_pending_state": "pending_observation",
+            },
+        ),
+    ],
+)
+def test_cli_rejects_semantically_malformed_accepted_result(
+    monkeypatch,
+    capsys,
+    payload: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    request = CommandRequest.from_dict(payload)
+    malformed = CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_ACCEPTED,
+        disposition=DISPOSITION_TERMINAL_ACCEPTED,
+        result=result,
+    ).to_dict()
+    monkeypatch.setattr(
+        "tendwire.cli._try_daemon_attempt",
+        lambda *_args, **_kwargs: _attempt(result=malformed),
+    )
+    code, output = _run(monkeypatch, capsys, payload)
+    assert code == 2 and output is None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [{"dry_run": True}, {"schema_version": 3}, {"extra": None}],
+)
+def test_cli_rejects_malformed_daemon_envelope(
+    monkeypatch,
+    capsys,
+    mutation: dict[str, Any],
+) -> None:
+    valid = CommandEnvelope.from_error(
+        CommandRequest.from_dict(_send()),
+        error_value(STATUS_REJECTED, "rejected"),
+    ).to_dict()
+    valid.update(mutation)
+    monkeypatch.setattr(
+        "tendwire.cli._try_daemon_attempt",
+        lambda *_args, **_kwargs: _attempt(result=valid),
+    )
+    code, result = _run(monkeypatch, capsys, _send())
+    assert code == 2 and result is None
+
+
+def test_valid_command_offline_returns_fixed_backend_failure(
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
     monkeypatch.setenv("TENDWIRE_DATA_DIR", str(tmp_path))
-    code, result = _run(monkeypatch, capsys, {"schema_version": 1, "action": "noop"})
-    assert code == 1
-    assert result["status"] == "backend_unavailable"
-    assert not (tmp_path / "tendwire.db").exists()
+    monkeypatch.setattr(
+        "tendwire.cli._try_daemon_attempt",
+        lambda *_args, **_kwargs: _attempt(
+            error_kind="unavailable", request_started=False
+        ),
+    )
+    code, result = _run(monkeypatch, capsys, _send())
+    assert code == 1 and result is not None
+    assert (result["action"], result["request_id"]) == (
+        "send_instruction",
+        "request-1",
+    )
+    assert result["status"] == STATUS_BACKEND_UNAVAILABLE
+    assert result["dry_run"] is False
+    assert not any(tmp_path.iterdir())
+
+
+def test_started_request_without_response_is_never_fabricated(
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(
+        "tendwire.cli._try_daemon_attempt",
+        lambda *_args, **_kwargs: _attempt(
+            error_kind="unavailable", request_started=True
+        ),
+    )
+    code, result = _run(monkeypatch, capsys, _send())
+    assert code == 2 and result is None

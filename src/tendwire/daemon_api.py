@@ -19,7 +19,12 @@ from pathlib import Path
 from typing import Any
 
 from ._version import __version__
-from .core.commands import CommandEnvelope, error_value
+from .core.commands import (
+    CommandEnvelope,
+    error_value,
+    parse_command_request,
+    validate_public_command_envelope,
+)
 from .core.models import (
     Snapshot,
     public_json_dumps,
@@ -672,7 +677,7 @@ def _snapshot_dict(snapshot: Snapshot) -> dict[str, Any]:
     return sanitize_public_mapping(snapshot.to_dict())
 
 
-def _command_result(value: Any) -> dict[str, Any]:
+def _command_result(value: Any, request_params: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(value, CommandEnvelope):
         data: Any = value.to_dict()
     elif hasattr(value, "to_dict"):
@@ -681,15 +686,23 @@ def _command_result(value: Any) -> dict[str, Any]:
         data = value
     if not isinstance(data, dict):
         raise ValueError("command.submit returned a non-object result")
-    return CommandEnvelope.from_dict(data).to_dict()
+    request, parse_error = parse_command_request(
+        json.dumps(dict(request_params), ensure_ascii=False, separators=(",", ":"))
+    )
+    if parse_error is not None:
+        request = None
+    return validate_public_command_envelope(
+        CommandEnvelope.from_dict(data), request
+    ).to_dict()
 
 
 def _command_success_response(
     value: Any,
     *,
+    request_params: Mapping[str, Any],
     request_id: Any = None,
 ) -> dict[str, Any]:
-    command_result = _command_result(value)
+    command_result = _command_result(value, request_params)
     response = success_response({}, request_id=request_id)
     response["result"] = command_result
     return response
@@ -903,6 +916,7 @@ class TendwireDaemonAPI:
             if method == "command.submit":
                 return _command_success_response(
                     self._submit_command(dict(params)),
+                    request_params=params,
                     request_id=request_id,
                 )
             if method.startswith("connector."):

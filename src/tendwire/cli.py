@@ -14,13 +14,15 @@ from typing import Any, Mapping
 
 from .config import Config, load_config
 from .core.commands import (
+    ALLOWED_ACTIONS,
     STATUS_BACKEND_UNAVAILABLE,
     STATUS_INVALID_REQUEST,
     CommandEnvelope,
     CommandRequest,
     error_value,
+    is_valid_request_id,
     parse_command_request,
-    validate_request,
+    validate_public_command_envelope,
 )
 from .core.models import public_json_dumps
 from .core.turns import (
@@ -416,24 +418,32 @@ def cmd_command(
         envelope = CommandEnvelope.from_error(request, error)
         print(envelope.to_json(indent=2))
         return 1
-    witness = None
+    candidate = None
+    expected_identity: tuple[str, str | None] = ("", None)
     try:
         candidate, parse_error = parse_command_request(raw)
-        if candidate is not None and parse_error is None and validate_request(candidate) is None:
-            witness = candidate
+        if candidate is not None:
+            action = candidate.action if candidate.action in ALLOWED_ACTIONS else ""
+            request_id = (
+                candidate.request_id
+                if action and is_valid_request_id(candidate.request_id)
+                else None
+            )
+            expected_identity = (action, request_id)
     except Exception:
-        witness = None
+        candidate = None
     attempt = _try_daemon_attempt(config, "command.submit", payload)
     if attempt.result is not None:
         try:
-            envelope = CommandEnvelope.from_dict(attempt.result)
+            envelope = validate_public_command_envelope(
+                CommandEnvelope.from_dict(attempt.result), candidate
+            )
         except (TypeError, ValueError):
             envelope = None
-        if envelope is not None and witness is not None:
-            response_identity = (envelope.action, envelope.request_id, envelope.dry_run)
-            witness_identity = (witness.action, witness.request_id, witness.dry_run)
-            if response_identity != witness_identity:
-                envelope = None
+        if envelope is not None and (
+            envelope.action, envelope.request_id
+        ) != expected_identity:
+            envelope = None
         if envelope is not None:
             print(envelope.to_json(indent=2))
             return 0 if envelope.ok else 1
@@ -441,9 +451,7 @@ def cmd_command(
         action = payload.get("action") if isinstance(payload.get("action"), str) else ""
         request_id = payload.get("request_id")
         request_id = request_id if isinstance(request_id, str) else None
-        dry_run = payload.get("dry_run")
-        dry_run = dry_run if type(dry_run) is bool else True
-        request = CommandRequest(action=action, request_id=request_id, dry_run=dry_run)
+        request = CommandRequest(action=action, request_id=request_id)
         envelope = CommandEnvelope.from_error(
             request,
             error_value(STATUS_BACKEND_UNAVAILABLE, "Tendwire daemon backend is unavailable"),

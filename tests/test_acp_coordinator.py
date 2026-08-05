@@ -60,7 +60,6 @@ from tendwire.store.receipts import get_command_request
 from tendwire.store.schema import init_store
 from .store_helpers import upsert_test_worker_bindings as upsert_worker_bindings
 
-
 def _config(tmp_path: Path) -> Config:
     return Config(
         host_id="acp-host",
@@ -820,6 +819,62 @@ def test_console_local_turn_is_suppressed_before_acp_submission_emits(
     assert slot.console_local_turns == observed[0]
 
 
+def test_console_pending_decision_submits_exact_worker_id_answer_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    console_executor_factory,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(
+        id="worker-1",
+        name="Agent",
+        status="active",
+        meta={"stable_key": "wsk1_" + "a" * 64, "stable_key_version": 1},
+    )
+    monkeypatch.setattr(
+        "tendwire.backends.acp_coordinator.latest_snapshot",
+        lambda _path, _host: Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-01-01T00:00:00+00:00",
+            workers=[worker],
+        ),
+    )
+    monkeypatch.setattr(
+        "tendwire.backends.acp_coordinator._console_pending_decision",
+        lambda *_args: ("decision-1", (("1", "Allow"), ("2", "Reject")), "prompt"),
+    )
+    submitted: list[dict[str, Any]] = []
+
+    def capture(_config: Config, payload: str, **_kwargs: Any) -> Any:
+        submitted.append(json.loads(payload))
+        return SimpleNamespace(status="accepted")
+
+    monkeypatch.setattr("tendwire.command_submission.submit_command", capture)
+    slot = _RuntimeSlot(
+        replace(_binding(), worker_fingerprint=worker.fingerprint),
+        "42",
+        SimpleNamespace(),
+        console=HerdrAcpConsoleEndpoint(42, "coordinator-lease"),
+        console_executor=console_executor_factory(),
+    )
+    coordinator = AcpRuntimeCoordinator(
+        config, threading.Event(), reconcile_interval=60.0
+    )
+
+    assert coordinator._submit_console_input_fenced(slot, 1, "Allow") == "permission"
+    assert len(submitted) == 1
+    assert submitted[0] == {
+        "schema_version": 1,
+        "action": "answer_decision",
+        "request_id": submitted[0]["request_id"],
+        "target": {"worker_id": "worker-1"},
+        "params": {
+            "decision_ref": "decision-1",
+            "selection": {"option_refs": ["1"]},
+        },
+    }
+
+
 def test_stop_reports_failed_while_console_submission_thread_is_still_running(
     tmp_path: Path,
 ) -> None:
@@ -1229,7 +1284,6 @@ def _request(request_id: str = "request-1") -> dict[str, Any]:
         "schema_version": 1,
         "action": "send_instruction",
         "request_id": request_id,
-        "dry_run": False,
         "target": {"worker_id": "worker-1"},
         "instruction": {"text": "do the work"},
     }
@@ -1453,7 +1507,6 @@ def test_acp_failure_before_transport_boundary_is_immediately_retryable(
     )
     assert receipt is not None
     assert receipt["state"] == "reserved"
-    assert receipt["binding_fingerprint"] is None
 
     good_route = _Route()
     second = submit_command(
