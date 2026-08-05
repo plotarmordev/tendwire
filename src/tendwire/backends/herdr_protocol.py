@@ -70,20 +70,18 @@ def _home_path(home: str | os.PathLike[str] | None = None) -> Path:
     return Path(home)
 
 
-def _expand_home(path: str, *, home: str | os.PathLike[str] | None = None) -> Path:
-    if path == "~":
-        return _home_path(home)
-    if path.startswith("~/"):
-        return _home_path(home) / path[2:]
-    return Path(os.path.expanduser(path))
-
-
 def _validate_socket_path(path: str, *, home: str | os.PathLike[str] | None = None) -> str:
     if not isinstance(path, str):
         raise HerdrSocketPathError("Herdr socket path must be a string")
     if not path.strip():
         raise HerdrSocketPathError("Herdr socket path must not be empty")
-    resolved = _expand_home(path.strip(), home=home)
+    stripped = path.strip()
+    if stripped == "~":
+        resolved = _home_path(home)
+    elif stripped.startswith("~/"):
+        resolved = _home_path(home) / stripped[2:]
+    else:
+        resolved = Path(os.path.expanduser(stripped))
     if not resolved.is_absolute():
         raise HerdrSocketPathError("Herdr socket path must be absolute")
     return str(resolved)
@@ -168,10 +166,7 @@ def parse_json_line(line: bytes | str) -> dict[str, Any]:
     else:
         raise HerdrMalformedLineError("Herdr line must be bytes or text")
 
-    if text.endswith("\n"):
-        text = text[:-1]
-    if text.endswith("\r"):
-        text = text[:-1]
+    text = text.removesuffix("\n").removesuffix("\r")
     if not text:
         raise HerdrMalformedLineError("Herdr line is empty")
 
