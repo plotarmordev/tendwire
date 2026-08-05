@@ -322,6 +322,18 @@ def test_missing_persisted_snapshot_fails_before_receipt_and_acp(tmp_path: Path)
     assert config.db_path is not None and not config.db_path.exists()
 
 
+def test_unknown_resolution_status_fails_closed_without_candidate_leak() -> None:
+    request = _request_object(_instruction("unknown-resolution-status"))
+    result = command_submission._target_resolution_error(
+        request,
+        "private_unknown_status",
+        [{"worker_id": "private-worker"}],
+    )
+    assert result.status == "not_found"
+    assert result.result == {"candidates": []}
+    assert "private" not in result.to_json()
+
+
 @pytest.mark.parametrize("failure", ["prepare", "binding", "blank_binding"])
 def test_route_failure_before_reservation_is_retryable(
     tmp_path: Path,
@@ -634,7 +646,7 @@ def test_boolean_canonical_version_cannot_claim_v1_receipt(
         acp_prompt_router=lambda candidate: route if candidate == worker else None,
     )
     assert accepted.status == "accepted"
-    real_get = command_submission.get_command_request
+    real_get = command_submission.receipts.get_command_request
 
     def boolean_version(*args: Any, **kwargs: Any) -> Any:
         receipt = real_get(*args, **kwargs)
@@ -642,7 +654,7 @@ def test_boolean_canonical_version_cannot_claim_v1_receipt(
         return {**receipt, "canonical_version": True}
 
     monkeypatch.setattr(
-        command_submission, "get_command_request", boolean_version
+        command_submission.receipts, "get_command_request", boolean_version
     )
 
     replay = submit_command(
@@ -715,7 +727,7 @@ def test_reserve_commit_then_exception_recovers_without_transport(
     config = _config(tmp_path)
     worker, _binding = _seed(config)
     route = _Route()
-    real_reserve = command_submission.reserve_command_request
+    real_reserve = command_submission.receipts.reserve_command_request
     calls = 0
 
     def committed_then_failed(*args: Any, **kwargs: Any) -> Any:
@@ -725,7 +737,7 @@ def test_reserve_commit_then_exception_recovers_without_transport(
         raise OSError("lost reply after commit")
 
     monkeypatch.setattr(
-        command_submission,
+        command_submission.receipts,
         "reserve_command_request",
         committed_then_failed,
     )
@@ -763,7 +775,7 @@ def test_reserve_exception_readback_rejects_different_selector(
         },
     )
     winner = _request_object(winner_data)
-    real_reserve = command_submission.reserve_command_request
+    real_reserve = command_submission.receipts.reserve_command_request
 
     def conflict_then_failed(*args: Any, **kwargs: Any) -> Any:
         winner_kwargs = {**kwargs, "selector_proof": build_selector_proof(winner)}
@@ -772,7 +784,7 @@ def test_reserve_exception_readback_rejects_different_selector(
         raise OSError("lost conflict reply")
 
     monkeypatch.setattr(
-        command_submission,
+        command_submission.receipts,
         "reserve_command_request",
         conflict_then_failed,
     )
@@ -796,14 +808,14 @@ def test_send_start_commit_then_exception_is_never_replayed(
     config = _config(tmp_path)
     worker, _binding = _seed(config)
     route = _Route()
-    real_start = command_submission.mark_command_send_started
+    real_start = command_submission.receipts.mark_command_send_started
 
     def committed_then_failed(*args: Any, **kwargs: Any) -> Any:
         real_start(*args, **kwargs)
         raise OSError("lost send-start acknowledgement")
 
     monkeypatch.setattr(
-        command_submission,
+        command_submission.receipts,
         "mark_command_send_started",
         committed_then_failed,
     )
@@ -836,14 +848,14 @@ def test_finish_commit_then_exception_recovers_exact_terminal_receipt(
     config = _config(tmp_path)
     worker, _binding = _seed(config)
     route = _Route()
-    real_finish = command_submission.finish_command_request
+    real_finish = command_submission.receipts.finish_command_request
 
     def committed_then_failed(*args: Any, **kwargs: Any) -> Any:
         real_finish(*args, **kwargs)
         raise OSError("lost terminal acknowledgement")
 
     monkeypatch.setattr(
-        command_submission,
+        command_submission.receipts,
         "finish_command_request",
         committed_then_failed,
     )
@@ -1083,7 +1095,7 @@ def test_permission_terminal_effect_failure_rolls_back_receipt_and_pending(
         return fail
 
     monkeypatch.setattr(
-        command_submission,
+        command_submission.pending_store,
         "backend_pending_decision_terminal_effect",
         failing_effect,
     )
@@ -1111,14 +1123,14 @@ def test_permission_terminal_commit_loss_recovers_both_atomic_states(
     _worker, _binding = _seed(config)
     decision_ref = _pending_decision(config)
     router = _DecisionRouter()
-    real_finish = command_submission.finish_command_request
+    real_finish = command_submission.receipts.finish_command_request
 
     def committed_then_failed(*args: Any, **kwargs: Any) -> Any:
         real_finish(*args, **kwargs)
         raise OSError("lost atomic terminal acknowledgement")
 
     monkeypatch.setattr(
-        command_submission,
+        command_submission.receipts,
         "finish_command_request",
         committed_then_failed,
     )
@@ -1151,7 +1163,7 @@ def test_v2_receipt_is_immutable_and_public_projection_runs_once_per_response(
     config = _config(tmp_path)
     worker, _binding = _seed(config)
     route = _Route()
-    real_settle = command_submission.settle_submission_link_for_request
+    real_settle = command_submission.receipts.settle_submission_link_for_request
     settle_count = 0
 
     def counted_settle(*args: Any, **kwargs: Any) -> Any:
@@ -1160,7 +1172,7 @@ def test_v2_receipt_is_immutable_and_public_projection_runs_once_per_response(
         return real_settle(*args, **kwargs)
 
     monkeypatch.setattr(
-        command_submission,
+        command_submission.receipts,
         "settle_submission_link_for_request",
         counted_settle,
     )
