@@ -457,19 +457,6 @@ def owned_socket_identity_at(parent_fd: int, name: str) -> EntryIdentity | None:
     return entry_identity(value)
 
 
-def inspect_owned_socket_at(parent_fd: int, name: str) -> PermissionResult:
-    value = lstat_at(parent_fd, name)
-    if value is None:
-        return PermissionResult(LocalStateKind.SOCKET, PermissionState.ABSENT, None)
-    _validate(value, EntryType.SOCKET)
-    mode = stat.S_IMODE(value.st_mode)
-    return PermissionResult(
-        LocalStateKind.SOCKET,
-        PermissionState.PRIVATE if mode == PRIVATE_SOCKET_MODE else PermissionState.REPAIR_REQUIRED,
-        mode,
-    )
-
-
 def pin_owned_socket_at(parent_fd: int, name: str) -> tuple[int, EntryIdentity] | None:
     if lstat_at(parent_fd, name) is None:
         return None
@@ -486,12 +473,18 @@ def pin_owned_socket_at(parent_fd: int, name: str) -> tuple[int, EntryIdentity] 
         raise
 
 
-def pin_group_socket_for_client_at(
+def pin_socket_for_client_at(
     parent_fd: int, name: str, socket_group: str | None,
 ) -> tuple[int, EntryIdentity, int]:
     group = resolve_socket_group(socket_group)
     if group is None:
-        _raise(LocalStateErrorCode.INVALID_SOCKET_GROUP)
+        validate_private_socket_parent_at(parent_fd)
+    else:
+        parent = os.fstat(parent_fd)
+        if not stat.S_ISDIR(parent.st_mode):
+            _raise(LocalStateErrorCode.WRONG_TYPE)
+        if parent.st_gid != group.group_id or stat.S_IMODE(parent.st_mode) != 0o710:
+            _raise(LocalStateErrorCode.INSECURE_SOCKET_PARENT)
     try:
         fd = os.open(_leaf(name), _flags(path_only=True), dir_fd=parent_fd)
     except FileNotFoundError:
@@ -500,14 +493,16 @@ def pin_group_socket_for_client_at(
         _raise(LocalStateErrorCode.OPERATION_FAILED)
     try:
         value = os.fstat(fd)
-        parent = os.fstat(parent_fd)
-        if not stat.S_ISSOCK(value.st_mode):
+        if group is None:
+            _validate(value, EntryType.SOCKET)
+        elif not stat.S_ISSOCK(value.st_mode):
             _raise(LocalStateErrorCode.WRONG_TYPE)
-        if value.st_uid != parent.st_uid:
+        elif value.st_uid != parent.st_uid:
             _raise(LocalStateErrorCode.WRONG_OWNER)
-        if value.st_gid != group.group_id:
+        elif value.st_gid != group.group_id:
             _raise(LocalStateErrorCode.WRONG_GROUP)
-        if stat.S_IMODE(value.st_mode) != GROUP_SOCKET_MODE:
+        expected_mode = GROUP_SOCKET_MODE if group else PRIVATE_SOCKET_MODE
+        if stat.S_IMODE(value.st_mode) != expected_mode:
             _raise(LocalStateErrorCode.INSECURE_MODE)
         return fd, entry_identity(value), int(value.st_uid)
     except BaseException:

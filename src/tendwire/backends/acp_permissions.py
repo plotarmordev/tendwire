@@ -13,7 +13,10 @@ from typing import Any
 from ..config import Config
 from ..core.models import WorkerBinding, sanitize_public_text, stable_fingerprint
 from ..core.turns import PendingObservation, PendingObservedChoice
-from ..store.pending import apply_backend_pending_observation
+from ..store.pending import (
+    apply_backend_pending_observation,
+    backend_pending_decision_ref,
+)
 from ..store.projection import list_worker_bindings
 from .acp_protocol import PermissionRequest
 from .acp_runtime import PermissionSelection
@@ -91,7 +94,11 @@ class AcpPermissionBroker:
             }
         )
         offer = _Offer(
-            decision_ref=f"decision-{persisted_revision}",
+            decision_ref=backend_pending_decision_ref(
+                self.config.host_id,
+                self.worker_id,
+                persisted_revision,
+            ),
             binding=binding,
             option_ids=tuple(option.option_id for option in request.options),
         )

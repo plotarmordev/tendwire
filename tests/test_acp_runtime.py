@@ -556,7 +556,9 @@ def test_callback_cleanup_is_scoped_to_one_exact_worker_authority(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "events.db"
-    continuity = continuity_binding()
+    continuity = replace(
+        continuity_binding(), observed_at="2026-08-05T11:59:59+00:00"
+    )
     other_continuity = replace(
         continuity,
         worker_id="other-worker",

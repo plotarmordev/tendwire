@@ -57,6 +57,7 @@ from tendwire.daemon_api import (
     UnixSocketJSONServer,
     ensure_daemon_socket_not_active,
     MAX_RESPONSE_BYTES,
+    success_response,
 )
 
 
@@ -172,6 +173,142 @@ class _ConnectorMemoryConnection:
 
     def shutdown(self, _how: int) -> None:
         return None
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["ping", "health.get", "snapshot.get", "attention.list", "pending.list"],
+)
+def test_daemon_api_rejects_params_for_closed_methods(method: str) -> None:
+    api = _ProductionTendwireDaemonAPI(**_required_daemon_callbacks())
+    response = api.dispatch(
+        {"id": "public-1", "method": method, "params": {"unexpected": True}}
+    )
+    assert response["id"] == "public-1"
+    assert response["error"] == {
+        "code": "invalid_params",
+        "message": f"{method} contains unknown parameters",
+        "details": {"field_count": 1},
+    }
+
+
+def test_connector_edge_bounds_hostile_callback_results_during_framing() -> None:
+    common = {
+        "schema_version": 1,
+        "ok": True,
+        "host_id": "host-a",
+        "name": "turn-final",
+    }
+    key = "turn-final:revision:twfinal1." + "F" * 43
+    ref = "twref1." + "R" * 43
+    leased = "2026-08-05T01:03:03.000000Z"
+    cases: list[tuple[str, dict[Any, Any], str]] = []
+    for field, value in (
+        ("schema_version", True),
+        ("attempt", True),
+        ("ref", "not-a-ref"),
+        ("leased_until", "2026-08-05T01:03:03+00:00"),
+    ):
+        result = {
+            **common,
+            "status": "renewed",
+            "ref": ref,
+            "key": key,
+            "attempt": 1,
+            "leased_until": leased,
+        }
+        result[field] = value
+        cases.append(("connector.renew", result, "turn-final"))
+    cases.extend(
+        [
+            ("connector.reclaim", {**common, "status": "ok"}, "turn-final"),
+            (
+                "connector.reclaim",
+                {**common, "status": "ok", "reclaimed": 0, "extra": float("inf")},
+                "turn-final",
+            ),
+            (
+                "connector.reclaim",
+                {**common, "status": "ok", "reclaimed": 0, 1: "non-string"},
+                "turn-final",
+            ),
+            (
+                "connector.reclaim",
+                {**common, "status": "ok", "reclaimed": 0, "extra": "\ud800"},
+                "turn-final",
+            ),
+            (
+                "connector.reclaim",
+                {**common, "status": "ok", "reclaimed": 0},
+                "chat_id",
+            ),
+        ]
+    )
+    deep: dict[str, Any] = {}
+    cursor = deep
+    for _ in range(14):
+        cursor["next"] = {}
+        cursor = cursor["next"]
+    cases.append((
+        "connector.reclaim",
+        {**common, "status": "ok", "reclaimed": 0, "extra": deep},
+        "turn-final",
+    ))
+    cases.append((
+        "connector.reclaim",
+        {**common, "status": "ok", "reclaimed": 0, "extra": [None] * 4097},
+        "turn-final",
+    ))
+    cyclic = {**common, "status": "ok", "reclaimed": 0}
+    cyclic["extra"] = cyclic
+    cases.append(("connector.reclaim", cyclic, "turn-final"))
+
+    for method, result, request_name in cases:
+        api = TendwireDaemonAPI(
+            get_snapshot=lambda: None,  # type: ignore[arg-type]
+            get_health=lambda: {},
+            submit_command=lambda _params: {},
+            connector_call=lambda _method, _params, value=result: value,
+        )
+        server = UnixSocketJSONServer("/unused.sock", api.dispatch)
+        request = {"method": method, "params": {"name": request_name}}
+        connection = _ConnectorMemoryConnection(json.dumps(request).encode() + b"\n")
+        server._handle_connection(connection)  # type: ignore[arg-type]
+        response = json.loads(connection.response.split(b"\n", 1)[0])
+        assert response["ok"] is False
+        assert response["error"]["code"] == "internal_error"
+        assert "host-a" not in connection.response.decode()
+
+
+def test_response_trust_cannot_be_forged_by_post_construction_mutation() -> None:
+    def mutated_helper_response(_request: Any) -> dict[str, Any]:
+        response = success_response({"safe": "kept"})
+        response["result"]["backend_target"] = {"session_id": "secret-session"}
+        return response
+
+    for dispatcher in (
+        mutated_helper_response,
+        lambda _request: {"ok": True, "result": {"safe": "kept", "text": "\ud800"}},
+    ):
+        server = UnixSocketJSONServer("/unused.sock", dispatcher)
+        connection = _ConnectorMemoryConnection(b'{"method":"ping"}\n')
+        server._handle_connection(connection)  # type: ignore[arg-type]
+        response = json.loads(connection.response.split(b"\n", 1)[0])
+        assert "secret-session" not in connection.response.decode()
+        if dispatcher is mutated_helper_response:
+            assert response["result"] == {"safe": "kept"}
+        else:
+            assert response["error"]["code"] == "internal_error"
+
+    api = _ProductionTendwireDaemonAPI(**_required_daemon_callbacks())
+    sealed = api.dispatch({"method": "ping"})
+    sealed["result"]["backend_target"] = {"session_id": "secret-session"}
+    server = UnixSocketJSONServer("/unused.sock", lambda _request: sealed)
+    connection = _ConnectorMemoryConnection(b'{"method":"ping"}\n')
+    server._handle_connection(connection)  # type: ignore[arg-type]
+    response = json.loads(connection.response.split(b"\n", 1)[0])
+    assert response["result"]["pong"] is True
+    assert "secret-session" not in connection.response.decode()
 
 
 @pytest.mark.parametrize(

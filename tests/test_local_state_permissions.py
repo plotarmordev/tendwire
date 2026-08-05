@@ -21,8 +21,8 @@ from tendwire.local_state import (
     entry_identity,
     inspect_private_file_at,
     open_private_file_at,
-    pin_group_socket_for_client_at,
     pin_owned_socket_at,
+    pin_socket_for_client_at,
     prepare_and_open_private_directory,
     prepare_resolved_private_parent,
     prepare_sqlite_family_at,
@@ -174,7 +174,7 @@ def test_group_socket_parent_mode_and_pin_validate_owner_group(tmp_path: Path) -
             parent_fd, "group.sock", socket_group=group_name, expected=identity
         )
         assert result.mode == 0o660
-        pinned_fd, pinned_identity, owner_uid = pin_group_socket_for_client_at(
+        pinned_fd, pinned_identity, owner_uid = pin_socket_for_client_at(
             parent_fd, "group.sock", group_name
         )
         assert pinned_identity == identity

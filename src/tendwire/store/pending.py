@@ -36,8 +36,11 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def _decision_ref(revision: str) -> str:
-    return f"decision-{revision}"
+def backend_pending_decision_ref(
+    host_id: str, worker_id: str, revision_digest: str,
+) -> str:
+    material = _json([host_id, worker_id, revision_digest]).encode("utf-8")
+    return "pending-" + hashlib.sha256(material).hexdigest()[:24]
 
 
 def _opaque_digest(prefix: str, domain: str, value: Mapping[str, Any]) -> str:
@@ -123,6 +126,7 @@ def _enqueue_decision(
     host_id: str,
     worker_id: str,
     decision_ref: str,
+    revision_digest: str,
     observation: PendingObservation,
     now: str,
     *,
@@ -134,7 +138,6 @@ def _enqueue_decision(
     if binding is None:
         raise RuntimeError("decision route unavailable")
     worker = _public_worker(conn, host_id, worker_id, binding)
-    revision_digest = str(observation.revision_digest)
     key_token = _opaque_digest(
         "twdecision1.",
         "tendwire.decision.v1",
@@ -450,7 +453,7 @@ def apply_backend_pending_observation(
             "binding_private_fingerprint": binding_private_fingerprint or "",
             "observed_turn_target_value": observed_turn_target_value or "",
         })
-        ref = _decision_ref(revision)
+        ref = backend_pending_decision_ref(host_id, worker_id, revision)
         for prior in existing_rows:
             if prior["decision_ref"] == ref or prior["state"] != "open":
                 continue
@@ -514,7 +517,16 @@ def apply_backend_pending_observation(
             payload_json=excluded.payload_json,status='open',observed_at=excluded.observed_at""",
             (host_id, ref, revision, worker_id, route["route_generation"], _json(public_payload), now),
         )
-        _enqueue_decision(conn, host_id, worker_id, ref, observation, now, binding=route)
+        _enqueue_decision(
+            conn,
+            host_id,
+            worker_id,
+            ref,
+            revision,
+            observation,
+            now,
+            binding=route,
+        )
         return (
             existing is None
             or str(existing["revision_digest"]) != revision

@@ -104,12 +104,8 @@ def _single_object(completed: subprocess.CompletedProcess[str]) -> dict[str, Any
 
 def test_invalid_arguments_emit_one_fixed_compact_object() -> None:
     completed = _invoke(
-        "--iterations",
-        "0",
-        "--daemon-wal-cycles",
-        "1",
         "--requests-per-method",
-        "1",
+        "0",
         "--json",
         timeout=15,
     )
@@ -137,11 +133,20 @@ def test_recursive_privacy_gate_rejects_values_and_success_error_keys() -> None:
     assert not driver._privacy_scan({**safe, "nested": {"error_type": "none"}}, [])
 
 
-@pytest.mark.parametrize("field", ["iterations", "daemon_wal_cycles", "requests_per_method"])
-def test_argument_contract_requires_positive_exact_work(field: str) -> None:
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("requests_per_method", 0),
+        ("herdres_sync_passes", 2),
+        ("phase_timeout_seconds", 0),
+    ],
+)
+def test_argument_contract_requires_positive_exact_work(
+    field: str, value: int,
+) -> None:
     driver = _load_driver()
     namespace = driver._parser().parse_args(["--json"])
-    setattr(namespace, field, 0)
+    setattr(namespace, field, value)
 
     with pytest.raises(driver._ArgumentError):
         driver._argument_values(namespace)

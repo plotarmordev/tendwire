@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Callable
 import pytest
 
 from tendwire.core.models import Snapshot, Worker, WorkerBinding
+from tendwire.core.turns import PendingObservation
 from tendwire.store.db import write_transaction
 from tendwire.store.outbox import (
     ack_connector_delivery,
@@ -26,6 +28,7 @@ from tendwire.store.outbox import (
     renew_connector_delivery,
     retry_connector_dead_letter,
 )
+from tendwire.store.pending import apply_backend_pending_observation
 from tendwire.store.projection import save_snapshot
 from tendwire.store.schema import init_store
 from tendwire.store.turns import apply_turn_refresh
@@ -90,6 +93,73 @@ def _final(db_path: Path, *, text: str = "a") -> dict[str, object]:
     leased = poll_connector_outbox(db_path, "host-a", "turn-final")["items"][0]
     assert leased["payload"]["kind"] == "final_ready"
     return leased
+
+
+def test_pending_decision_producer_emits_leaseable_canonical_identity(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "decision.db"
+    worker = Worker(
+        id="worker-a",
+        name="codex",
+        meta={"stable_key": "wsk1_" + "a" * 64, "stable_key_version": 1},
+    )
+    binding = WorkerBinding(
+        host_id="host-a",
+        worker_id=worker.id,
+        worker_fingerprint=worker.fingerprint,
+        backend="acp",
+        target_kind="agent_id",
+        target_value="private",
+        private_fingerprint="private-a",
+    )
+    save_snapshot(
+        db_path,
+        Snapshot(host_id="host-a", updated_at="2026-08-05T00:00:00Z", workers=[worker]),
+        worker_bindings=[binding],
+        binding_backend="acp",
+    )
+    assert apply_backend_pending_observation(
+        db_path,
+        "host-a",
+        worker.id,
+        PendingObservation(
+            kind="open_prompt",
+            question="Allow the tool?",
+            pending_kind="approval",
+            revision_digest="backend-revision-a",
+            decision_kind="single",
+            decision_options=("Allow", "Reject"),
+            decision_question_count=1,
+        ),
+        observed_at="2026-08-05T00:00:01Z",
+        binding_private_fingerprint="private-a",
+    )
+
+    leased = poll_connector_outbox(db_path, "host-a", "turn-final")["items"]
+    assert len(leased) == 1
+    decision = leased[0]["payload"]["decision"]
+    expected_ref = "pending-" + hashlib.sha256(json.dumps(
+        ["host-a", worker.id, decision["revision_digest"]],
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode()).hexdigest()[:24]
+    assert leased[0]["payload"]["kind"] == "decision"
+    assert decision["decision_ref"] == expected_ref
+    assert leased[0]["key"].startswith("turn-final:decision:twdecision1.")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        pending = conn.execute(
+            "SELECT decision_ref,revision_digest FROM backend_pending"
+        ).fetchone()
+        outbox = conn.execute(
+            "SELECT decision_ref,status FROM connector_outbox WHERE kind='decision'"
+        ).fetchone()
+    assert pending is not None and outbox is not None
+    assert pending["decision_ref"] == decision["decision_ref"]
+    assert pending["revision_digest"] == decision["revision_digest"]
+    assert outbox["decision_ref"] == decision["decision_ref"]
+    assert outbox["status"] == "leased"
 
 
 @pytest.mark.parametrize(

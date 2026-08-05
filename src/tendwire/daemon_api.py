@@ -41,13 +41,11 @@ from .local_state import (
     EntryIdentity,
     LocalStateError,
     LocalStateErrorCode,
-    PermissionState,
     enforce_bound_socket_permissions_at,
-    inspect_owned_socket_at,
     open_resolved_parent,
     owned_socket_identity_at,
-    pin_group_socket_for_client_at,
     pin_owned_socket_at,
+    pin_socket_for_client_at,
     prepare_resolved_private_parent,
     proc_fd_path,
     resolve_socket_group,
@@ -71,24 +69,34 @@ _FINAL_RE = re.compile(r"twfinal1\.[A-Za-z0-9_-]{43}")
 _PLAN_RE = re.compile(r"twplan1\.[A-Za-z0-9_-]{1,256}")
 _REF_RE = re.compile(r"twref1\.[A-Za-z0-9_-]{43}")
 _CONNECTOR_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_RESTORE_REVISION_RE = re.compile(r"twrev1\.[A-Za-z0-9_-]+")
 _CONNECTOR_NAME_FORBIDDEN = (
     "backend_target", "pane_id", "session_id", "terminal_id", "chat_id", "topic_id",
     "message_id", "bot_token", "shell", "argv", "environment", "stdout", "stderr",
 )
-_RESTORE_PLAN_RE = re.compile(r"twplan1\.[A-Za-z0-9_-]+")
-_RESTORE_FINAL_RE = re.compile(r"twfinal1\.[A-Za-z0-9_-]+")
-_RESTORE_REVISION_RE = re.compile(r"twrev1\.[A-Za-z0-9_-]+")
-_RESTORE_DELIVERY_RE = re.compile(r"turn-final:revision:twfinal1\.[A-Za-z0-9_-]+")
-_RESTORE_PATTERNS = {
-    "plan_token": _RESTORE_PLAN_RE, "failed_plan_token": _RESTORE_PLAN_RE,
-    "recovered_plan_token": _RESTORE_PLAN_RE, "replaces_plan_token": _RESTORE_PLAN_RE,
-    "recovers_plan_token": _RESTORE_PLAN_RE, "final_identity": _RESTORE_FINAL_RE,
-    "content_revision": _RESTORE_REVISION_RE, "key": _RESTORE_DELIVERY_RE,
-}
+_SEAL_TOKEN = object()
 
 
-class _ExactConnectorResponse(dict[str, Any]):
-    """Marker for a connector result already validated at its strict edge."""
+class _SealedResponse(dict[str, Any]):
+    """Completed API response with an immutable serialization snapshot."""
+
+    __slots__ = ("_encoded",)
+
+    def __init__(self, value: Mapping[str, Any], token: object) -> None:
+        if token is not _SEAL_TOKEN:
+            raise TypeError("daemon response seal is private")
+        super().__init__(value)
+        object.__setattr__(self, "_encoded", json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8"))
+
+    @property
+    def encoded(self) -> bytes:
+        return self._encoded
+
+    def __setattr__(self, _name: str, _value: Any) -> None:
+        raise TypeError("daemon response seal is immutable")
 
 
 _CONNECTOR_PRIVATE_KEYS = frozenset(
@@ -100,6 +108,35 @@ _CONNECTOR_PRIVATE_KEYS = frozenset(
         "environment", "stdin", "stdout", "stderr",
     }
 )
+_CONNECTOR_COMMON = frozenset({"schema_version", "ok", "status", "host_id", "name"})
+_CONNECTOR_ERROR_STATUSES = frozenset(
+    "invalid_params invalid_payload invalid_ref stale_ref store_unavailable unknown_method "
+    "revision_not_found stale_revision content_unavailable plan_not_found plan_conflict "
+    "part_conflict plan_incomplete plan_not_failed not_recoverable request_conflict "
+    "ack_deadline_expired not_retryable".split()
+)
+_CONNECTOR_RESULT_SPECS = {
+    method: (frozenset(statuses.split()), tuple(frozenset(fields.split()) for fields in shapes))
+    for method, (statuses, shapes) in {
+        "connector.poll": ("ok", ("items",)),
+        "connector.reclaim": ("ok", ("reclaimed",)),
+        "connector.renew": ("renewed", ("ref key attempt leased_until",)),
+        "connector.ack": ("acknowledged", ("ref key attempt",)),
+        "connector.release": ("released superseded", ("ref key attempt",)),
+        "connector.fail": ("retry_scheduled attempts_exhausted superseded", ("ref key attempt", "ref key attempt available_at")),
+        "connector.defer": ("deferred superseded", ("ref key attempt", "ref key attempt available_at")),
+        "connector.inspect": ("ok", ("total items",)),
+        "connector.retry": ("requeued", ("key retry_generation prior_attempt_count", "key retry_generation prior_attempt_count warning")),
+        "connector.prepare": ("ok recovered", (
+            "plan_token state generation part_count accepted_ordinals",
+            "plan_token state generation part_count ordinal accepted_ordinals",
+            "plan_token state generation part_count job_count accepted_ordinals",
+            "failed_plan_token plan_token generation content_revision state acknowledged_prefix_count executable_job_count retained_failed_job_count prior_attempt_count idempotent_replay",
+        )),
+    }.items()
+}
+
+
 def _exact_json_value(
     value: Any, *, depth: int = 0, budget: list[int] | None = None,
 ) -> Any:
@@ -109,6 +146,10 @@ def _exact_json_value(
     if depth > 12 or budget[0] > 4096:
         raise ValueError("connector response is too deeply nested")
     if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeError:
+            raise ValueError("connector response contains invalid text") from None
         return value
     if value is None or isinstance(value, (bool, int)):
         return value
@@ -121,6 +162,10 @@ def _exact_json_value(
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError("connector response keys must be strings")
+            try:
+                key.encode("utf-8")
+            except UnicodeError:
+                raise ValueError("connector response contains an invalid key") from None
             if key.lower() in _CONNECTOR_PRIVATE_KEYS:
                 raise ValueError("connector response contains a private key")
             result[key] = _exact_json_value(item, depth=depth + 1, budget=budget)
@@ -184,6 +229,31 @@ def _valid_ref_fields(value: Mapping[str, Any], *, dates_required: bool = False)
     )
 
 
+_INSPECT_FIELDS = frozenset("kind key final_identity failed_plan_token decision_ref target_key reason attempt_count prior_attempt_count created_at terminal_at retryable recoverable".split())
+_INSPECT_KINDS = frozenset("working final_ready final_part decision retire".split())
+_INSPECT_REASONS = frozenset("temporary rate_limited provider_rejected provider_uncertain invalid_payload content_unavailable route_unavailable provider_binding_unknown lease_expired ack_deadline_expired superseded attempts_exhausted operator_recovery".split())
+
+
+def _valid_inspect_item(value: Any) -> bool:
+    item = _closed_mapping(value, set(_INSPECT_FIELDS))
+    return bool(
+        item
+        and item.get("kind") in _INSPECT_KINDS
+        and _valid_connector_key("turn-final", item.get("key"))
+        and (item.get("decision_ref") is None or _public_exact_identifier("decision_ref", item["decision_ref"]))
+        and _optional_match(_FINAL_RE, item.get("final_identity"))
+        and _optional_match(_PLAN_RE, item.get("failed_plan_token"))
+        and (item.get("target_key") is None or _valid_connector_key("turn-final", item["target_key"]))
+        and _exact_int(item.get("attempt_count"))
+        and _exact_int(item.get("prior_attempt_count"))
+        and item.get("reason") in _INSPECT_REASONS
+        and _valid_utc(item.get("created_at"))
+        and _valid_utc(item.get("terminal_at"))
+        and type(item.get("retryable")) is bool
+        and type(item.get("recoverable")) is bool
+    )
+
+
 def _valid_nonpoll_connector_result(method: str, value: Mapping[str, Any]) -> bool:
     name = str(value.get("name"))
     if method == "connector.reclaim":
@@ -214,6 +284,10 @@ def _valid_nonpoll_connector_result(method: str, value: Mapping[str, Any]) -> bo
         recovering = "failed_plan_token" in value
         accepted = value.get("accepted_ordinals", [])
         part_count = value.get("part_count")
+        counts = (
+            "acknowledged_prefix_count", "executable_job_count",
+            "retained_failed_job_count", "prior_attempt_count",
+        )
         return bool(
             name == "turn-final"
             and _matches(_PLAN_RE, value.get("plan_token"))
@@ -223,60 +297,21 @@ def _valid_nonpoll_connector_result(method: str, value: Mapping[str, Any]) -> bo
             and (part_count is None or _exact_int(part_count, 1) and part_count <= 10_000)
             and ("ordinal" not in value or _exact_int(value["ordinal"]) and value["ordinal"] < part_count)
             and ("job_count" not in value or _exact_int(value["job_count"], 1))
-            and all(field not in value or _exact_int(value[field]) for field in (
-                "acknowledged_prefix_count", "executable_job_count",
-                "retained_failed_job_count", "prior_attempt_count",
-            ))
-            and (
-                "content_revision" not in value
-                or (
-                    _matches(_REVISION_RE, value["content_revision"])
-                )
-            )
+            and all(field not in value or _exact_int(value[field]) for field in counts)
+            and ("content_revision" not in value or _matches(_REVISION_RE, value["content_revision"]))
             and isinstance(accepted, list)
             and all(_exact_int(item) and part_count is not None and item < part_count for item in accepted)
             and accepted == sorted(set(accepted))
-            and value.get("state") in {
-                "preparing", "active", "waiting_predecessor", "completed",
-                "failed", "superseded",
-            }
+            and value.get("state") in "preparing active waiting_predecessor completed failed superseded".split()
             and ("idempotent_replay" not in value or type(value["idempotent_replay"]) is bool)
         )
     if method == "connector.inspect":
         items = value.get("items")
-        item_fields = {
-            "kind", "key", "final_identity", "failed_plan_token", "decision_ref",
-            "target_key", "reason", "attempt_count", "prior_attempt_count",
-            "created_at", "terminal_at", "retryable", "recoverable",
-        }
         return bool(
             name == "turn-final"
             and _exact_int(value.get("total"))
             and isinstance(items, list)
-            and all(
-                (item := _closed_mapping(raw, item_fields)) is not None
-                and item.get("kind") in {"working", "final_ready", "final_part", "decision", "retire"}
-                and _valid_connector_key(name, item.get("key"))
-                and (item.get("decision_ref") is None or _public_exact_identifier(
-                    "decision_ref", item.get("decision_ref")
-                ))
-                and _optional_match(_FINAL_RE, item.get("final_identity"))
-                and _optional_match(_PLAN_RE, item.get("failed_plan_token"))
-                and (item.get("target_key") is None or _valid_connector_key(name, item["target_key"]))
-                and _exact_int(item.get("attempt_count"))
-                and _exact_int(item.get("prior_attempt_count"))
-                and item.get("reason") in {
-                    "temporary", "rate_limited", "provider_rejected", "provider_uncertain",
-                    "invalid_payload", "content_unavailable", "route_unavailable",
-                    "provider_binding_unknown", "lease_expired", "ack_deadline_expired",
-                    "superseded", "attempts_exhausted", "operator_recovery",
-                }
-                and _valid_utc(item.get("created_at"))
-                and _valid_utc(item.get("terminal_at"))
-                and type(item.get("retryable")) is bool
-                and type(item.get("recoverable")) is bool
-                for raw in items
-            )
+            and all(_valid_inspect_item(item) for item in items)
             and value["total"] >= len(items)
         )
     return False
@@ -288,9 +323,8 @@ def _validated_connector_result(
     copied = _exact_json_value(result)
     if not isinstance(copied, dict):
         raise ValueError("connector result must be an object")
-    common = {"schema_version", "ok", "status", "host_id", "name"}
     if (
-        not common <= set(copied)
+        not _CONNECTOR_COMMON <= copied.keys()
         or copied.get("schema_version") != 1
         or type(copied.get("schema_version")) is not int
         or type(copied.get("ok")) is not bool
@@ -303,51 +337,18 @@ def _validated_connector_result(
         if (
             result_name not in {"", expected_name}
             or (bool(result_name) and not _matches(_CONNECTOR_NAME_RE, result_name))
-            or set(copied) != common | {"message"}
+            or copied.keys() != _CONNECTOR_COMMON | {"message"}
             or copied.get("message") != copied.get("status")
-            or copied.get("status") not in {
-                "invalid_params", "invalid_payload", "invalid_ref", "stale_ref",
-                "store_unavailable", "unknown_method", "revision_not_found",
-                "stale_revision", "content_unavailable", "plan_not_found",
-                "plan_conflict", "part_conflict", "plan_incomplete", "plan_not_failed",
-                "not_recoverable", "request_conflict", "ack_deadline_expired",
-                "not_retryable",
-            }
+            or copied.get("status") not in _CONNECTOR_ERROR_STATUSES
         ):
             raise ValueError("connector error has an invalid envelope")
         return copied
     if not expected_name or result_name != expected_name:
         raise ValueError("connector result identity is invalid")
-    alternatives: dict[str, tuple[frozenset[str], ...]] = {
-        "connector.poll": (frozenset(common | {"items"}),),
-        "connector.reclaim": (frozenset(common | {"reclaimed"}),),
-        "connector.renew": (frozenset(common | {"ref", "key", "attempt", "leased_until"}),),
-        "connector.ack": (frozenset(common | {"ref", "key", "attempt"}),),
-        "connector.release": (frozenset(common | {"ref", "key", "attempt"}),),
-        "connector.fail": (frozenset(common | {"ref", "key", "attempt"}), frozenset(common | {"ref", "key", "attempt", "available_at"})),
-        "connector.defer": (frozenset(common | {"ref", "key", "attempt"}), frozenset(common | {"ref", "key", "attempt", "available_at"})),
-        "connector.inspect": (frozenset(common | {"total", "items"}),),
-        "connector.retry": (frozenset(common | {"key", "retry_generation", "prior_attempt_count"}), frozenset(common | {"key", "retry_generation", "prior_attempt_count", "warning"})),
-    }
-    prepare_sets = (
-        common | {"plan_token", "state", "generation", "part_count", "accepted_ordinals"},
-        common | {"plan_token", "state", "generation", "part_count", "ordinal", "accepted_ordinals"},
-        common | {"plan_token", "state", "generation", "part_count", "job_count", "accepted_ordinals"},
-        common | {"failed_plan_token", "plan_token", "generation", "content_revision", "state", "acknowledged_prefix_count", "executable_job_count", "retained_failed_job_count", "prior_attempt_count", "idempotent_replay"},
-    )
-    allowed = tuple(frozenset(fields) for fields in prepare_sets) if method == "connector.prepare" else alternatives.get(method, ())
-    if frozenset(copied) not in allowed:
+    statuses, field_sets = _CONNECTOR_RESULT_SPECS[method]
+    if not any(copied.keys() == _CONNECTOR_COMMON | fields for fields in field_sets):
         raise ValueError("connector result has unexpected fields")
-    statuses = {
-        "connector.poll": {"ok"}, "connector.reclaim": {"ok"},
-        "connector.renew": {"renewed"}, "connector.ack": {"acknowledged"},
-        "connector.release": {"released", "superseded"},
-        "connector.fail": {"retry_scheduled", "attempts_exhausted", "superseded"},
-        "connector.defer": {"deferred", "superseded"},
-        "connector.inspect": {"ok"}, "connector.retry": {"requeued"},
-        "connector.prepare": {"ok", "recovered"},
-    }
-    if copied.get("status") not in statuses.get(method, set()):
+    if copied.get("status") not in statuses:
         raise ValueError("connector result status is invalid")
     if method == "connector.poll":
         items = copied.get("items")
@@ -390,12 +391,33 @@ _REQUEST_ID_FORBIDDEN_COMPACT = frozenset(
     segment.replace("_", "") for segment in _REQUEST_ID_FORBIDDEN_SEGMENTS
 )
 
-REQUIRED_METHODS = frozenset(
-    "ping health.get snapshot.get attention.list turn.list turn.delta turn.content.get "
-    "pending.list command.submit connector.prepare connector.poll connector.ack connector.fail "
-    "connector.defer connector.renew connector.release connector.reclaim connector.retry "
-    "connector.inspect".split()
-)
+_METHOD_PARAMS = {
+    method: frozenset(fields.split())
+    for method, fields in {
+        "ping": "", "health.get": "", "snapshot.get": "", "attention.list": "",
+        "pending.list": "", "turn.list": "schema_version limit cursor since",
+        "turn.delta": "watermark cursor limit",
+        "turn.content.get": "schema_version turn_id content_revision field cursor",
+    }.items()
+}
+_METHOD_PARAMS.update({"command.submit": None, **dict.fromkeys(_CONNECTOR_RESULT_SPECS)})
+REQUIRED_METHODS = frozenset(_METHOD_PARAMS)
+_SIMPLE_METHODS = {
+    "health.get": ("_get_health", True),
+    "snapshot.get": ("_get_snapshot", False),
+    "attention.list": ("_get_attention", False),
+    "pending.list": ("_get_pending", False),
+}
+_PAGE_METHODS = {
+    "turn.list": (
+        "_get_turns", ("cursor", "since"), TURN_LIST_DEFAULT_LIMIT,
+        TURN_LIST_MAX_LIMIT,
+    ),
+    "turn.delta": (
+        "_get_turn_delta", ("watermark", "cursor"), TURN_DELTA_DEFAULT_LIMIT,
+        TURN_DELTA_MAX_LIMIT,
+    ),
+}
 
 
 class DaemonAPIError(Exception):
@@ -485,8 +507,8 @@ def _connector_success_response(
     *,
     expected_name: str,
     request_id: Any = None,
-) -> _ExactConnectorResponse:
-    response: _ExactConnectorResponse = _ExactConnectorResponse(
+) -> dict[str, Any]:
+    response = dict(
         schema_version=API_SCHEMA_VERSION,
         ok=True,
         status="ok",
@@ -630,6 +652,16 @@ class TendwireDaemonAPI:
             setattr(self, f"_{name}", callback)
 
     def dispatch(self, request: Any) -> dict[str, Any]:
+        try:
+            return _SealedResponse(self._dispatch(request), _SEAL_TOKEN)
+        except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+            return _SealedResponse(error_response(
+                "internal_error", "daemon method failed",
+                details={"type": type(exc).__name__},
+                request_id=request.get("id") if isinstance(request, Mapping) else None,
+            ), _SEAL_TOKEN)
+
+    def _dispatch(self, request: Any) -> dict[str, Any]:
         if not isinstance(request, Mapping):
             return error_response("invalid_request", "request must be a JSON object")
 
@@ -651,7 +683,8 @@ class TendwireDaemonAPI:
                 details={"field": "method"},
                 request_id=request_id,
             )
-        if method not in REQUIRED_METHODS:
+        allowed_params = _METHOD_PARAMS.get(method)
+        if method not in _METHOD_PARAMS:
             return error_response(
                 "unknown_method",
                 "unknown method",
@@ -669,6 +702,12 @@ class TendwireDaemonAPI:
                 details={"field": "params"},
                 request_id=request_id,
             )
+        if allowed_params is not None:
+            invalid = _unknown_params_error(
+                params, set(allowed_params), method, request_id
+            )
+            if invalid:
+                return invalid
 
         try:
             if method == "ping":
@@ -676,78 +715,44 @@ class TendwireDaemonAPI:
                     {"pong": True, "methods": sorted(REQUIRED_METHODS)},
                     request_id=request_id,
                 )
-            if method == "health.get":
-                return _daemon_identity_response(
-                    self._get_health(),
-                    request_id=request_id,
-                )
-            if method == "snapshot.get":
-                return success_response(_snapshot_dict(self._get_snapshot()), request_id=request_id)
-            if method == "attention.list":
-                return success_response(self._get_attention(), request_id=request_id)
-            if method == "turn.list":
-                invalid = _unknown_params_error(
-                    params, {"schema_version", "limit", "cursor", "since"},
-                    method, request_id,
-                )
-                if invalid:
-                    return invalid
+            simple = _SIMPLE_METHODS.get(method)
+            if simple is not None:
+                callback_name, include_identity = simple
+                result = getattr(self, callback_name)()
+                if method == "snapshot.get":
+                    result = _snapshot_dict(result)
+                response = _daemon_identity_response if include_identity else success_response
+                return response(result, request_id=request_id)
+            page_spec = _PAGE_METHODS.get(method)
+            if page_spec is not None:
                 schema_version = params.get("schema_version", 1)
-                if schema_version not in {1, 2} or isinstance(schema_version, bool):
+                if method == "turn.list" and (
+                    schema_version not in {1, 2} or isinstance(schema_version, bool)
+                ):
                     return error_response(
                         "unsupported_schema",
                         "unsupported turn list schema version",
                         details={"supported_turn_schema_versions": [1, 2]},
                         request_id=request_id,
                     )
-                page, invalid = _page_params(
-                    params, ("cursor", "since"), TURN_LIST_DEFAULT_LIMIT,
-                    TURN_LIST_MAX_LIMIT, request_id,
-                )
+                callback_name, tokens, default, maximum = page_spec
+                page, invalid = _page_params(params, tokens, default, maximum, request_id)
                 if invalid:
                     return invalid
                 assert page is not None
-                limit, cursor, since = page
-                turn_result = dict(
-                    self._get_turns(
-                        schema_version=schema_version,
-                        limit=limit,
-                        cursor=cursor,
-                        since=since,
-                    )
-                )
-                response = success_response(turn_result, request_id=request_id)
-                _restore_turn_list_text(response, turn_result)
-                return response
-            if method == "turn.delta":
-                invalid = _unknown_params_error(
-                    params, {"watermark", "cursor", "limit"}, method, request_id
-                )
-                if invalid:
-                    return invalid
-                page, invalid = _page_params(
-                    params, ("watermark", "cursor"), TURN_DELTA_DEFAULT_LIMIT,
-                    TURN_DELTA_MAX_LIMIT, request_id,
-                )
-                if invalid:
-                    return invalid
-                assert page is not None
-                delta_limit, delta_watermark, delta_cursor = page
-                delta_result = dict(self._get_turn_delta(
-                    watermark=delta_watermark,
-                    cursor=delta_cursor,
-                    limit=delta_limit,
+                result = dict(getattr(self, callback_name)(
+                    **{
+                        "limit": page[0],
+                        **dict(zip(tokens, page[1:], strict=True)),
+                        **({"schema_version": schema_version} if method == "turn.list" else {}),
+                    }
                 ))
-                response = success_response(delta_result, request_id=request_id)
-                _restore_turn_delta_text(response, delta_result)
+                response = success_response(result, request_id=request_id)
+                (_restore_turn_list_text if method == "turn.list" else _restore_turn_delta_text)(
+                    response, result
+                )
                 return response
             if method == "turn.content.get":
-                invalid = _unknown_params_error(
-                    params, {"schema_version", "turn_id", "content_revision", "field", "cursor"},
-                    method, request_id,
-                )
-                if invalid:
-                    return invalid
                 content_schema = params.get("schema_version", 1)
                 if content_schema != 1 or isinstance(content_schema, bool):
                     return error_response(
@@ -782,8 +787,6 @@ class TendwireDaemonAPI:
                 response = success_response(result, request_id=request_id)
                 _restore_content_page_text(response, result)
                 return response
-            if method == "pending.list":
-                return success_response(self._get_pending(), request_id=request_id)
             if method == "command.submit":
                 return _command_success_response(
                     self._submit_command(dict(params)),
@@ -805,11 +808,7 @@ class TendwireDaemonAPI:
                 request_id=request_id,
             )
 
-        return error_response(
-            "unknown_method",
-            "unknown method",
-            request_id=request_id,
-        )
+        raise AssertionError("required daemon method is not dispatched")
 
 
 def _restore_turn_text(
@@ -903,73 +902,21 @@ def _restore_turn_delta_text(
         _restore_turn_text(target_turn, original_turn, 2)
 
 
-def _restore_plan_token(
-    response: dict[str, Any],
-    original_result: Mapping[str, Any],
-) -> None:
-    result = response.get("result")
-    if not isinstance(result, dict):
-        return
-
-    def restore(target: dict[str, Any], original: Mapping[str, Any]) -> None:
-        for key, pattern in _RESTORE_PATTERNS.items():
-            if _matches(pattern, original.get(key)):
-                target[key] = original[key]
-        for nested_key in ("turn", "final", "payload", "content"):
-            nested_original = original.get(nested_key)
-            nested_target = target.get(nested_key)
-            if isinstance(nested_original, Mapping) and isinstance(nested_target, dict):
-                restore(nested_target, nested_original)
-        original_items = original.get("items")
-        target_items = target.get("items")
-        if isinstance(original_items, list) and isinstance(target_items, list):
-            for target_item, original_item in zip(
-                target_items,
-                original_items,
-                strict=False,
-            ):
-                if isinstance(target_item, dict) and isinstance(original_item, Mapping):
-                    restore(target_item, original_item)
-
-    restore(result, original_result)
-
-
 def _serialized_response(response: Mapping[str, Any]) -> bytes:
-    """Serialize one public response while preserving canonical content pages."""
-    if isinstance(response, _ExactConnectorResponse):
-        return json.dumps(
-            _exact_json_value(response),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    sanitized = sanitize_public_mapping(response)
-    original_result = response.get("result")
-    if isinstance(original_result, Mapping):
-        # PID is normally excluded from public projections. The local daemon
-        # identity is the one narrow exception: it lets startup diagnostics
-        # identify the exact socket holder without exposing backend process
-        # details. Require the current version/PID pair before restoring it.
-        if (
-            original_result.get("version") == __version__
-            and original_result.get("pid") == os.getpid()
-            and isinstance(sanitized.get("result"), dict)
-        ):
-            sanitized["result"]["version"] = __version__
-            sanitized["result"]["pid"] = os.getpid()
-        _restore_turn_list_text(sanitized, original_result)
-        _restore_turn_delta_text(sanitized, original_result)
-        _restore_content_page_text(sanitized, original_result)
-        _restore_plan_token(sanitized, original_result)
-        try:
-            command_result = _command_result(dict(original_result))
-        except (TypeError, ValueError):
-            pass
-        else:
-            sanitized["result"] = command_result
+    if isinstance(response, _SealedResponse):
+        return response.encoded
+    value = sanitize_public_mapping(response)
+    original = response.get("result")
+    public = value.get("result")
+    if (
+        isinstance(original, Mapping)
+        and isinstance(public, dict)
+        and original.get("version") == __version__
+        and original.get("pid") == os.getpid()
+    ):
+        public.update(version=__version__, pid=os.getpid())
     return json.dumps(
-        sanitized,
+        value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -1018,6 +965,14 @@ def _local_state_unavailable(exc: LocalStateError) -> DaemonUnavailable:
         "daemon socket local state is invalid",
         code=exc.code,
     )
+
+
+def _close_fd(fd: int | None) -> None:
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 @contextmanager
@@ -1080,10 +1035,7 @@ def _cleanup_stale_socket(parent_fd: int, leaf: str, address: str) -> None:
         raise DaemonUnavailable("daemon socket is already active")
     finally:
         probe.close()
-        try:
-            os.close(pin_fd)
-        except OSError:
-            pass
+        _close_fd(pin_fd)
 
 
 def ensure_daemon_socket_not_active(
@@ -1304,9 +1256,7 @@ class UnixSocketJSONServer:
         self._periodic_future: Future[Any] | None = None
         self._closed = False
         self._accepting = False
-        self._connections: set[socket.socket] = set()
-        self._futures: set[Future[None]] = set()
-        self._future_connections: dict[Future[None], socket.socket] = {}
+        self._futures: dict[Future[None], socket.socket] = {}
 
     @property
     def listening(self) -> bool:
@@ -1435,10 +1385,7 @@ class UnixSocketJSONServer:
             if listener is not None:
                 listener.close()
             if parent_fd is not None and self._parent_fd != parent_fd:
-                try:
-                    os.close(parent_fd)
-                except OSError:
-                    pass
+                _close_fd(parent_fd)
 
     def _rollback_bound_socket(
         self,
@@ -1450,11 +1397,7 @@ class UnixSocketJSONServer:
     ) -> None:
         listener.close()
         if identity is None:
-            if pin_fd is not None:
-                try:
-                    os.close(pin_fd)
-                except OSError:
-                    pass
+            _close_fd(pin_fd)
             return
         try:
             unlink_verified_socket_at(parent_fd, leaf, identity)
@@ -1470,11 +1413,7 @@ class UnixSocketJSONServer:
                 self._parent_fd = parent_fd
                 self._leaf = leaf
                 return
-        if pin_fd is not None:
-            try:
-                os.close(pin_fd)
-            except OSError:
-                pass
+        _close_fd(pin_fd)
 
     def serve_forever(self) -> None:
         self.start()
@@ -1526,24 +1465,18 @@ class UnixSocketJSONServer:
                 self._admission.release()
                 self._reject_connection(conn, "daemon_stopping")
                 return
-            self._connections.add(conn)
             try:
                 future = executor.submit(self._handle_connection, conn)
             except RuntimeError:
-                self._connections.discard(conn)
                 self._admission.release()
                 self._reject_connection(conn, "daemon_stopping")
                 return
-            self._futures.add(future)
-            self._future_connections[future] = conn
+            self._futures[future] = conn
             future.add_done_callback(self._request_finished)
 
     def _request_finished(self, future: Future[None]) -> None:
         with self._tracking_lock:
-            conn = self._future_connections.pop(future, None)
-            self._futures.discard(future)
-            if conn is not None:
-                self._connections.discard(conn)
+            conn = self._futures.pop(future, None)
         if conn is not None:
             if future.cancelled() and self.stop_event.is_set():
                 self._reject_connection(conn, "daemon_stopping")
@@ -1624,7 +1557,13 @@ class UnixSocketJSONServer:
             if self.stop_event.is_set():
                 return
             try:
-                encoded = _serialized_response(response)
+                try:
+                    encoded = _serialized_response(response)
+                except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+                    encoded = _serialized_response(error_response(
+                        "internal_error", "daemon response serialization failed",
+                        details={"type": type(exc).__name__},
+                    ))
                 if len(encoded) > self.max_response_bytes:
                     encoded = _serialized_response(
                         error_response(
@@ -1669,7 +1608,7 @@ class UnixSocketJSONServer:
             if running and self.shutdown_grace_seconds > 0:
                 wait(running, timeout=self.shutdown_grace_seconds)
             with self._tracking_lock:
-                connections = tuple(self._connections)
+                connections = tuple(self._futures.values())
             for conn in connections:
                 try:
                     conn.shutdown(socket.SHUT_RDWR)
@@ -1712,16 +1651,8 @@ class UnixSocketJSONServer:
         self._pin_fd = None
         self._parent_fd = None
         self._leaf = None
-        if pin_fd is not None:
-            try:
-                os.close(pin_fd)
-            except OSError:
-                pass
-        if parent_fd is not None:
-            try:
-                os.close(parent_fd)
-            except OSError:
-                pass
+        _close_fd(pin_fd)
+        _close_fd(parent_fd)
 
 
 @contextmanager
@@ -1734,53 +1665,16 @@ def _validated_client_socket(
     try:
         try:
             parent_fd, leaf = open_resolved_parent(path, path_only=True)
-            if socket_group is not None:
-                pin_fd, identity, expected_peer_uid = (
-                    pin_group_socket_for_client_at(
-                        parent_fd,
-                        leaf,
-                        socket_group,
-                    )
-                )
-            else:
-                pinned = pin_owned_socket_at(parent_fd, leaf)
-                if pinned is None:
-                    raise DaemonUnavailable(
-                        "daemon socket local state is invalid",
-                        code=LocalStateErrorCode.MISSING_ENTRY,
-                    )
-                pin_fd, identity = pinned
-                inspected = inspect_owned_socket_at(parent_fd, leaf)
-                current_identity = owned_socket_identity_at(parent_fd, leaf)
-                if (
-                    current_identity != identity
-                    or inspected.state is PermissionState.ABSENT
-                    or inspected.mode != 0o600
-                ):
-                    raise DaemonUnavailable(
-                        "daemon socket local state is invalid",
-                        code=(
-                            LocalStateErrorCode.ENTRY_CHANGED
-                            if current_identity != identity
-                            else LocalStateErrorCode.INSECURE_MODE
-                        ),
-                    )
-                expected_peer_uid = os.geteuid()
+            pin_fd, identity, expected_peer_uid = pin_socket_for_client_at(
+                parent_fd, leaf, socket_group
+            )
             address = proc_fd_path(parent_fd, leaf)
         except LocalStateError as exc:
             raise _local_state_unavailable(exc) from None
         yield parent_fd, leaf, identity, expected_peer_uid, address
     finally:
-        if pin_fd is not None:
-            try:
-                os.close(pin_fd)
-            except OSError:
-                pass
-        if parent_fd is not None:
-            try:
-                os.close(parent_fd)
-            except OSError:
-                pass
+        _close_fd(pin_fd)
+        _close_fd(parent_fd)
 
 
 def _recheck_connected_socket(
@@ -1792,14 +1686,9 @@ def _recheck_connected_socket(
     recheck_fd: int | None = None
     try:
         try:
-            if socket_group is None:
-                current = owned_socket_identity_at(parent_fd, leaf)
-            else:
-                recheck_fd, current, _owner_uid = pin_group_socket_for_client_at(
-                    parent_fd,
-                    leaf,
-                    socket_group,
-                )
+            recheck_fd, current, _owner_uid = pin_socket_for_client_at(
+                parent_fd, leaf, socket_group
+            )
         except LocalStateError as exc:
             raise _local_state_unavailable(exc) from None
         if current != expected:
@@ -1808,11 +1697,7 @@ def _recheck_connected_socket(
                 code=LocalStateErrorCode.ENTRY_CHANGED,
             )
     finally:
-        if recheck_fd is not None:
-            try:
-                os.close(recheck_fd)
-            except OSError:
-                pass
+        _close_fd(recheck_fd)
 
 
 def _validate_connected_peer(conn: socket.socket, expected_uid: int) -> None:
