@@ -5,6 +5,36 @@ Herdres, and Herdr system. It does not authorize deployment or a service
 restart. The proof is owner-authorized, starts from clean accepted checkouts,
 and uses no direct Herdr CLI observer.
 
+## Owner-ratified stopping boundary
+
+For this checkpoint, the owner supersedes the 14,000-line global reduction
+target with the exact canonical Tendwire and Herdres counts recorded in the
+bound release summary. Existing component-budget debt remains explicit; it is
+not hidden by reclassification. The feature set is frozen, no further
+architecture reduction is authorized, and the SQLite/security redesign is out
+of scope. Only correctness or privacy fixes found by the gates below may alter
+the candidate.
+
+The ACP-enabled Herdr fork at
+`9026d9bc5a12d9adc2d9f68ebdc564133e4098b4` is the accepted Herdr baseline
+exception. Its endpoint ownership, visible-console bridge, resume behavior, and
+six supported adapters are intentional release inputs rather than a violation
+of the older cleanup-only Herdr assumption.
+
+`agent-client-protocol` 0.11.0 remains the upstream schema authority, but its
+transport/connection implementation is rejected for this checkpoint. The
+reviewed installed 29-file Python source digest is
+`f5e621738a5651da9d14559806ab1d3491e8a9da6a72e686baf087e67a87e5f6`.
+It is SHA-256 over files sorted by relative POSIX path; each entry is framed as
+the four-byte big-endian UTF-8 path length, path bytes, eight-byte big-endian
+content length, and raw content bytes.
+Its line reader does not impose our hard frame bound after a limit overrun, its
+message queues are unbounded, its default stderr pipe is not drained, and its
+timeouts and lifecycle differ from the required request-scoped and fail-closed
+contracts. Tendwire therefore keeps its bounded transport while using upstream
+ACP schemas. Kimi may run only as a bounded compatibility row in the adapter
+matrix, never as development or review workforce.
+
 ## Bound inputs
 
 Before starting, record the exact Tendwire, Herdres, and Herdr commit IDs,
