@@ -16,21 +16,21 @@ from pathlib import Path
 from typing import Any
 
 
-RELEASE_ID = "9026d9bc-7446533-6c0d0f5"
+RELEASE_ID = "9026d9bc-7446533-3659994"
 TRANSACTION_ID = "frozen-7446533-6c0d0f5"
 TENDWIRE_REVISION = "7446533bb6fb2560a9a9dd871f638c4a6ccbb086"
-HERDRES_REVISION = "6c0d0f5e06d88db23d9cf786c0419935ba2557f0"
+HERDRES_REVISION = "36599949daa64f68494d04f96a3bfee31904a804"
 HERDR_REVISION = "9026d9bc5a12d9adc2d9f68ebdc564133e4098b4"
 ACTIVE_LINK = Path("/home/smith/.local/share/acp-runtime/active")
 RELEASE_ROOT = Path(f"/home/smith/.local/share/acp-runtime/releases/{RELEASE_ID}")
 MANIFEST = Path(f"/home/smith/.local/share/acp-runtime/manifests/{RELEASE_ID}.json")
 TRANSACTION_ROOT = Path(f"/home/smith/.local/state/acp-cutover/{TRANSACTION_ID}")
-TENDWIRE_RUNTIME = Path("/home/smith/.local/share/tendwire-runtime/acp-7446533")
+TENDWIRE_RUNTIME = Path("/home/smith/.local/share/tendwire-runtime/acp-7446533-3659994")
 TENDWIRE_PYTHON = RELEASE_ROOT / "tendwire/bin/python"
 TENDWIRE_SOCKET = Path("/home/smith/.local/share/tendwire/tendwire.sock")
 TENDWIRE_DB = Path("/home/smith/.local/share/tendwire/candidates/7446533/tendwire.db")
-HERDRES_STATE = Path("/home/smith/.local/share/herdres/candidates/6c0d0f5/state.json")
-HERDRES_INGRESS = Path("/home/smith/.local/share/herdres/candidates/6c0d0f5/ingress.db")
+HERDRES_STATE = Path("/home/smith/.local/share/herdres/candidates/3659994/state.json")
+HERDRES_INGRESS = Path("/home/smith/.local/share/herdres/candidates/3659994/ingress.db")
 TOPIC_TOOL = RELEASE_ROOT / "reset-telegram-topics"
 TOPIC_PYTHON = Path("/home/smith/.local/share/uv/tools/contexto/bin/python")
 DEFAULT_OUTPUT = TRANSACTION_ROOT / "one-hour-monitor.json"

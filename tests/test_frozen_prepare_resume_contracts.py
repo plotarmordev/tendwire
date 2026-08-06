@@ -130,12 +130,15 @@ def test_resume_validates_frozen_transaction_before_authorizing_recovery() -> No
         main,
         'exec 9>"${CUTOVER_LOCK}"',
         "flock -n 9",
-        'test "$(<"${PHASE_FILE}")" = committing',
+        'current_phase="$(<"${PHASE_FILE}")"',
+        'case "${current_phase}" in',
         'test -f "${RESET_STARTED}"',
         'test "$(stat -c \'%u:%a\' "${RESET_STARTED}")" = "$(id -u):600"',
-        'test "$(readlink -f "${ACTIVE_LINK}")" = "${NEW_RELEASE}"',
         'test "$(systemctl --user show --value -p MainPID herdr-server.service)" =',
+        "rebind_forward_release",
+        'test "$(readlink -f "${ACTIVE_LINK}")" = "${NEW_RELEASE}"',
         'cmp -s -- "${NEW_RELEASE}/systemd/${unit}-99.conf"',
+        "assert_effective_units",
         'rm -f -- "${RESUME_AUTH}"',
         "printf '%s %s %s\\n' RESUME_FROZEN_ACP_CUTOVER",
         'chmod 0600 "${RESUME_AUTH}.tmp.$$"',
@@ -143,6 +146,53 @@ def test_resume_validates_frozen_transaction_before_authorizing_recovery() -> No
         "systemctl --user start acp-frozen-release-recovery.service",
         "systemctl --user is-active --quiet acp-frozen-release-recovery.service",
     )
+
+
+def test_resume_rebinds_only_from_the_verified_stopped_previous_release() -> None:
+    source = RESUME.read_text(encoding="utf-8")
+    rebind = source[
+        source.index("rebind_forward_release() {") : source.index("wait_tendwire() {")
+    ]
+
+    _ordered(
+        rebind,
+        'test "${current}" = "${PREVIOUS_RELEASE}"',
+        'assert_unit_quiescent "${unit}"',
+        '"${PREVIOUS_RELEASE}/validate-frozen-release"',
+        'mv -T -- "${TRANSACTION_ROOT}/release-validation.json"',
+        '"${NEW_RELEASE}/validate-frozen-release"',
+        "--manifest \"${RELEASE_MANIFEST}\" --create",
+        "prepare_private_env",
+        'publish_unit "${NEW_RELEASE}/systemd/${unit}-99.conf"',
+        "switch_release",
+        "systemctl --user daemon-reload",
+    )
+    assert 'readonly PREVIOUS_VALIDATION=${TRANSACTION_ROOT}/release-validation.6c0d0f5.json' in source
+    assert "os.O_NOFOLLOW" in source
+    assert "opened = os.fstat(descriptor)" in source
+    assert "after = os.fstat(descriptor)" in source
+    assert "stat.S_IMODE(opened.st_mode) != 0o600" in source
+    assert 'elif [[ ! -e "${TRANSACTION_ROOT}/release-validation.json"' in source
+    assert "provisional|validating|validation_failed)" in source
+    assert 'assert_previous_validation_file "${PREVIOUS_VALIDATION}"' in source
+    assert 'assert_exec acp-frozen-release-recovery.service' in source
+    assert 'assert_exec acp-frozen-live-monitor.service' in source
+    assert 'assert_exec acp-cutover-recovery.service' in source
+    assert 'assert_environment_assignment "${tw_environment}" PYTHONPATH ""' in source
+    assert 'active_state="$(systemctl --user show --value -p ActiveState "${unit}")"' in source
+    assert 'job="$(systemctl --user show --value -p Job "${unit}")"' in source
+    assert "assert_active_validation()" in source
+    active_validation = source[
+        source.index("assert_active_validation()") : source.index('exec 9>"${CUTOVER_LOCK}"')
+    ]
+    assert "heartbeat_body_after" in active_validation
+    assert "heartbeat_identity_after != heartbeat_identity" in active_validation
+    assert 'print("initializing")' in active_validation
+    assert 'len(samples) == heartbeat_index + 1' in active_validation
+    assert 'test "${unit_start}" -lt "${owner_start}"' in active_validation
+    assert "assert_unit_quiescent acp-cutover-recovery.service" in active_validation
+    publish = source[source.index("publish_unit() {") : source.index("prepare_private_env() {")]
+    _ordered(publish, 'install -m 0644 "${source}" "${temporary}"', 'sync "${temporary}"', 'mv -T -- "${temporary}" "${target}"', 'sync -d "$(dirname "${target}")"')
 
 
 def test_prepare_packages_tooling_from_named_git_revision() -> None:

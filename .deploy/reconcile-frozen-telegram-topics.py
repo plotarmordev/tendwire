@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import Iterator
 
 
-PRIVATE_ENV = Path("/home/smith/.config/herdres/frozen-7446533-6c0d0f5.env")
+PRIVATE_ENV = Path("/home/smith/.config/herdres/frozen-7446533-3659994.env")
 SESSION_PATH = Path("/home/smith/.local/share/contexto/contexto_capture.session")
-STATE_PATH = Path("/home/smith/.local/share/herdres/candidates/6c0d0f5/state.json")
-INGRESS_PATH = Path("/home/smith/.local/share/herdres/candidates/6c0d0f5/ingress.db")
+STATE_PATH = Path("/home/smith/.local/share/herdres/candidates/3659994/state.json")
+INGRESS_PATH = Path("/home/smith/.local/share/herdres/candidates/3659994/ingress.db")
 PHASE_PATH = Path("/home/smith/.local/state/acp-cutover/frozen-7446533-6c0d0f5/phase")
 EVIDENCE_ROOT = PHASE_PATH.parent
 PLAN_PATH = EVIDENCE_ROOT / "telegram-topic-reset-plan.json"

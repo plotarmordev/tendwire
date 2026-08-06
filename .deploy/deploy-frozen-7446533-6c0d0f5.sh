@@ -32,24 +32,24 @@ unset BASH_ENV ENV CDPATH GLOBIGNORE PYTHONHOME PYTHONPATH TAR_OPTIONS
 # shellcheck disable=SC2034
 readonly TENDWIRE_REVISION=7446533bb6fb2560a9a9dd871f638c4a6ccbb086
 # shellcheck disable=SC2034
-readonly HERDRES_REVISION=6c0d0f5e06d88db23d9cf786c0419935ba2557f0
+readonly HERDRES_REVISION=36599949daa64f68494d04f96a3bfee31904a804
 # shellcheck disable=SC2034
 readonly HERDR_REVISION=9026d9bc5a12d9adc2d9f68ebdc564133e4098b4
 readonly HERDR_BINARY=/home/smith/.local/share/herdr-runtime/acp-9026d9bc/herdr
 readonly HERDR_SHA256=2e58e1b11ed289d6a99ba36b80867e5e5d5920d03406bb40a1113e2d391f386f
-readonly TENDWIRE_RUNTIME=/home/smith/.local/share/tendwire-runtime/acp-7446533
-readonly NEW_RELEASE=/home/smith/.local/share/acp-runtime/releases/9026d9bc-7446533-6c0d0f5
-readonly RELEASE_MANIFEST=/home/smith/.local/share/acp-runtime/manifests/9026d9bc-7446533-6c0d0f5.json
-readonly RUNNER_ROOT=/home/smith/.local/share/acp-runtime/runners/9026d9bc-7446533-6c0d0f5
+readonly TENDWIRE_RUNTIME=/home/smith/.local/share/tendwire-runtime/acp-7446533-3659994
+readonly NEW_RELEASE=/home/smith/.local/share/acp-runtime/releases/9026d9bc-7446533-3659994
+readonly RELEASE_MANIFEST=/home/smith/.local/share/acp-runtime/manifests/9026d9bc-7446533-3659994.json
+readonly RUNNER_ROOT=/home/smith/.local/share/acp-runtime/runners/9026d9bc-7446533-3659994
 readonly DEPLOY_RUNNER=${RUNNER_ROOT}/deploy
-readonly PREPARE_COMPLETE=/home/smith/.local/share/acp-runtime/prepared/9026d9bc-7446533-6c0d0f5.complete
+readonly PREPARE_COMPLETE=/home/smith/.local/share/acp-runtime/prepared/9026d9bc-7446533-3659994.complete
 readonly EXPECTED_TENDWIRE_RUNTIME_SHA256=PREPARE_REQUIRED
 readonly EXPECTED_TENDWIRE_RUNTIME_ENTRIES=PREPARE_REQUIRED
 readonly EXPECTED_COMBINED_RELEASE_SHA256=PREPARE_REQUIRED
 readonly EXPECTED_COMBINED_RELEASE_ENTRIES=PREPARE_REQUIRED
 readonly ACTIVE_LINK=/home/smith/.local/share/acp-runtime/active
 readonly USER_UNITS=/home/smith/.config/systemd/user
-readonly PRIVATE_ENV=/home/smith/.config/herdres/frozen-7446533-6c0d0f5.env
+readonly PRIVATE_ENV=/home/smith/.config/herdres/frozen-7446533-3659994.env
 readonly PRIVATE_ENV_TEMP=${PRIVATE_ENV}.tmp
 readonly LEGACY_ENV=/home/smith/.config/herdres/herdres.env
 readonly LEGACY_STATE_PARENT=/home/smith/.local/share/herdres
@@ -57,7 +57,7 @@ readonly LEGACY_TENDWIRE_DB=/home/smith/.local/share/tendwire/tendwire.db
 readonly LEGACY_HERDRES_STATE=${LEGACY_STATE_PARENT}/state.json
 readonly LEGACY_HERDRES_INGRESS=${LEGACY_STATE_PARENT}/ingress.db
 readonly TENDWIRE_CANDIDATE=/home/smith/.local/share/tendwire/candidates/7446533
-readonly HERDRES_CANDIDATE=/home/smith/.local/share/herdres/candidates/6c0d0f5
+readonly HERDRES_CANDIDATE=/home/smith/.local/share/herdres/candidates/3659994
 readonly TENDWIRE_DB=${TENDWIRE_CANDIDATE}/tendwire.db
 readonly TENDWIRE_SOCKET=/home/smith/.local/share/tendwire/tendwire.sock
 readonly HERDRES_STATE=${HERDRES_CANDIDATE}/state.json
@@ -73,7 +73,7 @@ readonly LIVE_MONITOR_UNIT=${USER_UNITS}/acp-frozen-live-monitor.service
 readonly OLD_RECOVERY_OVERRIDE=${USER_UNITS}/acp-cutover-recovery.service.d/99-frozen-acp-release.conf
 readonly TOPIC_RESET_TOOL=${NEW_RELEASE}/reset-telegram-topics
 readonly TOPIC_RESET_PYTHON=/home/smith/.local/share/uv/tools/contexto/bin/python
-readonly TOPIC_RESET_SHA256=29cfe108278f9a1c6de04371d3071d2646a80c3a35b4fc84ec980ed8c3c374ca
+readonly TOPIC_RESET_SHA256=b48bc7793b264b930b9b87ef7d936d69379e6e34f55b131abe062912781c7353
 readonly TOPIC_RESET_STARTED=${TRANSACTION_ROOT}/telegram-topic-reset-started.json
 readonly EXPECTED_ACP_WORKER_COUNT=1
 readonly EXPECTED_ACP_ADAPTER=codex
@@ -533,7 +533,7 @@ valid = (
     and record == {
         "schema_version": 1,
         "tendwire_revision": "7446533bb6fb2560a9a9dd871f638c4a6ccbb086",
-        "herdres_revision": "6c0d0f5e06d88db23d9cf786c0419935ba2557f0",
+        "herdres_revision": "36599949daa64f68494d04f96a3bfee31904a804",
         "herdr_revision": "9026d9bc5a12d9adc2d9f68ebdc564133e4098b4",
         "tooling_revision": tooling_revision,
         "deploy_runner_sha256": runner_digest,
@@ -735,8 +735,8 @@ telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else
 managed = telegram.get("managed_bots") if isinstance(telegram.get("managed_bots"), dict) else {}
 values = {
     "HERDRES_ENV_FILE": str(target_path),
-    "HERDRES_INGRESS_PATH": "/home/smith/.local/share/herdres/candidates/6c0d0f5/ingress.db",
-    "HERDRES_STATE_PATH": "/home/smith/.local/share/herdres/candidates/6c0d0f5/state.json",
+    "HERDRES_INGRESS_PATH": "/home/smith/.local/share/herdres/candidates/3659994/ingress.db",
+    "HERDRES_STATE_PATH": "/home/smith/.local/share/herdres/candidates/3659994/state.json",
     "HERDRES_TENDWIRE_MODE": "source",
     "TENDWIRE_SOCKET_PATH": "/home/smith/.local/share/tendwire/tendwire.sock",
     "TELEGRAM_CHAT_ID": safe("chat", telegram.get("chat_id"), r"-?[0-9]{1,24}"),
