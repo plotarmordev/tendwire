@@ -27,15 +27,15 @@ unset FROZEN_ACP_CLEAN_ENV
 export PATH=/usr/bin:/bin
 unset BASH_ENV ENV CDPATH GLOBIGNORE PYTHONHOME PYTHONPATH TAR_OPTIONS
 
-readonly RELEASE_ID=9026d9bc-7446533-3659994-r2
+readonly RELEASE_ID=9026d9bc-7446533-3659994-r3
 readonly NEW_RELEASE=/home/smith/.local/share/acp-runtime/releases/${RELEASE_ID}
 readonly RELEASE_MANIFEST=/home/smith/.local/share/acp-runtime/manifests/${RELEASE_ID}.json
-readonly PREVIOUS_RELEASE=/home/smith/.local/share/acp-runtime/releases/9026d9bc-7446533-6c0d0f5
-readonly PREVIOUS_RUNTIME=/home/smith/.local/share/tendwire-runtime/acp-7446533
-readonly PREVIOUS_MANIFEST=/home/smith/.local/share/acp-runtime/manifests/9026d9bc-7446533-6c0d0f5.json
+readonly PREVIOUS_RELEASE=/home/smith/.local/share/acp-runtime/releases/9026d9bc-7446533-3659994-r2
+readonly PREVIOUS_RUNTIME=/home/smith/.local/share/tendwire-runtime/acp-7446533-3659994-r2
+readonly PREVIOUS_MANIFEST=/home/smith/.local/share/acp-runtime/manifests/9026d9bc-7446533-3659994-r2.json
 readonly ACTIVE_LINK=/home/smith/.local/share/acp-runtime/active
 readonly HERDR_BINARY=/home/smith/.local/share/herdr-runtime/acp-9026d9bc/herdr
-readonly TENDWIRE_RUNTIME=/home/smith/.local/share/tendwire-runtime/acp-7446533-3659994-r2
+readonly TENDWIRE_RUNTIME=/home/smith/.local/share/tendwire-runtime/acp-7446533-3659994-r3
 readonly TENDWIRE_SOCKET=/home/smith/.local/share/tendwire/tendwire.sock
 readonly TENDWIRE_DB=/home/smith/.local/share/tendwire/candidates/7446533/tendwire.db
 readonly HERDRES_STATE=/home/smith/.local/share/herdres/candidates/3659994/state.json
@@ -53,10 +53,12 @@ readonly USER_UNITS=/home/smith/.config/systemd/user
 readonly LIVE_MONITOR_UNIT=${USER_UNITS}/acp-frozen-live-monitor.service
 readonly RECOVERY_UNIT=${USER_UNITS}/acp-frozen-release-recovery.service
 readonly LEGACY_RECOVERY_OVERRIDE=${USER_UNITS}/acp-cutover-recovery.service.d/99-frozen-acp-release.conf
-readonly PRIVATE_ENV=/home/smith/.config/herdres/frozen-7446533-3659994-r2.env
-readonly PREVIOUS_PRIVATE_ENV=/home/smith/.config/herdres/frozen-7446533-6c0d0f5.env
-readonly PREVIOUS_VALIDATION=${TRANSACTION_ROOT}/release-validation.6c0d0f5.json
-readonly PREVIOUS_VALIDATION_SHA256=cddd693567bec5152248896eb518e989ec27b4ba1f8325b359d1f6349ec214f1
+readonly PRIVATE_ENV=/home/smith/.config/herdres/frozen-7446533-3659994-r3.env
+readonly PREVIOUS_PRIVATE_ENV=/home/smith/.config/herdres/frozen-7446533-3659994-r2.env
+readonly PREVIOUS_VALIDATION=${TRANSACTION_ROOT}/release-validation.r2.json
+readonly PREVIOUS_VALIDATION_SHA256=f9150a0bf106cee8e3c59ad3c3164ee21f98d7bfbc57115f1ae26ecebbcbfb66
+readonly BASE_VALIDATION=${TRANSACTION_ROOT}/release-validation.6c0d0f5.json
+readonly BASE_VALIDATION_SHA256=cddd693567bec5152248896eb518e989ec27b4ba1f8325b359d1f6349ec214f1
 readonly CUTOVER_LOCK=/home/smith/.local/state/acp-cutover/frozen-7446533-6c0d0f5.lock
 readonly EXPECTED_ACP_WORKER_COUNT=1
 readonly EXPECTED_ACP_ADAPTER=codex
@@ -87,15 +89,24 @@ phase_write() {
     sync -d "${TRANSACTION_ROOT}"
 }
 
-assert_previous_validation_file() {
+assert_validation_file() {
     local path="$1"
+    local expected_sha256="$2"
     local digest extra
     test -f "${path}"
     test ! -L "${path}"
     test "$(stat -c '%u:%a:%h' "${path}")" = "$(id -u):600:1"
     read -r digest extra < <(sha256sum -- "${path}")
     test -n "${extra}"
-    test "${digest}" = "${PREVIOUS_VALIDATION_SHA256}"
+    test "${digest}" = "${expected_sha256}"
+}
+
+assert_previous_validation_file() {
+    assert_validation_file "$1" "${PREVIOUS_VALIDATION_SHA256}"
+}
+
+assert_base_validation_file() {
+    assert_validation_file "$1" "${BASE_VALIDATION_SHA256}"
 }
 
 assert_working_directory() {
@@ -336,8 +347,8 @@ if set(source_values) != expected_keys:
     raise RuntimeError("previous private environment keys are invalid")
 expected_source = {
     "HERDRES_ENV_FILE": str(source),
-    "HERDRES_STATE_PATH": "/home/smith/.local/share/herdres/candidates/6c0d0f5/state.json",
-    "HERDRES_INGRESS_PATH": "/home/smith/.local/share/herdres/candidates/6c0d0f5/ingress.db",
+    "HERDRES_STATE_PATH": "/home/smith/.local/share/herdres/candidates/3659994/state.json",
+    "HERDRES_INGRESS_PATH": "/home/smith/.local/share/herdres/candidates/3659994/ingress.db",
     "HERDRES_TENDWIRE_MODE": "source",
     "TENDWIRE_SOCKET_PATH": "/home/smith/.local/share/tendwire/tendwire.sock",
 }
@@ -410,6 +421,7 @@ PY
 rebind_forward_release() {
     local current
     local rotated=0
+    assert_base_validation_file "${BASE_VALIDATION}"
     current="$(readlink -f "${ACTIVE_LINK}")"
     if [[ "${current}" = "${NEW_RELEASE}" ]]; then
         assert_previous_validation_file "${PREVIOUS_VALIDATION}"
@@ -593,6 +605,7 @@ assert_active_validation() {
     local owner_tag owner_pid owner_start owner_extra current_start
     local unit unit_pid unit_start validation_snapshot_state
     test "$(readlink -f "${ACTIVE_LINK}")" = "${NEW_RELEASE}"
+    assert_base_validation_file "${BASE_VALIDATION}"
     assert_previous_validation_file "${PREVIOUS_VALIDATION}"
     test -f "${TRANSACTION_ROOT}/release-validation.json"
     test ! -L "${TRANSACTION_ROOT}/release-validation.json"
@@ -878,7 +891,6 @@ for unit in tendwired.service herdres.service herdres-gateway.service; do
     test "$(systemctl --user show --value -p NRestarts "${unit}")" = 0
 done
 phase_write provisional
-systemctl --user reset-failed acp-frozen-live-monitor.service
 systemctl --user start acp-frozen-live-monitor.service
 monitor_ready=0
 for _attempt in $(seq 1 30); do

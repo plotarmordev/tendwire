@@ -167,7 +167,9 @@ def test_resume_rebinds_only_from_the_verified_stopped_previous_release() -> Non
         "switch_release",
         "systemctl --user daemon-reload",
     )
-    assert 'readonly PREVIOUS_VALIDATION=${TRANSACTION_ROOT}/release-validation.6c0d0f5.json' in source
+    assert 'readonly PREVIOUS_VALIDATION=${TRANSACTION_ROOT}/release-validation.r2.json' in source
+    assert 'readonly BASE_VALIDATION=${TRANSACTION_ROOT}/release-validation.6c0d0f5.json' in source
+    assert 'assert_base_validation_file "${BASE_VALIDATION}"' in source
     assert "os.O_NOFOLLOW" in source
     assert "opened = os.fstat(descriptor)" in source
     assert "after = os.fstat(descriptor)" in source
