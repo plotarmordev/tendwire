@@ -27,7 +27,7 @@ unset FROZEN_ACP_CLEAN_ENV
 export PATH=/usr/bin:/bin
 unset BASH_ENV ENV CDPATH GLOBIGNORE PYTHONHOME PYTHONPATH TAR_OPTIONS
 
-readonly RELEASE_ID=9026d9bc-7446533-3659994
+readonly RELEASE_ID=9026d9bc-7446533-3659994-r2
 readonly NEW_RELEASE=/home/smith/.local/share/acp-runtime/releases/${RELEASE_ID}
 readonly RELEASE_MANIFEST=/home/smith/.local/share/acp-runtime/manifests/${RELEASE_ID}.json
 readonly PREVIOUS_RELEASE=/home/smith/.local/share/acp-runtime/releases/9026d9bc-7446533-6c0d0f5
@@ -35,7 +35,7 @@ readonly PREVIOUS_RUNTIME=/home/smith/.local/share/tendwire-runtime/acp-7446533
 readonly PREVIOUS_MANIFEST=/home/smith/.local/share/acp-runtime/manifests/9026d9bc-7446533-6c0d0f5.json
 readonly ACTIVE_LINK=/home/smith/.local/share/acp-runtime/active
 readonly HERDR_BINARY=/home/smith/.local/share/herdr-runtime/acp-9026d9bc/herdr
-readonly TENDWIRE_RUNTIME=/home/smith/.local/share/tendwire-runtime/acp-7446533-3659994
+readonly TENDWIRE_RUNTIME=/home/smith/.local/share/tendwire-runtime/acp-7446533-3659994-r2
 readonly TENDWIRE_SOCKET=/home/smith/.local/share/tendwire/tendwire.sock
 readonly TENDWIRE_DB=/home/smith/.local/share/tendwire/candidates/7446533/tendwire.db
 readonly HERDRES_STATE=/home/smith/.local/share/herdres/candidates/3659994/state.json
@@ -53,7 +53,7 @@ readonly USER_UNITS=/home/smith/.config/systemd/user
 readonly LIVE_MONITOR_UNIT=${USER_UNITS}/acp-frozen-live-monitor.service
 readonly RECOVERY_UNIT=${USER_UNITS}/acp-frozen-release-recovery.service
 readonly LEGACY_RECOVERY_OVERRIDE=${USER_UNITS}/acp-cutover-recovery.service.d/99-frozen-acp-release.conf
-readonly PRIVATE_ENV=/home/smith/.config/herdres/frozen-7446533-3659994.env
+readonly PRIVATE_ENV=/home/smith/.config/herdres/frozen-7446533-3659994-r2.env
 readonly PREVIOUS_PRIVATE_ENV=/home/smith/.config/herdres/frozen-7446533-6c0d0f5.env
 readonly PREVIOUS_VALIDATION=${TRANSACTION_ROOT}/release-validation.6c0d0f5.json
 readonly PREVIOUS_VALIDATION_SHA256=cddd693567bec5152248896eb518e989ec27b4ba1f8325b359d1f6349ec214f1

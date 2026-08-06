@@ -12,17 +12,17 @@ from pathlib import Path
 from typing import Any
 
 
-RELEASE_ID = "9026d9bc-7446533-3659994"
+RELEASE_ID = "9026d9bc-7446533-3659994-r2"
 TENDWIRE_REVISION = "7446533bb6fb2560a9a9dd871f638c4a6ccbb086"
 HERDRES_REVISION = "36599949daa64f68494d04f96a3bfee31904a804"
 HERDR_REVISION = "9026d9bc5a12d9adc2d9f68ebdc564133e4098b4"
 HERDR_SHA256 = "2e58e1b11ed289d6a99ba36b80867e5e5d5920d03406bb40a1113e2d391f386f"
 ACP_SHA256 = "f5e621738a5651da9d14559806ab1d3491e8a9da6a72e686baf087e67a87e5f6"
 RUNNER_ROOT = Path(
-    "/home/smith/.local/share/acp-runtime/runners/9026d9bc-7446533-3659994"
+    "/home/smith/.local/share/acp-runtime/runners/9026d9bc-7446533-3659994-r2"
 )
 PREPARE_COMPLETE = Path(
-    "/home/smith/.local/share/acp-runtime/prepared/9026d9bc-7446533-3659994.complete"
+    "/home/smith/.local/share/acp-runtime/prepared/9026d9bc-7446533-3659994-r2.complete"
 )
 TRANSACTION_ROOT = Path("/home/smith/.local/state/acp-cutover/frozen-7446533-6c0d0f5")
 EVIDENCE_PATH = TRANSACTION_ROOT / "release-validation.json"

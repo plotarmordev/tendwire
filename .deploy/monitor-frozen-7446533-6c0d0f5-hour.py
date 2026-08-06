@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 
-RELEASE_ID = "9026d9bc-7446533-3659994"
+RELEASE_ID = "9026d9bc-7446533-3659994-r2"
 TRANSACTION_ID = "frozen-7446533-6c0d0f5"
 TENDWIRE_REVISION = "7446533bb6fb2560a9a9dd871f638c4a6ccbb086"
 HERDRES_REVISION = "36599949daa64f68494d04f96a3bfee31904a804"
@@ -25,7 +25,7 @@ ACTIVE_LINK = Path("/home/smith/.local/share/acp-runtime/active")
 RELEASE_ROOT = Path(f"/home/smith/.local/share/acp-runtime/releases/{RELEASE_ID}")
 MANIFEST = Path(f"/home/smith/.local/share/acp-runtime/manifests/{RELEASE_ID}.json")
 TRANSACTION_ROOT = Path(f"/home/smith/.local/state/acp-cutover/{TRANSACTION_ID}")
-TENDWIRE_RUNTIME = Path("/home/smith/.local/share/tendwire-runtime/acp-7446533-3659994")
+TENDWIRE_RUNTIME = Path("/home/smith/.local/share/tendwire-runtime/acp-7446533-3659994-r2")
 TENDWIRE_PYTHON = RELEASE_ROOT / "tendwire/bin/python"
 TENDWIRE_SOCKET = Path("/home/smith/.local/share/tendwire/tendwire.sock")
 TENDWIRE_DB = Path("/home/smith/.local/share/tendwire/candidates/7446533/tendwire.db")
