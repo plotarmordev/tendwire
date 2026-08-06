@@ -853,6 +853,11 @@ systemctl --user start acp-frozen-release-recovery.service
 systemctl --user is-active --quiet acp-frozen-release-recovery.service
 
 systemctl --user stop herdres-gateway.service herdres.service tendwired.service
+systemctl --user reset-failed \
+    herdres-gateway.service herdres.service tendwired.service
+for unit in tendwired.service herdres.service herdres-gateway.service; do
+    test "$(systemctl --user show --value -p NRestarts "${unit}")" = 0
+done
 systemctl --user start tendwired.service
 wait_tendwire
 "${TOPIC_PYTHON}" -I "${TOPIC_TOOL}" --apply

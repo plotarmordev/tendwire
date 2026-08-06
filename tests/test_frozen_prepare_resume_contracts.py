@@ -273,6 +273,7 @@ def test_resume_starts_and_validates_each_candidate_layer_in_order() -> None:
     _ordered(
         main,
         "systemctl --user stop herdres-gateway.service herdres.service tendwired.service",
+        "systemctl --user reset-failed",
         "systemctl --user start tendwired.service",
         "wait_tendwire",
         '"${TOPIC_PYTHON}" -I "${TOPIC_TOOL}" --apply',
