@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from tendwire.core.agent_events import agent_event
 from tendwire.core.models import Snapshot, Worker, WorkerBinding
-from tendwire.store.projection import save_snapshot
+from tendwire.store.projection import save_snapshot, upsert_worker_bindings
 from tendwire.store.retention import RetentionPolicy, run_retention_cycle
 from tendwire.store.receipts import (
     finish_command_request,
@@ -50,13 +51,37 @@ def _acp_binding(
     )
 
 
+def _herdr_binding(worker: Worker) -> WorkerBinding:
+    return WorkerBinding(
+        host_id="host-a",
+        worker_id=worker.id,
+        worker_fingerprint=worker.fingerprint,
+        backend="herdr",
+        target_kind="terminal_id",
+        target_value="terminal-private",
+        sendable=True,
+        observed_at=NOW,
+        private_fingerprint="private-herdr",
+    )
+
+
 def _seed(db_path: Path) -> Worker:
     init_store(db_path)
     worker = Worker(id="worker-a", name="codex", meta={"stable_key": "wsk1_" + "a" * 64, "stable_key_version": 1})
     base = Snapshot(host_id="host-a", updated_at=NOW, workers=[worker])
-    return save_snapshot(
-        db_path, base, worker_bindings=[_acp_binding(worker)], binding_backend="acp"
+    persisted = save_snapshot(
+        db_path,
+        base,
+        worker_bindings=[_herdr_binding(worker)],
+        binding_backend="herdr",
     ).workers[0]
+    acp = replace(
+        _acp_binding(persisted),
+        target_kind="terminal_id",
+        target_value="terminal-private",
+    )
+    upsert_worker_bindings(db_path, [acp])
+    return persisted
 
 
 def _reserve(db_path: Path, request_id: str = "request-a") -> dict[str, object]:
@@ -205,9 +230,19 @@ def test_accepted_receipt_submission_can_link_later_turn(tmp_path: Path) -> None
     )
     assert accepted["status"] == "accepted"
     with sqlite3.connect(db_path) as conn:
+        generations = dict(
+            conn.execute(
+                "SELECT backend,route_generation FROM worker_bindings"
+            ).fetchall()
+        )
         assert conn.execute(
             "SELECT state FROM turn_submissions WHERE request_id='request-a'"
         ).fetchone() == ("submitted",)
+        submission_generation = conn.execute(
+            "SELECT route_generation FROM turn_submissions WHERE request_id='request-a'"
+        ).fetchone()[0]
+    assert submission_generation == generations["herdr"]
+    assert submission_generation != generations["acp"]
     append_test_turn(
         db_path,
         "host-a",

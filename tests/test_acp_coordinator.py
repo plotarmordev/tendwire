@@ -92,6 +92,28 @@ def _append_console_event(db_path: Path, host_id: str, event: AgentEvent) -> Non
         assert append_agent_event(conn, host_id, event).inserted
 
 
+@pytest.mark.parametrize("target_kind", ["agent_id", "agent", "name", "label"])
+def test_coordinator_rejects_legacy_mutable_continuity_targets(
+    tmp_path: Path,
+    target_kind: str,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    legacy = replace(
+        _binding(),
+        target_kind=target_kind,
+        target_value="mutable-private-target",
+        private_fingerprint=f"legacy-{target_kind}",
+    )
+    upsert_worker_bindings(config.db_path, [legacy])
+    coordinator = AcpRuntimeCoordinator(config, threading.Event())
+
+    current, ambiguities = coordinator._continuity_bindings()
+
+    assert current == {}
+    assert ambiguities == 0
+
+
 @pytest.fixture
 def console_executor_factory():
     executors: list[ThreadPoolExecutor] = []
@@ -186,6 +208,12 @@ def test_endpoint_requires_explicit_acp_ownership_and_strict_attach_shape(tmp_pa
     wrong_status["worker"]["terminal_id"] = "other-terminal"
     with pytest.raises(AcpCoordinatorError, match="target changed"):
         _parse_status(terminal_binding, wrong_status)
+
+    colliding_agent = replace(
+        _binding(), target_kind="agent_id", target_value="codex"
+    )
+    with pytest.raises(AcpCoordinatorError, match="target changed"):
+        _parse_endpoint(config, colliding_agent, _endpoint())
 
 
 def test_console_exchange_requires_floor_and_next_sequence_contract() -> None:
@@ -1275,8 +1303,6 @@ def _seed(config: Config) -> Worker:
     acp_route = replace(
         continuity,
         backend="acp",
-        target_kind="acp_session_id",
-        target_value="session-private",
         turn_target_kind="acp_session_id",
         turn_target_value="session-private",
         private_fingerprint="acp-private-binding",

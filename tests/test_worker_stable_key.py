@@ -100,6 +100,21 @@ def test_conflicting_agent_matches_are_non_sendable_in_any_row_order(
     assert bindings == []
 
 
+def test_agent_identity_keys_must_all_match_one_pane(tmp_path) -> None:
+    workers, bindings = _discover(
+        tmp_path,
+        [_pane()],
+        [{
+            "name": "codex",
+            "agent": "codex",
+            "pane_id": "wR9:stale",
+            "terminal_id": "term-one",
+        }],
+    )
+    assert workers == []
+    assert bindings == []
+
+
 def test_duplicate_private_identity_fences_public_and_private_targets(tmp_path) -> None:
     workers, bindings = _discover(tmp_path, [_pane(), _pane()])
     assert workers == []
@@ -453,3 +468,4 @@ def test_public_projection_contains_no_raw_private_identifiers(tmp_path) -> None
     assert "term-private" not in encoded
     assert "agent-private" not in encoded
     assert "/secret/private" not in encoded
+    assert workers[0].backend_target["kind"] == "terminal_id"

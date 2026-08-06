@@ -829,10 +829,6 @@ class AcpSupervisor:
         grouped: dict[str, list[WorkerBinding]] = {}
         for binding in bindings:
             if binding.sendable and binding.target_kind in {
-                "agent_id",
-                "agent",
-                "name",
-                "label",
                 "terminal_id",
                 "pane_id",
             }:
@@ -1418,8 +1414,9 @@ def _pane_match(
     matches = [
         pane
         for pane in panes
-        if (pane_id and _text(pane, "pane_id") == pane_id)
-        or (terminal_id and _text(pane, "terminal_id") == terminal_id)
+        if (pane_id or terminal_id)
+        and (not pane_id or _text(pane, "pane_id") == pane_id)
+        and (not terminal_id or _text(pane, "terminal_id") == terminal_id)
     ]
     return (matches[0], False) if len(matches) == 1 else (None, len(matches) > 1)
 
@@ -1513,7 +1510,6 @@ def _discovered_workers(
         target_kind = ""
         target_value = ""
         for kind, value in (
-            ("agent_id", _text(agent or {}, "agent_id")),
             ("terminal_id", _text(pane, "terminal_id")),
             ("pane_id", pane_id),
         ):
@@ -1535,7 +1531,6 @@ def _discovered_workers(
                 "workspace_id": workspace_id,
                 "pane_id": pane_id,
                 "terminal_id": _text(pane, "terminal_id"),
-                "agent_id": _text(agent or {}, "agent_id"),
             },
         )
         rows.append(
@@ -1593,23 +1588,9 @@ def _require_target_identity(
     direct_fields = {
         "terminal_id": "terminal_id",
         "pane_id": "pane_id",
-        "name": "name",
-        "label": "name",
-        "agent": "agent",
     }
     field = direct_fields.get(continuity.target_kind)
-    if field is not None:
-        matched = worker.get(field) == continuity.target_value
-    else:
-        # Older Herdr projections can call the terminal identity `agent_id`.
-        # The v1 endpoint contract has no agent_id member, so require that the
-        # authority token still matches one of its immutable identity fields.
-        matched = continuity.target_value in {
-            worker.get("terminal_id"),
-            worker.get("pane_id"),
-            worker.get("name"),
-            worker.get("agent"),
-        }
+    matched = field is not None and worker.get(field) == continuity.target_value
     _ensure(matched, f"Herdr ACP {response} target changed")
 
 

@@ -27,6 +27,7 @@ from tendwire.backends.acp_runtime import AcpWorkerSession, SessionOpenMode
 from tendwire.command_submission import submit_command
 from tendwire.config import Config
 from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
+from tendwire.core.turns import PendingObservation
 from tendwire.daemon import TendwireDaemon
 from tendwire.store.pending import (
     backend_pending_decision_terminal_effect,
@@ -65,8 +66,8 @@ def _binding(worker: Worker) -> WorkerBinding:
         worker_id=worker.id,
         worker_fingerprint=worker.fingerprint,
         backend="herdr",
-        target_kind="agent_id",
-        target_value="agent-secret",
+        target_kind="terminal_id",
+        target_value="terminal-private",
         turn_target_kind=None,
         turn_target_value=None,
         sendable=True,
@@ -235,6 +236,61 @@ def _setup(tmp_path: Path) -> tuple[Any, Worker, str, AcpPermissionBroker]:
             timeout=2,
         ),
     )
+
+
+def test_pending_authentication_and_presentation_routes_are_split(
+    tmp_path: Path,
+) -> None:
+    config, worker, _session_id, broker = _setup(tmp_path)
+    try:
+        assert config.db_path is not None
+        binding = list_worker_bindings(
+            config.db_path, config.host_id, backend="acp"
+        )[0]
+        assert pending_store.apply_backend_pending_observation(
+            config.db_path,
+            config.host_id,
+            worker.id,
+            PendingObservation(
+                kind="open_prompt",
+                question="Choose once",
+                pending_kind="choice",
+                revision_digest="decision-revision",
+                decision_kind="single",
+                decision_options=("Allow", "Reject"),
+                decision_question_count=1,
+            ),
+            binding_private_fingerprint=binding.private_fingerprint,
+            observed_turn_target_value=binding.turn_target_value,
+            binding_authoritative=True,
+        )
+        with sqlite3.connect(config.db_path) as conn:
+            generations = dict(
+                conn.execute(
+                    "SELECT backend,route_generation FROM worker_bindings"
+                ).fetchall()
+            )
+            backend_generation = conn.execute(
+                "SELECT route_generation FROM backend_pending"
+            ).fetchone()[0]
+            public_generation = conn.execute(
+                "SELECT route_generation FROM pending_interactions"
+            ).fetchone()[0]
+            outbox = conn.execute(
+                "SELECT partition_key,payload_json FROM connector_outbox "
+                "WHERE kind='decision'"
+            ).fetchone()
+            herdr_partition = conn.execute(
+                "SELECT partition_key FROM worker_bindings WHERE backend='herdr'"
+            ).fetchone()[0]
+        payload = json.loads(outbox[1])
+        assert backend_generation == generations["acp"]
+        assert public_generation == generations["herdr"]
+        assert payload["worker"]["route_generation"] == generations["herdr"]
+        assert outbox[0] == herdr_partition
+        assert generations["acp"] != generations["herdr"]
+    finally:
+        broker.close()
 
 
 def test_expired_pending_claim_takeover_fences_old_token(

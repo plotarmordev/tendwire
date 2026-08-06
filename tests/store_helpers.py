@@ -41,8 +41,11 @@ def _current_test_binding(
         for binding in list_worker_bindings(Path(db_path), host_id)
         if binding.worker_id == worker_id
     ]
-    assert len(matches) == 1
-    return matches[0]
+    if len(matches) == 1:
+        return matches[0]
+    acp = [binding for binding in matches if binding.backend == "acp"]
+    assert len(acp) == 1
+    return acp[0]
 
 
 def append_test_turn(

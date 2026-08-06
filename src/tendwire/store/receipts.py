@@ -12,6 +12,7 @@ from typing import Any, Callable, Mapping
 
 from ..core.commands import CommandEnvelope, instruction_fingerprint, turn_submission_id
 from .db import add_seconds, canonical_utc, read_transaction, utc_now, write_transaction
+from .projection import presentation_binding_row
 
 
 _TERMINAL_STATES = frozenset({"accepted", "rejected", "uncertain"})
@@ -341,6 +342,11 @@ def mark_command_send_started(
             or private_binding.get("sendable") is not True
         ):
             return _response("stale_route", row)
+        presentation = presentation_binding_row(
+            conn, host_id, str(binding["worker_id"]), binding
+        )
+        if presentation is None:
+            return _response("stale_route", row)
         authority = {
             "worker_id": binding["worker_id"],
             "worker_fingerprint": private_binding.get("worker_fingerprint"),
@@ -406,7 +412,7 @@ def mark_command_send_started(
         submission_id = None
         if submission_worker is not None and instruction_text is not None:
             stable = submission_worker.meta.get("stable_key")
-            generation = str(binding["route_generation"])
+            generation = str(presentation["route_generation"])
             if not isinstance(stable, str) or not generation:
                 raise ValueError("submission worker route is incomplete")
             fingerprint = instruction_fingerprint(instruction_text)

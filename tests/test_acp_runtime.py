@@ -228,6 +228,7 @@ def binding(session_id: str = "session-private") -> WorkerBinding:
         target_value="pane-private-secret",
         turn_target_kind="acp_session_id",
         turn_target_value=session_id,
+        sendable=True,
         private_fingerprint="binding-private-secret",
     )
 
@@ -242,6 +243,7 @@ def continuity_binding() -> WorkerBinding:
         target_value="pane-private-secret",
         turn_target_kind="pane_id",
         turn_target_value="pane-private-secret",
+        sendable=True,
         private_fingerprint="continuity-binding-private-secret",
     )
 
@@ -297,7 +299,7 @@ def bound_runtime(
     **kwargs: Any,
 ) -> AcpRuntime:
     db_path = tmp_path / "bound-events.db"
-    upsert_worker_bindings(db_path, [current_binding])
+    upsert_worker_bindings(db_path, [continuity_binding(), current_binding])
     return AcpRuntime(
         client,  # type: ignore[arg-type]
         config=Config(

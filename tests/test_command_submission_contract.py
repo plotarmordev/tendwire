@@ -137,8 +137,6 @@ def _seed(
         continuity,
         worker_fingerprint=public_worker.fingerprint,
         backend="acp",
-        target_kind="acp_session_id",
-        target_value="private-session",
         turn_target_kind="acp_session_id",
         turn_target_value="private-session",
         private_fingerprint="private-acp-binding",

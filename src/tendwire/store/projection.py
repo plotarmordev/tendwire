@@ -60,6 +60,35 @@ def _binding_dict(binding: WorkerBinding) -> dict[str, Any]:
     }
 
 
+def presentation_binding_row(
+    conn: Any,
+    host_id: str,
+    worker_id: str,
+    authenticated: Any,
+) -> Any:
+    """Resolve the durable Herdr route anchored by an ACP authority row."""
+
+    authority = json.loads(authenticated["private_binding_json"])
+    if authority.get("backend") != "acp":
+        return authenticated
+    rows = conn.execute(
+        """SELECT * FROM worker_bindings
+        WHERE host_id=? AND worker_id=? AND backend='herdr' AND stable_key=?
+          AND (expires_at IS NULL OR expires_at>?)""",
+        (host_id, worker_id, authenticated["stable_key"], utc_now()),
+    ).fetchall()
+    matches = []
+    for row in rows:
+        private = json.loads(row["private_binding_json"])
+        if (
+            private.get("sendable") is True
+            and private.get("target_kind") == authority.get("target_kind")
+            and private.get("target_value") == authority.get("target_value")
+        ):
+            matches.append(row)
+    return matches[0] if len(matches) == 1 else None
+
+
 def _partition(host_id: str, stable_key: str, generation: str) -> str:
     material = _json(
         {

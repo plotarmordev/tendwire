@@ -307,8 +307,11 @@ class ConnectorOutboxAPI:
             source_ref = (
                 _ref(data.get("source_ref"))
             )
+            valid_turn_id = turn_id.startswith("turn-") or re.fullmatch(
+                r"acpt_[0-9a-f]{24}", turn_id
+            ) is not None
             if (
-                not turn_id.startswith("turn-")
+                not valid_turn_id
                 or len(turn_id) > 128
                 or any(char not in _CONNECTOR_NAME_CHARS for char in turn_id)
                 or not revision

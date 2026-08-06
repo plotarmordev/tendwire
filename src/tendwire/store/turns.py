@@ -50,6 +50,7 @@ from ..core.turns import (
 from .db import canonical_utc, read_transaction, utc_now, write_transaction
 from .events import _append
 from .outbox import OutboxInvariantError, _validate_polled_payload
+from .projection import presentation_binding_row
 
 
 @dataclass(frozen=True)
@@ -457,6 +458,7 @@ def _apply(
     *,
     complete: bool,
     expected_binding: WorkerBinding | None = None,
+    binding_row: Any = None,
 ) -> int:
     now = canonical_utc(now)
     connector_now = now
@@ -469,13 +471,16 @@ def _apply(
             WHERE host_id=? AND turn_id=?""",
             (host_id, turn_id),
         ).fetchone()
-        binding = _binding_row(conn, host_id, worker_id, expected_binding)
+        binding = (
+            binding_row
+            if binding_row is not None
+            else _binding_row(conn, host_id, worker_id, expected_binding)
+        )
         if (
             prior is None
             or binding is None
             or prior["worker_id"] != worker_id
             or prior["stable_key"] != binding["stable_key"]
-            or prior["route_generation"] != binding["route_generation"]
             or prior["removed_at"] is not None
             or now < prior["observed_at"]
         ):
@@ -536,7 +541,11 @@ def _apply(
             ).fetchone()[0]
         )
     )
-    binding = _binding_row(conn, host_id, worker_id, expected_binding)
+    binding = (
+        binding_row
+        if binding_row is not None
+        else _binding_row(conn, host_id, worker_id, expected_binding)
+    )
     if binding is None:
         return 0
     if (
@@ -654,7 +663,10 @@ def append_agent_event_and_apply_turn_for_binding(
     _fault_inject: Callable[[str], None] | None = None,
 ) -> AppendProjectedAgentEventResult:
     with write_transaction(db_path) as conn:
-        if _binding_row(conn, host_id, event.worker_id, expected_binding) is None:
+        authenticated = _binding_row(
+            conn, host_id, event.worker_id, expected_binding
+        )
+        if authenticated is None:
             return AppendProjectedAgentEventResult(
                 AppendBoundAgentEventResult("binding_changed", event.event_id)
             )
@@ -679,6 +691,18 @@ def append_agent_event_and_apply_turn_for_binding(
             ).fetchone()
             is None
         ):
+            presentation = (
+                authenticated
+                if content.get("removed") is True
+                else presentation_binding_row(
+                    conn,
+                    host_id,
+                    event.worker_id,
+                    authenticated,
+                )
+            )
+            if presentation is None:
+                raise RuntimeError("presentation route unavailable")
             complete = content.get("complete") is True
             turn = TurnRefreshApplyResult(
                 _apply(
@@ -689,6 +713,7 @@ def append_agent_event_and_apply_turn_for_binding(
                     persisted_observed_at,
                     complete=complete,
                     expected_binding=expected_binding,
+                    binding_row=presentation,
                 ),
                 False,
             )

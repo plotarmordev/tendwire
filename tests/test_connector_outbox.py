@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
 import pytest
 
+from tendwire.connectors import ConnectorOutboxAPI
 from tendwire.core.models import Snapshot, Worker, WorkerBinding
 from tendwire.core.turns import PendingObservation
 from tendwire.store.db import write_transaction
@@ -29,7 +31,7 @@ from tendwire.store.outbox import (
     retry_connector_dead_letter,
 )
 from tendwire.store.pending import apply_backend_pending_observation
-from tendwire.store.projection import save_snapshot
+from tendwire.store.projection import save_snapshot, upsert_worker_bindings
 from tendwire.store.schema import init_store
 from .store_helpers import append_test_turn
 
@@ -56,7 +58,9 @@ def _generic(db_path: Path, *, key: str = "notice-a", payload: dict[str, object]
         )
 
 
-def _final(db_path: Path, *, text: str = "a") -> dict[str, object]:
+def _final(
+    db_path: Path, *, text: str = "a", turn_id: str = "turn-a"
+) -> dict[str, object]:
     init_store(db_path)
     worker = Worker(
         id="worker-a",
@@ -83,7 +87,7 @@ def _final(db_path: Path, *, text: str = "a") -> dict[str, object]:
         "host-a",
         worker.id,
         {
-            "source_turn_id": "turn-a",
+            "source_turn_id": turn_id,
             "user_text": text,
             "assistant_final_text": text,
             "complete": True,
@@ -95,6 +99,63 @@ def _final(db_path: Path, *, text: str = "a") -> dict[str, object]:
     return leased
 
 
+def test_acp_turn_id_can_begin_final_presentation_plan(tmp_path: Path) -> None:
+    db_path = tmp_path / "acp-final.db"
+    source = _final(db_path, turn_id="acpt_" + "a" * 24)
+    turn = source["payload"]["turn"]
+
+    result = ConnectorOutboxAPI(db_path, "host-a").prepare(
+        {
+            "schema_version": 1,
+            "action": "begin",
+            "name": "turn-final",
+            "turn_id": turn["turn_id"],
+            "content_revision": turn["content_revision"],
+            "presentation_version": "turn-present-v3",
+            "part_count": 1,
+            "source_ref": source["ref"],
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "ok"
+
+
+@pytest.mark.parametrize(
+    "turn_id",
+    [
+        "acpt_",
+        "acpt_" + "a" * 23,
+        "acpt_" + "a" * 25,
+        "acpt_" + "A" * 24,
+        "acpt_" + "a" * 23 + ".",
+        "acpt_" + "a" * 23 + "-",
+    ],
+)
+def test_noncanonical_acp_turn_id_cannot_begin_plan(
+    tmp_path: Path, turn_id: str
+) -> None:
+    db_path = tmp_path / "bad-acp-final.db"
+    source = _final(db_path)
+    turn = source["payload"]["turn"]
+
+    result = ConnectorOutboxAPI(db_path, "host-a").prepare(
+        {
+            "schema_version": 1,
+            "action": "begin",
+            "name": "turn-final",
+            "turn_id": turn_id,
+            "content_revision": turn["content_revision"],
+            "presentation_version": "turn-present-v3",
+            "part_count": 1,
+            "source_ref": source["ref"],
+        }
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "invalid_params"
+
+
 def test_pending_decision_producer_emits_leaseable_canonical_identity(
     tmp_path: Path,
 ) -> None:
@@ -104,21 +165,30 @@ def test_pending_decision_producer_emits_leaseable_canonical_identity(
         name="codex",
         meta={"stable_key": "wsk1_" + "a" * 64, "stable_key_version": 1},
     )
-    binding = WorkerBinding(
+    continuity = WorkerBinding(
         host_id="host-a",
         worker_id=worker.id,
         worker_fingerprint=worker.fingerprint,
-        backend="acp",
-        target_kind="agent_id",
-        target_value="private",
-        private_fingerprint="private-a",
+        backend="herdr",
+        target_kind="terminal_id",
+        target_value="terminal-private",
+        sendable=True,
+        private_fingerprint="private-herdr",
     )
     save_snapshot(
         db_path,
         Snapshot(host_id="host-a", updated_at="2026-08-05T00:00:00Z", workers=[worker]),
-        worker_bindings=[binding],
-        binding_backend="acp",
+        worker_bindings=[continuity],
+        binding_backend="herdr",
     )
+    binding = replace(
+        continuity,
+        backend="acp",
+        turn_target_kind="acp_session_id",
+        turn_target_value="session-private",
+        private_fingerprint="private-a",
+    )
+    upsert_worker_bindings(db_path, [binding])
     assert apply_backend_pending_observation(
         db_path,
         "host-a",

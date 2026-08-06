@@ -18,6 +18,7 @@ from ..core.turns import (
     TURN_SCHEMA_VERSION,
 )
 from .db import add_seconds, canonical_utc, read_transaction, utc_now, write_transaction
+from .projection import presentation_binding_row
 
 
 @dataclass(frozen=True)
@@ -503,13 +504,18 @@ def apply_backend_pending_observation(
             "turn_target_value": observed_turn_target_value or "",
             "choice_routes": {c.choice_id: c.picker_ordinal for c in observation.choices},
         }
-        route = _binding_route(
+        authority = _binding_route(
             conn,
             host_id,
             worker_id,
             binding_private_fingerprint or None,
         )
-        if route is None:
+        if authority is None:
+            return False
+        presentation = presentation_binding_row(
+            conn, host_id, worker_id, authority
+        )
+        if presentation is None:
             return False
         conn.execute(
             """DELETE FROM backend_pending_claims
@@ -546,7 +552,7 @@ def apply_backend_pending_observation(
                 ref,
                 revision,
                 worker_id,
-                route["route_generation"],
+                authority["route_generation"],
                 _json(private),
                 "open",
                 now,
@@ -565,7 +571,7 @@ def apply_backend_pending_observation(
                 ref,
                 revision,
                 worker_id,
-                route["route_generation"],
+                presentation["route_generation"],
                 _json(public_payload),
                 now,
             ),
@@ -578,7 +584,7 @@ def apply_backend_pending_observation(
             revision,
             observation,
             now,
-            binding=route,
+            binding=presentation,
         )
         return (
             existing is None
