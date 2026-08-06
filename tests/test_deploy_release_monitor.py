@@ -213,8 +213,15 @@ def test_success_evidence_is_one_hour_and_aggregate_only(
     transaction = tmp_path / module.TRANSACTION_ID
     monkeypatch.setattr(module, "TRANSACTION_ROOT", transaction)
     monkeypatch.setattr(module, "DEFAULT_OUTPUT", transaction / "one-hour-monitor.json")
+    monkeypatch.setattr(
+        module,
+        "MONITOR_HEARTBEAT_PATH",
+        transaction / "validation-monitor-heartbeat",
+    )
+    heartbeat_indices: list[int] = []
     monkeypatch.setattr(module, "_begin_validation", lambda: None)
     monkeypatch.setattr(module, "_finish_validation", lambda _phase: None)
+    monkeypatch.setattr(module, "_heartbeat", heartbeat_indices.append)
     monkeypatch.setattr(module, "_release_integrity_preflight", lambda: None)
     monkeypatch.setattr(module, "_release_preflight", lambda: None)
     monkeypatch.setattr(module, "_service_baseline", lambda: {"service": "private-pid"})
@@ -241,7 +248,11 @@ def test_success_evidence_is_one_hour_and_aggregate_only(
     })
     clock = [0.0]
     monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(module.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(
+        module.time,
+        "sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
     monkeypatch.setattr(sys, "argv", ["monitor"])
 
     assert module.main() == 0
@@ -250,6 +261,7 @@ def test_success_evidence_is_one_hour_and_aggregate_only(
     assert evidence["elapsed_seconds"] >= 3600
     assert evidence["required_duration_seconds"] == 3600
     assert evidence["sample_count"] >= 60
+    assert heartbeat_indices == list(range(evidence["sample_count"]))
     assert evidence["aggregate_counts_only"] is True
     assert evidence["contains_process_ids"] is False
     assert all(

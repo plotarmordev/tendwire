@@ -10,7 +10,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 PREPARE = ROOT / ".deploy/prepare-frozen-release.sh"
+DEPLOY = ROOT / ".deploy/deploy-frozen-7446533-6c0d0f5.sh"
 RESUME = ROOT / ".deploy/resume-frozen-cutover.sh"
+GUARD = ROOT / ".deploy/frozen-cutover-recovery.sh"
 
 
 def _git_repository(path: Path) -> str:
@@ -44,9 +46,6 @@ def _render_prepare(tmp_path: Path, tendwire: Path, herdres: Path) -> Path:
         ),
         "readonly HERDRES_SOURCE=/home/smith/tendwire/.worktrees/herdres-acp-route": (
             f"readonly HERDRES_SOURCE={shlex.quote(str(herdres))}"
-        ),
-        "readonly DEPLOY_SOURCE=/home/smith/tendwire/.deploy": (
-            f"readonly DEPLOY_SOURCE={shlex.quote(str(tmp_path / 'deploy'))}"
         ),
         'build_root="$(mktemp -d /tmp/frozen-acp-release.XXXXXX)"': (
             f"build_root={shlex.quote(str(tmp_path / 'build'))}"
@@ -97,7 +96,14 @@ def test_prepare_rejects_tracked_dirty_sources_before_build_or_publish(
     (dirty / "tracked.txt").write_text("dirty\n", encoding="utf-8")
 
     result = subprocess.run(
-        ["bash", "-x", script], capture_output=True, check=False, text=True
+        [
+            "/usr/bin/env", "-i", "HOME=/home/smith", "USER=smith",
+            "LOGNAME=smith", "PATH=/usr/bin:/bin", "FROZEN_ACP_CLEAN_ENV=1",
+            "/bin/bash", "-x", script,
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
     )
 
     assert result.returncode != 0
@@ -139,6 +145,77 @@ def test_resume_validates_frozen_transaction_before_authorizing_recovery() -> No
     )
 
 
+def test_prepare_packages_tooling_from_named_git_revision() -> None:
+    source = PREPARE.read_text(encoding="utf-8")
+    archive = (
+        'git -C "${TENDWIRE_SOURCE}" archive --format=tar '
+        '--output="${build_root}/tooling.tar"'
+    )
+    extract = 'tar -xf "${build_root}/tooling.tar" -C "${build_root}/tooling-source"'
+    install_release = (
+        'install -m 0555 "${DEPLOY_SOURCE}/validate-frozen-release.py"'
+    )
+    assert 'readonly DEPLOY_SOURCE="${build_root}/tooling-source/.deploy"' in source
+    assert source.index(archive) < source.index(extract) < source.index(install_release)
+    assert '"${TOOLING_REVISION}" -- .deploy' in source
+
+
+def test_release_shells_use_privileged_absolute_bash_and_sanitize_environment() -> None:
+    for path in (PREPARE, DEPLOY, RESUME, GUARD):
+        source = path.read_text(encoding="utf-8")
+        assert source.startswith("#!/bin/bash -p\nset -Eeuo pipefail\n")
+        clean_launch = "exec /usr/bin/env -i"
+        path_export = "export PATH=/usr/bin:/bin"
+        environment_reset = (
+            "unset BASH_ENV ENV CDPATH GLOBIGNORE PYTHONHOME PYTHONPATH TAR_OPTIONS"
+        )
+        assert source.index(clean_launch) < source.index(path_export)
+        assert "done < <(compgen -e)" in source[: source.index(clean_launch)]
+        assert "*) return 1 ;;" in source[: source.index(clean_launch)]
+        assert source.index(path_export) < source.index(environment_reset)
+        assert source.index(environment_reset) < source.index("readonly ")
+        launch = source[source.index(clean_launch) : source.index("fi\n", source.index(clean_launch))]
+        for forbidden in (
+            "TAR_OPTIONS", "GIT_DIR", "LD_PRELOAD", "HTTPS_PROXY", "ALL_PROXY",
+            "SSL_CERT_FILE", "SSL_CERT_DIR",
+        ):
+            assert forbidden not in launch
+        assert "/usr/bin/env bash" not in source
+
+
+def test_prepare_owns_each_publication_before_rename_and_recovers_partial_state() -> None:
+    source = PREPARE.read_text(encoding="utf-8")
+    publication_pairs = (
+        ("published_runtime=1", 'mv -T -- "${runtime_stage}" "${TENDWIRE_RUNTIME}"'),
+        ("published_release=1", 'mv -T -- "${release_stage}" "${RELEASE_ROOT}"'),
+        ("published_runner=1", 'mv -T -- "${runner_stage}" "${RUNNER_ROOT}"'),
+        (
+            "published_manifest=1",
+            'mv -T -- "${manifest_publish_tmp}" "${MANIFEST}"',
+        ),
+        (
+            "published_complete=1",
+            'mv -T -- "${complete_publish_tmp}" "${COMPLETE_MARKER}"',
+        ),
+    )
+    publication = source.index('install -d -m 0755 -- "$(dirname "${TENDWIRE_RUNTIME}")"')
+    for flag, rename in publication_pairs:
+        assert source.index(flag, publication) < source.index(rename, publication)
+    postcheck = '"${TENDWIRE_RUNTIME}/bin/python" -B -I -c'
+    marker_move = 'mv -T -- "${complete_publish_tmp}" "${COMPLETE_MARKER}"'
+    assert source.index(postcheck, publication) < source.index(marker_move, publication)
+    recovery_call = source.index("quarantine_partial_publication\n")
+    absence_gate = source.index(
+        '[[ ! -e "${TENDWIRE_RUNTIME}" && ! -L "${TENDWIRE_RUNTIME}" ]]'
+    )
+    assert recovery_call < absence_gate
+    recovery = source[source.index("quarantine_partial_publication()") : recovery_call]
+    for guard in ("ACTIVE_LINK", "TENDWIRE_CANDIDATE", "HERDRES_CANDIDATE", "TRANSACTION_ROOT"):
+        assert guard in recovery
+    assert '"${MANIFEST}" "${COMPLETE_MARKER}"' in recovery
+    assert '[[ "${present}" -ne 5 ]]' in recovery
+
+
 def test_resume_starts_and_validates_each_candidate_layer_in_order() -> None:
     source = RESUME.read_text(encoding="utf-8")
     main = source[source.index('exec 9>"${CUTOVER_LOCK}"') :]
@@ -148,15 +225,15 @@ def test_resume_starts_and_validates_each_candidate_layer_in_order() -> None:
         "systemctl --user stop herdres-gateway.service herdres.service tendwired.service",
         "systemctl --user start tendwired.service",
         "wait_tendwire",
-        '"${TOPIC_PYTHON}" "${TOPIC_TOOL}" --apply',
-        '"${TOPIC_PYTHON}" "${TOPIC_TOOL}" --gate-presenter',
-        '"${TOPIC_PYTHON}" "${TOPIC_TOOL}" --gate-existing-presenter',
+        '"${TOPIC_PYTHON}" -I "${TOPIC_TOOL}" --apply',
+        '"${TOPIC_PYTHON}" -I "${TOPIC_TOOL}" --gate-presenter',
+        '"${TOPIC_PYTHON}" -I "${TOPIC_TOOL}" --gate-existing-presenter',
         "systemctl --user start herdres.service",
         "wait_herdres",
-        '"${TOPIC_PYTHON}" "${TOPIC_TOOL}" --verify-presenter',
+        '"${TOPIC_PYTHON}" -I "${TOPIC_TOOL}" --verify-presenter',
         "systemctl --user start herdres-gateway.service",
         "wait_gateway",
-        '"${TOPIC_PYTHON}" "${TOPIC_TOOL}" --verify-gateway',
+        '"${TOPIC_PYTHON}" -I "${TOPIC_TOOL}" --verify-gateway',
         "phase_write provisional",
         "systemctl --user start acp-frozen-live-monitor.service",
         '"$(<"${PHASE_FILE}")" = validating',
