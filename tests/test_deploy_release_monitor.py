@@ -184,6 +184,47 @@ def test_monitor_requires_exactly_one_presenter_binding_and_one_non_general_foru
             module._forum_sample()
 
 
+def test_forum_sample_retries_one_transient_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_monitor()
+    result = {
+        "schema_version": 1,
+        "mode": "monitor_sample",
+        "live_workers": 1,
+        "active_bindings": 1,
+        "forum_topics": 2,
+        "general_preserved": True,
+        "unsettled_topic_claims": 0,
+        "plan_sha256": "a" * 64,
+    }
+    calls = 0
+
+    def run(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise module.subprocess.TimeoutExpired(["topic-probe"], 30)
+        return json.dumps(result)
+
+    monkeypatch.setattr(module, "_run", run)
+    assert module._forum_sample()["forum_topics"] == 2
+    assert calls == 2
+
+
+def test_forum_sample_fails_after_two_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_monitor()
+
+    def timeout(*_args, **_kwargs):
+        raise module.subprocess.TimeoutExpired(["topic-probe"], 30)
+
+    monkeypatch.setattr(module, "_run", timeout)
+    with pytest.raises(module.MonitorFailure, match="telegram_forum_probe_timeout"):
+        module._forum_sample()
+
+
 def test_monitor_has_no_under_hour_or_interval_bypass(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
