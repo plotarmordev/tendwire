@@ -1409,17 +1409,17 @@ def _discovered_spaces(payload: Any) -> list[Space]:
     return spaces
 
 
-def _agent_match(
-    pane: Mapping[str, Any],
-    agents: Sequence[Mapping[str, Any]],
+def _pane_match(
+    agent: Mapping[str, Any],
+    panes: Sequence[Mapping[str, Any]],
 ) -> tuple[Mapping[str, Any] | None, bool]:
-    pane_id = _text(pane, "pane_id")
-    terminal_id = _text(pane, "terminal_id")
+    pane_id = _text(agent, "pane_id")
+    terminal_id = _text(agent, "terminal_id")
     matches = [
-        agent
-        for agent in agents
-        if (pane_id and _text(agent, "pane_id") == pane_id)
-        or (terminal_id and _text(agent, "terminal_id") == terminal_id)
+        pane
+        for pane in panes
+        if (pane_id and _text(pane, "pane_id") == pane_id)
+        or (terminal_id and _text(pane, "terminal_id") == terminal_id)
     ]
     return (matches[0], False) if len(matches) == 1 else (None, len(matches) > 1)
 
@@ -1489,18 +1489,21 @@ def _discovered_workers(
     observed_at: str,
 ) -> tuple[list[Worker], list[WorkerBinding], int]:
     panes = _items(pane_payload, "panes")
-    agents = _items(agent_payload, "agents")
+    # Herdr detects ordinary PTY-owned agents as codex/claude/kimi too, but
+    # those rows deliberately have no authority name. Only a named agent is an
+    # ACP ownership claim. Unnamed conventional panes remain wholly outside the
+    # coordinator; malformed or unattached named claims still fail closed.
+    agents = [
+        agent
+        for agent in _items(agent_payload, "agents")
+        if _text(agent, "name") is not None
+    ]
     rows: list[dict[str, Any]] = []
-    candidate_count = 0
+    candidate_count = len(agents)
     installation_key: bytes | None = None
-    for pane in panes:
-        agent, ambiguous_agent = _agent_match(pane, agents)
-        if agent is None and not ambiguous_agent and not _text(
-            pane, "agent", "name", "label"
-        ):
-            continue
-        candidate_count += 1
-        if ambiguous_agent:
+    for agent in agents:
+        pane, ambiguous_pane = _pane_match(agent, panes)
+        if pane is None or ambiguous_pane:
             continue
         workspace_id = _text(pane, "workspace_id")
         pane_id = _text(pane, "pane_id")
@@ -1537,7 +1540,7 @@ def _discovered_workers(
         )
         rows.append(
             {
-                "agent": agent or {},
+                "agent": agent,
                 "pane": pane,
                 "private_fingerprint": private_fingerprint,
                 "stable_key": stable_key,

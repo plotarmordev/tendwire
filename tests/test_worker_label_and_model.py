@@ -15,9 +15,17 @@ def test_pane_label_is_public_but_cwd_and_target_are_private(tmp_path) -> None:
             "label": "Review pane",
             "cwd": "/private/path",
         }]},
-        {"agents": []},
+        {"agents": [{
+            "name": "reviewer",
+            "agent": "claude",
+            "status": "working",
+            "pane_id": "wR9:pA",
+            "terminal_id": "term-private",
+        }]},
         "2026-01-01T00:00:00+00:00",
     )
+    assert workers[0].name == "claude"
+    assert workers[0].status == "active"
     assert workers[0].meta["label"] == "Review pane"
     assert "private" not in str(workers[0].to_dict())
     assert bindings[0].target_value == "term-private"

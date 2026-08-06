@@ -15,6 +15,13 @@ architecture reduction is authorized, and the SQLite/security redesign is out
 of scope. Only correctness or privacy fixes found by the gates below may alter
 the candidate.
 
+The owner-authorized test-branch cutover is a provisional deployment, not an
+RC promotion. It may start the frozen candidate and a fresh Telegram cursor so
+the live gates can run, but the transaction remains `validating` until the
+uninterrupted-hour evidence and all four artifacts pass. `deployed` is reserved
+for the later immutable finalization step; provisional operation cannot be
+reported as release-ready.
+
 The ACP-enabled Herdr fork at
 `9026d9bc5a12d9adc2d9f68ebdc564133e4098b4` is the accepted Herdr baseline
 exception. Its endpoint ownership, visible-console bridge, resume behavior, and
@@ -32,8 +39,10 @@ Its line reader does not impose our hard frame bound after a limit overrun, its
 message queues are unbounded, its default stderr pipe is not drained, and its
 timeouts and lifecycle differ from the required request-scoped and fail-closed
 contracts. Tendwire therefore keeps its bounded transport while using upstream
-ACP schemas. Kimi may run only as a bounded compatibility row in the adapter
-matrix, never as development or review workforce.
+ACP schemas. The owner's later instruction not to use Kimi supersedes the
+earlier bounded-compatibility allowance for this release: no Kimi process or
+model is invoked. The adapter matrix must record Kimi as an explicit
+owner-exempt row, not as a pass, failure, or silently skipped check.
 
 ## Bound inputs
 
@@ -51,11 +60,15 @@ unit hashes. For each supported adapter (`codex`, `claude`, `gemini`, `hermes`,
 Private paths, tickets, sessions, endpoint coordinates, prompts, message IDs,
 and credentials must not enter a public artifact. A missing binary, credential,
 revision, or execution authority is a blocked adapter entry, never a generic
-pass. Exercise initialization and endpoint mint/status for all six adapters and
-record an explicit pass, fail, or blocked result for every matrix row. A failed
-or blocked row for any of `codex`, `claude`, `gemini`, `hermes`, `omp`, or
-`kimi` blocks both the RC and deployment; artifact presence alone cannot pass
-the gate.
+pass. Exercise initialization and endpoint mint/status for `codex`, `claude`,
+`gemini`, `hermes`, and `omp`, and record an explicit pass, fail, or blocked
+result for those rows. A failed or blocked row for any of those five adapters
+blocks both the RC and deployment; artifact presence alone cannot pass the
+gate. Record Kimi separately as `owner_exempt` and do not invoke it.
+The existing Kimi-labelled Telegram bot may be identity-checked and polled only
+as a compatibility routing receiver. That does not start a Kimi ACP adapter or
+model; the matrix and release summary must record
+`kimi_model_process_invocations=0`.
 
 Declare a fresh live Telegram update cursor before the first proof message.
 Only messages created after that cursor are in scope. Historical catch-up is
@@ -66,10 +79,14 @@ not required or permitted.
 Run `systemctl --user is-active herdr-server.service`. Use status-only commands
 if diagnosis is needed. Do not restart Herdr.
 
-Tendwire must use the production Herdr Unix socket only for
-`agent.acp_status`, `agent.acp_endpoint`, and the bounded visible-pane transport
-`agent.acp_console_exchange`. Record the public status, adapter identity digest,
-and endpoint generation obtained by the production coordinator. Every console
+Tendwire must use the production Herdr Unix socket only for the read-only
+lifecycle discovery methods `workspace.list`, `pane.list`, and `agent.list`,
+the ACP ownership methods `agent.acp_status` and `agent.acp_endpoint`, and the
+bounded visible-pane transport `agent.acp_console_exchange`. These lifecycle
+list methods are the allowed implementation of Herdr's worker/pane lifecycle
+ownership; they do not authorize transcript reading, event-list observation,
+or pane mutation. Record the public status, adapter identity digest, and
+endpoint generation obtained by the production coordinator. Every console
 exchange must target the current endpoint generation, hold a live coordinator
 lease, accept only bounded console input for that leased adapter session, and
 return only bounded console output to the owning process. Reject stale
@@ -107,7 +124,7 @@ The proof fails if Herdres calls Herdr directly, reads Tendwire SQLite/WAL
 files, invokes the Tendwire CLI as its transport, or if Tendwire observes the
 agent through a Herdr CLI subprocess. In every artifact,
 `direct_herdr_calls=0` means Herdres made zero direct Herdr calls; it does not
-disable Tendwire's three allowed production socket methods.
+disable Tendwire's six allowed production socket methods.
 
 ## Deterministic full-process fault proof
 

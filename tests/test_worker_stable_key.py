@@ -31,7 +31,18 @@ def _config(tmp_path) -> Config:
     return Config(host_id="host", data_dir=tmp_path, db_path=tmp_path / "db.sqlite")
 
 
-def _discover(tmp_path, panes, agents=()):
+def _discover(tmp_path, panes, agents=None):
+    if agents is None:
+        agents = [
+            {
+                "name": pane["agent"],
+                "agent": pane["agent"],
+                "pane_id": pane.get("pane_id"),
+                "terminal_id": pane.get("terminal_id"),
+            }
+            for pane in panes
+            if pane.get("agent")
+        ]
     workers, bindings, _omissions = _discovered_workers(
         _config(tmp_path),
         {"panes": panes},
@@ -111,7 +122,13 @@ def test_duplicate_canonical_pane_identity_is_omitted_before_snapshot_save(tmp_p
         _pane(terminal_id="second", agent="B"),
     ]
     workers, bindings, omissions = _discovered_workers(
-        _config(tmp_path), {"panes": panes}, {"agents": []}, OBSERVED_AT
+        _config(tmp_path),
+        {"panes": panes},
+        {"agents": [
+            {"name": "A", "pane_id": "wR9:pA", "terminal_id": "first"},
+            {"name": "B", "pane_id": "wR9:pA", "terminal_id": "second"},
+        ]},
+        OBSERVED_AT,
     )
     assert workers == []
     assert bindings == []
@@ -139,12 +156,166 @@ def test_irrelevant_shell_pane_does_not_degrade_valid_agent_discovery(tmp_path) 
     workers, bindings, omissions = _discovered_workers(
         _config(tmp_path),
         {"panes": [_pane(), shell]},
-        {"agents": []},
+        {"agents": [{
+            "name": "codex",
+            "agent": "codex",
+            "pane_id": "wR9:pA",
+            "terminal_id": "term-one",
+        }]},
         OBSERVED_AT,
     )
     assert len(workers) == len(bindings) == 1
     assert workers[0].name == "codex"
     assert omissions == 0
+
+
+def _conventional_rows() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    panes = []
+    agents = []
+    for index, kind in enumerate(("codex", "claude", "kimi"), 1):
+        pane_id = f"wR9:p{index}"
+        terminal_id = f"term-{index}"
+        panes.append({
+            "workspace_id": "wR9",
+            "pane_id": pane_id,
+            "terminal_id": terminal_id,
+            "agent": kind,
+            "label": kind,
+        })
+        agents.append({
+            "pane_id": pane_id,
+            "terminal_id": terminal_id,
+            "agent": kind,
+        })
+    return panes, agents
+
+
+def test_unnamed_conventional_agents_are_outside_acp_discovery(tmp_path) -> None:
+    panes, agents = _conventional_rows()
+    workers, bindings, omissions = _discovered_workers(
+        _config(tmp_path),
+        {"panes": panes},
+        {"agents": agents},
+        OBSERVED_AT,
+    )
+
+    assert workers == []
+    assert bindings == []
+    assert omissions == 0
+
+
+def test_mixed_discovery_keeps_only_named_acp_authority(tmp_path) -> None:
+    panes, agents = _conventional_rows()
+    panes.append(_pane(pane_id="wR9:pA", terminal_id="term-acp", agent="codex"))
+    agents.append({
+        "name": "reviewer",
+        "pane_id": "wR9:pA",
+        "terminal_id": "term-acp",
+        "agent": "codex",
+    })
+
+    workers, bindings, omissions = _discovered_workers(
+        _config(tmp_path),
+        {"panes": panes},
+        {"agents": agents},
+        OBSERVED_AT,
+    )
+
+    assert [worker.name for worker in workers] == ["codex"]
+    assert len(bindings) == 1
+    assert bindings[0].target_value == "term-acp"
+    assert omissions == 0
+
+
+def test_unnamed_conventional_agents_do_not_degrade_required_start(tmp_path) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    panes, agents = _conventional_rows()
+    endpoint_calls = 0
+
+    class LifecycleClient:
+        def workspace_list(self, *, timeout): return [{"id": "wR9"}]
+        def pane_list(self, *, timeout): return panes
+        def agent_list(self, *, timeout): return agents
+        def close(self): return None
+
+    class EndpointClient:
+        def agent_acp_endpoint(self, _target, *, timeout):
+            nonlocal endpoint_calls
+            endpoint_calls += 1
+            raise AssertionError("conventional agent reached ACP endpoint discovery")
+
+        def close(self): return None
+
+    supervisor = AcpSupervisor(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        discovery_client_factory=lambda _config: LifecycleClient(),
+        connection_factory=lambda *_args, **_kwargs: object(),
+        reconcile_interval=60.0,
+    ).start()
+    try:
+        health = supervisor.status()
+        assert health["healthy"] is True
+        assert health["worker_count"] == 0
+        assert health["failure_type"] is None
+        assert endpoint_calls == 0
+        snapshot = latest_snapshot(config.db_path, config.host_id)
+        assert snapshot is not None
+        assert snapshot.backend_health[0].status == "healthy"
+        assert snapshot.backend_health[0].outcome == "healthy_non_empty"
+    finally:
+        supervisor.stop()
+
+
+def test_named_acp_authority_endpoint_failure_remains_fatal(tmp_path) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    pane = _pane(agent="codex")
+    endpoint_calls = 0
+
+    class LifecycleClient:
+        def workspace_list(self, *, timeout): return [{"id": "wR9"}]
+        def pane_list(self, *, timeout): return [pane]
+        def agent_list(self, *, timeout):
+            return [{
+                "name": "reviewer",
+                "agent": "codex",
+                "pane_id": pane["pane_id"],
+                "terminal_id": pane["terminal_id"],
+            }]
+
+        def close(self): return None
+
+    class EndpointClient:
+        def agent_acp_endpoint(self, _target, *, timeout):
+            nonlocal endpoint_calls
+            endpoint_calls += 1
+            raise AcpCoordinatorError("named ACP endpoint unavailable")
+
+        def close(self): return None
+
+    supervisor = AcpSupervisor(
+        config,
+        threading.Event(),
+        endpoint_client_factory=lambda _config: EndpointClient(),
+        discovery_client_factory=lambda _config: LifecycleClient(),
+        connection_factory=lambda *_args, **_kwargs: object(),
+        reconcile_interval=60.0,
+    )
+    with pytest.raises(AcpCoordinatorError, match="failed to attach"):
+        supervisor.start()
+    assert endpoint_calls == 1
+    snapshot = latest_snapshot(config.db_path, config.host_id)
+    assert snapshot is not None
+    assert [worker.name for worker in snapshot.workers] == ["codex"]
+    assert snapshot.backend_health[0].status == "healthy"
+    bindings = list_worker_bindings(config.db_path, config.host_id, backend="herdr")
+    assert len(bindings) == 1
+    assert bindings[0].target_value == "term-one"
 
 
 def test_closed_and_unknown_statuses_are_projected_canonically(tmp_path) -> None:
@@ -194,7 +365,8 @@ def test_discovery_omissions_publish_degraded_health_and_fail_required_start(tmp
     class MalformedLifecycleClient:
         def workspace_list(self, *, timeout): return [{"id": "wR9"}]
         def pane_list(self, *, timeout): return [_pane(pane_id="not-canonical")]
-        def agent_list(self, *, timeout): return []
+        def agent_list(self, *, timeout):
+            return [{"name": "reviewer", "terminal_id": "term-one"}]
         def close(self): return None
 
     supervisor = AcpSupervisor(
@@ -224,7 +396,13 @@ def test_supervisor_reconcile_reuses_exact_binding_then_rebinds_target_churn(tmp
 
         def workspace_list(self, *, timeout): return [{"id": "wR9"}]
         def pane_list(self, *, timeout): return [dict(self.pane)]
-        def agent_list(self, *, timeout): return []
+        def agent_list(self, *, timeout):
+            return [{
+                "name": self.pane["agent"],
+                "agent": self.pane["agent"],
+                "pane_id": self.pane["pane_id"],
+                "terminal_id": self.pane["terminal_id"],
+            }]
         def close(self): return None
 
     client = MutableLifecycleClient()
