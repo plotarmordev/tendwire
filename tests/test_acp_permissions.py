@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 import tendwire.command_submission as command_submission
+import tendwire.store.pending as pending_store
 from tendwire.backends.acp_permissions import (
     AcpPermissionBroker,
     AcpPermissionBrokerError,
@@ -412,7 +413,10 @@ def test_older_pending_close_cannot_close_newer_observation(tmp_path: Path) -> N
     ][0]["question"] == "Still current"
 
 
-def test_retention_deletes_settled_pending_claim_before_prompt(tmp_path: Path) -> None:
+def test_retention_deletes_settled_pending_claim_before_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pending_store, "utc_now", lambda: "2026-08-05T00:00:03Z")
     config, worker, _session_id, _broker = _setup(tmp_path)
     assert config.db_path is not None
     binding = list_worker_bindings(
