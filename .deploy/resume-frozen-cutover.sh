@@ -27,15 +27,15 @@ unset FROZEN_ACP_CLEAN_ENV
 export PATH=/usr/bin:/bin
 unset BASH_ENV ENV CDPATH GLOBIGNORE PYTHONHOME PYTHONPATH TAR_OPTIONS
 
-readonly RELEASE_ID=9026d9bc-7446533-3659994-r3
+readonly RELEASE_ID=9026d9bc-7446533-3659994-r4
 readonly NEW_RELEASE=/home/smith/.local/share/acp-runtime/releases/${RELEASE_ID}
 readonly RELEASE_MANIFEST=/home/smith/.local/share/acp-runtime/manifests/${RELEASE_ID}.json
-readonly PREVIOUS_RELEASE=/home/smith/.local/share/acp-runtime/releases/9026d9bc-7446533-3659994-r2
-readonly PREVIOUS_RUNTIME=/home/smith/.local/share/tendwire-runtime/acp-7446533-3659994-r2
-readonly PREVIOUS_MANIFEST=/home/smith/.local/share/acp-runtime/manifests/9026d9bc-7446533-3659994-r2.json
+readonly PREVIOUS_RELEASE=/home/smith/.local/share/acp-runtime/releases/9026d9bc-7446533-3659994-r3
+readonly PREVIOUS_RUNTIME=/home/smith/.local/share/tendwire-runtime/acp-7446533-3659994-r3
+readonly PREVIOUS_MANIFEST=/home/smith/.local/share/acp-runtime/manifests/9026d9bc-7446533-3659994-r3.json
 readonly ACTIVE_LINK=/home/smith/.local/share/acp-runtime/active
 readonly HERDR_BINARY=/home/smith/.local/share/herdr-runtime/acp-9026d9bc/herdr
-readonly TENDWIRE_RUNTIME=/home/smith/.local/share/tendwire-runtime/acp-7446533-3659994-r3
+readonly TENDWIRE_RUNTIME=/home/smith/.local/share/tendwire-runtime/acp-7446533-3659994-r4
 readonly TENDWIRE_SOCKET=/home/smith/.local/share/tendwire/tendwire.sock
 readonly TENDWIRE_DB=/home/smith/.local/share/tendwire/candidates/7446533/tendwire.db
 readonly HERDRES_STATE=/home/smith/.local/share/herdres/candidates/3659994/state.json
@@ -53,10 +53,12 @@ readonly USER_UNITS=/home/smith/.config/systemd/user
 readonly LIVE_MONITOR_UNIT=${USER_UNITS}/acp-frozen-live-monitor.service
 readonly RECOVERY_UNIT=${USER_UNITS}/acp-frozen-release-recovery.service
 readonly LEGACY_RECOVERY_OVERRIDE=${USER_UNITS}/acp-cutover-recovery.service.d/99-frozen-acp-release.conf
-readonly PRIVATE_ENV=/home/smith/.config/herdres/frozen-7446533-3659994-r3.env
-readonly PREVIOUS_PRIVATE_ENV=/home/smith/.config/herdres/frozen-7446533-3659994-r2.env
-readonly PREVIOUS_VALIDATION=${TRANSACTION_ROOT}/release-validation.r2.json
-readonly PREVIOUS_VALIDATION_SHA256=f9150a0bf106cee8e3c59ad3c3164ee21f98d7bfbc57115f1ae26ecebbcbfb66
+readonly PRIVATE_ENV=/home/smith/.config/herdres/frozen-7446533-3659994-r4.env
+readonly PREVIOUS_PRIVATE_ENV=/home/smith/.config/herdres/frozen-7446533-3659994-r3.env
+readonly PREVIOUS_VALIDATION=${TRANSACTION_ROOT}/release-validation.r3.json
+readonly PREVIOUS_VALIDATION_SHA256=e41fec9a5ae040197c43734858782edea5ba95faa54249d231abdc130840992c
+readonly CHAIN_VALIDATION=${TRANSACTION_ROOT}/release-validation.r2.json
+readonly CHAIN_VALIDATION_SHA256=f9150a0bf106cee8e3c59ad3c3164ee21f98d7bfbc57115f1ae26ecebbcbfb66
 readonly BASE_VALIDATION=${TRANSACTION_ROOT}/release-validation.6c0d0f5.json
 readonly BASE_VALIDATION_SHA256=cddd693567bec5152248896eb518e989ec27b4ba1f8325b359d1f6349ec214f1
 readonly CUTOVER_LOCK=/home/smith/.local/state/acp-cutover/frozen-7446533-6c0d0f5.lock
@@ -103,6 +105,10 @@ assert_validation_file() {
 
 assert_previous_validation_file() {
     assert_validation_file "$1" "${PREVIOUS_VALIDATION_SHA256}"
+}
+
+assert_chain_validation_file() {
+    assert_validation_file "$1" "${CHAIN_VALIDATION_SHA256}"
 }
 
 assert_base_validation_file() {
@@ -204,6 +210,7 @@ assert_effective_units() {
         assert_dependency acp-frozen-release-recovery.service Before "${unit}"
         assert_dependency acp-frozen-live-monitor.service Requires "${unit}"
         assert_dependency acp-frozen-live-monitor.service After "${unit}"
+        test "$(systemctl --user show --value -p Restart "${unit}")" = no
     done
     assert_dependency acp-frozen-live-monitor.service Requires herdr-server.service
     assert_dependency acp-frozen-live-monitor.service After herdr-server.service
@@ -422,6 +429,7 @@ rebind_forward_release() {
     local current
     local rotated=0
     assert_base_validation_file "${BASE_VALIDATION}"
+    assert_chain_validation_file "${CHAIN_VALIDATION}"
     current="$(readlink -f "${ACTIVE_LINK}")"
     if [[ "${current}" = "${NEW_RELEASE}" ]]; then
         assert_previous_validation_file "${PREVIOUS_VALIDATION}"
@@ -606,6 +614,7 @@ assert_active_validation() {
     local unit unit_pid unit_start validation_snapshot_state
     test "$(readlink -f "${ACTIVE_LINK}")" = "${NEW_RELEASE}"
     assert_base_validation_file "${BASE_VALIDATION}"
+    assert_chain_validation_file "${CHAIN_VALIDATION}"
     assert_previous_validation_file "${PREVIOUS_VALIDATION}"
     test -f "${TRANSACTION_ROOT}/release-validation.json"
     test ! -L "${TRANSACTION_ROOT}/release-validation.json"

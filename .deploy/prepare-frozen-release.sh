@@ -30,23 +30,23 @@ readonly HERDRES_REVISION=36599949daa64f68494d04f96a3bfee31904a804
 readonly HERDR_REVISION=9026d9bc5a12d9adc2d9f68ebdc564133e4098b4
 readonly HERDR_BINARY=/home/smith/.local/share/herdr-runtime/acp-9026d9bc/herdr
 readonly HERDR_SHA256=2e58e1b11ed289d6a99ba36b80867e5e5d5920d03406bb40a1113e2d391f386f
-readonly TENDWIRE_RUNTIME=/home/smith/.local/share/tendwire-runtime/acp-7446533-3659994-r3
-readonly RELEASE_ROOT=/home/smith/.local/share/acp-runtime/releases/9026d9bc-7446533-3659994-r3
-readonly MANIFEST=/home/smith/.local/share/acp-runtime/manifests/9026d9bc-7446533-3659994-r3.json
-readonly PREPARE_LOCK=/home/smith/.local/state/acp-cutover/prepare-9026d9bc-7446533-3659994-r3.lock
-readonly RUNNER_ROOT=/home/smith/.local/share/acp-runtime/runners/9026d9bc-7446533-3659994-r3
+readonly TENDWIRE_RUNTIME=/home/smith/.local/share/tendwire-runtime/acp-7446533-3659994-r4
+readonly RELEASE_ROOT=/home/smith/.local/share/acp-runtime/releases/9026d9bc-7446533-3659994-r4
+readonly MANIFEST=/home/smith/.local/share/acp-runtime/manifests/9026d9bc-7446533-3659994-r4.json
+readonly PREPARE_LOCK=/home/smith/.local/state/acp-cutover/prepare-9026d9bc-7446533-3659994-r4.lock
+readonly RUNNER_ROOT=/home/smith/.local/share/acp-runtime/runners/9026d9bc-7446533-3659994-r4
 readonly ACTIVE_LINK=/home/smith/.local/share/acp-runtime/active
 readonly TENDWIRE_CANDIDATE=/home/smith/.local/share/tendwire/candidates/7446533
 readonly HERDRES_CANDIDATE=/home/smith/.local/share/herdres/candidates/3659994
 readonly TRANSACTION_ROOT=/home/smith/.local/state/acp-cutover/frozen-7446533-6c0d0f5
-readonly COMPLETE_MARKER=/home/smith/.local/share/acp-runtime/prepared/9026d9bc-7446533-3659994-r3.complete
+readonly COMPLETE_MARKER=/home/smith/.local/share/acp-runtime/prepared/9026d9bc-7446533-3659994-r4.complete
 readonly TOOLING_REVISION="$(git -C "${TENDWIRE_SOURCE}" rev-parse HEAD)"
 
 build_root="$(mktemp -d /tmp/frozen-acp-release.XXXXXX)"
 readonly DEPLOY_SOURCE="${build_root}/tooling-source/.deploy"
-runtime_stage="$(dirname "${TENDWIRE_RUNTIME}")/.acp-7446533-3659994-r3.stage.$$"
-release_stage="$(dirname "${RELEASE_ROOT}")/.9026d9bc-7446533-3659994-r3.stage.$$"
-runner_stage="$(dirname "${RUNNER_ROOT}")/.9026d9bc-7446533-3659994-r3.stage.$$"
+runtime_stage="$(dirname "${TENDWIRE_RUNTIME}")/.acp-7446533-3659994-r4.stage.$$"
+release_stage="$(dirname "${RELEASE_ROOT}")/.9026d9bc-7446533-3659994-r4.stage.$$"
+runner_stage="$(dirname "${RUNNER_ROOT}")/.9026d9bc-7446533-3659994-r4.stage.$$"
 manifest_stage="${build_root}/release-manifest.json"
 manifest_publish_tmp="${MANIFEST}.tmp.$$"
 complete_publish_tmp="${COMPLETE_MARKER}.tmp.$$"
@@ -87,7 +87,7 @@ quarantine_partial_publication() {
         fail "partial publication has a Herdres candidate"
     [[ ! -e "${TRANSACTION_ROOT}" && ! -L "${TRANSACTION_ROOT}" ]] || \
         fail "partial publication has a cutover transaction"
-    failure_root="/home/smith/.local/share/acp-runtime/prepare-failures/$(date -u +%Y%m%dT%H%M%SZ)-9026d9bc-7446533-3659994-r3-$$"
+    failure_root="/home/smith/.local/share/acp-runtime/prepare-failures/$(date -u +%Y%m%dT%H%M%SZ)-9026d9bc-7446533-3659994-r4-$$"
     install -d -m 0700 -- "${failure_root}"
     if [[ -e "${TENDWIRE_RUNTIME}" || -L "${TENDWIRE_RUNTIME}" ]]; then
         mv -T -- "${TENDWIRE_RUNTIME}" "${failure_root}/tendwire-runtime"
@@ -123,25 +123,25 @@ cleanup_failed_publication() {
         mv -T -- "${manifest_publish_tmp}" "$(dirname "${MANIFEST}")/.failed-release-manifest.tmp.$$"
     fi
     if [[ "${published_manifest}" -eq 1 && -f "${MANIFEST}" ]]; then
-        mv -T -- "${MANIFEST}" "$(dirname "${MANIFEST}")/.failed-9026d9bc-7446533-3659994-r3.json.$$"
+        mv -T -- "${MANIFEST}" "$(dirname "${MANIFEST}")/.failed-9026d9bc-7446533-3659994-r4.json.$$"
     fi
     if [[ "${published_runner}" -eq 1 && -d "${RUNNER_ROOT}" ]]; then
-        mv -T -- "${RUNNER_ROOT}" "$(dirname "${RUNNER_ROOT}")/.failed-runner-9026d9bc-7446533-3659994-r3.$$"
+        mv -T -- "${RUNNER_ROOT}" "$(dirname "${RUNNER_ROOT}")/.failed-runner-9026d9bc-7446533-3659994-r4.$$"
     fi
     if [[ "${published_release}" -eq 1 && -d "${RELEASE_ROOT}" ]]; then
-        mv -T -- "${RELEASE_ROOT}" "$(dirname "${RELEASE_ROOT}")/.failed-9026d9bc-7446533-3659994-r3.$$"
+        mv -T -- "${RELEASE_ROOT}" "$(dirname "${RELEASE_ROOT}")/.failed-9026d9bc-7446533-3659994-r4.$$"
     fi
     if [[ "${published_runtime}" -eq 1 && -d "${TENDWIRE_RUNTIME}" ]]; then
-        mv -T -- "${TENDWIRE_RUNTIME}" "$(dirname "${TENDWIRE_RUNTIME}")/.failed-acp-7446533-3659994-r3.$$"
+        mv -T -- "${TENDWIRE_RUNTIME}" "$(dirname "${TENDWIRE_RUNTIME}")/.failed-acp-7446533-3659994-r4.$$"
     fi
     if [[ "${runtime_stage_created}" -eq 1 && -d "${runtime_stage}" ]]; then
-        mv -T -- "${runtime_stage}" "$(dirname "${runtime_stage}")/.failed-acp-7446533-3659994-r3.stage.$$"
+        mv -T -- "${runtime_stage}" "$(dirname "${runtime_stage}")/.failed-acp-7446533-3659994-r4.stage.$$"
     fi
     if [[ "${release_stage_created}" -eq 1 && -d "${release_stage}" ]]; then
-        mv -T -- "${release_stage}" "$(dirname "${release_stage}")/.failed-9026d9bc-7446533-3659994-r3.stage.$$"
+        mv -T -- "${release_stage}" "$(dirname "${release_stage}")/.failed-9026d9bc-7446533-3659994-r4.stage.$$"
     fi
     if [[ "${runner_stage_created}" -eq 1 && -d "${runner_stage}" ]]; then
-        mv -T -- "${runner_stage}" "$(dirname "${runner_stage}")/.failed-runner-9026d9bc-7446533-3659994-r3.stage.$$"
+        mv -T -- "${runner_stage}" "$(dirname "${runner_stage}")/.failed-runner-9026d9bc-7446533-3659994-r4.stage.$$"
     fi
     exit "${status}"
 }
