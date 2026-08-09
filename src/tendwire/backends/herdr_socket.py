@@ -110,7 +110,10 @@ class HerdrSocketClient:
         """Send one strictly correlated request and return its raw result payload."""
         try:
             request_id, deadline = self._send_request(method, params, timeout=timeout)
-            response = self._read_response(request_id, deadline=deadline)
+            line = self._read_line(deadline=deadline)
+            response = parse_json_line(line)
+            response = validate_server_envelope(response)
+            ensure_response_id(response, request_id)
             if is_error_response(response):
                 raise HerdrErrorResponse(error_payload(response), request_id)
             return result_payload(response)
@@ -236,20 +239,6 @@ class HerdrSocketClient:
         except OSError as exc:
             self.close()
             raise HerdrSocketDisconnectedError("Herdr socket disconnected during write") from exc
-
-    def _read_response(
-        self,
-        request_id: str,
-        *,
-        deadline: float,
-    ) -> dict[str, Any]:
-        envelope = self._read_server_envelope(deadline=deadline)
-        ensure_response_id(envelope, request_id)
-        return envelope
-
-    def _read_server_envelope(self, *, deadline: float) -> dict[str, Any]:
-        envelope = parse_json_line(self._read_line(deadline=deadline))
-        return validate_server_envelope(envelope)
 
     def _read_line(self, *, deadline: float) -> bytes:
         while True:
