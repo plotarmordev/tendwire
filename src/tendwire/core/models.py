@@ -579,11 +579,11 @@ def _looks_like_raw_command(value: str) -> bool:
         return False
     if any(ord(char) < 32 or 0x80 <= ord(char) <= 0x9F for char in text):
         return True
-    if _SHELL_META_RE.search(text):
-        return True
-    if _RAW_COMMAND_HEAD_RE.search(text):
-        return True
-    if _RAW_COMMAND_OPTION_RE.search(text):
+    if (
+        _SHELL_META_RE.search(text)
+        or _RAW_COMMAND_HEAD_RE.search(text)
+        or _RAW_COMMAND_OPTION_RE.search(text)
+    ):
         return True
     first = text.split(maxsplit=1)[0]
     return ("/" in first or first.endswith((".bat", ".cmd", ".exe", ".py", ".sh"))) and " " in text
@@ -628,14 +628,18 @@ def utc_timestamp(dt: datetime | None = None) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
-def stable_json_dumps(value: Any, *, indent: int | None = None) -> str:
+def _deterministic_json_dumps(value: Any, *, indent: int | None = None) -> str:
     return json.dumps(
-        sanitize_forbidden_fields(value),
+        value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
         indent=indent,
     )
+
+
+def stable_json_dumps(value: Any, *, indent: int | None = None) -> str:
+    return _deterministic_json_dumps(sanitize_forbidden_fields(value), indent=indent)
 
 
 def worker_binding_private_fingerprint(
@@ -675,13 +679,11 @@ def sanitize_forbidden_fields(value: Any) -> Any:
     if isinstance(value, datetime):
         return utc_timestamp(value)
     if isinstance(value, Mapping):
-        sanitized: dict[str, Any] = {}
-        for key, item in value.items():
-            if _is_forbidden_field_name(key):
-                continue
-            key_text = str(key)
-            sanitized[key_text] = sanitize_forbidden_fields(item)
-        return sanitized
+        return {
+            str(key): sanitize_forbidden_fields(item)
+            for key, item in value.items()
+            if not _is_forbidden_field_name(key)
+        }
     if isinstance(value, tuple | list):
         return [sanitize_forbidden_fields(item) for item in value]
     if value is None or isinstance(value, str | int | float | bool):
@@ -954,13 +956,7 @@ def sanitize_public_mapping(value: Any, *, backend_neutral: bool = False) -> dic
     return clean if isinstance(clean, dict) else {}
 
 def public_json_dumps(value: Any, *, indent: int | None = None) -> str:
-    return json.dumps(
-        sanitize_public_value(value),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        indent=indent,
-    )
+    return _deterministic_json_dumps(sanitize_public_value(value), indent=indent)
 
 
 def _string_value(value: Any, default: str = "") -> str:
@@ -1018,9 +1014,10 @@ def _public_safe_backend_message(value: Any) -> str:
         "stdout",
         "token",
     }
-    if tokens & sensitive_markers:
-        return "Backend health details redacted"
-    if tokens & (_TEXT_FORBIDDEN_FIELD_NAMES - {"command"}):
+    if (
+        tokens & sensitive_markers
+        or tokens & (_TEXT_FORBIDDEN_FIELD_NAMES - {"command"})
+    ):
         return "Backend health details redacted"
     if len(collapsed) > 160:
         return collapsed[:157].rstrip() + "..."
@@ -1124,7 +1121,7 @@ class SuggestedAction:
         payload = {
             "action_id": self.action_id,
             "label": self.label,
-            "params": sanitize_public_mapping(self.params),
+            "params": self.params,
         }
         public_tendwire_action = _public_tendwire_action_value(self.tendwire_action)
         if public_tendwire_action is not None:
@@ -1188,7 +1185,7 @@ class Space:
             "updated_at": self.updated_at,
             "status_line": self.status_line,
             "fingerprint": self.fingerprint,
-            "meta": sanitize_public_mapping(self.meta),
+            "meta": self.meta,
         })
 
     @classmethod
@@ -1260,7 +1257,7 @@ class Worker:
             "last_seen_at": self.last_seen_at,
             "summary": self.summary,
             "fingerprint": self.fingerprint,
-            "meta": sanitize_public_mapping(self.meta),
+            "meta": self.meta,
         })
 
     @classmethod
@@ -1352,7 +1349,7 @@ class AttentionSignal:
             "updated_at": self.updated_at,
             "suggested_actions": [action.to_dict() for action in self.suggested_actions],
             "fingerprint": self.fingerprint,
-            "meta": sanitize_public_mapping(self.meta),
+            "meta": self.meta,
         })
 
     @classmethod
