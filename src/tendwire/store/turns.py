@@ -54,6 +54,9 @@ from .projection import presentation_binding_row
 from .receipts import link_submission_to_projected_turn_conn
 
 
+_MAX_PUBLIC_PAYLOAD_BYTES = 850_000
+
+
 @dataclass(frozen=True)
 class TurnRefreshApplyResult:
     updated: int
@@ -102,32 +105,23 @@ def _page_spans(text: str) -> list[tuple[int, int, int, int]]:
 
 def _field_descriptor(revision: str, field: str, text: str | None) -> dict[str, Any]:
     if text is None:
-        return {
-            "availability": "absent",
-            "inline": None,
-            "char_length": 0,
-            "byte_length": 0,
-            "page_count": 0,
-            "first_cursor": None,
-        }
-    byte_length = len(text.encode("utf-8"))
-    if byte_length <= TURN_CONTENT_PAGE_MAX_UTF8_BYTES:
-        return {
-            "availability": "complete",
-            "inline": text,
-            "char_length": len(text),
-            "byte_length": byte_length,
-            "page_count": 0,
-            "first_cursor": None,
-        }
-    pages = _page_spans(text)
+        char_length = byte_length = 0
+        pages: list[tuple[int, int, int, int]] = []
+    else:
+        char_length = len(text)
+        byte_length = len(text.encode("utf-8"))
+        pages = (
+            _page_spans(text)
+            if byte_length > TURN_CONTENT_PAGE_MAX_UTF8_BYTES
+            else []
+        )
     return {
-        "availability": "complete",
-        "inline": None,
-        "char_length": len(text),
+        "availability": "absent" if text is None else "complete",
+        "inline": text if text is not None and not pages else None,
+        "char_length": char_length,
         "byte_length": byte_length,
         "page_count": len(pages),
-        "first_cursor": content_cursor(revision, field, 0),
+        "first_cursor": content_cursor(revision, field, 0) if pages else None,
     }
 
 
@@ -203,6 +197,16 @@ def _sequence(
     if row is None:
         raise RuntimeError("route unavailable")
     return str(row[0]), int(row[1])
+
+
+def _next_change_sequence(conn: Any, host_id: str) -> int:
+    return int(
+        conn.execute(
+            """SELECT COALESCE(MAX(change_sequence),0)+1
+            FROM turns WHERE host_id=?""",
+            (host_id,),
+        ).fetchone()[0]
+    )
 
 
 def _worker_public(
@@ -382,24 +386,14 @@ def _enqueue_projection(
         ).fetchone()
         if prior_head is not None:
             replaces = str(prior_head["key"])
-    if complete:
-        payload = {
-            "schema_version": 3,
-            "kind": "final_ready",
-            "created_at": now,
-            "worker": worker,
-            "route": route,
-            "turn": {**blueprint["turn"], "replaces_key": replaces},
-        }
-    else:
-        payload = {
-            "schema_version": 1,
-            "kind": "working",
-            "created_at": now,
-            "worker": worker,
-            "route": route,
-            "turn": {**blueprint["turn"], "replaces_key": replaces},
-        }
+    payload = {
+        "schema_version": blueprint["version"],
+        "kind": blueprint["kind"],
+        "created_at": now,
+        "worker": worker,
+        "route": route,
+        "turn": {**blueprint["turn"], "replaces_key": replaces},
+    }
     if previous:
         if previous["kind"] == "final_ready" and previous["status"] == "awaiting_ack":
             conn.execute(
@@ -462,7 +456,6 @@ def _apply(
     binding_row: Any = None,
 ) -> int:
     now = canonical_utc(now)
-    connector_now = now
     turn_id = str(content.get("source_turn_id") or content.get("turn_id") or "")
     if not turn_id:
         return 0
@@ -486,13 +479,7 @@ def _apply(
             or now < prior["observed_at"]
         ):
             return 0
-        change = int(
-            conn.execute(
-                """SELECT COALESCE(MAX(change_sequence),0)+1
-                FROM turns WHERE host_id=?""",
-                (host_id,),
-            ).fetchone()[0]
-        )
+        change = _next_change_sequence(conn, host_id)
         conn.execute(
             """UPDATE turns SET change_sequence=?,state='removed',observed_at=?,removed_at=?
             WHERE host_id=? AND turn_id=?""",
@@ -504,12 +491,14 @@ def _apply(
     stream = sanitize_canonical_turn_text(content.get("assistant_stream_text"))
     if stream is None:
         stream = final
+    assistant_text = final if complete else stream
+    turn_state = "complete" if complete else "working"
     revision = make_revision(
         turn_id,
         user,
-        final if complete else stream,
+        assistant_text,
         "complete" if user is not None else "absent",
-        "complete" if (final if complete else stream) is not None else "absent",
+        "complete" if assistant_text is not None else "absent",
     )
     prior = conn.execute(
         """SELECT insertion_sequence,change_sequence,state,content_revision,
@@ -524,13 +513,7 @@ def _apply(
         return 0
     if prior is not None and prior["state"] == "complete" and not complete:
         return 0
-    high = int(
-        conn.execute(
-            """SELECT COALESCE(MAX(change_sequence),0)+1
-            FROM turns WHERE host_id=?""",
-            (host_id,),
-        ).fetchone()[0]
-    )
+    high = _next_change_sequence(conn, host_id)
     insertion = (
         int(prior[0])
         if prior
@@ -551,7 +534,7 @@ def _apply(
         return 0
     if (
         prior is not None
-        and prior["state"] == ("complete" if complete else "working")
+        and prior["state"] == turn_state
         and prior["content_revision"] == revision
         and prior["worker_id"] == worker_id
         and prior["stable_key"] == binding["stable_key"]
@@ -592,7 +575,7 @@ def _apply(
             binding["partition_key"],
             insertion,
             high,
-            "complete" if complete else "working",
+            turn_state,
             _json(payload),
             revision,
             now,
@@ -609,7 +592,7 @@ def _apply(
         known_incomplete,is_current,created_at)
         VALUES(?,?,?,?,?,0,1,?)
         ON CONFLICT(host_id,turn_id,content_revision) DO UPDATE SET is_current=1""",
-        (host_id, turn_id, revision, user, final if complete else stream, now),
+        (host_id, turn_id, revision, user, assistant_text, now),
     )
     revision_id = int(
         conn.execute(
@@ -624,7 +607,7 @@ def _apply(
     )
     for field, value in (
         ("user_text", user),
-        ("assistant_final_text", final if complete else stream),
+        ("assistant_final_text", assistant_text),
     ):
         if value is None:
             continue
@@ -645,10 +628,10 @@ def _apply(
             **content,
             "user_text": user,
             "assistant_stream_text": stream,
-            "assistant_final_text": final if complete else stream,
+            "assistant_final_text": assistant_text,
         },
         complete,
-        connector_now,
+        now,
         binding=binding,
     )
     return 1
@@ -812,6 +795,19 @@ def _retention_floors(conn: Any, host_id: str) -> tuple[int, int]:
     return int(row[0]), int(row[1])
 
 
+def _worker_insertion_position(
+    position: tuple[Any, Any, Any] | None,
+) -> tuple[str, tuple[Any, ...]]:
+    if position is None:
+        return "", ()
+    return (
+        "(t.worker_id>? OR (t.worker_id=? AND "
+        "(t.insertion_sequence<? OR "
+        "(t.insertion_sequence=? AND t.turn_id>?))))",
+        (position[0], position[0], position[1], position[1], position[2]),
+    )
+
+
 def turns_payload_from_store(
     db_path: Path | str,
     host_id: str,
@@ -908,22 +904,9 @@ def turns_payload_from_store(
                 ), current_high
                 expires, position = int(clock) + TURN_LIST_CURSOR_TTL_SECONDS, None
             params: list[Any] = [str(host_id), accepted, high]
-            continuation = ""
-            if position is not None:
-                continuation = (
-                    "AND (t.worker_id>? OR (t.worker_id=? AND "
-                    "(t.insertion_sequence<? OR "
-                    "(t.insertion_sequence=? AND t.turn_id>?))))"
-                )
-                params.extend(
-                    [
-                        position[0],
-                        position[0],
-                        position[1],
-                        position[1],
-                        position[2],
-                    ]
-                )
+            position_clause, position_params = _worker_insertion_position(position)
+            continuation = f"AND {position_clause}" if position_clause else ""
+            params.extend(position_params)
             params.append(limit + 1)
             rows = conn.execute(
                 f"""SELECT t.*,r.user_text,r.assistant_final_text
@@ -949,9 +932,9 @@ def turns_payload_from_store(
     for row in rows[:limit]:
         item = _project_turn_row(row, schema_version)
         item_bytes = 1 if item[1] else len(_json(item[0]).encode("utf-8")) + 1
-        if not item[1] and item_bytes > 850_000:
+        if not item[1] and item_bytes > _MAX_PUBLIC_PAYLOAD_BYTES:
             return {**error, "status": "store_unavailable"}
-        if selected and accumulated + item_bytes > 850_000:
+        if selected and accumulated + item_bytes > _MAX_PUBLIC_PAYLOAD_BYTES:
             break
         selected.append(row)
         projected.append(item)
@@ -1015,7 +998,7 @@ def turns_payload_from_store(
             )
         }
     )
-    if len(_json(result).encode("utf-8")) > 850_000:
+    if len(_json(result).encode("utf-8")) > _MAX_PUBLIC_PAYLOAD_BYTES:
         return {**error, "status": "store_unavailable"}
     return result
 
@@ -1155,21 +1138,10 @@ def turn_delta_payload_from_store(
             if mode == "bootstrap":
                 where = "removed_at IS NULL AND insertion_sequence<=?"
                 params.append(insertion_high)
-                if position:
-                    where += (
-                        " AND (t.worker_id>? OR (t.worker_id=? AND "
-                        "(t.insertion_sequence<? OR "
-                        "(t.insertion_sequence=? AND t.turn_id>?))))"
-                    )
-                    params.extend(
-                        [
-                            position[0],
-                            position[0],
-                            position[1],
-                            position[1],
-                            position[2],
-                        ]
-                    )
+                position_clause, position_params = _worker_insertion_position(position)
+                if position_clause:
+                    where += f" AND {position_clause}"
+                params.extend(position_params)
                 order = "t.worker_id,t.insertion_sequence DESC,t.turn_id"
             else:
                 where = "change_sequence>? AND change_sequence<=?"
@@ -1222,9 +1194,9 @@ def turn_delta_payload_from_store(
             ),
         }
         item_bytes = len(_json(change).encode("utf-8")) + 1
-        if item_bytes > 850_000:
+        if item_bytes > _MAX_PUBLIC_PAYLOAD_BYTES:
             return _delta_error(host_id, "store_unavailable")
-        if selected and accumulated + item_bytes > 850_000:
+        if selected and accumulated + item_bytes > _MAX_PUBLIC_PAYLOAD_BYTES:
             break
         selected.append(row)
         changes.append(change)
@@ -1278,7 +1250,7 @@ def turn_delta_payload_from_store(
     }
     return (
         result
-        if len(_json(result).encode("utf-8")) <= 850_000
+        if len(_json(result).encode("utf-8")) <= _MAX_PUBLIC_PAYLOAD_BYTES
         else _delta_error(host_id, "store_unavailable")
     )
 
