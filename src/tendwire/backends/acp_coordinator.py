@@ -15,7 +15,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -107,6 +107,11 @@ _CONSOLE_EXCHANGE_FIELDS = frozenset({
     "type", "inputs", "outputs", "input_floor_sequence", "output_floor_sequence",
     "next_input_sequence", "next_output_sequence",
 })
+_CONSOLE_TEXT_STREAMS = {
+    "user_message": "user",
+    "agent_message": "assistant",
+    "thought": "thought",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,8 +167,7 @@ class _PromptRoute:
     def binding_fingerprint(self) -> str:
         with self._owner._reconcile_lock:
             self._owner._require_reconcile_state(allow_starting=False)
-            if self._owner._current_slot(self._worker) is not self._slot:
-                raise AcpCoordinatorError("ACP worker route is stale")
+            self._owner._require_current_slot(self._worker, self._slot)
             return str(self._slot.runtime._binding.private_fingerprint)
 
     def prompt(
@@ -219,11 +223,9 @@ class _PromptRoute:
 
         with self._owner._reconcile_lock:
             self._owner._require_reconcile_state(allow_starting=False)
-            if self._owner._current_slot(self._worker) is not self._slot:
-                raise AcpCoordinatorError("ACP worker route is stale")
+            self._owner._require_current_slot(self._worker, self._slot)
             self._owner._require_attached_generation(self._slot)
-            if self._owner._current_slot(self._worker) is not self._slot:
-                raise AcpCoordinatorError("ACP worker route is stale")
+            self._owner._require_current_slot(self._worker, self._slot)
             depth = int(getattr(self._prepared, "depth", 0))
             self._prepared.depth = depth + 1
             try:
@@ -511,6 +513,12 @@ class AcpSupervisor:
             raise AcpCoordinatorError("ACP worker runtime is unhealthy")
         return slot
 
+    def _require_current_slot(
+        self, worker: Worker, expected: _SessionSlot
+    ) -> None:
+        if self._current_slot(worker) is not expected:
+            raise AcpCoordinatorError("ACP worker route is stale")
+
     def _run(self) -> None:
         next_reconcile = time.monotonic() + self._reconcile_interval
         while not self._stop.wait(_CONSOLE_BRIDGE_INTERVAL_SECONDS):
@@ -597,15 +605,13 @@ class AcpSupervisor:
                 )
                 self._console_failure_type = type(exc).__name__
             if failure_count >= 3:
-                try:
+                # Keep the worker in the persistent failure set until a
+                # replacement slot completes a successful console pass.
+                with suppress(Exception):
                     with self._reconcile_lock:
                         self._require_reconcile_state(allow_starting=False)
                         self._retire_worker(worker_id, expected=slot)
                         self._reconcile_worker(worker_id, strict=True)
-                except Exception:
-                    # Keep the worker in the persistent failure set until a
-                    # replacement slot completes a successful console pass.
-                    pass
 
     def _bridge_console_slot(self, slot: _SessionSlot) -> None:
         with slot.lock:
@@ -1118,12 +1124,10 @@ class AcpSupervisor:
 
         with self._reconcile_lock:
             self._require_reconcile_state(allow_starting=False)
-            if self._current_slot(worker) is not slot:
-                raise AcpCoordinatorError("ACP worker route is stale")
+            self._require_current_slot(worker, slot)
             if not generation_prepared:
                 self._require_attached_generation(slot)
-            if self._current_slot(worker) is not slot:
-                raise AcpCoordinatorError("ACP worker route is stale")
+            self._require_current_slot(worker, slot)
             if steering and not slot.runtime.can_steer():
                 raise AcpCoordinatorError("ACP steering route is unavailable")
             submit = (
@@ -1204,15 +1208,11 @@ class AcpSupervisor:
             return runtime, permission_broker, owned_bindings
         except Exception:
             permission_broker.close()
-            try:
+            with suppress(Exception):
                 client.close()
-            except Exception:
-                pass
             if owned_bindings:
-                try:
+                with suppress(Exception):
                     self._retire_binding(owned_bindings[0])
-                except Exception:
-                    pass
             raise
 
     def _retire_worker(
@@ -1236,18 +1236,13 @@ class AcpSupervisor:
                 # positive-disappearance path in reconciliation may remove it.
                 if not self._console_failed_claims:
                     self._console_failure_type = None
-            self._retire_slot(slot, timeout=timeout)
-
-    def _retire_slot(self, slot: _SessionSlot, *, timeout: float | None = None) -> None:
-        """Fence one slot and retire all generation-owned resources."""
-
-        with slot.lock:
-            slot.retired = True
-            executor = slot.console_executor
-        if slot.permission_broker is not None:
-            slot.permission_broker.close()
-        executor.shutdown(wait=False, cancel_futures=True)
-        self._stop_runtime(slot.runtime, timeout=timeout)
+            with slot.lock:
+                slot.retired = True
+                executor = slot.console_executor
+            if slot.permission_broker is not None:
+                slot.permission_broker.close()
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._stop_runtime(slot.runtime, timeout=timeout)
 
     def _stop_runtime(
         self,
@@ -1261,21 +1256,18 @@ class AcpSupervisor:
             if isinstance(candidate, WorkerBinding) and candidate.backend == "acp":
                 bindings[_binding_key(candidate)] = candidate
         try:
-            runtime.stop(
-                timeout=(
-                    self.config.acp_shutdown_timeout_seconds
-                    if timeout is None
-                    else timeout
+            with suppress(Exception):
+                runtime.stop(
+                    timeout=(
+                        self.config.acp_shutdown_timeout_seconds
+                        if timeout is None
+                        else timeout
+                    )
                 )
-            )
-        except Exception:
-            pass
         finally:
             for binding in bindings.values():
-                try:
+                with suppress(Exception):
                     self._retire_binding(binding)
-                except Exception:
-                    pass
 
     def _retire_binding(self, binding: WorkerBinding) -> None:
         self._pending_binding_releases[_binding_key(binding)] = binding
@@ -1859,18 +1851,12 @@ def _append_console_events(
 def _console_event_output(
     kind: str, payload: Mapping[str, Any]
 ) -> tuple[str, str] | None:
-    if kind in {"user_message", "agent_message", "thought"}:
+    stream = _CONSOLE_TEXT_STREAMS.get(kind)
+    if stream is not None:
         delta = payload.get("text_delta")
         if not isinstance(delta, str) or not delta:
             return None
-        return (
-            {
-                "user_message": "user",
-                "agent_message": "assistant",
-                "thought": "thought",
-            }[kind],
-            delta,
-        )
+        return stream, delta
     if kind in {"tool_call", "tool_call_update"}:
         snapshot = payload.get("snapshot")
         if not isinstance(snapshot, Mapping):
