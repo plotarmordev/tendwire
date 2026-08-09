@@ -28,6 +28,12 @@ from ..store.outbox import (
     renew_connector_delivery,
     retry_connector_dead_letter,
 )
+from .protocol import (
+    CONNECTOR_PRIVATE_KEYS,
+    connector_name,
+    connector_text_is_public,
+    validated_connector_result,
+)
 
 
 def _text(value: Any, default: str = "") -> str:
@@ -63,48 +69,6 @@ _PREPARE_MAX_PARTS = 10_000
 _PREPARE_MAX_SPANS = 64
 _PREPARE_FIELDS = frozenset({"user_text", "assistant_final_text"})
 _PREPARE_VERSION_CHARS = _CONNECTOR_NAME_CHARS
-_FORBIDDEN_PUBLIC_TEXT = (
-    "backend_target",
-    "pane_id",
-    "session_id",
-    "terminal_id",
-    "chat_id",
-    "topic_id",
-    "message_id",
-    "bot_token",
-    "shell",
-    "argv",
-    "environment",
-    "stdout",
-    "stderr",
-)
-_FORBIDDEN_PROTOCOL_KEYS = frozenset(
-    {
-        "backend_target",
-        "binding_private_fingerprint",
-        "private_fingerprint",
-        "private_binding",
-        "pane_id",
-        "session_id",
-        "terminal_id",
-        "chat_id",
-        "topic_id",
-        "message_id",
-        "bot_token",
-        "credential",
-        "credentials",
-        "secret",
-        "secrets",
-        "password",
-        "api_key",
-        "socket_path",
-        "argv",
-        "environment",
-        "stdin",
-        "stdout",
-        "stderr",
-    }
-)
 _DECLARED_EXACT_TEXT_FIELDS = frozenset(
     {"assistant_stream_text", "inline", "title", "body", "label"}
 )
@@ -114,10 +78,6 @@ _PRIVATE_VALUE_RE = re.compile(
     r"(?:^|\s)/(?:home|root|etc|var|tmp|run|proc|sys|usr)/|"
     r"\b(?:sk-|gh[oprsu]_|xox[baprs]-|AKIA|AIza|glpat-|npm_|pypi-)[A-Za-z0-9_-]+)"
 )
-def _contains_forbidden_public_text(value: str) -> bool:
-    lowered = value.lower()
-    compact = "".join(char for char in lowered if char.isalnum())
-    return any(token in lowered or token.replace("_", "") in compact for token in _FORBIDDEN_PUBLIC_TEXT)
 
 
 def _opaque_token(value: Any, prefix: str) -> str:
@@ -149,7 +109,7 @@ def _protocol_copy(
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
         for raw_key, child in value.items():
-            if not isinstance(raw_key, str) or raw_key.lower() in _FORBIDDEN_PROTOCOL_KEYS:
+            if not isinstance(raw_key, str) or raw_key.lower() in CONNECTOR_PRIVATE_KEYS:
                 raise ValueError("protocol object contains a private key")
             result[raw_key] = _protocol_copy(
                 child, depth=depth + 1, budget=budget, field=raw_key
@@ -212,23 +172,13 @@ def _ref(value: Any) -> str:
     return ref
 
 
-def _name(value: Any) -> str:
-    name = _text(value)
-    if not name or len(name) > 64:
-        return ""
-    if any(char not in _CONNECTOR_NAME_CHARS for char in name):
-        return ""
-    if _contains_forbidden_public_text(name):
-        return ""
-    return name
-
 def _request_id(value: Any) -> str:
     request_id = _text(value)
     if not request_id or len(request_id) > 128:
         return ""
     if any(char not in _CONNECTOR_NAME_CHARS for char in request_id):
         return ""
-    if _contains_forbidden_public_text(request_id):
+    if not connector_text_is_public(request_id):
         return ""
     return request_id
 
@@ -279,7 +229,7 @@ class ConnectorOutboxAPI:
         ):
             return _error("invalid_params", host_id=self.host_id)
         action = data.get("action")
-        name = _name(data.get("name"))
+        name = connector_name(data.get("name"))
         if name != _TURN_FINAL_NAME or action not in {"begin", "part", "commit", "recover"}:
             return _error("invalid_params", host_id=self.host_id)
         unavailable = self._require_store(name)
@@ -318,7 +268,7 @@ class ConnectorOutboxAPI:
                 or not version
                 or len(version) > 128
                 or any(char not in _PREPARE_VERSION_CHARS for char in version)
-                or _contains_forbidden_public_text(version)
+                or not connector_text_is_public(version)
                 or isinstance(part_count, bool)
                 or not isinstance(part_count, int)
                 or part_count < 1
@@ -447,7 +397,7 @@ class ConnectorOutboxAPI:
         data = dict(params or {})
         if not _exact_fields(data, {"name"}, {"limit", "lease_seconds"}):
             return _error("invalid_params", host_id=self.host_id)
-        name = _name(data.get("name"))
+        name = connector_name(data.get("name"))
         if not name:
             return _error("invalid_params", host_id=self.host_id)
         limit = _bounded_int_or_default(
@@ -511,7 +461,7 @@ class ConnectorOutboxAPI:
         data = dict(params or {})
         if set(data) != {"name"}:
             return _error("invalid_params", host_id=self.host_id)
-        name = _name(data.get("name"))
+        name = connector_name(data.get("name"))
         if not name:
             return _error("invalid_params", host_id=self.host_id)
         unavailable = self._require_store(name)
@@ -527,7 +477,7 @@ class ConnectorOutboxAPI:
         optional: set[str] | frozenset[str] = frozenset(),
     ) -> tuple[dict[str, Any], str, str] | dict[str, Any]:
         data = dict(params or {})
-        name = _name(data.get("name"))
+        name = connector_name(data.get("name"))
         ref = _ref(data.get("ref")) or None
         if not _exact_fields(data, {"name", "ref"} | required, optional):
             return _error("invalid_params", host_id=self.host_id, name=name)
@@ -649,7 +599,7 @@ class ConnectorOutboxAPI:
             "limit",
         }:
             return _error("invalid_params", host_id=self.host_id)
-        name = _name(data.get("name"))
+        name = connector_name(data.get("name"))
         status = _text(data.get("status"))
         limit = data.get("limit")
         if (
@@ -682,7 +632,7 @@ class ConnectorOutboxAPI:
             {"schema_version", "name", "final_identity"},
         ):
             return _error("invalid_params", host_id=self.host_id)
-        name = _name(data.get("name"))
+        name = connector_name(data.get("name"))
         key = _text(data.get("key"))
         key_valid = bool(
             key.startswith(_FINAL_KEY_PREFIX)
@@ -733,4 +683,11 @@ class ConnectorOutboxAPI:
             "connector.retry": self.retry,
         }
         handler = handlers.get(method) if isinstance(method, str) else None
-        return handler(params) if handler else _error("unknown_method", host_id=self.host_id)
+        if handler is None:
+            return _error("unknown_method", host_id=self.host_id)
+        expected_name = connector_name(params.get("name")) if isinstance(params, Mapping) else ""
+        return validated_connector_result(
+            method,
+            handler(params),
+            expected_name=expected_name,
+        )

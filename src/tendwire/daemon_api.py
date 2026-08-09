@@ -37,10 +37,9 @@ from .core.turns import (
     TURN_LIST_MAX_LIMIT,
 )
 from .connectors.protocol import (
-    valid_canonical_utc as _valid_utc,
-    valid_delivery_key,
-    valid_generic_payload,
-    valid_turn_final_delivery,
+    CONNECTOR_METHODS,
+    connector_name,
+    validated_connector_result,
 )
 from .local_state import (
     EntryIdentity,
@@ -69,16 +68,7 @@ _SOCKET_STARTUP_LOCK_TIMEOUT_SECONDS = 1.0
 _SOCKET_STARTUP_LOCK_RETRY_SECONDS = 0.01
 _SERVER_LISTEN_BACKLOG = 32
 _CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
-_REVISION_RE = re.compile(r"twrev1\.[A-Za-z0-9_-]{43}")
-_FINAL_RE = re.compile(r"twfinal1\.[A-Za-z0-9_-]{43}")
-_PLAN_RE = re.compile(r"twplan1\.[A-Za-z0-9_-]{1,256}")
-_REF_RE = re.compile(r"twref1\.[A-Za-z0-9_-]{43}")
-_CONNECTOR_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _RESTORE_REVISION_RE = re.compile(r"twrev1\.[A-Za-z0-9_-]+")
-_CONNECTOR_NAME_FORBIDDEN = (
-    "backend_target", "pane_id", "session_id", "terminal_id", "chat_id", "topic_id",
-    "message_id", "bot_token", "shell", "argv", "environment", "stdout", "stderr",
-)
 _SEAL_TOKEN = object()
 
 
@@ -102,334 +92,6 @@ class _SealedResponse(dict[str, Any]):
 
     def __setattr__(self, _name: str, _value: Any) -> None:
         raise TypeError("daemon response seal is immutable")
-
-
-_CONNECTOR_PRIVATE_KEYS = frozenset(
-    {
-        "backend_target", "binding_private_fingerprint", "private_fingerprint",
-        "private_binding", "pane_id", "session_id", "terminal_id", "chat_id",
-        "topic_id", "message_id", "bot_token", "credential", "credentials",
-        "secret", "secrets", "password", "api_key", "socket_path", "argv",
-        "environment", "stdin", "stdout", "stderr",
-    }
-)
-_CONNECTOR_COMMON = frozenset({"schema_version", "ok", "status", "host_id", "name"})
-_CONNECTOR_ERROR_STATUSES = frozenset(
-    {
-        "invalid_params",
-        "invalid_payload",
-        "invalid_ref",
-        "stale_ref",
-        "store_unavailable",
-        "unknown_method",
-        "revision_not_found",
-        "stale_revision",
-        "content_unavailable",
-        "plan_not_found",
-        "plan_conflict",
-        "part_conflict",
-        "plan_incomplete",
-        "plan_not_failed",
-        "not_recoverable",
-        "request_conflict",
-        "ack_deadline_expired",
-        "not_retryable",
-    }
-)
-_CONNECTOR_RESULT_SPECS = {
-    method: (frozenset(statuses.split()), tuple(frozenset(fields.split()) for fields in shapes))
-    for method, (statuses, shapes) in {
-        "connector.poll": ("ok", ("items",)),
-        "connector.reclaim": ("ok", ("reclaimed",)),
-        "connector.renew": ("renewed", ("ref key attempt leased_until",)),
-        "connector.ack": ("acknowledged", ("ref key attempt",)),
-        "connector.release": ("released superseded", ("ref key attempt",)),
-        "connector.fail": ("retry_scheduled attempts_exhausted superseded", ("ref key attempt", "ref key attempt available_at")),
-        "connector.defer": ("deferred superseded", ("ref key attempt", "ref key attempt available_at")),
-        "connector.inspect": ("ok", ("total items",)),
-        "connector.retry": ("requeued", ("key retry_generation prior_attempt_count", "key retry_generation prior_attempt_count warning")),
-        "connector.prepare": ("ok recovered", (
-            "plan_token state generation part_count accepted_ordinals",
-            "plan_token state generation part_count ordinal accepted_ordinals",
-            "plan_token state generation part_count job_count accepted_ordinals",
-            "failed_plan_token plan_token generation content_revision state acknowledged_prefix_count executable_job_count retained_failed_job_count prior_attempt_count idempotent_replay",
-        )),
-    }.items()
-}
-
-
-def _exact_json_value(
-    value: Any, *, depth: int = 0, budget: list[int] | None = None,
-) -> Any:
-    """Copy interoperable JSON without redacting protocol-defined fields."""
-    budget = [0] if budget is None else budget
-    budget[0] += 1
-    if depth > 12 or budget[0] > 4096:
-        raise ValueError("connector response is too deeply nested")
-    if isinstance(value, str):
-        try:
-            value.encode("utf-8")
-        except UnicodeError:
-            raise ValueError("connector response contains invalid text") from None
-        return value
-    if value is None or isinstance(value, (bool, int)):
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError("connector response contains a non-finite number")
-        return value
-    if isinstance(value, Mapping):
-        result: dict[str, Any] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise ValueError("connector response keys must be strings")
-            try:
-                key.encode("utf-8")
-            except UnicodeError:
-                raise ValueError("connector response contains an invalid key") from None
-            if key.lower() in _CONNECTOR_PRIVATE_KEYS:
-                raise ValueError("connector response contains a private key")
-            result[key] = _exact_json_value(item, depth=depth + 1, budget=budget)
-        return result
-    if isinstance(value, (list, tuple)):
-        return [_exact_json_value(item, depth=depth + 1, budget=budget) for item in value]
-    raise ValueError("connector response contains a non-JSON value")
-
-
-def _closed_mapping(value: Any, fields: set[str]) -> Mapping[str, Any] | None:
-    return value if isinstance(value, Mapping) and set(value) == fields else None
-
-
-def _matches(pattern: re.Pattern[str], value: Any) -> bool:
-    return isinstance(value, str) and pattern.fullmatch(value) is not None
-
-
-def _optional_match(pattern: re.Pattern[str], value: Any) -> bool:
-    return value is None or _matches(pattern, value)
-
-
-def _exact_int(value: Any, minimum: int = 0) -> bool:
-    return type(value) is int and value >= minimum
-
-
-def _public_exact_identifier(field: str, value: Any) -> bool:
-    if not isinstance(value, str) or not value or len(value) > 512:
-        return False
-    return sanitize_public_mapping({field: value}).get(field) == value
-
-
-def _valid_connector_key(name: str, value: Any) -> bool:
-    if not isinstance(value, str) or not value:
-        return False
-    return bool(
-        valid_delivery_key(value)
-        if name == "turn-final"
-        else _public_exact_identifier("key", value)
-    )
-
-
-def _request_connector_name(value: Any) -> str:
-    if not isinstance(value, str) or not _matches(_CONNECTOR_NAME_RE, value):
-        return ""
-    lowered, compact = value.lower(), re.sub(r"[^a-z0-9]", "", value.lower())
-    return value if _public_exact_identifier("name", value) and not any(
-        token in lowered or token.replace("_", "") in compact
-        for token in _CONNECTOR_NAME_FORBIDDEN
-    ) else ""
-
-
-def _valid_ref_fields(value: Mapping[str, Any], *, dates_required: bool = False) -> bool:
-    dates = (value.get("leased_until"), value.get("available_at"))
-    return bool(
-        _matches(_REF_RE, value.get("ref"))
-        and _exact_int(value.get("attempt"), 1)
-        and all(
-            _valid_utc(item) if dates_required else item is None or _valid_utc(item)
-            for item in dates
-        )
-    )
-
-
-_INSPECT_FIELDS = frozenset(
-    {
-        "kind",
-        "key",
-        "final_identity",
-        "failed_plan_token",
-        "decision_ref",
-        "target_key",
-        "reason",
-        "attempt_count",
-        "prior_attempt_count",
-        "created_at",
-        "terminal_at",
-        "retryable",
-        "recoverable",
-    }
-)
-_INSPECT_KINDS = frozenset("working final_ready final_part decision retire".split())
-_INSPECT_REASONS = frozenset(
-    {
-        "temporary",
-        "rate_limited",
-        "provider_rejected",
-        "provider_uncertain",
-        "invalid_payload",
-        "content_unavailable",
-        "route_unavailable",
-        "provider_binding_unknown",
-        "lease_expired",
-        "ack_deadline_expired",
-        "superseded",
-        "attempts_exhausted",
-        "operator_recovery",
-    }
-)
-
-
-def _valid_inspect_item(value: Any) -> bool:
-    item = _closed_mapping(value, set(_INSPECT_FIELDS))
-    return bool(
-        item
-        and item.get("kind") in _INSPECT_KINDS
-        and _valid_connector_key("turn-final", item.get("key"))
-        and (item.get("decision_ref") is None or _public_exact_identifier("decision_ref", item["decision_ref"]))
-        and _optional_match(_FINAL_RE, item.get("final_identity"))
-        and _optional_match(_PLAN_RE, item.get("failed_plan_token"))
-        and (item.get("target_key") is None or _valid_connector_key("turn-final", item["target_key"]))
-        and _exact_int(item.get("attempt_count"))
-        and _exact_int(item.get("prior_attempt_count"))
-        and item.get("reason") in _INSPECT_REASONS
-        and _valid_utc(item.get("created_at"))
-        and _valid_utc(item.get("terminal_at"))
-        and type(item.get("retryable")) is bool
-        and type(item.get("recoverable")) is bool
-    )
-
-
-def _valid_nonpoll_connector_result(method: str, value: Mapping[str, Any]) -> bool:
-    name = str(value.get("name"))
-    if method == "connector.reclaim":
-        return type(value.get("reclaimed")) is int and value["reclaimed"] >= 0
-    if method in {
-        "connector.renew", "connector.ack", "connector.release",
-        "connector.fail", "connector.defer",
-    }:
-        available = "available_at" in value
-        needs_available = (
-            (method == "connector.fail" and value.get("status") == "retry_scheduled")
-            or (method == "connector.defer" and value.get("status") == "deferred")
-        )
-        return bool(
-            _valid_ref_fields(value)
-            and _valid_connector_key(name, value.get("key"))
-            and (method not in {"connector.fail", "connector.defer"} or available == needs_available)
-        )
-    if method == "connector.retry":
-        return bool(
-            name == "turn-final"
-            and _valid_connector_key(name, value.get("key"))
-            and _exact_int(value.get("retry_generation"), 1)
-            and _exact_int(value.get("prior_attempt_count"))
-            and value.get("warning") in {None, "provider_acceptance_may_have_occurred"}
-        )
-    if method == "connector.prepare":
-        recovering = "failed_plan_token" in value
-        accepted = value.get("accepted_ordinals", [])
-        part_count = value.get("part_count")
-        counts = (
-            "acknowledged_prefix_count", "executable_job_count",
-            "retained_failed_job_count", "prior_attempt_count",
-        )
-        return bool(
-            name == "turn-final"
-            and _matches(_PLAN_RE, value.get("plan_token"))
-            and (not recovering or _matches(_PLAN_RE, value.get("failed_plan_token")))
-            and value.get("status") == ("recovered" if recovering else "ok")
-            and _exact_int(value.get("generation"), 1)
-            and (part_count is None or _exact_int(part_count, 1) and part_count <= 10_000)
-            and ("ordinal" not in value or _exact_int(value["ordinal"]) and value["ordinal"] < part_count)
-            and ("job_count" not in value or _exact_int(value["job_count"], 1))
-            and all(field not in value or _exact_int(value[field]) for field in counts)
-            and ("content_revision" not in value or _matches(_REVISION_RE, value["content_revision"]))
-            and isinstance(accepted, list)
-            and all(_exact_int(item) and part_count is not None and item < part_count for item in accepted)
-            and accepted == sorted(set(accepted))
-            and value.get("state") in "preparing active waiting_predecessor completed failed superseded".split()
-            and ("idempotent_replay" not in value or type(value["idempotent_replay"]) is bool)
-        )
-    if method == "connector.inspect":
-        items = value.get("items")
-        return bool(
-            name == "turn-final"
-            and _exact_int(value.get("total"))
-            and isinstance(items, list)
-            and all(_valid_inspect_item(item) for item in items)
-            and value["total"] >= len(items)
-        )
-    return False
-
-
-def _validated_connector_result(
-    method: str, result: Mapping[str, Any], *, expected_name: str,
-) -> dict[str, Any]:
-    copied = _exact_json_value(result)
-    if not isinstance(copied, dict):
-        raise ValueError("connector result must be an object")
-    if (
-        not _CONNECTOR_COMMON <= copied.keys()
-        or copied.get("schema_version") != 1
-        or type(copied.get("schema_version")) is not int
-        or type(copied.get("ok")) is not bool
-    ):
-        raise ValueError("connector result has an invalid envelope")
-    result_name = copied.get("name")
-    if not _public_exact_identifier("host_id", copied.get("host_id")):
-        raise ValueError("connector result identity is invalid")
-    if copied["ok"] is False:
-        if (
-            result_name not in {"", expected_name}
-            or (bool(result_name) and not _matches(_CONNECTOR_NAME_RE, result_name))
-            or copied.keys() != _CONNECTOR_COMMON | {"message"}
-            or copied.get("message") != copied.get("status")
-            or copied.get("status") not in _CONNECTOR_ERROR_STATUSES
-        ):
-            raise ValueError("connector error has an invalid envelope")
-        return copied
-    if not expected_name or result_name != expected_name:
-        raise ValueError("connector result identity is invalid")
-    statuses, field_sets = _CONNECTOR_RESULT_SPECS[method]
-    if not any(copied.keys() == _CONNECTOR_COMMON | fields for fields in field_sets):
-        raise ValueError("connector result has unexpected fields")
-    if copied.get("status") not in statuses:
-        raise ValueError("connector result status is invalid")
-    if method == "connector.poll":
-        items = copied.get("items")
-        item_fields = {"key", "ref", "attempt", "leased_until", "available_at", "payload"}
-        if not isinstance(items, list):
-            raise ValueError("connector poll items are invalid")
-        for item in items:
-            if not isinstance(item, Mapping) or set(item) not in {frozenset(item_fields), frozenset(item_fields | {"created_at"})}:
-                raise ValueError("connector poll item has unexpected fields")
-            if (
-                not _valid_connector_key(copied["name"], item.get("key"))
-                or not _valid_ref_fields(item, dates_required=True)
-                or (
-                    item.get("created_at") is not None
-                    and not _valid_utc(item.get("created_at"))
-                )
-            ):
-                raise ValueError("connector poll item values are invalid")
-            payload = item["payload"]
-            valid_payload = (
-                valid_turn_final_delivery(payload, item["key"], copied["host_id"])
-                if copied["name"] == "turn-final" else valid_generic_payload(payload)
-            )
-            if not valid_payload:
-                raise ValueError("connector poll payload is invalid")
-    elif not _valid_nonpoll_connector_result(method, copied):
-        raise ValueError("connector result values are invalid")
-    return copied
 
 
 _REQUEST_ID_FORBIDDEN_SEGMENTS = frozenset(
@@ -518,7 +180,7 @@ _METHOD_PARAMS = {
         "turn.content.get": "schema_version turn_id content_revision field cursor",
     }.items()
 }
-_METHOD_PARAMS.update({"command.submit": None, **dict.fromkeys(_CONNECTOR_RESULT_SPECS)})
+_METHOD_PARAMS.update({"command.submit": None, **dict.fromkeys(CONNECTOR_METHODS)})
 REQUIRED_METHODS = frozenset(_METHOD_PARAMS)
 _SIMPLE_METHODS = {
     "health.get": ("_get_health", True),
@@ -617,26 +279,6 @@ def success_response(result: Mapping[str, Any] | None = None, *, request_id: Any
     if public_id is not None:
         response["id"] = public_id
     return sanitize_public_mapping(response)
-
-
-def _connector_success_response(
-    method: str,
-    result: Mapping[str, Any],
-    *,
-    expected_name: str,
-    request_id: Any = None,
-) -> dict[str, Any]:
-    response = dict(
-        schema_version=API_SCHEMA_VERSION,
-        ok=True,
-        status="ok",
-        result=_validated_connector_result(method, result, expected_name=expected_name),
-        error=None,
-    )
-    public_id = _public_request_id(request_id)
-    if public_id is not None:
-        response["id"] = public_id
-    return response
 
 
 def _daemon_identity_response(
@@ -920,13 +562,14 @@ class TendwireDaemonAPI:
                     request_id=request_id,
                 )
             if method.startswith("connector."):
-                connector_result = dict(self._connector_call(method, dict(params)))
-                return _connector_success_response(
+                connector_result = validated_connector_result(
                     method,
-                    connector_result,
-                    expected_name=_request_connector_name(params.get("name")),
-                    request_id=request_id,
+                    self._connector_call(method, dict(params)),
+                    expected_name=connector_name(params.get("name")),
                 )
+                response = success_response(request_id=request_id)
+                response["result"] = connector_result
+                return response
         except Exception as exc:  # noqa: BLE001
             return error_response(
                 "internal_error",
@@ -1003,7 +646,10 @@ def _restore_content_page_text(
     if isinstance(result, dict):
         result["text"] = text
         content_revision = original_result.get("content_revision")
-        if _matches(_RESTORE_REVISION_RE, content_revision):
+        if (
+            isinstance(content_revision, str)
+            and _RESTORE_REVISION_RE.fullmatch(content_revision)
+        ):
             result["content_revision"] = content_revision
 
 

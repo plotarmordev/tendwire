@@ -11,6 +11,7 @@ from typing import Callable
 
 import pytest
 
+import tendwire.connectors.outbox as connector_outbox_module
 from tendwire.connectors import ConnectorOutboxAPI
 from tendwire.core.models import Snapshot, Worker, WorkerBinding
 from tendwire.core.turns import PendingObservation
@@ -37,6 +38,45 @@ from .store_helpers import append_test_turn
 
 
 MAX_RESPONSE_BYTES = 850_000
+
+
+def test_dispatch_rejects_hostile_store_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        connector_outbox_module,
+        "reclaim_expired_connector_leases",
+        lambda *_args: {
+            "schema_version": 1,
+            "ok": True,
+            "status": "ok",
+            "host_id": "host-a",
+            "name": "notice",
+            "reclaimed": 0,
+            "backend_target": "private-pane",
+        },
+    )
+
+    with pytest.raises(ValueError, match="private key"):
+        ConnectorOutboxAPI(tmp_path / "store.db", "host-a").dispatch(
+            "connector.reclaim",
+            {"name": "notice"},
+        )
+
+
+def test_unknown_dispatch_method_preserves_fixed_error() -> None:
+    assert ConnectorOutboxAPI(None, "host-a").dispatch(
+        "connector.private",
+        {"name": "notice"},
+    ) == {
+        "schema_version": 1,
+        "ok": False,
+        "status": "unknown_method",
+        "host_id": "host-a",
+        "name": "",
+        "message": "unknown_method",
+    }
 
 
 def _generic(db_path: Path, *, key: str = "notice-a", payload: dict[str, object] | None = None) -> None:

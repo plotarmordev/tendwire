@@ -16,7 +16,12 @@ import pytest
 
 from tendwire.cli import main
 from tendwire.core.turns import TURN_CONTENT_PAGE_MAX_UTF8_BYTES, content_cursor
-from tendwire.connectors.protocol import valid_generic_payload, valid_turn_final_delivery
+from tendwire.connectors.protocol import (
+    connector_name,
+    valid_generic_payload,
+    valid_turn_final_delivery,
+    validated_connector_result,
+)
 from tendwire.daemon_api import DaemonAPIClient, TendwireDaemonAPI, UnixSocketJSONServer
 
 
@@ -155,6 +160,27 @@ def test_private_or_nonfinite_connector_result_fails_closed() -> None:
     )
     assert response["ok"] is False
     assert response["error"]["code"] == "internal_error"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda result: result.update(status="\ud800"), "invalid text"),
+        (lambda result: result.update({"\ud800": None}), "invalid key"),
+    ],
+)
+def test_shared_connector_validator_normalizes_invalid_unicode_failure(
+    mutation: Any,
+    message: str,
+) -> None:
+    result = _result()
+    mutation(result)
+    with pytest.raises(ValueError, match=message):
+        validated_connector_result(
+            "connector.poll",
+            result,
+            expected_name="turn-final",
+        )
 
 
 def _paged_final_ready_result() -> dict[str, Any]:
@@ -317,6 +343,26 @@ def test_connector_name_contract_accepts_uppercase_and_preserves_invalid_name_er
     )
     assert error_response["ok"] is True
     assert error_response["result"] == invalid
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ".notice",
+        True,
+        7,
+        "n" * 65,
+        "Pane_ID",
+        "p.a.n.e.i.d",
+        "BACKEND-TARGET",
+    ],
+)
+def test_connector_name_rejects_noncanonical_or_private_values(value: Any) -> None:
+    assert connector_name(value) == ""
+
+
+def test_connector_name_preserves_public_uppercase() -> None:
+    assert connector_name("Notice.V2") == "Notice.V2"
 
 
 def test_connector_poll_rejects_shape_only_noncanonical_timestamp() -> None:
