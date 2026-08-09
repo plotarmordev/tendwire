@@ -57,6 +57,11 @@ def _exact_fields(
     return set(data) >= required and set(data) <= required | set(optional)
 
 
+def _schema_one(data: Mapping[str, Any]) -> bool:
+    value = data.get("schema_version")
+    return value == 1 and not isinstance(value, bool)
+
+
 _CONNECTOR_REF_PREFIX = "twref1."
 _CONNECTOR_REF_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 _CONNECTOR_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
@@ -163,13 +168,7 @@ def _error(status: str, *, host_id: str, name: str = "") -> dict[str, Any]:
 
 
 def _ref(value: Any) -> str:
-    ref = _text(value)
-    if not ref.startswith(_CONNECTOR_REF_PREFIX):
-        return ""
-    token = ref[len(_CONNECTOR_REF_PREFIX) :]
-    if not token or any(char not in _CONNECTOR_REF_CHARS for char in token):
-        return ""
-    return ref
+    return _opaque_token(value, _CONNECTOR_REF_PREFIX)
 
 
 def _request_id(value: Any) -> str:
@@ -222,11 +221,12 @@ class ConnectorOutboxAPI:
             return _error("store_unavailable", host_id=self.host_id, name=name)
         return None
 
+    def _lease_ceiling(self, name: str) -> int:
+        return self.max_lease_seconds if name == _TURN_FINAL_NAME else 86_400
+
     def prepare(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         data = dict(params or {})
-        if data.get("schema_version") != 1 or isinstance(
-            data.get("schema_version"), bool
-        ):
+        if not _schema_one(data):
             return _error("invalid_params", host_id=self.host_id)
         action = data.get("action")
         name = connector_name(data.get("name"))
@@ -269,10 +269,11 @@ class ConnectorOutboxAPI:
                 or len(version) > 128
                 or any(char not in _PREPARE_VERSION_CHARS for char in version)
                 or not connector_text_is_public(version)
-                or isinstance(part_count, bool)
-                or not isinstance(part_count, int)
-                or part_count < 1
-                or part_count > _PREPARE_MAX_PARTS
+                or _strict_int(
+                    part_count,
+                    minimum=1,
+                    maximum=_PREPARE_MAX_PARTS,
+                ) is None
             ):
                 return _error("invalid_params", host_id=self.host_id, name=name)
             if not source_ref:
@@ -410,7 +411,7 @@ class ConnectorOutboxAPI:
             data.get("lease_seconds"),
             self.default_lease_seconds,
             minimum=1,
-            maximum=self.max_lease_seconds if name == _TURN_FINAL_NAME else 86_400,
+            maximum=self._lease_ceiling(name),
         )
         if limit is None or lease_seconds is None:
             return _error("invalid_params", host_id=self.host_id, name=name)
@@ -478,12 +479,12 @@ class ConnectorOutboxAPI:
     ) -> tuple[dict[str, Any], str, str] | dict[str, Any]:
         data = dict(params or {})
         name = connector_name(data.get("name"))
-        ref = _ref(data.get("ref")) or None
+        ref = _ref(data.get("ref"))
         if not _exact_fields(data, {"name", "ref"} | required, optional):
             return _error("invalid_params", host_id=self.host_id, name=name)
         if not name:
             return _error("invalid_params", host_id=self.host_id)
-        if ref is None:
+        if not ref:
             return _error("invalid_ref", host_id=self.host_id, name=name)
         unavailable = self._require_store(name)
         return unavailable or (data, name, ref)
@@ -522,11 +523,7 @@ class ConnectorOutboxAPI:
             data.get("lease_seconds"),
             self.default_lease_seconds,
             minimum=1,
-            maximum=(
-                self.max_lease_seconds
-                if name == _TURN_FINAL_NAME
-                else 86400
-            ),
+            maximum=self._lease_ceiling(name),
         )
         if lease_seconds is None:
             return _error("invalid_params", host_id=self.host_id, name=name)
@@ -603,14 +600,10 @@ class ConnectorOutboxAPI:
         status = _text(data.get("status"))
         limit = data.get("limit")
         if (
-            data.get("schema_version") != 1
-            or isinstance(data.get("schema_version"), bool)
+            not _schema_one(data)
             or name != _TURN_FINAL_NAME
             or status != "dead_letter"
-            or isinstance(limit, bool)
-            or not isinstance(limit, int)
-            or limit < 1
-            or limit > 100
+            or _strict_int(limit, minimum=1, maximum=100) is None
         ):
             return _error("invalid_params", host_id=self.host_id, name=name)
         unavailable = self._require_store(name)
@@ -647,8 +640,7 @@ class ConnectorOutboxAPI:
             _FINAL_ID_PREFIX,
         )
         if (
-            data.get("schema_version") != 1
-            or isinstance(data.get("schema_version"), bool)
+            not _schema_one(data)
             or name != _TURN_FINAL_NAME
             or (
                 "key" in data
