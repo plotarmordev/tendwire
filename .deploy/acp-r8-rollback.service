@@ -1,0 +1,15 @@
+[Unit]
+Description=Fail closed and restore the exact pane after an r8 ACP release failure
+Conflicts=acp-r8-rollout.service acp-frozen-live-monitor.service tendwired.service herdres.service herdres-gateway.service acp-r8-release-guard.service
+After=acp-r8-rollout.service acp-frozen-live-monitor.service tendwired.service herdres.service herdres-gateway.service acp-r8-release-guard.service
+# Rollback must remain startable when the candidate Herdr binary itself failed.
+# The rollback script restores the prior unit/drop-in and starts Herdr as needed.
+StartLimitIntervalSec=300
+StartLimitBurst=12
+
+[Service]
+Type=oneshot
+ExecStart=/home/smith/.local/share/acp-runtime/releases/67568f32-0b94403-f50af73-r8/rollback-r8
+TimeoutStartSec=600
+Restart=on-failure
+RestartSec=5

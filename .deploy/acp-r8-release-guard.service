@@ -1,0 +1,17 @@
+[Unit]
+Description=Guard the r8 ACP release transaction
+# R8_IDENTITY_PLACEHOLDER: 9026d9bc must be replaced before installation.
+Requires=herdr-server.service
+After=herdr-server.service
+OnFailure=acp-r8-rollback.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/home/smith/.local/share/acp-runtime/releases/67568f32-0b94403-f50af73-r8/release-guard
+ExecStopPost=/home/smith/.local/share/acp-runtime/releases/67568f32-0b94403-f50af73-r8/monitor-exit-guard $SERVICE_RESULT
+TimeoutStartSec=45
+Restart=no
+
+[Install]
+WantedBy=default.target

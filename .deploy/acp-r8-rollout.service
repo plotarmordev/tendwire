@@ -1,0 +1,11 @@
+[Unit]
+Description=Perform the reviewed r8 ACP live cutover
+Requires=herdr-server.service
+After=herdr-server.service network-online.target
+OnFailure=acp-r8-rollback.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/smith/.local/share/acp-runtime/releases/67568f32-0b94403-f50af73-r8/rollout-acp-release-r8
+TimeoutStartSec=1800
+Restart=no
