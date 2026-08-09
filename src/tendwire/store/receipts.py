@@ -800,15 +800,7 @@ def settle_due_submission_links_conn(conn: Any, *, now: str, limit: int) -> int:
     return changed
 
 
-def _terminal_without_owner(
-    db_path: Path,
-    *,
-    state: str,
-    status: str,
-    result_key: str,
-    required_submission_states: frozenset[str] | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
+def recover_unresolved_command_send(db_path: Path, **kwargs: Any) -> dict[str, Any]:
     host_id = kwargs["host_id"]
     request_id = kwargs["request_id"]
     with write_transaction(db_path) as conn:
@@ -827,24 +819,10 @@ def _terminal_without_owner(
             or row["result_json"] != queued_result
         ):
             return _response("in_progress", row)
-        if (
-            not command_reservation_is_live(_row(row), now=kwargs.get("now"))
-            and result_key == "uncertain_result_json"
-            and required_submission_states is None
-        ):
-            pass
-        elif required_submission_states is not None:
-            submission = conn.execute(
-                """SELECT state,turn_id FROM turn_submissions
-                WHERE host_id=? AND request_id=?""",
-                (host_id, request_id),
-            ).fetchone()
-            if submission is None or submission["state"] not in required_submission_states:
+        if command_reservation_is_live(_row(row), now=kwargs.get("now")):
+            # Preserve the lease-boundary recheck before terminal recovery.
+            if command_reservation_is_live(_row(row), now=kwargs.get("now")):
                 return _response("in_progress", row)
-            if state == "accepted" and submission["turn_id"] is None:
-                return _response("in_progress", row)
-        elif command_reservation_is_live(_row(row), now=kwargs.get("now")):
-            return _response("in_progress", row)
         current = _now(kwargs.get("now"))
         changed = conn.execute(
             """UPDATE command_receipts
@@ -852,9 +830,9 @@ def _terminal_without_owner(
             WHERE host_id=? AND request_id=? AND state='send_started'
               AND request_fingerprint=? AND status='pending' AND result_json=?""",
             (
-                state,
-                status,
-                kwargs[result_key],
+                "uncertain",
+                "request_state_uncertain",
+                kwargs["uncertain_result_json"],
                 current,
                 host_id,
                 request_id,
@@ -867,20 +845,10 @@ def _terminal_without_owner(
         conn.execute(
             """UPDATE turn_submissions SET state=?,updated_at=?
             WHERE host_id=? AND request_id=? AND state<>'linked'""",
-            (state, current, host_id, request_id),
+            ("uncertain", current, host_id, request_id),
         )
         row = _receipt(conn, host_id, request_id)
-    return _response(state, row)
-
-
-def recover_unresolved_command_send(db_path: Path, **kwargs: Any) -> dict[str, Any]:
-    return _terminal_without_owner(
-        db_path,
-        state="uncertain",
-        status="request_state_uncertain",
-        result_key="uncertain_result_json",
-        **kwargs,
-    )
+    return _response("uncertain", row)
 
 
 def envelope_to_receipt_json(envelope: CommandEnvelope) -> str:
