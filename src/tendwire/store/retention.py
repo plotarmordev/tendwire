@@ -124,8 +124,7 @@ def _receipts(conn: Any, cutoff: str, batch: int) -> int:
         ORDER BY updated_at LIMIT ?""",
         (cutoff, batch),
     ).fetchall()
-    for row in rows:
-        conn.execute("DELETE FROM command_receipts WHERE host_id=? AND request_id=?", (row[0], row[1]))
+    conn.executemany("DELETE FROM command_receipts WHERE host_id=? AND request_id=?", rows)
     return len(rows)
 
 
@@ -137,11 +136,10 @@ def _submissions(conn: Any, cutoff: str, batch: int) -> int:
           ORDER BY updated_at LIMIT ?""",
         (cutoff, batch),
     ).fetchall()
-    for row in rows:
-        conn.execute(
-            "DELETE FROM turn_submissions WHERE host_id=? AND submission_id=?",
-            (row[0], row[1]),
-        )
+    conn.executemany(
+        "DELETE FROM turn_submissions WHERE host_id=? AND submission_id=?",
+        rows,
+    )
     return len(rows)
 
 
@@ -201,12 +199,11 @@ def _bindings(conn: Any, cutoff: str, batch: int) -> int:
         ORDER BY expires_at LIMIT ?""",
         (cutoff, cutoff, batch),
     ).fetchall()
-    for row in rows:
-        conn.execute(
-            """DELETE FROM worker_bindings
+    conn.executemany(
+        """DELETE FROM worker_bindings
             WHERE host_id=? AND worker_id=? AND route_generation=?""",
-            (row[0], row[1], row[2]),
-        )
+        rows,
+    )
     return len(rows)
 
 
@@ -278,6 +275,17 @@ def _floor_values(row: Any) -> tuple[int, int]:
         return 0, 0
 
 
+def _floor_payload(row: Any, insertion_floor: int, change_floor: int) -> dict[str, Any]:
+    return {
+        "id": str(row[1]),
+        "turn_id": str(row[1]),
+        "_retention_floor": {
+            "insertion_sequence": insertion_floor,
+            "change_sequence": change_floor,
+        },
+    }
+
+
 def _delete_turn_content(conn: Any, row: Any) -> None:
     revision_ids = [int(item[0]) for item in conn.execute(
         "SELECT id FROM turn_content_revisions WHERE host_id=? AND turn_id=?",
@@ -330,14 +338,7 @@ def _turns(conn: Any, cutoff: str, batch: int) -> tuple[int, int]:
     )
     deleted = sum(_delete_turn(conn, row) for row in deleted_rows)
     _delete_turn_content(conn, marker)
-    payload = {
-        "id": str(marker[1]),
-        "turn_id": str(marker[1]),
-        "_retention_floor": {
-            "insertion_sequence": insertion_floor,
-            "change_sequence": change_floor,
-        },
-    }
+    payload = _floor_payload(marker, insertion_floor, change_floor)
     conn.execute(
         """UPDATE turns SET state='removed_floor',content_revision=NULL,payload_json=?
         WHERE host_id=? AND turn_id=?""",
@@ -357,14 +358,7 @@ def _floor_content(conn: Any, cutoff: str, batch: int) -> int:
     for row in rows:
         insertion_floor, change_floor = _floor_values(row)
         _delete_turn_content(conn, row)
-        payload = {
-            "id": str(row[1]),
-            "turn_id": str(row[1]),
-            "_retention_floor": {
-                "insertion_sequence": insertion_floor,
-                "change_sequence": change_floor,
-            },
-        }
+        payload = _floor_payload(row, insertion_floor, change_floor)
         conn.execute(
             """UPDATE turns SET content_revision=NULL,payload_json=?
             WHERE host_id=? AND turn_id=?""",
@@ -381,14 +375,9 @@ def run_retention_cycle(db_path: Path, *, policy: RetentionPolicy, now: str | No
         )
         agent_events = _events(conn, _cutoff(current, policy.event_retention_days), policy.batch_size)
         snapshots = _snapshots(conn, _cutoff(current, policy.snapshot_retention_days), policy.batch_size)
-        deliveries = _deliveries(
-            conn, _cutoff(current, policy.targetable_retention_days),
-            policy.batch_size,
-        )
-        outbox = _outbox(
-            conn, _cutoff(current, policy.targetable_retention_days),
-            policy.batch_size,
-        )
+        targetable_cutoff = _cutoff(current, policy.targetable_retention_days)
+        deliveries = _deliveries(conn, targetable_cutoff, policy.batch_size)
+        outbox = _outbox(conn, targetable_cutoff, policy.batch_size)
         command_cutoff = _cutoff(current, policy.command_retention_days)
         submissions = _submissions(conn, command_cutoff, policy.batch_size)
         pending_claims, pending_prompts = _pending_history(
@@ -407,7 +396,7 @@ def run_retention_cycle(db_path: Path, *, policy: RetentionPolicy, now: str | No
             turn_cutoff,
             policy.turn_change_batch_size,
         )
-        bindings = _bindings(conn, _cutoff(current, policy.route_content_retention_days), policy.batch_size)
+        bindings = _bindings(conn, content_cutoff, policy.batch_size)
         result = {
             "agent_events": agent_events,
             "snapshots": snapshots,
