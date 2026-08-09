@@ -154,13 +154,10 @@ def _enqueue_decision(
     observation: PendingObservation,
     now: str,
     *,
-    binding: Any = None,
+    binding: Any,
 ) -> None:
     if observation.decision_kind is None:
         return
-    binding = binding if binding is not None else _binding_route(conn, host_id, worker_id)
-    if binding is None:
-        raise RuntimeError("decision route unavailable")
     worker = _public_worker(conn, host_id, worker_id, binding)
     key_token = _opaque_digest(
         "twdecision1.",
@@ -183,6 +180,14 @@ def _enqueue_decision(
         {"ordinal": index, "option_ref": str(index + 1), "label": label}
         for index, label in enumerate(public["decision_options"])
     ]
+    decision = {
+        "decision_ref": decision_ref,
+        "revision_digest": revision_digest,
+        "mode": observation.decision_kind,
+        "title": public["kind"] or "Decision",
+        "body": public["question"] or "",
+        "choices": choices,
+    }
     existing = conn.execute(
         """SELECT * FROM connector_outbox
         WHERE host_id=? AND connector='turn-final' AND key=?""",
@@ -191,15 +196,7 @@ def _enqueue_decision(
     if existing is not None:
         replay_payload = json.loads(existing["payload_json"])
         replay_decision = replay_payload.get("decision")
-        expected_decision = {
-            "decision_ref": decision_ref,
-            "revision_digest": revision_digest,
-            "mode": observation.decision_kind,
-            "title": public["kind"] or "Decision",
-            "body": public["question"] or "",
-            "choices": choices,
-        }
-        if replay_decision != expected_decision:
+        if replay_decision != decision:
             raise RuntimeError("decision producer identity conflict")
         return
     sequence = _allocate_sequence(conn, host_id, str(binding["partition_key"]))
@@ -212,14 +209,7 @@ def _enqueue_decision(
             "partition_key": binding["partition_key"],
             "partition_sequence": sequence,
         },
-        "decision": {
-            "decision_ref": decision_ref,
-            "revision_digest": revision_digest,
-            "mode": observation.decision_kind,
-            "title": public["kind"] or "Decision",
-            "body": public["question"] or "",
-            "choices": choices,
-        },
+        "decision": decision,
     }
     conn.execute(
         """UPDATE connector_outbox
@@ -262,42 +252,9 @@ def _enqueue_decision(
     )
 
 
-def _decision_retire_payload(
-    target: Any,
-    target_payload: Mapping[str, Any],
-    sequence: int,
-    now: str,
-) -> dict[str, Any]:
-    return {
-        "schema_version": 1,
-        "kind": "retire",
-        "created_at": now,
-        "worker": dict(target_payload["worker"]),
-        "route": {
-            "partition_key": target["partition_key"],
-            "partition_sequence": sequence,
-        },
-        "turn": {
-            "turn_id": target["turn_id"],
-            "final_identity": target["final_identity"],
-            "content_revision": target["content_revision"],
-        },
-        "retire": {
-            "target_key": target["key"],
-            "target_kind": "decision",
-            "target_ordinal": None,
-            "predecessor_key": target["key"],
-            "plan_token": None,
-            "generation": None,
-            "reason": "decision_resolved",
-        },
-    }
-
-
 def _resolve_decision_rows(
     conn: Any,
     host_id: str,
-    worker_id: str,
     decision_ref: str,
     resolving_revision: str,
     now: str,
@@ -365,7 +322,30 @@ def _resolve_decision_rows(
         if existing is not None:
             continue
         sequence = _allocate_sequence(conn, host_id, str(binding["partition_key"]))
-        payload = _decision_retire_payload(target, target_payload, sequence, now)
+        payload = {
+            "schema_version": 1,
+            "kind": "retire",
+            "created_at": now,
+            "worker": dict(target_payload["worker"]),
+            "route": {
+                "partition_key": target["partition_key"],
+                "partition_sequence": sequence,
+            },
+            "turn": {
+                "turn_id": target["turn_id"],
+                "final_identity": target["final_identity"],
+                "content_revision": target["content_revision"],
+            },
+            "retire": {
+                "target_key": target["key"],
+                "target_kind": "decision",
+                "target_ordinal": None,
+                "predecessor_key": target["key"],
+                "plan_token": None,
+                "generation": None,
+                "reason": "decision_resolved",
+            },
+        }
         conn.execute(
             """INSERT INTO connector_outbox(
             host_id,connector,key,kind,payload_version,status,partition_key,
@@ -395,15 +375,14 @@ def _resolve_decision_rows(
 def _public(
     observation: PendingObservation, decision_ref: str | None = None,
 ) -> dict[str, Any]:
-    choices = []
-    for index, choice in enumerate(observation.choices):
-        choices.append(
-            {
-                "choice_id": choice.choice_id,
-                "label": sanitize_canonical_turn_text(choice.label) or f"Option {index + 1}",
-                "ordinal": choice.picker_ordinal,
-            }
-        )
+    choices = [
+        {
+            "choice_id": choice.choice_id,
+            "label": sanitize_canonical_turn_text(choice.label) or f"Option {index + 1}",
+            "ordinal": choice.picker_ordinal,
+        }
+        for index, choice in enumerate(observation.choices)
+    ]
     public = {
         "question": sanitize_canonical_turn_text(observation.question),
         "kind": sanitize_canonical_turn_text(observation.pending_kind) or "question",
@@ -463,7 +442,6 @@ def apply_backend_pending_observation(
                 _resolve_decision_rows(
                     conn,
                     host_id,
-                    worker_id,
                     str(row["decision_ref"]),
                     str(row["revision_digest"]),
                     now,
@@ -493,7 +471,6 @@ def apply_backend_pending_observation(
             _resolve_decision_rows(
                 conn,
                 host_id,
-                worker_id,
                 str(prior["decision_ref"]),
                 revision,
                 now,
@@ -614,14 +591,7 @@ def pending_payload_from_store(db_path: Path | str, host_id: str) -> dict[str, A
                 (host_id,),
             ).fetchall()
     except Exception:
-        return {
-            "schema_version": TURN_SCHEMA_VERSION,
-            "host_id": host_id,
-            "ok": False,
-            "status": "store_unavailable",
-            "pending_interactions": [],
-            "backend_health": [],
-        }
+        snapshot = None
     if snapshot is None:
         return {
             "schema_version": TURN_SCHEMA_VERSION,
@@ -860,7 +830,6 @@ def _terminal(conn: Any, host_id: str, claim_token: str, accepted: bool) -> None
     _resolve_decision_rows(
         conn,
         host_id,
-        str(row["worker_id"]),
         str(row["decision_ref"]),
         str(row["revision_digest"]),
         now,
