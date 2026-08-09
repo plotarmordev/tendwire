@@ -1866,22 +1866,18 @@ def retry_connector_dead_letter(
         ).rowcount
         if changed != 1:
             return _error(host_id, TURN_FINAL_CONNECTOR, "not_retryable")
+    with read_transaction(db_path) as conn:
+        warning = _latest_reason(conn, int(row["id"]))[0] == "provider_uncertain"
     return _success(
         host_id, TURN_FINAL_CONNECTOR, "requeued", key=row["key"],
         retry_generation=int(row["retry_generation"]) + 1,
         prior_attempt_count=int(row["prior_attempt_count"]) + attempts,
         warning=(
             "provider_acceptance_may_have_occurred"
-            if reason_for_retry_requires_warning(db_path, int(row["id"]))
+            if warning
             else None
         ),
     )
-
-
-def reason_for_retry_requires_warning(db_path: Path | str, outbox_id: int) -> bool:
-    with read_transaction(db_path) as conn:
-        reason, _attempt = _latest_reason(conn, outbox_id)
-    return reason == "provider_uncertain"
 
 
 __all__ = tuple(
