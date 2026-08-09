@@ -7,6 +7,7 @@ import signal
 import threading
 import time
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -172,10 +173,7 @@ class TendwireDaemon:
                 self.socket_path,
                 socket_group=self.config.socket_group,
             )
-            if self.hooks.init_store is _default_init_store:
-                _default_init_store(Path(self.config.db_path))
-            else:
-                self.hooks.init_store(Path(self.config.db_path))
+            self.hooks.init_store(Path(self.config.db_path))
             api = TendwireDaemonAPI(
                 get_snapshot=self.get_snapshot,
                 get_health=self.get_health,
@@ -218,10 +216,8 @@ class TendwireDaemon:
             self._stop_acp_supervisor(supervisor)
             self._server = None
             if server is not None:
-                try:
+                with suppress(Exception):
                     server.close()
-                except Exception:
-                    pass
             self._snapshot = None
             raise
 
@@ -254,10 +250,8 @@ class TendwireDaemon:
             self._acp_supervisor = None
 
         if server is not None:
-            try:
+            with suppress(Exception):
                 server.close()
-            except Exception:
-                pass
 
         self._stop_acp_supervisor(supervisor)
 
@@ -300,16 +294,12 @@ class TendwireDaemon:
         timeout = self.config.acp_shutdown_timeout_seconds
         stop = getattr(supervisor, "stop", None)
         if callable(stop):
-            try:
+            with suppress(Exception):
                 stop(timeout=timeout)
-            except Exception:
-                pass
         join = getattr(supervisor, "join", None)
         if callable(join):
-            try:
+            with suppress(Exception):
                 join(timeout=timeout)
-            except Exception:
-                pass
 
     def _acp_supervisor_health(self) -> dict[str, Any]:
         """Return a fixed, public-safe ACP lifecycle aggregate."""
@@ -401,7 +391,6 @@ class TendwireDaemon:
         )
         try:
             result = run_retention_cycle(Path(self.config.db_path), policy=policy)
-            maintenance_status = {"ok": True, "status": "ok", "due": True, "result": result}
         except Exception:
             self._last_retention_cycle_monotonic = previous
             self._automatic_maintenance_status = {
@@ -416,7 +405,7 @@ class TendwireDaemon:
                 "agent_events_remaining_candidates": False,
             }
         else:
-            self._automatic_maintenance_status = maintenance_status
+            self._automatic_maintenance_status = {"ok": True, "status": "ok", "due": True, "result": result}
 
     def get_snapshot(self) -> Snapshot:
         from .store.projection import latest_snapshot
