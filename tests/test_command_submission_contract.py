@@ -879,6 +879,8 @@ def test_finish_commit_then_exception_recovers_exact_terminal_receipt(
     assert receipt is not None and receipt["state"] == "accepted"
     stored = CommandEnvelope.from_dict(json.loads(receipt["result_json"]))
     assert stored.result is not None and "submission_id" not in stored.result
+    assert stored.result["turn_id"] is None
+    assert stored.result["observed_turn_state"] == "pending_observation"
     assert second.to_dict() == first.to_dict()
     assert route.send_count == 1
 
@@ -918,6 +920,8 @@ def test_terminal_receipt_replays_exactly_without_resending(
         stored_envelope = CommandEnvelope.from_dict(json.loads(stored["result_json"]))
         assert stored_envelope.result is not None
         assert "submission_id" not in stored_envelope.result
+        assert stored_envelope.result["turn_id"] is None
+        assert stored_envelope.result["observed_turn_state"] == "pending_observation"
     else:
         assert stored["result_json"] == envelope_to_receipt_json(first)
     assert route.send_count == 1
@@ -1166,6 +1170,7 @@ def test_v2_receipt_is_immutable_and_public_projection_runs_once_per_response(
     route = _Route()
     real_settle = command_submission.receipts.settle_submission_link_for_request
     settle_count = 0
+    link_count = 0
 
     def counted_settle(*args: Any, **kwargs: Any) -> Any:
         nonlocal settle_count
@@ -1176,6 +1181,21 @@ def test_v2_receipt_is_immutable_and_public_projection_runs_once_per_response(
         command_submission.receipts,
         "settle_submission_link_for_request",
         counted_settle,
+    )
+
+    def linked_turn(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal link_count
+        link_count += 1
+        return {
+            "id": "turn-linked",
+            "source_turn_id": "source-linked",
+            "complete": True,
+        }
+
+    monkeypatch.setattr(
+        command_submission.receipts,
+        "linked_turn_for_submission",
+        linked_turn,
     )
     request = _instruction("public-projection")
     first = submit_command(
@@ -1190,11 +1210,18 @@ def test_v2_receipt_is_immutable_and_public_projection_runs_once_per_response(
         acp_prompt_router=lambda _candidate: route,
     )
 
+    assert first.to_dict() == second.to_dict()
     assert first.schema_version == second.schema_version == 2
     assert first.result is not None and first.result["submission_id"].startswith("twsub1.")
+    assert first.result["turn_id"] == "turn-linked"
+    assert first.result["observed_turn_state"] == "complete"
     assert receipt is not None
     stored = json.loads(receipt["result_json"])
     assert stored["schema_version"] == 2 and stored["dry_run"] is False
-    assert "submission_id" not in (stored.get("result") or {})
+    stored_result = stored.get("result") or {}
+    assert "submission_id" not in stored_result
+    assert stored_result["turn_id"] is None
+    assert stored_result["observed_turn_state"] == "pending_observation"
     assert settle_count == 2
+    assert link_count == 3
     assert route.send_count == 1

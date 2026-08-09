@@ -438,27 +438,6 @@ def _abandon_pending_claim(config: Config, claim_token: str) -> bool:
     )
 
 
-def _linked_submission_turn(
-    config: Config,
-    request: contract.CommandRequest,
-    *,
-    settle: bool = False,
-) -> Mapping[str, Any] | None:
-    try:
-        if settle:
-            receipts.settle_submission_link_for_request(
-                config.db_path, host_id=config.host_id,
-                request_id=request.request_id or "",
-            )
-        turn = receipts.linked_turn_for_submission(
-            config.db_path, host_id=config.host_id,
-            request_id=request.request_id or "",
-        )
-    except Exception:  # noqa: BLE001
-        return None
-    return turn if isinstance(turn, Mapping) else None
-
-
 def _pending_terminal_effect(
     config: Config,
     claim_token: str,
@@ -769,12 +748,6 @@ def _send_instruction_through_route(
         # transport boundary is not an accepted implementation.
         return retryable_before_transport()
 
-    refreshed = _linked_submission_turn(config, request)
-    observed_turn = refreshed if refreshed is not None else send_started
-    raw_turn_id = observed_turn.get("id")
-    observed_state = (
-        "complete" if observed_turn.get("complete") is True else "observed"
-    ) if str(observed_turn.get("source_turn_id") or "").strip() else "pending_observation"
     accepted = _accepted(
         request, {
             "target": {"worker_id": worker.id},
@@ -783,8 +756,8 @@ def _send_instruction_through_route(
             "target_state_at_send": (
                 str(worker.status or "").strip().lower().replace("-", "_") or "unknown"
             ),
-            "turn_id": raw_turn_id if isinstance(raw_turn_id, str) and raw_turn_id else None,
-            "observed_turn_state": observed_state,
+            "turn_id": None,
+            "observed_turn_state": "pending_observation",
             "submission_verdict": "submitted",
         },
     )
@@ -835,7 +808,7 @@ def _submit_instruction(
 
     if worker.status in _DISALLOWED_SEND_STATUSES:
         status_error = _target_resolution_error(
-            request, contract.STATUS_REJECTED, [contract.worker_candidate(worker)]
+            request, contract.STATUS_REJECTED, candidates
         )
         mutation = _Mutation.reserve(config, request, worker.id, takeover)
         return (
@@ -959,7 +932,21 @@ def submit_command(
         result["submission_id"] = contract.turn_submission_id(
             config.host_id, request.request_id or ""
         )
-        linked = _linked_submission_turn(config, request, settle=True)
+        try:
+            receipts.settle_submission_link_for_request(
+                config.db_path,
+                host_id=config.host_id,
+                request_id=request.request_id or "",
+            )
+            linked = receipts.linked_turn_for_submission(
+                config.db_path,
+                host_id=config.host_id,
+                request_id=request.request_id or "",
+            )
+        except Exception:  # noqa: BLE001
+            linked = None
+        if not isinstance(linked, Mapping):
+            linked = None
         result["turn_id"] = linked.get("id") if linked is not None else None
         result["observed_turn_state"] = (
             "complete" if linked is not None and linked.get("complete") is True
