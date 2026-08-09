@@ -271,20 +271,14 @@ class BoundedAcpConnection:
             capabilities_value = raw.get("agentCapabilities", {})
             if not isinstance(capabilities_value, Mapping):
                 capabilities_value = {}
-            meta = raw.get("_meta")
-            steering = meta.get("steering") if isinstance(meta, Mapping) else None
             self._steering_supported = (
-                isinstance(steering, Mapping) and steering.get("supported") is True
+                _capability_value(raw, "_meta", "steering", "supported") is True
             )
-            inject_only = (
-                steering.get("injectOnly")
-                if isinstance(steering, Mapping)
-                else None
+            inject_only_version = _capability_value(
+                raw, "_meta", "steering", "injectOnly", "version"
             )
             self._steering_inject_only_supported = (
-                isinstance(inject_only, Mapping)
-                and type(inject_only.get("version")) is int
-                and inject_only.get("version") == 1
+                type(inject_only_version) is int and inject_only_version == 1
             )
             parsed = dict(capabilities_value)
             with self._state_lock:
@@ -530,13 +524,12 @@ class BoundedAcpConnection:
                 "_session/steering returned an invalid outcome"
             ) from exc
         echoed_correlation = raw.get("correlationId")
-        if correlation_id is not None and echoed_correlation != correlation_id:
-            raise AcpEnvelopeError(
-                "_session/steering returned a mismatched correlationId"
+        if echoed_correlation != correlation_id:
+            problem = (
+                "a mismatched" if correlation_id is not None else "an unexpected"
             )
-        if correlation_id is None and echoed_correlation is not None:
             raise AcpEnvelopeError(
-                "_session/steering returned an unexpected correlationId"
+                f"_session/steering returned {problem} correlationId"
             )
         return SteeringResult(outcome, correlation_id)
 
@@ -756,7 +749,9 @@ class BoundedAcpConnection:
             "sessionResume": ("sessionCapabilities", "resume"),
             "additionalDirectories": ("sessionCapabilities", "additionalDirectories"),
         }[name]
-        if not _capability(self.capabilities, *path, object_value=len(path) > 1):
+        value = _capability_value(self.capabilities, *path)
+        available = isinstance(value, Mapping) if len(path) > 1 else value is True
+        if not available:
             raise AcpCapabilityError(f"agent did not advertise {name} capability")
 
     def _new_request_id(self) -> int:
@@ -880,8 +875,6 @@ class BoundedAcpConnection:
                     continue
                 line = bytes(buffer[: newline + 1])
                 del buffer[: newline + 1]
-                if len(line) > self.max_frame_bytes:
-                    raise AcpFramingError("ACP stdout frame exceeds configured size limit")
                 self._dispatch(
                     decode_json_line(line, max_frame_bytes=self.max_frame_bytes)
                 )
@@ -960,7 +953,7 @@ class BoundedAcpConnection:
             self._session_event_condition.notify_all()
 
     def _set_failed(self, failure: BaseException) -> None:
-        if not isinstance(failure, AcpClientError | AcpProtocolError):
+        if not isinstance(failure, AcpProtocolError):
             failure = AcpTransportError(str(failure))
         with self._state_lock:
             if self._state in {ClientState.CLOSING, ClientState.CLOSED}:
@@ -1023,15 +1016,11 @@ def _absolute_path(value: str | os.PathLike[str], name: str) -> str:
     return result
 
 
-def _capability(
-    capabilities: Mapping[str, Any],
-    *path: str,
-    object_value: bool = False,
-) -> bool:
+def _capability_value(capabilities: Any, *path: str) -> Any:
     value: Any = capabilities
     for key in path:
         value = value.get(key) if isinstance(value, Mapping) else None
-    return isinstance(value, Mapping) if object_value else value is True
+    return value
 
 
 def _validated_prompt_content_block(
@@ -1048,9 +1037,9 @@ def _validated_prompt_content_block(
         "audio": "audio",
         "resource": "embeddedContext",
     }.get(kind)
-    if capability and not _capability(
+    if capability and _capability_value(
         capabilities, "promptCapabilities", capability
-    ):
+    ) is not True:
         raise AcpCapabilityError(
             f"agent did not advertise prompt {capability} capability"
         )
@@ -1077,9 +1066,9 @@ def _validated_mcp_server(
     model = models.get(transport)
     if model is None:
         raise ValueError("MCP server type is not valid stable ACP v1")
-    if transport in {"http", "sse"} and not _capability(
+    if transport in {"http", "sse"} and _capability_value(
         capabilities, "mcpCapabilities", transport
-    ):
+    ) is not True:
         raise AcpCapabilityError(
             f"agent did not advertise MCP {str(transport).upper()} capability"
         )
