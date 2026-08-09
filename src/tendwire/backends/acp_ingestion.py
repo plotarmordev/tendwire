@@ -82,9 +82,6 @@ class AcpSessionIngestor:
         self._source_turn_id: str | None = None
         self._turn_complete = False
         self._local_prompt_recorded = False
-        self._turn_messages: dict[str, dict[int, str]] = {
-            "user_message": {}, "agent_message": {},
-        }
 
     @property
     def source_turn_id(self) -> str | None:
@@ -116,7 +113,6 @@ class AcpSessionIngestor:
         )
         self._turn_complete = False
         self._local_prompt_recorded = False
-        self._turn_messages = {"user_message": {}, "agent_message": {}}
         return self._source_turn_id
 
     def ingest_update(
@@ -316,7 +312,7 @@ class AcpSessionIngestor:
                 normalized_reason = StopReason(stop_reason)
             except ValueError as exc:
                 raise ValueError("unsupported ACP prompt stop reason") from exc
-            content = self._turn_content(complete=True)
+            content = self.projector.turn_content(self.session_id, complete=True)
             content["source_turn_id"] = self._source_turn_id
             content["assistant_final_text"] = _final_text_for_stop_reason(
                 str(content.get("assistant_final_text") or ""),
@@ -374,9 +370,7 @@ class AcpSessionIngestor:
         canonical: Mapping[str, Any],
         *,
         checkpoint: AcpProjectionCheckpoint,
-        prior_turn_state: tuple[
-            int, str | None, bool, bool, dict[str, dict[int, str]]
-        ],
+        prior_turn_state: tuple[int, str | None, bool, bool],
         producer_turn_id: str | None = None,
         producer_turn_required: bool = False,
     ) -> AcpIngestionResult:
@@ -415,8 +409,7 @@ class AcpSessionIngestor:
                 assembled_text = payload.get("assembled_text")
                 if type(message_index) is not int or not isinstance(assembled_text, str):
                     raise ValueError("canonical ACP message projection is invalid")
-                self._turn_messages[kind][message_index] = assembled_text
-                content = self._turn_content()
+                content = self.projector.turn_content(self.session_id)
                 if self._source_turn_id is not None:
                     content["source_turn_id"] = self._source_turn_id
                 projection = content
@@ -454,30 +447,18 @@ class AcpSessionIngestor:
             ),
         )
 
-    def _turn_content(self, *, complete: bool = False) -> dict[str, Any]:
-        user = "\n\n".join(self._turn_messages["user_message"].values())
-        assistant = "\n\n".join(self._turn_messages["agent_message"].values())
-        return {
-            "user_text": user,
-            "assistant_stream_text": "" if complete else assistant,
-            "assistant_final_text": assistant if complete else "",
-            "complete": complete,
-            "has_open_turn": bool(user or assistant) and not complete,
-        }
-
-    def _turn_state(self) -> tuple[int, str | None, bool, bool, dict[str, dict[int, str]]]:
+    def _turn_state(self) -> tuple[int, str | None, bool, bool]:
         return (
             self._turn_ordinal,
             self._source_turn_id,
             self._turn_complete,
             self._local_prompt_recorded,
-            deepcopy(self._turn_messages),
         )
 
     def _restore_speculation(
         self,
         checkpoint: AcpProjectionCheckpoint,
-        prior_turn_state: tuple[int, str | None, bool, bool, dict[str, dict[int, str]]],
+        prior_turn_state: tuple[int, str | None, bool, bool],
     ) -> None:
         self.projector.restore_session(checkpoint)
         (
@@ -485,7 +466,6 @@ class AcpSessionIngestor:
             self._source_turn_id,
             self._turn_complete,
             self._local_prompt_recorded,
-            self._turn_messages,
         ) = prior_turn_state
 
 

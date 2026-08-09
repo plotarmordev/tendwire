@@ -477,6 +477,48 @@ def test_append_exception_rolls_back_turn_identity_sequence_and_message(
     assert accepted.turn is not None
 
 
+def test_durable_replay_reconstructs_message_for_completion(tmp_path: Path) -> None:
+    projected: list[dict[str, object]] = []
+
+    def persist(
+        _path: Path | str,
+        _host: str,
+        event: AgentEvent,
+        *,
+        content=None,
+        **_kwargs,
+    ) -> AppendProjectedAgentEventResult:
+        if content is not None:
+            projected.append(dict(content))
+        return AppendProjectedAgentEventResult(
+            AppendBoundAgentEventResult("replayed", event.event_id, 1),
+            TurnRefreshApplyResult(0, False),
+        )
+
+    ingestor = AcpSessionIngestor(
+        _config(tmp_path / "events.db"),
+        session_id="session-a",
+        stream_generation="replay-generation",
+        binding=_binding(),
+        persist_event=persist,
+    )
+    ingestor.start_turn(producer_turn_id="producer-replay")
+    replayed = ingestor.ingest_update(
+        _update(
+            "agent_message_chunk",
+            messageId="answer-replay",
+            content={"type": "text", "text": "recovered answer"},
+        ),
+        source_event_id="message-replay",
+    )
+    completed = ingestor.mark_prompt_complete()
+
+    assert replayed.ignored_reason == "duplicate_event"
+    assert completed.ignored_reason == "duplicate_event"
+    assert projected[-1]["assistant_final_text"] == "recovered answer"
+    assert projected[-1]["assistant_stream_text"] == ""
+
+
 def test_oversized_first_chunk_does_not_leave_an_implicit_turn(tmp_path: Path) -> None:
     from tendwire.backends.acp_projection import AcpEventProjector, AcpProjectionError
 

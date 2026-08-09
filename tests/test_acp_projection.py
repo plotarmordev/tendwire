@@ -111,6 +111,57 @@ def test_non_text_and_assistant_only_content_do_not_become_public_text() -> None
     assert assistant_only["payload"]["assembled_text"] == ""
 
 
+def test_turn_content_is_ordered_read_only_and_excludes_thoughts() -> None:
+    projector = AcpEventProjector()
+    assert projector.turn_content("session-1") == {
+        "user_text": "",
+        "assistant_stream_text": "",
+        "assistant_final_text": "",
+        "complete": False,
+        "has_open_turn": False,
+    }
+    for update in (
+        _update(
+            "user_message_chunk",
+            messageId="user-1",
+            content={"type": "text", "text": "first"},
+        ),
+        _update(
+            "agent_thought_chunk",
+            messageId="thought-1",
+            content={"type": "text", "text": "private reasoning"},
+        ),
+        _update(
+            "user_message_chunk",
+            messageId="user-2",
+            content={"type": "text", "text": "second"},
+        ),
+        _update(
+            "agent_message_chunk",
+            messageId="answer-1",
+            content={"type": "text", "text": "answer"},
+        ),
+    ):
+        assert projector.normalize_session_update(update) is not None
+
+    assert projector.turn_content("session-1") == {
+        "user_text": "first\n\nsecond",
+        "assistant_stream_text": "answer",
+        "assistant_final_text": "",
+        "complete": False,
+        "has_open_turn": True,
+    }
+    assert projector.turn_content("session-1", complete=True) == {
+        "user_text": "first\n\nsecond",
+        "assistant_stream_text": "",
+        "assistant_final_text": "answer",
+        "complete": True,
+        "has_open_turn": False,
+    }
+    with pytest.raises(AcpProjectionError, match="another session"):
+        projector.turn_content("session-2")
+
+
 def test_tool_updates_merge_and_permission_attaches_options() -> None:
     projector = AcpEventProjector()
     started = projector.normalize_session_update(
@@ -145,6 +196,57 @@ def test_tool_updates_merge_and_permission_attaches_options() -> None:
     assert updated is not None and updated["payload"]["snapshot"]["status"] == "completed"
     assert permission is not None and permission["kind"] == "tool_call_update"
     assert permission["payload"]["permission"]["options"][0]["optionId"] == "allow"
+
+
+def test_permission_replaces_snapshot_and_preserves_limits_and_replay() -> None:
+    projector = AcpEventProjector()
+
+    def request(option_id: str) -> dict[str, object]:
+        return {
+            "sessionId": "session-1",
+            "toolCall": {"toolCallId": "tool-1"},
+            "options": [
+                {
+                    "optionId": option_id,
+                    "name": option_id.title(),
+                    "kind": "allow_once",
+                }
+            ],
+        }
+
+    first = projector.normalize_permission_request(
+        request("allow"), source_event_id="permission-1"
+    )
+    assert first is not None
+    assert projector.normalize_permission_request(
+        request("allow"), source_event_id="permission-1"
+    ) is None
+    with pytest.raises(AcpProjectionError, match="reused"):
+        projector.normalize_permission_request(
+            request("different"), source_event_id="permission-1"
+        )
+    replacement = projector.normalize_permission_request(
+        request("reject"), source_event_id="permission-2"
+    )
+    assert replacement is not None
+    assert replacement["payload"]["snapshot"]["permission"] == {
+        "required": True,
+        "options": [
+            {"optionId": "reject", "name": "Reject", "kind": "allow_once"}
+        ],
+    }
+    assert replacement["payload"]["permission"] == replacement["payload"]["snapshot"][
+        "permission"
+    ]
+
+    with pytest.raises(AcpProjectionError, match="field limit"):
+        AcpEventProjector(max_state_fields=1).normalize_permission_request(
+            request("allow")
+        )
+    with pytest.raises(AcpProjectionError, match="retained session state limit"):
+        AcpEventProjector(max_session_state_bytes=1).normalize_permission_request(
+            request("allow")
+        )
 
 
 def test_plan_usage_and_session_info_are_normalized() -> None:

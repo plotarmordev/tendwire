@@ -254,33 +254,19 @@ class AcpEventProjector:
         if self._is_replay(state, explicit_id, replay_digest):
             return None
 
-        if (
-            tool_call_id not in state.tools
-            and len(state.tools) >= self._max_tool_calls_per_session
-        ):
-            raise AcpProjectionError("ACP tool call state limit exceeded")
-        previous_tool = state.tools.get(tool_call_id)
-        snapshot = _merge_tool_snapshot(previous_tool, tool_call)
-        snapshot["permission"] = {
+        permission = {
             "required": True,
             "options": deepcopy(normalized_options),
         }
-        if len(snapshot) > self._max_state_fields:
-            raise AcpProjectionError("ACP tool snapshot field limit exceeded")
-        self._reserve_state(
+        payload = self._normalize_tool(
             state,
-            _json_size(snapshot) - (_json_size(previous_tool) if previous_tool else 0),
+            "tool_call_update",
+            tool_call,
+            permission=permission,
         )
-        state.tools[tool_call_id] = snapshot
         self._commit_event(
             session_id, state, "tool_call_update", explicit_id, replay_digest
         )
-        payload = {
-            "tool_call_id": tool_call_id,
-            "changes": _without_discriminator(tool_call),
-            "snapshot": deepcopy(snapshot),
-            "permission": deepcopy(snapshot["permission"]),
-        }
         extension_meta = _scoped_metadata(params=params, toolCall=tool_call)
         if extension_meta:
             payload["extensions"] = extension_meta
@@ -324,6 +310,26 @@ class AcpEventProjector:
         else:
             self._session_id = checkpoint.session_id
             self._state = checkpoint.state
+
+    def turn_content(
+        self, session_id: str, *, complete: bool = False
+    ) -> dict[str, Any]:
+        """Return the current public turn text without changing projector state."""
+
+        if self._session_id not in {None, session_id}:
+            raise AcpProjectionError("ACP projector is already bound to another session")
+        messages = self._state.messages if self._state is not None else {}
+        user = "\n\n".join(item.text for item in messages.get("user_message", ()))
+        assistant = "\n\n".join(
+            item.text for item in messages.get("agent_message", ())
+        )
+        return {
+            "user_text": user,
+            "assistant_stream_text": "" if complete else assistant,
+            "assistant_final_text": assistant if complete else "",
+            "complete": complete,
+            "has_open_turn": bool(user or assistant) and not complete,
+        }
 
     def _normalize_message(
         self,
@@ -410,12 +416,16 @@ class AcpEventProjector:
         state: _SessionState,
         kind: str,
         update: Mapping[str, Any],
+        *,
+        permission: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         tool_call_id = _required_string(update, "toolCallId")
         previous = state.tools.get(tool_call_id)
         if previous is None and len(state.tools) >= self._max_tool_calls_per_session:
             raise AcpProjectionError("ACP tool call state limit exceeded")
         snapshot = _merge_tool_snapshot(previous, update)
+        if permission is not None:
+            snapshot["permission"] = deepcopy(dict(permission))
         if len(snapshot) > self._max_state_fields:
             raise AcpProjectionError("ACP tool snapshot field limit exceeded")
         payload: dict[str, Any] = {
@@ -424,6 +434,8 @@ class AcpEventProjector:
         }
         if kind == "tool_call_update":
             payload["changes"] = _without_discriminator(update)
+        if permission is not None:
+            payload["permission"] = deepcopy(dict(permission))
         self._reserve_state(
             state, _json_size(snapshot) - (_json_size(previous) if previous else 0)
         )
@@ -678,13 +690,7 @@ def _bounded_json(
 ) -> None:
     _validate_json_depth(value, label=label, max_depth=max_depth)
     try:
-        encoded = json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
+        encoded = _json_bytes(value)
     except (TypeError, ValueError, RecursionError) as exc:
         raise AcpProjectionError(f"{label} must be bounded JSON data") from exc
     if len(encoded) > max_bytes:
@@ -716,15 +722,7 @@ def _safe_deepcopy(value: Any, *, label: str) -> Any:
 
 
 def _json_size(value: Any) -> int:
-    return len(
-        json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-    )
+    return len(_json_bytes(value))
 
 
 def _messages_state_bytes(
@@ -738,14 +736,17 @@ def _messages_state_bytes(
 
 
 def _event_digest(kind: str, value: Mapping[str, Any]) -> str:
-    encoded = json.dumps(
-        {"kind": kind, "value": value},
+    return hashlib.sha256(_json_bytes({"kind": kind, "value": value})).hexdigest()
+
+
+def _json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _canonical_event(
