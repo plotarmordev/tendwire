@@ -98,8 +98,15 @@ for line in sys.stdin:
                 ),
                 "agentInfo": {"name": "fake", "version": "1.0"},
                 **(
-                    {"_meta": {"steering": {"supported": True}}}
-                    if MODE == "steering"
+                    {
+                        "_meta": {
+                            "steering": {
+                                "supported": True,
+                                "injectOnly": {"version": 1},
+                            }
+                        }
+                    }
+                    if MODE in {"steering", "steering_idle"}
                     else {}
                 ),
                 **(
@@ -255,12 +262,36 @@ for line in sys.stdin:
         )
         pending_permission_ids.add(900)
     elif method == "_session/steering":
+        correlation_id = params.get("correlationId")
+        if MODE == "steering_idle" and params.get("startNewTurnWhenIdle") is False:
+            response(
+                request_id,
+                {
+                    "outcome": "notActive",
+                    **(
+                        {"correlationId": correlation_id}
+                        if correlation_id is not None
+                        else {}
+                    ),
+                },
+            )
+            continue
         update(
             params["sessionId"],
             "user_message_chunk",
             content=params["prompt"][0],
         )
-        response(request_id, {"outcome": "injected"})
+        response(
+            request_id,
+            {
+                "outcome": "injected",
+                **(
+                    {"correlationId": correlation_id}
+                    if correlation_id is not None
+                    else {}
+                ),
+            },
+        )
     elif method == "session/cancel":
         if MODE == "cancel_race" and pending_prompt_id is not None:
             send(

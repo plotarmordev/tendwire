@@ -10,7 +10,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from ..core.commands import CommandEnvelope, instruction_fingerprint, turn_submission_id
+from ..core.commands import (
+    CommandEnvelope,
+    acp_producer_turn_id,
+    instruction_fingerprint,
+    is_turn_submission_id,
+    turn_submission_id,
+)
 from .db import add_seconds, canonical_utc, read_transaction, utc_now, write_transaction
 from .projection import presentation_binding_row
 
@@ -29,6 +35,20 @@ def _hash(value: str) -> str:
 
 def _now(value: str | None) -> str:
     return utc_now() if value is None else canonical_utc(value)
+
+
+def _binding_authority_fingerprint(binding: Any, private: Mapping[str, Any]) -> str:
+    authority = {
+        "worker_id": binding["worker_id"],
+        "worker_fingerprint": private.get("worker_fingerprint"),
+        "stable_key": binding["stable_key"],
+        "stable_key_version": binding["stable_key_version"],
+        "route_generation": binding["route_generation"],
+        "private_fingerprint": binding["private_fingerprint"],
+    }
+    return _hash(
+        json.dumps(authority, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    )
 
 
 def _validate_request_identity(
@@ -347,14 +367,6 @@ def mark_command_send_started(
         )
         if presentation is None:
             return _response("stale_route", row)
-        authority = {
-            "worker_id": binding["worker_id"],
-            "worker_fingerprint": private_binding.get("worker_fingerprint"),
-            "stable_key": binding["stable_key"],
-            "stable_key_version": binding["stable_key_version"],
-            "route_generation": binding["route_generation"],
-            "private_fingerprint": binding["private_fingerprint"],
-        }
         if submission_worker is not None:
             meta = getattr(submission_worker, "meta", {})
             snapshot_row = conn.execute(
@@ -385,13 +397,8 @@ def mark_command_send_started(
                 or public_meta.get("stable_key_version") != binding["stable_key_version"]
             ):
                 return _response("stale_route", row)
-        authority_fingerprint = _hash(
-            json.dumps(
-                authority,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
+        authority_fingerprint = _binding_authority_fingerprint(
+            binding, private_binding
         )
         changed = conn.execute(
             """UPDATE command_receipts
@@ -435,6 +442,24 @@ def mark_command_send_started(
                     current,
                     current,
                 ),
+            )
+            session_id = private_binding.get("turn_target_value")
+            if (
+                private_binding.get("turn_target_kind") != "acp_session_id"
+                or not isinstance(session_id, str)
+                or not session_id
+            ):
+                raise RuntimeError("ACP submission session authority is unavailable")
+            link_submission_to_projected_turn_conn(
+                conn,
+                host_id=host_id,
+                submission_id=submission_id,
+                turn_id=acp_producer_turn_id(session_id, submission_id),
+                worker_id=submission_worker.id,
+                authenticated_binding=binding,
+                presentation_binding=presentation,
+                now=current,
+                required=False,
             )
         effect = send_started_effect(conn) if send_started_effect else None
         row = conn.execute(
@@ -539,6 +564,120 @@ def linked_turn_for_submission(
             (host_id, request_id),
         ).fetchone()
     return None if row is None else json.loads(row[0])
+
+
+def link_submission_to_projected_turn_conn(
+    conn: Any,
+    *,
+    host_id: str,
+    submission_id: str,
+    turn_id: str,
+    worker_id: str,
+    authenticated_binding: Any,
+    presentation_binding: Any,
+    now: str,
+    required: bool = True,
+) -> dict[str, Any]:
+    """Atomically link one producer-owned submission to its exact ACP turn.
+
+    This path is intentionally stricter than the bounded text-fingerprint
+    reconciler below.  ACP supplies the durable ``turn_submission_id`` at the
+    prompt boundary, so a link is authoritative only when the authenticated
+    ACP binding, durable presentation route, receipt authority, and projected
+    turn all still describe the same worker generation.
+    """
+
+    if any(
+        not isinstance(value, str) or not value.strip()
+        for value in (host_id, submission_id, turn_id, worker_id)
+    ):
+        raise ValueError("submission link identity fields must be non-empty")
+    if not is_turn_submission_id(submission_id):
+        raise ValueError("submission_id is not a canonical turn submission ID")
+    current = canonical_utc(now)
+    row = conn.execute(
+        """SELECT s.*,r.public_worker_id,r.binding_fingerprint
+        FROM turn_submissions s
+        JOIN command_receipts r
+          ON r.host_id=s.host_id AND r.request_id=s.request_id
+        WHERE s.host_id=? AND s.submission_id=?""",
+        (host_id, submission_id),
+    ).fetchone()
+    if row is None:
+        if not required:
+            return {"state": "deferred", "linked_turn_id": None, "changed": False}
+        raise RuntimeError("turn submission authority unavailable")
+    if turn_submission_id(host_id, row["request_id"]) != submission_id:
+        raise RuntimeError("turn submission identity is inconsistent")
+    if row["worker_id"] != worker_id or row["public_worker_id"] != worker_id:
+        raise RuntimeError("turn submission worker authority changed")
+
+    try:
+        private = json.loads(str(authenticated_binding["private_binding_json"]))
+    except (TypeError, json.JSONDecodeError, KeyError) as exc:
+        raise RuntimeError("ACP binding authority is corrupt") from exc
+    if (
+        authenticated_binding["host_id"] != host_id
+        or authenticated_binding["worker_id"] != worker_id
+        or authenticated_binding["backend"] != "acp"
+        or authenticated_binding["stable_key_version"] != 1
+        or private.get("host_id") != host_id
+        or private.get("worker_id") != worker_id
+        or private.get("backend") != "acp"
+        or private.get("turn_target_kind") != "acp_session_id"
+        or not isinstance(private.get("turn_target_value"), str)
+        or not private.get("turn_target_value")
+        or private.get("private_fingerprint")
+        != authenticated_binding["private_fingerprint"]
+        or private.get("sendable") is not True
+    ):
+        raise RuntimeError("ACP binding authority changed")
+    authority_fingerprint = _binding_authority_fingerprint(
+        authenticated_binding, private
+    )
+    if not secrets.compare_digest(
+        str(row["binding_fingerprint"] or ""), authority_fingerprint
+    ):
+        raise RuntimeError("turn submission receipt authority changed")
+    if (
+        presentation_binding["host_id"] != host_id
+        or presentation_binding["worker_id"] != worker_id
+        or presentation_binding["stable_key"] != authenticated_binding["stable_key"]
+        or presentation_binding["stable_key_version"] != 1
+        or row["route_generation"] != presentation_binding["route_generation"]
+    ):
+        raise RuntimeError("turn submission presentation route changed")
+    if row["state"] == "linked":
+        if row["turn_id"] != turn_id:
+            raise RuntimeError("turn submission is already linked elsewhere")
+        return {"state": "linked", "linked_turn_id": turn_id, "changed": False}
+    projected = conn.execute(
+        """SELECT 1 FROM turns
+        WHERE host_id=? AND turn_id=? AND worker_id=? AND route_generation=?
+          AND stable_key=? AND removed_at IS NULL""",
+        (
+            host_id,
+            turn_id,
+            worker_id,
+            presentation_binding["route_generation"],
+            presentation_binding["stable_key"],
+        ),
+    ).fetchone()
+    if projected is None:
+        if not required:
+            return {"state": "deferred", "linked_turn_id": None, "changed": False}
+        raise RuntimeError("exact projected turn is unavailable")
+    if row["state"] not in _OPEN_SUBMISSION_STATES or row["turn_id"] is not None:
+        raise RuntimeError("turn submission is not linkable")
+    changed = conn.execute(
+        """UPDATE turn_submissions SET state='linked',turn_id=?,updated_at=?
+        WHERE host_id=? AND submission_id=?
+          AND state IN('send_started','submitted') AND turn_id IS NULL""",
+        (turn_id, current, host_id, submission_id),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError("turn submission link lost authority")
+    return {"state": "linked", "linked_turn_id": turn_id, "changed": True}
 
 
 def _settle_submission_conn(conn: Any, submission: Any, current: str) -> dict[str, Any]:

@@ -32,9 +32,11 @@ from tendwire.core.commands import (
     TERMINAL_MUTATION_REJECTION_STATUSES,
     CommandEnvelope,
     CommandRequest,
+    acp_producer_turn_id,
     build_canonical_mutation,
     build_selector_proof,
     instruction_fingerprint,
+    is_turn_submission_id,
     is_selector_proof,
     is_valid_request_id,
     parse_command_request,
@@ -557,5 +559,15 @@ def test_worker_candidate_and_public_ids_are_bounded() -> None:
         "worker_fingerprint": worker.fingerprint,
     }
     assert turn_submission_id("host-a", "request-1").startswith("twsub1.")
+    submission_id = turn_submission_id("host-a", "request-1")
+    assert is_turn_submission_id(submission_id)
+    assert not is_turn_submission_id("twsub1." + "g" * 64)
+    assert not is_turn_submission_id("twsub1." + "a" * 63)
+    assert acp_producer_turn_id("session-a", submission_id).startswith("acpt_")
+    assert acp_producer_turn_id("session-a", submission_id) == acp_producer_turn_id(
+        "session-a", submission_id
+    )
     with pytest.raises(ValueError):
         turn_submission_id("", "request-1")
+    with pytest.raises(ValueError):
+        acp_producer_turn_id("", submission_id)

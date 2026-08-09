@@ -756,10 +756,7 @@ def _send_instruction_through_route(
         if use_steering:
             steering_outcome = getattr(route_result, "value", route_result)
             if steering_outcome not in {"injected", "startedNewTurn"}:
-                rejected = steering_outcome == "failed"
-                return mutation.finish_instruction_failure(
-                    worker, "steering_failed" if rejected else "unknown"
-                )
+                return mutation.finish_instruction_failure(worker, "unknown")
     except SendStartRejected as exc:
         return exc.args[0]
     except Exception:  # noqa: BLE001

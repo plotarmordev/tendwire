@@ -22,6 +22,7 @@ from tendwire.backends.acp_protocol import (
     SessionUpdate,
     StopReason,
     SteeringOutcome,
+    SteeringResult,
 )
 from tendwire.backends.acp_runtime import (
     AcpWorkerSession as AcpRuntime,
@@ -64,7 +65,8 @@ class FakeClient:
         self.closed = False
         self.close_calls = 0
         self.steering_supported = False
-        self.steering_result = SteeringOutcome.INJECTED
+        self.steering_inject_only_supported = False
+        self.steering_result = SteeringResult(SteeringOutcome.INJECTED)
 
     def initialize(self, **kwargs: Any) -> object:
         self.calls.append(("initialize", (), kwargs))
@@ -92,6 +94,9 @@ class FakeClient:
         self.calls.append(("prompt", (session_id, prompt), kwargs))
         if self.prompt_failure is not None:
             raise self.prompt_failure
+        on_send_start = kwargs.get("on_send_start")
+        if callable(on_send_start):
+            on_send_start()
         on_submitted = kwargs.get("on_submitted")
         if callable(on_submitted):
             on_submitted()
@@ -110,7 +115,11 @@ class FakeClient:
         on_submitted = kwargs.get("on_submitted")
         if callable(on_submitted):
             on_submitted()
-        return self.steering_result
+        result = self.steering_result
+        correlation_id = kwargs.get("correlation_id")
+        if isinstance(result, SteeringResult) and correlation_id is not None:
+            return SteeringResult(result.outcome, correlation_id)
+        return result
 
     def cancel(self, session_id: str) -> None:
         self.calls.append(("cancel", (session_id,), {}))
@@ -156,6 +165,7 @@ class FakeIngestor:
         self.permission_failure: BaseException | None = None
         self.completion_failure: BaseException | None = None
         self.appended: list[tuple[object, str]] = []
+        self.ordered: list[str] = []
         self.appendable = True
         persisted = SimpleNamespace(status="inserted")
         self.update_result: object = SimpleNamespace(
@@ -177,6 +187,7 @@ class FakeIngestor:
     def ingest_update(self, raw: object, **_kwargs: Any) -> object:
         if self.update_failure is not None:
             raise self.update_failure
+        self.ordered.append("update")
         self.updates.append(raw)
         return self.update_result
 
@@ -204,6 +215,7 @@ class FakeIngestor:
         return self.appendable
 
     def append_prompt(self, prompt: object, *, producer_turn_id: str) -> object:
+        self.ordered.append("append")
         self.appended.append((prompt, producer_turn_id))
         return self.update_result
 
@@ -1182,9 +1194,10 @@ def test_submit_prompt_acknowledges_frame_before_end_of_turn(tmp_path: Path) -> 
     service.stop()
 
 
-def test_submit_steering_records_input_at_transport_boundary(tmp_path: Path) -> None:
+def test_submit_steering_projects_input_after_correlated_injection(tmp_path: Path) -> None:
     client = FakeClient()
     client.steering_supported = True
+    client.steering_inject_only_supported = True
     ingestor = FakeIngestor()
     service = runtime(tmp_path, client, ingestor).start()
     try:
@@ -1205,27 +1218,83 @@ def test_submit_steering_records_input_at_transport_boundary(tmp_path: Path) -> 
         service.stop()
 
 
-def test_submit_steering_retries_definite_non_application_once(tmp_path: Path) -> None:
+def test_malformed_reserved_steering_id_is_rejected_before_transport(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    client.steering_supported = True
+    client.steering_inject_only_supported = True
+    service = runtime(tmp_path, client, FakeIngestor()).start()
+    try:
+        with pytest.raises(ValueError, match="malformed reserved namespace"):
+            service.submit_steering(
+                "must not send",
+                producer_turn_id="twsub1.BAD",
+                acknowledgement_timeout=0.25,
+            )
+        assert [call[0] for call in client.calls].count("steer") == 0
+        assert [call[0] for call in client.calls].count("prompt") == 0
+        assert service.status().state is RuntimeState.RUNNING
+    finally:
+        service.stop()
+
+
+def test_injected_prompt_is_projected_before_queued_assistant_updates(
+    tmp_path: Path,
+) -> None:
+    class UpdatingSteeringClient(FakeClient):
+        def steer_session(
+            self, session_id: str, prompt: object, **kwargs: Any
+        ) -> SteeringResult:
+            self.calls.append(("steer", (session_id, prompt), kwargs))
+            on_send_start = kwargs.get("on_send_start")
+            if callable(on_send_start):
+                on_send_start()
+            self.updates.put(update(session_id))
+            time.sleep(0.02)
+            return SteeringResult(
+                SteeringOutcome.INJECTED,
+                kwargs.get("correlation_id"),
+            )
+
+    client = UpdatingSteeringClient()
+    client.steering_supported = True
+    client.steering_inject_only_supported = True
+    ingestor = FakeIngestor()
+    service = runtime(tmp_path, client, ingestor).start()
+    try:
+        result = service.submit_steering(
+            "ordered follow-up",
+            producer_turn_id="producer-steer-order",
+            acknowledgement_timeout=0.25,
+        )
+        assert result is SteeringOutcome.INJECTED
+        wait_until(lambda: len(ingestor.updates) == 1)
+        assert ingestor.ordered[:2] == ["append", "update"]
+    finally:
+        service.stop()
+
+
+def test_submit_steering_never_retries_ambiguous_failure(tmp_path: Path) -> None:
     class FailOnceSteeringClient(FakeClient):
         def __init__(self) -> None:
             super().__init__()
             self.steering_supported = True
+            self.steering_inject_only_supported = True
             self.steering_attempts = 0
 
         def steer_session(
             self, session_id: str, prompt: object, **kwargs: Any
-        ) -> SteeringOutcome:
+        ) -> SteeringResult:
             self.calls.append(("steer", (session_id, prompt), kwargs))
             self.steering_attempts += 1
             on_send_start = kwargs.get("on_send_start")
             if callable(on_send_start):
                 on_send_start()
-            outcome = (
-                SteeringOutcome.FAILED
-                if self.steering_attempts == 1
-                else SteeringOutcome.INJECTED
+            return SteeringResult(
+                SteeringOutcome.FAILED,
+                kwargs.get("correlation_id"),
             )
-            return outcome
 
     client = FailOnceSteeringClient()
     ingestor = FakeIngestor()
@@ -1238,38 +1307,185 @@ def test_submit_steering_retries_definite_non_application_once(tmp_path: Path) -
             acknowledgement_timeout=0.25,
             on_send_start=lambda: callbacks.append("started"),
         )
-        assert result is SteeringOutcome.INJECTED
+        assert result is SteeringOutcome.FAILED
         assert callbacks == ["started"]
-        assert len(ingestor.appended) == 1
-        assert ingestor.appended[0][1] == "producer-steer-retry"
-        assert [call[0] for call in client.calls].count("steer") == 2
-        assert client.calls[-1][2].get("on_send_start") is None
-        assert 0 < client.calls[-1][2]["timeout"] <= 0.25
+        assert ingestor.appended == []
+        assert [call[0] for call in client.calls].count("steer") == 1
+        assert service.status().state is RuntimeState.FAILED
     finally:
-        service.stop()
+        with pytest.raises(AcpRuntimeProtocolError):
+            service.stop()
 
 
-def test_submit_steering_returns_second_definite_failure_without_third_attempt(
+@pytest.mark.parametrize("failure_kind", ["timeout", "mismatch"])
+def test_post_boundary_steering_error_quarantines_without_fallback(
+    tmp_path: Path,
+    failure_kind: str,
+) -> None:
+    class BrokenResponseClient(FakeClient):
+        def steer_session(
+            self, session_id: str, prompt: object, **kwargs: Any
+        ) -> SteeringResult:
+            self.calls.append(("steer", (session_id, prompt), kwargs))
+            on_send_start = kwargs.get("on_send_start")
+            assert callable(on_send_start)
+            on_send_start()
+            if failure_kind == "timeout":
+                raise AcpRequestTimeoutError("response acknowledgement timed out")
+            return SteeringResult(
+                SteeringOutcome.INJECTED,
+                "different-correlation",
+            )
+
+    client = BrokenResponseClient()
+    client.steering_supported = True
+    client.steering_inject_only_supported = True
+    ingestor = FakeIngestor()
+    service = runtime(tmp_path, client, ingestor).start()
+    try:
+        expected = AcpRequestTimeoutError if failure_kind == "timeout" else AcpRuntimeProtocolError
+        with pytest.raises(expected):
+            service.submit_steering(
+                "ambiguous follow-up",
+                producer_turn_id="producer-steer-ambiguous",
+                acknowledgement_timeout=0.25,
+            )
+        assert service.status().state is RuntimeState.FAILED
+        assert ingestor.appended == []
+        assert [call[0] for call in client.calls].count("steer") == 1
+        assert [call[0] for call in client.calls].count("prompt") == 0
+    finally:
+        with pytest.raises(expected):
+            service.stop()
+
+
+def test_inject_only_idle_race_falls_back_to_one_standard_prompt(
     tmp_path: Path,
 ) -> None:
     client = FakeClient()
     client.steering_supported = True
-    client.steering_result = SteeringOutcome.FAILED
+    client.steering_inject_only_supported = True
+    client.steering_result = SteeringResult(SteeringOutcome.NOT_ACTIVE)
     ingestor = FakeIngestor()
     service = runtime(tmp_path, client, ingestor).start()
     try:
         callbacks: list[str] = []
         result = service.submit_steering(
-            "live failed follow-up",
-            producer_turn_id="producer-steer-failed",
-            acknowledgement_timeout=0.25,
+            "late follow-up",
+            producer_turn_id="producer-steer-fallback",
+            acknowledgement_timeout=0.5,
             on_send_start=lambda: callbacks.append("started"),
         )
-        assert result is SteeringOutcome.FAILED
+        assert result is SteeringOutcome.STARTED_NEW_TURN
         assert callbacks == ["started"]
-        assert len(ingestor.appended) == 1
-        assert [call[0] for call in client.calls].count("steer") == 2
+        assert ingestor.appended == []
+        assert ingestor.started == ["producer-steer-fallback"]
+        assert [call[0] for call in client.calls].count("steer") == 1
+        assert [call[0] for call in client.calls].count("prompt") == 1
+        wait_until(lambda: service.status().prompts_completed == 1)
     finally:
+        service.stop()
+
+
+def test_turn_completion_between_route_selection_and_write_uses_standard_prompt(
+    tmp_path: Path,
+) -> None:
+    class CompletingIngestor(FakeIngestor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.append_checks = 0
+
+        def can_append_prompt(self) -> bool:
+            self.append_checks += 1
+            return self.append_checks == 1
+
+    client = FakeClient()
+    client.steering_supported = True
+    client.steering_inject_only_supported = True
+    ingestor = CompletingIngestor()
+    service = runtime(tmp_path, client, ingestor).start()
+    try:
+        callbacks: list[str] = []
+        result = service.submit_steering(
+            "boundary follow-up",
+            producer_turn_id="producer-boundary-fallback",
+            acknowledgement_timeout=0.5,
+            on_send_start=lambda: callbacks.append("started"),
+        )
+        assert result is SteeringOutcome.STARTED_NEW_TURN
+        assert callbacks == ["started"]
+        assert [call[0] for call in client.calls].count("steer") == 0
+        assert [call[0] for call in client.calls].count("prompt") == 1
+        assert ingestor.started == ["producer-boundary-fallback"]
+        wait_until(lambda: service.status().prompts_completed == 1)
+    finally:
+        service.stop()
+
+
+def test_inject_only_fallback_waits_for_old_prompt_completion(
+    tmp_path: Path,
+) -> None:
+    class BlockingOldPromptClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.old_release = threading.Event()
+            self.prompt_count = 0
+
+        def prompt(self, session_id: str, prompt: object, **kwargs: Any) -> object:
+            self.calls.append(("prompt", (session_id, prompt), kwargs))
+            self.prompt_count += 1
+            on_submitted = kwargs.get("on_submitted")
+            if callable(on_submitted):
+                on_submitted()
+            if self.prompt_count == 1:
+                assert self.old_release.wait(1.0)
+            return StopReason.END_TURN
+
+    client = BlockingOldPromptClient()
+    client.steering_supported = True
+    client.steering_inject_only_supported = True
+    client.steering_result = SteeringResult(SteeringOutcome.NOT_ACTIVE)
+    ingestor = FakeIngestor()
+    service = runtime(tmp_path, client, ingestor).start()
+    service.submit_prompt(
+        "old prompt",
+        producer_turn_id="producer-old",
+        acknowledgement_timeout=0.25,
+    )
+    outcome: list[SteeringOutcome] = []
+    failure: list[BaseException] = []
+
+    def submit_late() -> None:
+        try:
+            outcome.append(service.submit_steering(
+                "new prompt",
+                producer_turn_id="producer-new",
+                acknowledgement_timeout=0.75,
+            ))
+        except BaseException as exc:
+            failure.append(exc)
+
+    late_thread = threading.Thread(target=submit_late)
+    late_thread.start()
+    try:
+        wait_until(lambda: [call[0] for call in client.calls].count("steer") == 1)
+        time.sleep(0.03)
+        assert [call[0] for call in client.calls].count("prompt") == 1
+        assert ingestor.started == ["producer-old"]
+        client.old_release.set()
+        late_thread.join(timeout=1.0)
+        assert not late_thread.is_alive()
+        assert failure == []
+        assert outcome == [SteeringOutcome.STARTED_NEW_TURN]
+        wait_until(lambda: service.status().prompts_completed == 2)
+        assert ingestor.started == ["producer-old", "producer-new"]
+        assert ingestor.completion_reasons == [
+            StopReason.END_TURN,
+            StopReason.END_TURN,
+        ]
+    finally:
+        client.old_release.set()
+        late_thread.join(timeout=1.0)
         service.stop()
 
 

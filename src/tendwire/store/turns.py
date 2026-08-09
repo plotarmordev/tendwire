@@ -51,6 +51,7 @@ from .db import canonical_utc, read_transaction, utc_now, write_transaction
 from .events import _append
 from .outbox import OutboxInvariantError, _validate_polled_payload
 from .projection import presentation_binding_row
+from .receipts import link_submission_to_projected_turn_conn
 
 
 @dataclass(frozen=True)
@@ -660,6 +661,8 @@ def append_agent_event_and_apply_turn_for_binding(
     *,
     expected_binding: WorkerBinding,
     content: Mapping[str, Any] | None = None,
+    producer_turn_id: str | None = None,
+    producer_turn_required: bool = False,
     _fault_inject: Callable[[str], None] | None = None,
 ) -> AppendProjectedAgentEventResult:
     with write_transaction(db_path) as conn:
@@ -683,6 +686,7 @@ def append_agent_event_and_apply_turn_for_binding(
         if _fault_inject:
             _fault_inject("after_event_append")
         turn = None
+        presentation = None
         if content is not None and (
             appended.inserted
             or conn.execute(
@@ -716,6 +720,29 @@ def append_agent_event_and_apply_turn_for_binding(
                     binding_row=presentation,
                 ),
                 False,
+            )
+        if producer_turn_id is not None:
+            if event.source_turn_id is None or content is None:
+                raise RuntimeError("producer turn linkage requires projected content")
+            if presentation is None:
+                presentation = presentation_binding_row(
+                    conn,
+                    host_id,
+                    event.worker_id,
+                    authenticated,
+                )
+            if presentation is None:
+                raise RuntimeError("presentation route unavailable")
+            link_submission_to_projected_turn_conn(
+                conn,
+                host_id=host_id,
+                submission_id=producer_turn_id,
+                turn_id=event.source_turn_id,
+                worker_id=event.worker_id,
+                authenticated_binding=authenticated,
+                presentation_binding=presentation,
+                now=persisted_observed_at,
+                required=producer_turn_required,
             )
         if _fault_inject:
             _fault_inject("after_turn_projection")

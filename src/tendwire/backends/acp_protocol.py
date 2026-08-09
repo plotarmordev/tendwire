@@ -76,7 +76,16 @@ class SteeringOutcome(str, Enum):
 
     INJECTED = "injected"
     STARTED_NEW_TURN = "startedNewTurn"
+    NOT_ACTIVE = "notActive"
     FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class SteeringResult:
+    """One correlated response from the inject-only steering extension."""
+
+    outcome: SteeringOutcome
+    correlation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

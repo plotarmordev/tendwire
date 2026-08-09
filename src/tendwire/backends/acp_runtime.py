@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Config
+from ..core.commands import is_turn_submission_id
 from ..core.models import WorkerBinding, stable_fingerprint
 from ..store.projection import list_worker_bindings
 from .acp_ingestion import AcpSessionIngestor
@@ -27,6 +28,7 @@ from .acp_protocol import (
     SessionUpdate,
     StopReason,
     SteeringOutcome,
+    SteeringResult,
 )
 
 
@@ -286,8 +288,7 @@ class AcpWorkerSession:
         with self._prompt_lock:
             self.raise_if_failed()
             session_id, ingestor = self._running_components()
-            if not isinstance(producer_turn_id, str) or not producer_turn_id.strip():
-                raise ValueError("producer_turn_id must be non-empty text")
+            producer_turn_id = _validated_producer_turn_id(producer_turn_id)
             self._increment("prompts_started")
             close_on_failure = False
             try:
@@ -295,7 +296,7 @@ class AcpWorkerSession:
                 prepared_prompt = _prepare_prompt_content(self._client, prompt)
                 prompt_event = ingestor.begin_prompt(
                     prepared_prompt,
-                    producer_turn_id=producer_turn_id.strip(),
+                    producer_turn_id=producer_turn_id,
                 )
                 _raise_for_binding_rejection(prompt_event)
                 close_on_failure = True
@@ -398,7 +399,10 @@ class AcpWorkerSession:
     def can_steer(self) -> bool:
         """Return whether this runtime can append to a live ACP turn."""
 
-        if self._client.steering_supported is not True:
+        if (
+            self._client.steering_supported is not True
+            or self._client.steering_inject_only_supported is not True
+        ):
             return False
         with self._idle_condition:
             if self._state is not RuntimeState.RUNNING or self._failure is not None:
@@ -419,8 +423,7 @@ class AcpWorkerSession:
 
         if acknowledgement_timeout <= 0:
             raise ValueError("acknowledgement_timeout must be positive")
-        if not isinstance(producer_turn_id, str) or not producer_turn_id.strip():
-            raise ValueError("producer_turn_id must be non-empty text")
+        producer_turn_id = _validated_producer_turn_id(producer_turn_id)
         with self._steering_lock:
             self.raise_if_failed()
             session_id, ingestor = self._running_components()
@@ -428,41 +431,90 @@ class AcpWorkerSession:
             if not self.can_steer():
                 raise AcpRuntimeStateError("ACP steering is unavailable")
 
-            def start_and_record() -> None:
+            transport_started = False
+
+            def mark_transport_started() -> None:
+                nonlocal transport_started
                 if on_send_start is not None:
                     on_send_start()
-                with self._ingest_lock:
-                    result = ingestor.append_prompt(
-                        prepared,
-                        producer_turn_id=producer_turn_id.strip(),
-                    )
-                    _raise_for_binding_rejection(result)
+                transport_started = True
 
+            correlation_id = producer_turn_id
             deadline = time.monotonic() + acknowledgement_timeout
-            result = self._client.steer_session(
-                session_id,
-                prepared,
-                timeout=acknowledgement_timeout,
-                on_send_start=start_and_record,
-            )
-            if result is not SteeringOutcome.FAILED:
-                return result
-
-            # The steering extension defines ``failed`` as a definite
-            # non-application outcome.  Retrying once is therefore safe and
-            # prevents a transient adapter/app-server race from turning a
-            # live Telegram message into a terminal drop.  The durable input
-            # and transport-boundary callback were already recorded by the
-            # first attempt, so the retry deliberately omits the callback and
-            # stays inside the caller's original acknowledgement budget.
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return result
-            return self._client.steer_session(
-                session_id,
-                prepared,
-                timeout=remaining,
-            )
+            try:
+                # Keep projection ordered while the adapter decides whether
+                # this input joined the active turn. The client reader keeps
+                # draining frames into its bounded queue.
+                with self._ingest_lock:
+                    steerable_at_write = ingestor.can_append_prompt()
+                    result = (
+                        self._client.steer_session(
+                            session_id,
+                            prepared,
+                            correlation_id=correlation_id,
+                            start_new_turn_when_idle=False,
+                            timeout=acknowledgement_timeout,
+                            on_send_start=mark_transport_started,
+                        )
+                        if steerable_at_write
+                        else None
+                    )
+                    if steerable_at_write:
+                        if not isinstance(result, SteeringResult):
+                            raise AcpRuntimeProtocolError(
+                                "ACP steering returned an invalid correlated response"
+                            )
+                        if result.correlation_id != correlation_id:
+                            raise AcpRuntimeProtocolError(
+                                "ACP steering response correlation changed"
+                            )
+                        if result.outcome is SteeringOutcome.INJECTED:
+                            appended = ingestor.append_prompt(
+                                prepared,
+                                producer_turn_id=correlation_id,
+                            )
+                            _raise_for_binding_rejection(appended)
+                            return result.outcome
+                if not steerable_at_write:
+                    # The local turn completed after route selection but
+                    # before any steering frame was written. Start one normal
+                    # prompt and cross the durable send boundary there.
+                    self.submit_prompt(
+                        prepared,
+                        producer_turn_id=correlation_id,
+                        acknowledgement_timeout=acknowledgement_timeout,
+                        on_send_start=mark_transport_started,
+                    )
+                    return SteeringOutcome.STARTED_NEW_TURN
+                assert isinstance(result, SteeringResult)
+                if result.outcome is SteeringOutcome.NOT_ACTIVE:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise AcpRuntimeStopTimeout(
+                            "ACP inject-only fallback exhausted its acknowledgement budget"
+                        )
+                    # The inject-only response proves the first request did
+                    # not apply the prompt. Submit it exactly once through
+                    # standard ACP without crossing the receipt boundary again.
+                    self.submit_prompt(
+                        prepared,
+                        producer_turn_id=correlation_id,
+                        acknowledgement_timeout=remaining,
+                    )
+                    return SteeringOutcome.STARTED_NEW_TURN
+                if result.outcome is SteeringOutcome.FAILED:
+                    failure = AcpRuntimeProtocolError(
+                        "ACP inject-only steering failed after transport start"
+                    )
+                    self._record_failure(failure)
+                    return result.outcome
+                raise AcpRuntimeProtocolError(
+                    "ACP inject-only steering returned an unsupported outcome"
+                )
+            except BaseException as exc:
+                if transport_started:
+                    self._record_failure(exc)
+                raise
 
     def cancel(self) -> None:
         """Cancel the active session and any permission requests pending in it."""
@@ -849,6 +901,15 @@ class AcpWorkerSession:
             self._state = RuntimeState.FAILED
             self._stop_event.set()
             self._idle_condition.notify_all()
+
+
+def _validated_producer_turn_id(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("producer_turn_id must be non-empty text")
+    producer = value.strip()
+    if producer.startswith("twsub1.") and not is_turn_submission_id(producer):
+        raise ValueError("producer_turn_id uses a malformed reserved namespace")
+    return producer
 
 
 def _prepare_prompt_content(

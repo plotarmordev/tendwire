@@ -16,6 +16,7 @@ from tendwire.backends.acp_client import (
     ClientState,
 )
 from tendwire.backends.acp_protocol import (
+    AcpEnvelopeError,
     AcpProtocolError,
     PermissionRequest,
     SessionUpdate,
@@ -164,6 +165,7 @@ def test_advertised_steering_extension_is_capability_gated() -> None:
         acp.new_session("/tmp/project")
         acp.next_session_event(timeout=1)
         assert acp.steering_supported
+        assert acp.steering_inject_only_supported
         callbacks: list[str] = []
         result = acp.steer_session(
             "s-new",
@@ -171,7 +173,8 @@ def test_advertised_steering_extension_is_capability_gated() -> None:
             on_send_start=lambda: callbacks.append("started"),
             on_submitted=lambda: callbacks.append("submitted"),
         )
-        assert result is SteeringOutcome.INJECTED
+        assert result.outcome is SteeringOutcome.INJECTED
+        assert result.correlation_id is None
         assert callbacks == ["started", "submitted"]
         echoed = acp.next_session_event(timeout=1)
         assert echoed.raw["update"]["sessionUpdate"] == "user_message_chunk"
@@ -179,8 +182,98 @@ def test_advertised_steering_extension_is_capability_gated() -> None:
     with opened_client() as acp:
         acp.initialize()
         assert not acp.steering_supported
+        assert not acp.steering_inject_only_supported
         with pytest.raises(AcpCapabilityError, match="steering"):
             acp.steer_session("s1", "no capability")
+
+
+def test_inject_only_steering_is_correlated_and_never_starts_an_idle_turn() -> None:
+    with opened_client("steering_idle") as acp:
+        acp.initialize()
+        result = acp.steer_session(
+            "s1",
+            "late input",
+            correlation_id="submission-1",
+            start_new_turn_when_idle=False,
+        )
+        assert result.outcome is SteeringOutcome.NOT_ACTIVE
+        assert result.correlation_id == "submission-1"
+
+
+def test_inject_only_steering_requires_capability_and_bounded_correlation() -> None:
+    with opened_client("steering") as acp:
+        acp.initialize()
+        with pytest.raises(ValueError, match="correlation_id"):
+            acp.steer_session(
+                "s1",
+                "bad",
+                correlation_id="",
+                start_new_turn_when_idle=False,
+            )
+        with pytest.raises(ValueError, match="correlation_id"):
+            acp.steer_session(
+                "s1",
+                "bad",
+                correlation_id="x" * 513,
+                start_new_turn_when_idle=False,
+            )
+
+    with opened_client() as acp:
+        acp.initialize()
+        with pytest.raises(AcpCapabilityError, match="steering"):
+            acp.steer_session(
+                "s1",
+                "unsupported",
+                correlation_id="submission-2",
+                start_new_turn_when_idle=False,
+            )
+
+
+@pytest.mark.parametrize("invalid_version", [True, 1.0])
+def test_inject_only_capability_requires_integer_version_one(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_version: object,
+) -> None:
+    with opened_client("initialize_only") as acp:
+        monkeypatch.setattr(
+            acp,
+            "request",
+            lambda *_args, **_kwargs: {
+                "protocolVersion": 1,
+                "agentCapabilities": {},
+                "_meta": {
+                    "steering": {
+                        "supported": True,
+                        "injectOnly": {"version": invalid_version},
+                    }
+                },
+            },
+        )
+        acp.initialize()
+        assert acp.steering_supported
+        assert not acp.steering_inject_only_supported
+
+
+def test_inject_only_steering_rejects_mismatched_correlation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with opened_client("steering") as acp:
+        acp.initialize()
+        monkeypatch.setattr(
+            acp,
+            "request",
+            lambda *_args, **_kwargs: {
+                "outcome": "injected",
+                "correlationId": "different-submission",
+            },
+        )
+        with pytest.raises(AcpEnvelopeError, match="mismatched correlationId"):
+            acp.steer_session(
+                "s1",
+                "correlated",
+                correlation_id="submission-3",
+                start_new_turn_when_idle=False,
+            )
 
 
 def test_ordered_session_event_api_preserves_cross_kind_reader_order() -> None:

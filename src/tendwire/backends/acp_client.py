@@ -45,6 +45,7 @@ from .acp_protocol import (
     RequestId,
     SessionUpdate,
     SteeringOutcome,
+    SteeringResult,
     StopReason,
     decode_json_line,
     encode_message,
@@ -155,6 +156,7 @@ class BoundedAcpConnection:
         self._failure: BaseException | None = None
         self._capabilities: Mapping[str, Any] | None = None
         self._steering_supported = False
+        self._steering_inject_only_supported = False
 
     @property
     def state(self) -> ClientState:
@@ -168,6 +170,10 @@ class BoundedAcpConnection:
     @property
     def steering_supported(self) -> bool:
         return self._steering_supported
+
+    @property
+    def steering_inject_only_supported(self) -> bool:
+        return self._steering_inject_only_supported
 
     def start(self) -> "BoundedAcpConnection":
         with self._state_lock:
@@ -269,6 +275,16 @@ class BoundedAcpConnection:
             steering = meta.get("steering") if isinstance(meta, Mapping) else None
             self._steering_supported = (
                 isinstance(steering, Mapping) and steering.get("supported") is True
+            )
+            inject_only = (
+                steering.get("injectOnly")
+                if isinstance(steering, Mapping)
+                else None
+            )
+            self._steering_inject_only_supported = (
+                isinstance(inject_only, Mapping)
+                and type(inject_only.get("version")) is int
+                and inject_only.get("version") == 1
             )
             parsed = dict(capabilities_value)
             with self._state_lock:
@@ -457,26 +473,51 @@ class BoundedAcpConnection:
         session_id: str,
         prompt: str | Sequence[Mapping[str, Any]],
         *,
+        correlation_id: str | None = None,
+        start_new_turn_when_idle: bool | None = None,
         timeout: float | None = None,
         on_send_start: Callable[[], None] | None = None,
         on_submitted: Callable[[], None] | None = None,
-    ) -> SteeringOutcome:
+    ) -> SteeringResult:
         """Inject input into an active turn through an advertised extension.
 
-        ``codex-acp`` serializes these requests per session and either injects
-        into the live turn or starts a new turn after the prior one drains.
-        The method is never used unless the initialize response opted in.
+        Tendwire's live route uses the advertised inject-only contract so an
+        idle race is a definite non-application outcome.  Legacy callers may
+        omit that option and retain the adapter's upstream-compatible default.
         """
 
         if not self.steering_supported:
             raise AcpCapabilityError("agent did not advertise steering capability")
+        if correlation_id is not None and (
+            not isinstance(correlation_id, str)
+            or not correlation_id
+            or len(correlation_id) > 512
+        ):
+            raise ValueError("correlation_id must be 1 to 512 characters")
+        if (
+            start_new_turn_when_idle is not None
+            and type(start_new_turn_when_idle) is not bool
+        ):
+            raise ValueError("start_new_turn_when_idle must be a boolean or None")
+        if start_new_turn_when_idle is False:
+            if not self.steering_inject_only_supported:
+                raise AcpCapabilityError(
+                    "agent did not advertise inject-only steering capability"
+                )
+            if correlation_id is None:
+                raise ValueError("inject-only steering requires correlation_id")
         content = list(self.prepare_prompt(prompt))
+        params: dict[str, Any] = {
+            "sessionId": _nonempty(session_id, "session_id"),
+            "prompt": content,
+        }
+        if correlation_id is not None:
+            params["correlationId"] = correlation_id
+        if start_new_turn_when_idle is not None:
+            params["startNewTurnWhenIdle"] = start_new_turn_when_idle
         result = self.request(
             "_session/steering",
-            {
-                "sessionId": _nonempty(session_id, "session_id"),
-                "prompt": content,
-            },
+            params,
             timeout=timeout,
             on_writing=on_send_start,
             on_written=on_submitted,
@@ -488,7 +529,16 @@ class BoundedAcpConnection:
             raise AcpEnvelopeError(
                 "_session/steering returned an invalid outcome"
             ) from exc
-        return outcome
+        echoed_correlation = raw.get("correlationId")
+        if correlation_id is not None and echoed_correlation != correlation_id:
+            raise AcpEnvelopeError(
+                "_session/steering returned a mismatched correlationId"
+            )
+        if correlation_id is None and echoed_correlation is not None:
+            raise AcpEnvelopeError(
+                "_session/steering returned an unexpected correlationId"
+            )
+        return SteeringResult(outcome, correlation_id)
 
     def prepare_prompt(
         self,

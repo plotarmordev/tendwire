@@ -169,6 +169,29 @@ def turn_submission_id(host_id: Any, request_id: Any) -> str:
     return f"twsub1.{_digest(b'tendwire.turn-submission-id.v1', host, request)}"
 
 
+def is_turn_submission_id(value: Any) -> bool:
+    """Return whether value is an exact v1 durable submission identifier."""
+
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"twsub1\.[0-9a-f]{64}", value, re.ASCII) is not None
+    )
+
+
+def acp_producer_turn_id(session_id: Any, producer_turn_id: Any) -> str:
+    """Derive the exact public ACP turn ID for one producer submission."""
+
+    session = str(session_id or "").strip()
+    producer = str(producer_turn_id or "").strip()
+    if not session or not producer:
+        raise ValueError("ACP producer turn identity fields must be non-empty")
+    return "acpt_" + stable_fingerprint({
+        "source": "acp",
+        "session": session,
+        "producer_turn": producer,
+    })
+
+
 @dataclass(frozen=True)
 class CommandRequest:
     action: str
@@ -509,8 +532,7 @@ def _valid_public_result(result: Mapping[str, Any], request: CommandRequest) -> 
                 "pending_observation", "observed", "complete",
             }
             and result.get("submission_verdict") == "submitted"
-            and isinstance(submission_id, str)
-            and re.fullmatch(r"twsub1\.[0-9a-f]{64}", submission_id, re.ASCII) is not None
+            and is_turn_submission_id(submission_id)
         )
     decision = result.get("decision")
     return (

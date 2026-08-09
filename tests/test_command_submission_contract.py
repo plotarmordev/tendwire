@@ -887,7 +887,7 @@ def test_finish_commit_then_exception_recovers_exact_terminal_receipt(
     ("verdict", "status", "disposition"),
     [
         ("accepted", "accepted", "terminal_accepted"),
-        ("rejected", "rejected", "terminal_rejected"),
+        ("steering_failed", "request_state_uncertain", "terminal_uncertain"),
         ("uncertain", "request_state_uncertain", "terminal_uncertain"),
     ],
 )
@@ -901,7 +901,7 @@ def test_terminal_receipt_replays_exactly_without_resending(
     _worker, _binding = _seed(config)
     route = {
         "accepted": _Route(),
-        "rejected": _Route(steering=True, steering_outcome="failed"),
+        "steering_failed": _Route(steering=True, steering_outcome="failed"),
         "uncertain": _Route(failure="after_send_start"),
     }[verdict]
     request = _instruction(f"terminal-{verdict}")

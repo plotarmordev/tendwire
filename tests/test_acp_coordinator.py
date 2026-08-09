@@ -1396,7 +1396,7 @@ def test_live_acp_route_uses_advertised_steering_despite_observer_lag(
     assert receipt is not None and receipt["state"] == "accepted"
 
 
-def test_definite_acp_steering_failure_is_rejected_not_uncertain(
+def test_ambiguous_acp_steering_failure_is_uncertain_and_not_retried(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path)
@@ -1427,14 +1427,15 @@ def test_definite_acp_steering_failure_is_rejected_not_uncertain(
         acp_prompt_router=lambda _routed: route,
     )
 
-    assert envelope.status == "rejected"
-    assert envelope.disposition == "terminal_rejected"
+    assert envelope.status == "request_state_uncertain"
+    assert envelope.disposition == "terminal_uncertain"
+    assert len(route.steering_calls) == 1
     receipt = get_command_request(
         config.db_path,
         config.host_id,
         "request-active-steer-failed",
     )
-    assert receipt is not None and receipt["state"] == "rejected"
+    assert receipt is not None and receipt["state"] == "uncertain"
 
 
 def test_acp_failure_after_send_started_is_uncertain_and_never_falls_back(tmp_path: Path) -> None:

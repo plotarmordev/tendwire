@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Config
+from ..core.commands import acp_producer_turn_id, is_turn_submission_id
 from ..core.agent_events import AgentEvent, AppendBoundAgentEventResult, agent_event
 from ..core.models import WorkerBinding, stable_fingerprint
 from ..store.turns import (
@@ -104,20 +105,15 @@ class AcpSessionIngestor:
         # transport recreation.  Synthetic identity exists only for unsolicited or
         # historical inbound streams; outgoing prompts require producer
         # identity before any durable or remote side effect.
-        identity = (
-            {
-                "source": "acp",
-                "session": self.session_id,
-                "producer_turn": producer_turn_id.strip(),
-            }
+        self._source_turn_id = (
+            acp_producer_turn_id(self.session_id, producer_turn_id)
             if producer_turn_id is not None
-            else {
+            else "acpt_" + stable_fingerprint({
                 "source": "acp",
                 "session": self.session_id,
                 "turn": self._turn_ordinal,
-            }
+            })
         )
-        self._source_turn_id = f"acpt_{stable_fingerprint(identity)}"
         self._turn_complete = False
         self._local_prompt_recorded = False
         self._turn_messages = {"user_message": {}, "agent_message": {}}
@@ -218,6 +214,8 @@ class AcpSessionIngestor:
         checkpoint = self.projector.checkpoint_session(self.session_id)
         prior_turn_state = self._turn_state()
         producer = producer_turn_id.strip()
+        if producer.startswith("twsub1.") and not is_turn_submission_id(producer):
+            raise ValueError("producer_turn_id uses a malformed reserved namespace")
         if steering:
             source_event_id = "steer-input:" + stable_fingerprint(
                 {"producer_turn": producer}
@@ -253,7 +251,11 @@ class AcpSessionIngestor:
             self._restore_speculation(checkpoint, prior_turn_state)
             raise
         result = self._accept(
-            canonical, checkpoint=checkpoint, prior_turn_state=prior_turn_state
+            canonical,
+            checkpoint=checkpoint,
+            prior_turn_state=prior_turn_state,
+            producer_turn_id=(producer if is_turn_submission_id(producer) else None),
+            producer_turn_required=steering,
         )
         if result.event is not None and result.event.status != "binding_changed":
             self._local_prompt_recorded = True
@@ -375,6 +377,8 @@ class AcpSessionIngestor:
         prior_turn_state: tuple[
             int, str | None, bool, bool, dict[str, dict[int, str]]
         ],
+        producer_turn_id: str | None = None,
+        producer_turn_required: bool = False,
     ) -> AcpIngestionResult:
         kind = str(canonical.get("kind") or "")
         try:
@@ -422,6 +426,8 @@ class AcpSessionIngestor:
                 event,
                 expected_binding=self.binding,
                 content=projection,
+                producer_turn_id=producer_turn_id,
+                producer_turn_required=producer_turn_required,
             )
         except BaseException:
             self._restore_speculation(checkpoint, prior_turn_state)
