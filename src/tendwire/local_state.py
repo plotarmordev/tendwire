@@ -95,6 +95,12 @@ class SocketGroup:
 
 
 _UMASK_LOCK = threading.RLock()
+_SQLITE_FAMILY = (
+    ("", LocalStateKind.DATABASE),
+    ("-wal", LocalStateKind.DATABASE_WAL),
+    ("-shm", LocalStateKind.DATABASE_SHM),
+    ("-journal", LocalStateKind.DATABASE_JOURNAL),
+)
 
 
 def _raise(code: LocalStateErrorCode) -> NoReturn:
@@ -356,8 +362,7 @@ def prepare_resolved_private_parent(
     path: str | os.PathLike[str],
 ) -> tuple[int, str, PermissionResult]:
     parent_fd, leaf = open_resolved_parent(path, create_missing=True)
-    result = _directory_result(parent_fd, LocalStateKind.STATE_DIRECTORY)
-    return parent_fd, leaf, result
+    return parent_fd, leaf, _directory_result(parent_fd, LocalStateKind.STATE_DIRECTORY)
 
 
 def prepare_sqlite_family_at(
@@ -365,10 +370,7 @@ def prepare_sqlite_family_at(
     _expected_main_identity: EntryIdentity | None = None,
 ) -> tuple[PermissionResult, ...]:
     results: list[PermissionResult] = []
-    for index, (suffix, kind) in enumerate((
-        ("", LocalStateKind.DATABASE), ("-wal", LocalStateKind.DATABASE_WAL),
-        ("-shm", LocalStateKind.DATABASE_SHM), ("-journal", LocalStateKind.DATABASE_JOURNAL),
-    )):
+    for index, (suffix, kind) in enumerate(_SQLITE_FAMILY):
         leaf = _leaf(name + suffix)
         current = lstat_at(parent_fd, leaf)
         if current is None and index == 0 and create_main:
@@ -548,15 +550,14 @@ def repair_config_state(
     def stage_leaf(
         parent_fd: int, name: str, expected: EntryType,
         kind: LocalStateKind, maximum: int,
-    ) -> bool:
+    ) -> None:
         value = lstat_at(parent_fd, name)
         if value is None:
-            return False
+            return
         _validate(value, expected)
         if expected is EntryType.REGULAR_FILE and value.st_nlink != 1:
             _raise(LocalStateErrorCode.INSECURE_MODE)
         staged.append((parent_fd, name, entry_identity(value), expected, kind, maximum))
-        return True
 
     try:
         opened = open_parent(data_dir)
@@ -574,12 +575,7 @@ def repair_config_state(
                     opened[0], None, entry_identity(parent), EntryType.DIRECTORY,
                     LocalStateKind.STATE_DIRECTORY, PRIVATE_DIRECTORY_MODE,
                 ))
-                for suffix, kind in (
-                    ("", LocalStateKind.DATABASE),
-                    ("-wal", LocalStateKind.DATABASE_WAL),
-                    ("-shm", LocalStateKind.DATABASE_SHM),
-                    ("-journal", LocalStateKind.DATABASE_JOURNAL),
-                ):
+                for suffix, kind in _SQLITE_FAMILY:
                     stage_leaf(
                         opened[0], opened[1] + suffix, EntryType.REGULAR_FILE,
                         kind, PRIVATE_FILE_MODE,
