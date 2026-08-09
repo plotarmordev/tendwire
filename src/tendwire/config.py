@@ -9,7 +9,6 @@ from __future__ import annotations
 import math
 import os
 import platform
-import socket
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
