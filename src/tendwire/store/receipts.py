@@ -136,6 +136,14 @@ def _same(
     ) and str(row["selector_proof"] or "") == selector_proof
 
 
+def _receipt(conn: Any, host_id: str, request_id: str) -> Any:
+    return conn.execute(
+        """SELECT * FROM command_receipts
+        WHERE host_id=? AND request_id=?""",
+        (host_id, request_id),
+    ).fetchone()
+
+
 def get_command_request(
     db_path: Path,
     host_id: str,
@@ -143,11 +151,7 @@ def get_command_request(
 ) -> dict[str, Any] | None:
     try:
         with read_transaction(db_path) as conn:
-            row = conn.execute(
-                """SELECT * FROM command_receipts
-                WHERE host_id=? AND request_id=?""",
-                (host_id, request_id),
-            ).fetchone()
+            row = _receipt(conn, host_id, request_id)
     except Exception:
         return None
     return None if row is None else _row(row)
@@ -202,11 +206,7 @@ def reserve_command_request(
     token = secrets.token_urlsafe(32)
     digest = _hash(token)
     with write_transaction(db_path) as conn:
-        row = conn.execute(
-            """SELECT * FROM command_receipts
-            WHERE host_id=? AND request_id=?""",
-            (host_id, request_id),
-        ).fetchone()
+        row = _receipt(conn, host_id, request_id)
         if row is not None:
             if not _same(
                 row,
@@ -261,11 +261,7 @@ def reserve_command_request(
                     current,
                 ),
             )
-        row = conn.execute(
-            """SELECT * FROM command_receipts
-            WHERE host_id=? AND request_id=?""",
-            (host_id, request_id),
-        ).fetchone()
+        row = _receipt(conn, host_id, request_id)
     return _response("reserved", row, owner_token=token)
 
 
@@ -325,11 +321,7 @@ def mark_command_send_started(
         raise ValueError("submission hard TTL must cover the link window")
     current = _now(now)
     with write_transaction(db_path) as conn:
-        row = conn.execute(
-            """SELECT * FROM command_receipts
-            WHERE host_id=? AND request_id=?""",
-            (host_id, request_id),
-        ).fetchone()
+        row = _receipt(conn, host_id, request_id)
         if row is None:
             return _response("not_found", None)
         if row["request_fingerprint"] != canonical_fingerprint:
@@ -462,11 +454,7 @@ def mark_command_send_started(
                 required=False,
             )
         effect = send_started_effect(conn) if send_started_effect else None
-        row = conn.execute(
-            """SELECT * FROM command_receipts
-            WHERE host_id=? AND request_id=?""",
-            (host_id, request_id),
-        ).fetchone()
+        row = _receipt(conn, host_id, request_id)
     result = _response("send_started", row, owner_token=owner_token)
     if submission_id:
         result["submission_id"] = submission_id
@@ -498,11 +486,7 @@ def finish_command_request(
         raise ValueError("uncertain receipt requires uncertain status")
     current = _now(now)
     with write_transaction(db_path) as conn:
-        row = conn.execute(
-            """SELECT * FROM command_receipts
-            WHERE host_id=? AND request_id=?""",
-            (host_id, request_id),
-        ).fetchone()
+        row = _receipt(conn, host_id, request_id)
         if row is None:
             return _response("not_found", None)
         if row["request_fingerprint"] != canonical_fingerprint:
@@ -542,11 +526,7 @@ def finish_command_request(
                   AND state NOT IN('linked','ambiguous','expired')""",
                 (terminal_state, current, host_id, request_id),
             )
-        row = conn.execute(
-            """SELECT * FROM command_receipts
-            WHERE host_id=? AND request_id=?""",
-            (host_id, request_id),
-        ).fetchone()
+        row = _receipt(conn, host_id, request_id)
     return _response(terminal_state, row)
 
 
@@ -832,11 +812,7 @@ def _terminal_without_owner(
     host_id = kwargs["host_id"]
     request_id = kwargs["request_id"]
     with write_transaction(db_path) as conn:
-        row = conn.execute(
-            """SELECT * FROM command_receipts
-            WHERE host_id=? AND request_id=?""",
-            (host_id, request_id),
-        ).fetchone()
+        row = _receipt(conn, host_id, request_id)
         if row is None:
             return _response("not_found", None)
         if row["request_fingerprint"] != kwargs["canonical_fingerprint"]:
@@ -893,11 +869,7 @@ def _terminal_without_owner(
             WHERE host_id=? AND request_id=? AND state<>'linked'""",
             (state, current, host_id, request_id),
         )
-        row = conn.execute(
-            """SELECT * FROM command_receipts
-            WHERE host_id=? AND request_id=?""",
-            (host_id, request_id),
-        ).fetchone()
+        row = _receipt(conn, host_id, request_id)
     return _response(state, row)
 
 
