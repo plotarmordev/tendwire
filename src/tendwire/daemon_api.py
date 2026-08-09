@@ -14,7 +14,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future, wait
 from queue import Empty, Full, Queue
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +67,12 @@ MAX_PUBLIC_REQUEST_ID_CHARS = 128
 _SOCKET_STARTUP_LOCK_TIMEOUT_SECONDS = 1.0
 _SOCKET_STARTUP_LOCK_RETRY_SECONDS = 0.01
 _SERVER_LISTEN_BACKLOG = 32
+_BENIGN_SOCKET_CLEANUP_CODES = (
+    LocalStateErrorCode.MISSING_ENTRY,
+    LocalStateErrorCode.WRONG_TYPE,
+    LocalStateErrorCode.WRONG_OWNER,
+    LocalStateErrorCode.ENTRY_CHANGED,
+)
 _CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _RESTORE_REVISION_RE = re.compile(r"twrev1\.[A-Za-z0-9_-]+")
 _SEAL_TOKEN = object()
@@ -719,17 +725,13 @@ def _read_json_frame(
         chunk = conn.recv(4096)
         if not chunk:
             break
-        if b"\n" in chunk:
-            head, _tail = chunk.split(b"\n", 1)
-            chunks.append(head)
-            total += len(head)
-            if total > max_bytes:
-                raise DaemonProtocolError("request exceeds maximum frame size")
-            break
-        chunks.append(chunk)
-        total += len(chunk)
+        frame_chunk, separator, _tail = chunk.partition(b"\n")
+        chunks.append(frame_chunk)
+        total += len(frame_chunk)
         if total > max_bytes:
             raise DaemonProtocolError("request exceeds maximum frame size")
+        if separator:
+            break
     return b"".join(chunks)
 
 
@@ -742,10 +744,8 @@ def _local_state_unavailable(exc: LocalStateError) -> DaemonUnavailable:
 
 def _close_fd(fd: int | None) -> None:
     if fd is not None:
-        try:
+        with suppress(OSError):
             os.close(fd)
-        except OSError:
-            pass
 
 
 @contextmanager
@@ -1175,12 +1175,7 @@ class UnixSocketJSONServer:
         try:
             unlink_verified_socket_at(parent_fd, leaf, identity)
         except LocalStateError as exc:
-            if exc.code not in {
-                LocalStateErrorCode.MISSING_ENTRY,
-                LocalStateErrorCode.WRONG_TYPE,
-                LocalStateErrorCode.WRONG_OWNER,
-                LocalStateErrorCode.ENTRY_CHANGED,
-            }:
+            if exc.code not in _BENIGN_SOCKET_CLEANUP_CODES:
                 self._identity = identity
                 self._pin_fd = pin_fd
                 self._parent_fd = parent_fd
@@ -1254,10 +1249,8 @@ class UnixSocketJSONServer:
             if future.cancelled() and self.stop_event.is_set():
                 self._reject_connection(conn, "daemon_stopping")
             else:
-                try:
+                with suppress(OSError):
                     conn.close()
-                except OSError:
-                    pass
             self._admission.release()
 
     def _reject_connection(self, conn: socket.socket, code: str) -> None:
@@ -1277,10 +1270,8 @@ class UnixSocketJSONServer:
             encoded = _serialized_response(response)
             conn.settimeout(0.01)
             conn.sendall(encoded + b"\n")
-            try:
+            with suppress(OSError):
                 conn.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
             for _chunk_index in range(4):
                 try:
                     chunk = conn.recv(
@@ -1296,10 +1287,8 @@ class UnixSocketJSONServer:
         except (OSError, TimeoutError):
             pass
         finally:
-            try:
+            with suppress(OSError):
                 conn.close()
-            except OSError:
-                pass
 
     def _handle_connection(self, conn: socket.socket) -> None:
         with conn:
@@ -1383,14 +1372,10 @@ class UnixSocketJSONServer:
             with self._tracking_lock:
                 connections = tuple(self._futures.values())
             for conn in connections:
-                try:
+                with suppress(OSError):
                     conn.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                try:
+                with suppress(OSError):
                     conn.close()
-                except OSError:
-                    pass
             executor.shutdown(cancel_futures=True)
         if periodic_future is not None:
             periodic_future.cancel()
@@ -1410,12 +1395,7 @@ class UnixSocketJSONServer:
             try:
                 unlink_verified_socket_at(parent_fd, leaf, identity)
             except LocalStateError as exc:
-                if exc.code not in {
-                    LocalStateErrorCode.MISSING_ENTRY,
-                    LocalStateErrorCode.WRONG_TYPE,
-                    LocalStateErrorCode.WRONG_OWNER,
-                    LocalStateErrorCode.ENTRY_CHANGED,
-                }:
+                if exc.code not in _BENIGN_SOCKET_CLEANUP_CODES:
                     raise DaemonUnavailable(
                         "daemon socket cleanup failed",
                         code=exc.code,
@@ -1495,6 +1475,13 @@ def _validate_connected_peer(conn: socket.socket, expected_uid: int) -> None:
         )
 
 
+def _set_client_deadline(conn: socket.socket, deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise socket.timeout("daemon request deadline exceeded")
+    conn.settimeout(remaining)
+
+
 class DaemonAPIClient:
     """Blocking one-request client for the local daemon JSON socket."""
 
@@ -1527,10 +1514,7 @@ class DaemonAPIClient:
         ) as (parent_fd, leaf, identity, expected_peer_uid, address):
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise socket.timeout("daemon request deadline exceeded")
-                conn.settimeout(remaining)
+                _set_client_deadline(conn, deadline)
                 conn.connect(address)
                 _recheck_connected_socket(
                     parent_fd,
@@ -1557,10 +1541,7 @@ class DaemonAPIClient:
                 ) from None
             request_started = False
             try:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise socket.timeout("daemon request deadline exceeded")
-                conn.settimeout(remaining)
+                _set_client_deadline(conn, deadline)
                 request_started = True
                 conn.sendall(raw_payload)
                 raw_response = _read_json_frame(
