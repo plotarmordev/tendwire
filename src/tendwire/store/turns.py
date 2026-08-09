@@ -341,9 +341,8 @@ def _enqueue_projection(
     complete: bool,
     now: str,
     *,
-    binding: Any = None,
+    binding: Any,
 ) -> None:
-    binding = binding if binding is not None else _binding_row(conn, host_id, worker_id)
     if binding is None:
         raise RuntimeError("route unavailable")
     worker = _worker_public(conn, host_id, worker_id, binding)
@@ -452,8 +451,7 @@ def _apply(
     now: str,
     *,
     complete: bool,
-    expected_binding: WorkerBinding | None = None,
-    binding_row: Any = None,
+    binding: Any,
 ) -> int:
     now = canonical_utc(now)
     turn_id = str(content.get("source_turn_id") or content.get("turn_id") or "")
@@ -465,11 +463,6 @@ def _apply(
             WHERE host_id=? AND turn_id=?""",
             (host_id, turn_id),
         ).fetchone()
-        binding = (
-            binding_row
-            if binding_row is not None
-            else _binding_row(conn, host_id, worker_id, expected_binding)
-        )
         if (
             prior is None
             or binding is None
@@ -524,11 +517,6 @@ def _apply(
                 (host_id,),
             ).fetchone()[0]
         )
-    )
-    binding = (
-        binding_row
-        if binding_row is not None
-        else _binding_row(conn, host_id, worker_id, expected_binding)
     )
     if binding is None:
         return 0
@@ -699,8 +687,7 @@ def append_agent_event_and_apply_turn_for_binding(
                     content,
                     persisted_observed_at,
                     complete=complete,
-                    expected_binding=expected_binding,
-                    binding_row=presentation,
+                    binding=presentation,
                 ),
                 False,
             )
