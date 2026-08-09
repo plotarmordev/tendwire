@@ -305,6 +305,24 @@ def test_explicit_source_identity_replay_is_idempotent_and_collision_fails() -> 
         )
 
 
+def test_explicit_source_identity_enforces_its_exact_size_limit() -> None:
+    update = _update(
+        "agent_message_chunk", content={"type": "text", "text": "first"}
+    )
+    assert (
+        AcpEventProjector().normalize_session_update(
+            update, source_event_id="x" * 512
+        )
+        is not None
+    )
+    with pytest.raises(
+        AcpProjectionError, match="^ACP value has invalid source_event_id$"
+    ):
+        AcpEventProjector().normalize_session_update(
+            update, source_event_id="x" * 513
+        )
+
+
 def test_size_and_depth_limits_fail_closed() -> None:
     with pytest.raises(AcpProjectionError, match="size limit"):
         AcpEventProjector(max_event_bytes=128).normalize_session_update(

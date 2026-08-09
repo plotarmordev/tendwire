@@ -573,13 +573,9 @@ def _identifier(value: Any, label: str) -> str:
 def _explicit_source_event_id(value: Any) -> str | None:
     if value is None:
         return None
-    return _source_identifier(value, "source_event_id")
-
-
-def _source_identifier(value: Any, label: str) -> str:
-    identifier = _identifier(value, label)
+    identifier = _identifier(value, "source_event_id")
     if len(identifier) > _MAX_SOURCE_ID_CHARS:
-        raise AcpProjectionError(f"ACP value has invalid {label}")
+        raise AcpProjectionError("ACP value has invalid source_event_id")
     return identifier
 
 
