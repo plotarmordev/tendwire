@@ -142,6 +142,7 @@ def test_rollback_restores_all_mutated_state_and_exact_topology_fields() -> None
         "restore_entries 8 8",
         "restore_entries 5 7",
         "systemctl --user daemon-reload",
+        "systemctl --user reset-failed acp-r8-release-guard.service",
         "systemctl --user reset-failed acp-r8-rollout.service",
         "verify_restored_prestate",
     )
