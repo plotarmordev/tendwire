@@ -16,7 +16,7 @@ exec 9>"${LOCK}"
 chmod 600 "${LOCK}"
 flock -n 9
 
-resolve_target_terminal() {
+resolve_active_terminal() {
     local pane workspaces
     pane="$(${HERDR} pane get "${PANE}" 2>/dev/null)" || return 1
     workspaces="$(${HERDR} workspace list 2>/dev/null)" || return 1
@@ -61,9 +61,65 @@ print(terminal)
 PY
 }
 
+resolve_shell_terminal() {
+    local pane process workspaces
+    pane="$(${HERDR} pane get "${PANE}" 2>/dev/null)" || return 1
+    process="$(${HERDR} pane process-info --pane "${PANE}" 2>/dev/null)" || return 1
+    workspaces="$(${HERDR} workspace list 2>/dev/null)" || return 1
+    python3 - "${pane}" "${process}" "${workspaces}" <<'PY'
+import json
+import os
+import sys
+
+pane_raw, process_raw, workspaces_raw = sys.argv[1:]
+pane = json.loads(pane_raw)["result"]["pane"]
+info = json.loads(process_raw)["result"]["process_info"]
+workspaces = (json.loads(workspaces_raw).get("result") or {}).get("workspaces") or []
+terminal = pane.get("terminal_id")
+foreground = info.get("foreground_processes") or []
+shell_pid = info.get("shell_pid")
+shell_name = (
+    os.path.basename(str(foreground[0].get("name") or "")).lstrip("-").lower()
+    if len(foreground) == 1 else ""
+)
+
+def terminal_token(value):
+    return (
+        isinstance(value, str)
+        and value.startswith("term_")
+        and 1 <= len(value.removeprefix("term_")) <= 32
+        and all(character in "0123456789abcdef" for character in value[5:])
+    )
+
+workspace_matches = [
+    row for row in workspaces
+    if row.get("workspace_id") == "w53" and row.get("label") == "Tendwire"
+]
+valid = (
+    pane.get("pane_id") == "w53:p8"
+    and pane.get("workspace_id") == "w53"
+    and pane.get("cwd") == "/home/smith/tendwire"
+    and pane.get("agent") in {None, "unknown"}
+    and not (pane.get("agent_session") or {})
+    and terminal_token(terminal)
+    and len(workspace_matches) == 1
+    and info.get("pane_id") == "w53:p8"
+    and isinstance(shell_pid, int) and shell_pid > 1
+    and info.get("foreground_process_group_id") == shell_pid
+    and len(foreground) == 1
+    and foreground[0].get("pid") == shell_pid
+    and foreground[0].get("cwd") == "/home/smith/tendwire"
+    and shell_name in {"sh", "bash", "dash", "zsh", "fish"}
+)
+if not valid:
+    raise SystemExit(1)
+print(terminal)
+PY
+}
+
 conventional_ready() {
     local agents process workspaces terminal
-    terminal="$(resolve_target_terminal)" || return 1
+    terminal="$(resolve_active_terminal)" || return 1
     agents="$(${HERDR} agent list 2>/dev/null)" || return 1
     process="$(${HERDR} pane process-info --pane "${PANE}" 2>/dev/null)" || return 1
     workspaces="$(${HERDR} workspace list 2>/dev/null)" || return 1
@@ -117,7 +173,7 @@ PY
 
 session_ready_on_target() {
     local agents candidate process workspaces terminal
-    terminal="$(resolve_target_terminal)" || return 1
+    terminal="$(resolve_active_terminal)" || return 1
     agents="$(${HERDR} agent list 2>/dev/null)" || return 1
     workspaces="$(${HERDR} workspace list 2>/dev/null)" || return 1
     candidate="$(python3 - "${terminal}" "${agents}" "${workspaces}" <<'PY'
@@ -185,10 +241,11 @@ if session_ready_on_target; then
 fi
 
 # An anchor is required only when a candidate ACP console actually needs to be
-# dismantled.  A failed prepare before migration leaves the native session
-# intact and must remain rollback-safe even if an older transaction anchor is
-# absent or unrelated.
-anchor_terminal="$(python3 - "${ANCHOR}" <<'PY'
+# dismantled. A stopped native session has no agent/session metadata on its
+# pane, so authenticate that shell state separately instead of requiring the
+# active-session resolver before deciding whether an ACP endpoint exists.
+if status="$(${HERDR} agent acp-status tendwire-live 2>/dev/null)"; then
+    anchor_terminal="$(python3 - "${ANCHOR}" <<'PY'
 import json
 import sys
 
@@ -222,11 +279,13 @@ if (
 print(value["terminal_id"])
 PY
 )"
-test -n "${anchor_terminal}"
-
-current_terminal="$(resolve_target_terminal)"
-test -n "${current_terminal}"
-if status="$(${HERDR} agent acp-status tendwire-live 2>/dev/null)"; then
+    test -n "${anchor_terminal}"
+    if current_terminal="$(resolve_active_terminal)"; then
+        :
+    else
+        current_terminal="$(resolve_shell_terminal)"
+    fi
+    test -n "${current_terminal}"
     python3 - "${anchor_terminal}" "${current_terminal}" "${status}" <<'PY'
 import json
 import sys
@@ -264,29 +323,8 @@ for _attempt in $(seq 1 60); do
     if session_ready_on_target; then
         exit 0
     fi
-    info="$(${HERDR} pane process-info --pane "${PANE}" 2>/dev/null || true)"
-    if python3 - "${info}" <<'PY'
-import json
-import os
-import sys
-
-try:
-    value = json.loads(sys.argv[1])["result"]["process_info"]
-    foreground = value.get("foreground_processes") or []
-    shell = value.get("shell_pid")
-    name = os.path.basename(str(foreground[0].get("name") or "")) if len(foreground) == 1 else ""
-except (ValueError, KeyError):
-    raise SystemExit(1)
-raise SystemExit(
-    0 if value.get("pane_id") == "w53:p8"
-    and len(foreground) == 1
-    and foreground[0].get("pid") == shell
-    and foreground[0].get("cwd") == "/home/smith/tendwire"
-    and name in {"sh", "bash", "dash", "zsh", "fish"}
-    else 1
-)
-PY
-    then
+    if shell_terminal="$(resolve_shell_terminal)"; then
+        test -n "${shell_terminal}"
         command="$(python3 - "${CODEX}" "${SESSION}" <<'PY'
 import shlex
 import sys

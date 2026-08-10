@@ -25,6 +25,7 @@ registered=0
 tendwire_started=0
 PANE=
 STOPPED_GROUP=
+FREEZE_IDENTITY=
 
 write_status() {
     local phase="$1"
@@ -193,7 +194,7 @@ PY
 
 terminate_visible_codex() {
     local first_agents_json second_agents_json pre_stop_agents_json
-    local process_json stopped_agents_json stopped_process_json
+    local process_json
     # Require a stable idle observation across a quiet interval.  Telegram
     # writers are still stopped at this point, so any intervening turn can only
     # come from the local pane and changes the compared agent snapshot.
@@ -247,13 +248,15 @@ PY
     process_json="$(${HERDR} pane process-info --pane "${PANE}")"
     pre_stop_agents_json="$(${HERDR} agent list)"
     validate_idle_visible_codex "${pre_stop_agents_json}"
-    STOPPED_GROUP="$(python3 - "${PANE}" "${CWD}" "${process_json}" <<'PY'
+    FREEZE_IDENTITY="$(mktemp "${STATE_DIR}/freeze-identity.XXXXXX")"
+    chmod 600 "${FREEZE_IDENTITY}"
+    STOPPED_GROUP="$(python3 - "${PANE}" "${CWD}" "${process_json}" \
+        "${FREEZE_IDENTITY}" <<'PY'
 import json
 import os
-import signal
 import sys
 
-expected_pane, expected_cwd, raw = sys.argv[1:]
+expected_pane, expected_cwd, raw, identity_path = sys.argv[1:]
 info = json.loads(raw)["result"]["process_info"]
 foreground = info.get("foreground_processes") or []
 shell_pid = info.get("shell_pid")
@@ -270,92 +273,162 @@ if not (
     and group != shell_pid
 ):
     raise SystemExit(1)
-os.killpg(group, signal.SIGSTOP)
+
+def proc_identity(pid):
+    raw_stat = open(f"/proc/{pid}/stat", encoding="utf-8").read().strip()
+    prefix, tail = raw_stat.rsplit(") ", 1)
+    parsed_pid, comm = prefix.split(" (", 1)
+    fields = tail.split()
+    return {
+        "pid": int(parsed_pid),
+        "comm": comm,
+        "state": fields[0],
+        "pgrp": int(fields[2]),
+        "session": int(fields[3]),
+        "tty_nr": int(fields[4]),
+        "tpgid": int(fields[5]),
+        "starttime": int(fields[19]),
+        "cwd": os.readlink(f"/proc/{pid}/cwd"),
+    }
+
+members = []
+for entry in os.scandir("/proc"):
+    if not entry.name.isdigit():
+        continue
+    try:
+        identity = proc_identity(int(entry.name))
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        continue
+    if identity["pgrp"] == group:
+        members.append(identity)
+members.sort(key=lambda item: item["pid"])
+foreground_by_pid = {item.get("pid"): item for item in foreground}
+if (
+    {item["pid"] for item in members} != set(foreground_by_pid)
+    or any(item["cwd"] != expected_cwd for item in members)
+    or any(
+        item["comm"]
+        != os.path.basename(str(foreground_by_pid[item["pid"]].get("name") or ""))
+        for item in members
+    )
+):
+    raise SystemExit(1)
+shell = proc_identity(shell_pid)
+member_ttys = {item["tty_nr"] for item in members}
+member_sessions = {item["session"] for item in members}
+if (
+    shell["pgrp"] != shell_pid
+    or shell["cwd"] != expected_cwd
+    or len(member_ttys) != 1
+    or next(iter(member_ttys)) <= 0
+    or shell["tty_nr"] not in member_ttys
+    or len(member_sessions) != 1
+    or shell["session"] not in member_sessions
+    or any(item["tpgid"] != group for item in members)
+):
+    raise SystemExit(1)
+value = {"schema_version": 1, "group": group, "shell": shell, "members": members}
+temporary = f"{identity_path}.tmp.{os.getpid()}"
+with open(temporary, "x", encoding="utf-8") as target:
+    os.chmod(temporary, 0o600)
+    json.dump(value, target, sort_keys=True, separators=(",", ":"))
+    target.write("\n")
+    target.flush()
+    os.fsync(target.fileno())
+os.replace(temporary, identity_path)
 print(group)
 PY
 )"
     test "${STOPPED_GROUP}" -gt 1
+    write_status process_identity_captured
+    kill -STOP -- "-${STOPPED_GROUP}"
+    write_status group_stopped
 
-    # Stopping the full foreground process group closes the final local-input
-    # race. Re-read both identities while it cannot advance; a mismatch resumes
-    # the original group and aborts without killing the user's session.
-    if ! stopped_agents_json="$(${HERDR} agent list)" \
-        || ! stopped_process_json="$(${HERDR} pane process-info --pane "${PANE}")" \
-        || ! python3 - "${PANE}" "${CWD}" "${session_id}" "${terminal_id}" \
-            "${pre_stop_agents_json}" "${stopped_agents_json}" \
-            "${process_json}" "${stopped_process_json}" "${STOPPED_GROUP}" <<'PY'
+    # Bash correctly reclaims the tty after the foreground job is stopped, so
+    # Herdr's post-stop process view is the shell rather than the frozen Codex
+    # group. Prove the captured group directly through procfs instead: every
+    # member must be the same process generation and stopped by SIGSTOP, with
+    # no new member or third foreground group admitted.
+    if ! python3 - "${CWD}" "${FREEZE_IDENTITY}" <<'PY'
 import json
 import os
 import sys
+import time
 
-expected_pane, expected_cwd, expected_session, expected_terminal, before_agents_raw, after_agents_raw, before_process_raw, after_process_raw, raw_group = sys.argv[1:]
-expected_group = int(raw_group)
+expected_cwd, identity_path = sys.argv[1:]
+captured = json.load(open(identity_path, encoding="utf-8"))
+if set(captured) != {"schema_version", "group", "shell", "members"}:
+    raise SystemExit(1)
+if type(captured["schema_version"]) is not int or captured["schema_version"] != 1:
+    raise SystemExit(1)
+group = captured["group"]
+shell_before = captured["shell"]
+members_before = captured["members"]
 
-def agent(raw):
-    rows = (json.loads(raw).get("result") or {}).get("agents") or []
-    matches = [
-        row for row in rows
-        if row.get("pane_id") == expected_pane
-        and row.get("workspace_id") == "w53"
-        and row.get("terminal_id") == expected_terminal
-        and row.get("agent") == "codex"
-        and row.get("name") is None
-        and row.get("cwd") == expected_cwd
-        and row.get("focused") is True
-        and row.get("agent_status") == "idle"
-        and (row.get("agent_session") or {}) == {
-            "agent": "codex", "kind": "id", "source": "herdr:codex",
-            "value": expected_session,
-        }
-    ]
-    if len(matches) != 1:
-        raise SystemExit(1)
-    row = matches[0]
-    if row.get("turn") != (row.get("last_completed_turn") or {}).get("turn"):
-        raise SystemExit(1)
-    return {key: row.get(key) for key in (
-        "pane_id", "workspace_id", "terminal_id", "agent", "name",
-        "focused", "agent_status", "agent_session", "turn",
-        "last_completed_turn",
-    )}
-
-def process(raw):
-    info = json.loads(raw)["result"]["process_info"]
-    foreground = info.get("foreground_processes") or []
-    identity = [
-        {
-            "pid": item.get("pid"),
-            "name": os.path.basename(str(item.get("name") or "")),
-            "cwd": item.get("cwd"),
-        }
-        for item in foreground
-    ]
-    if (
-        info.get("pane_id") != expected_pane
-        or info.get("foreground_process_group_id") != expected_group
-        or not identity
-        or sum(item["name"] == "codex" for item in identity) != 1
-        or any(item["name"] not in {"node", "codex"} for item in identity)
-        or any(item["cwd"] != expected_cwd for item in identity)
-    ):
-        raise SystemExit(1)
+def proc_identity(pid):
+    raw_stat = open(f"/proc/{pid}/stat", encoding="utf-8").read().strip()
+    prefix, tail = raw_stat.rsplit(") ", 1)
+    parsed_pid, comm = prefix.split(" (", 1)
+    fields = tail.split()
     return {
-        "pane_id": info.get("pane_id"),
-        "shell_pid": info.get("shell_pid"),
-        "foreground_process_group_id": info.get("foreground_process_group_id"),
-        "foreground_processes": identity,
+        "pid": int(parsed_pid),
+        "comm": comm,
+        "state": fields[0],
+        "pgrp": int(fields[2]),
+        "session": int(fields[3]),
+        "tty_nr": int(fields[4]),
+        "tpgid": int(fields[5]),
+        "starttime": int(fields[19]),
+        "cwd": os.readlink(f"/proc/{pid}/cwd"),
     }
 
-if agent(before_agents_raw) != agent(after_agents_raw):
-    raise SystemExit(1)
-if process(before_process_raw) != process(after_process_raw):
-    raise SystemExit(1)
+def group_members():
+    members = []
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        try:
+            identity = proc_identity(int(entry.name))
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if identity["pgrp"] == group:
+            members.append(identity)
+    return sorted(members, key=lambda item: item["pid"])
+
+stable_fields = ("pid", "comm", "pgrp", "session", "tty_nr", "starttime", "cwd")
+expected = [{key: item[key] for key in stable_fields} for item in members_before]
+deadline = time.monotonic() + 0.25
+while True:
+    members = group_members()
+    actual = [{key: item[key] for key in stable_fields} for item in members]
+    shell = proc_identity(shell_before["pid"])
+    shell_actual = {key: shell[key] for key in stable_fields}
+    shell_expected = {key: shell_before[key] for key in stable_fields}
+    foreground_groups = {item["tpgid"] for item in [*members, shell]}
+    if actual != expected or shell_actual != shell_expected:
+        raise SystemExit(1)
+    if any(item["cwd"] != expected_cwd for item in members):
+        raise SystemExit(1)
+    if not foreground_groups <= {group, shell_before["pgrp"]}:
+        raise SystemExit(1)
+    if members and all(item["state"] == "T" for item in members):
+        break
+    if time.monotonic() >= deadline:
+        raise SystemExit(1)
+    time.sleep(0.01)
 PY
     then
         kill -CONT -- "-${STOPPED_GROUP}" >/dev/null 2>&1 || true
         STOPPED_GROUP=
+        rm -f -- "${FREEZE_IDENTITY}"
+        FREEZE_IDENTITY=
         return 1
     fi
+    write_status frozen_identity_verified
+    rm -f -- "${FREEZE_IDENTITY}"
+    FREEZE_IDENTITY=
+    # Arm rollback before the first destructive signal.
+    exited=1
     kill -TERM -- "-${STOPPED_GROUP}"
     kill -CONT -- "-${STOPPED_GROUP}" >/dev/null 2>&1 || true
     STOPPED_GROUP=
@@ -512,6 +585,10 @@ restore_conventional_session() {
     if [[ -n "${STOPPED_GROUP}" ]]; then
         kill -CONT -- "-${STOPPED_GROUP}" >/dev/null 2>&1 || true
         STOPPED_GROUP=
+    fi
+    if [[ -n "${FREEZE_IDENTITY}" ]]; then
+        rm -f -- "${FREEZE_IDENTITY}" >/dev/null 2>&1 || true
+        FREEZE_IDENTITY=
     fi
     if [[ "${tendwire_started}" -eq 1 ]]; then
         systemctl --user stop tendwired.service >/dev/null 2>&1 || true

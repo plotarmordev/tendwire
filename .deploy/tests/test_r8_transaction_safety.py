@@ -142,8 +142,10 @@ def test_rollback_restores_all_mutated_state_and_exact_topology_fields() -> None
         "restore_entries 8 8",
         "restore_entries 5 7",
         "systemctl --user daemon-reload",
+        "systemctl --user reset-failed acp-r8-rollout.service",
         "verify_restored_prestate",
     )
+    assert "reset-failed acp-r8-rollback.service" not in rollback
 
 
 def test_terminal_generation_is_dynamic_and_monitoring_uses_the_migration_anchor() -> None:
@@ -208,18 +210,30 @@ def test_terminal_generation_is_dynamic_and_monitoring_uses_the_migration_anchor
         'all(character in "0123456789abcdef" for character in token[5:])',
         'expected_terminals = {anchor_terminal, current_terminal}',
         'worker.get("terminal_id") in expected_terminals',
+        "resolve_shell_terminal()",
+        'pane.get("agent") in {None, "unknown"}',
+        'not (pane.get("agent_session") or {})',
+        'info.get("foreground_process_group_id") == shell_pid',
     ):
         assert token in restore
     assert "term_6589e193be915a" not in restore
     assert restore.count("expected_terminals =") == 1
     ordered(
         restore,
+        'if status="$(${HERDR} agent acp-status tendwire-live',
         'anchor_terminal="$(python3 - "${ANCHOR}"',
-        'current_terminal="$(resolve_target_terminal)"',
-        'agent acp-status tendwire-live',
+        'current_terminal="$(resolve_active_terminal)"',
+        'current_terminal="$(resolve_shell_terminal)"',
         'expected_terminals = {anchor_terminal, current_terminal}',
         'worker.get("terminal_id") in expected_terminals',
         'agent acp-unregister tendwire-live',
+    )
+    assert 'current_terminal="$(resolve_target_terminal)"' not in restore
+    ordered(
+        restore,
+        'if shell_terminal="$(resolve_shell_terminal)"; then',
+        '"${HERDR}" pane run "${PANE}" "${command}"',
+        "if conventional_ready || session_ready_on_target; then",
     )
 
 
@@ -518,9 +532,26 @@ def test_idle_migration_requires_quiescent_identical_snapshots() -> None:
         'second_agents_json="$(${HERDR} agent list)"',
         "if target(first_raw) != target(second_raw)",
         "validate_idle_visible_codex",
-        "os.killpg(group, signal.SIGSTOP)",
-        'stopped_agents_json="$(${HERDR} agent list)"',
-        "if agent(before_agents_raw) != agent(after_agents_raw)",
+        'FREEZE_IDENTITY="$(mktemp',
+        'members.sort(key=lambda item: item["pid"])',
+        "write_status process_identity_captured",
+        'kill -STOP -- "-${STOPPED_GROUP}"',
+        "write_status group_stopped",
+        'all(item["state"] == "T" for item in members)',
+        "write_status frozen_identity_verified",
+        "exited=1",
         'kill -TERM -- "-${STOPPED_GROUP}"',
         'kill -CONT -- "-${STOPPED_GROUP}"',
     )
+    for token in (
+        '"pid", "comm", "pgrp", "session", "tty_nr", "starttime", "cwd"',
+        'shell["tty_nr"] not in member_ttys',
+        'shell["session"] not in member_sessions',
+        'actual != expected or shell_actual != shell_expected',
+        'foreground_groups <= {group, shell_before["pgrp"]}',
+        "time.monotonic() + 0.25",
+    ):
+        assert token in body
+    assert "stopped_process_json" not in body
+    assert "stopped_agents_json" not in body
+    assert "os.killpg(group, signal.SIGSTOP)" not in body

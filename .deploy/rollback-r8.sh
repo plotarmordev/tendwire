@@ -264,6 +264,11 @@ systemctl --user daemon-reload
 # required to be canonical inactive/success, so reset its systemd result after
 # restoring the exact fragment and before comparing the frozen monitor state.
 systemctl --user reset-failed acp-frozen-live-monitor.service >/dev/null 2>&1 || true
+# A failed rollout remains ActiveState=failed even after its transient fragment
+# is removed and daemon-reload reports LoadState=not-found. The captured r8
+# prestate is inactive/not-found, so clear only that stale result before the
+# exact unit-state comparison. Never reset the running rollback unit itself.
+systemctl --user reset-failed acp-r8-rollout.service >/dev/null 2>&1 || true
 verify_restored_prestate
 
 reset_started=false

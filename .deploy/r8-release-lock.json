@@ -46,7 +46,7 @@
     "platform": "linux-arm64"
   },
   "operational_sha256": {
-    ".deploy/acp-migrate-current-pane-r8.sh": "7f93969c12577e88ce524a3b06fda2255132c9a6b10d46abd29b2b92809e5410",
+    ".deploy/acp-migrate-current-pane-r8.sh": "16bc4e1048a00c2a659156b84fa1ebc305c9d9ecdcea59ad6921796e976baf22",
     ".deploy/acp-r8-release-guard.service": "77e280a86ab91d04ef06bc5b809fc4cc8f8d06719d5be5cb1795ea67fa1d3db3",
     ".deploy/acp-r8-rollback.service": "0cc97b04a68040dc3e5b47b709cce651933a4b1bd4dc3c1b67a8a03f0684ec4b",
     ".deploy/acp-r8-rollout.service": "7e18353888bda5ee39f51869e1fbcb5989bf04e4bcf0a4f6e85c1ecd86725222",
@@ -62,15 +62,15 @@
     ".deploy/recover-stale-r8-artifacts.py": "1a834459b8e6abc3112d7ac1fa3db365345c837b5e282dbe05c3436206408d50",
     ".deploy/release-guard-r8.py": "90d2ed9cace611a907efc9fb3cca16380cf3b302f3fa0372f78e1faffe3c7bd9",
     ".deploy/release-integrity-r8.py": "60dd3884c503ccd9132003fae44caf12e5a9b0d784c7471d5589ecc11f614869",
-    ".deploy/restore-current-pane-r8.sh": "4d04493a4870221607effc710bad9e6fde7c5e22f2a4dc39f1f96a7f1b853633",
-    ".deploy/rollback-r8.sh": "8034823dbd2ad7b7a552fe2b1e54cbc17b76de9b48b7b66da84bd4760ba090c2",
+    ".deploy/restore-current-pane-r8.sh": "0c21478bb2a4d74515efe00509f79d35da1c40364cc4f7cf23c8bc3a213784b7",
+    ".deploy/rollback-r8.sh": "9470d8c32e7522b3ed524a6bd0380c26742ee2918785195b25666a75e4bd78f1",
     ".deploy/rollout-acp-release-r8.sh": "d748c3f5ab7ff3ced5fd6f0f0ba43cc60bb388f2b41277633a04c67a8df13aa7",
     ".deploy/tests/r8_failure_injection_harness.py": "d4baf9d12824439dcc8239f4562f53bc8ea66300ea0096a8e47ef30c8a523a36",
     ".deploy/tests/test_herdr_console_canary_r8.py": "252500a1473481b89c6569a66ee7b83afc4708003ab9ea808fadadf4b28f2145",
     ".deploy/tests/test_r8_failure_injection_harness.py": "c3bd81fab7a3a59e4780400eb2a14b714d037f1f336d82a87e19326e36e0adbe",
     ".deploy/tests/test_r8_stale_owned_recovery.py": "04e836adf1030db970c78fbd26a996a3d270c45129956e3765652284b20cff1f",
     ".deploy/tests/test_r8_topology_normalizer.py": "256fa417463361a9984b3afdcad83b51954e0bdbd9f00195fb3c0a9096900508",
-    ".deploy/tests/test_r8_transaction_safety.py": "526c7efabf83cd4cad9f5a33ba0f58e7b886d973fdad1ec86e6e3d0f495c68ea",
+    ".deploy/tests/test_r8_transaction_safety.py": "4ad17d14c9c201cce626ac75e9f859e32b0ee21f4716189a64cec3528e145ad0",
     ".deploy/topology-normalizer-r8.py": "9c6fb1358e1253c2cd403e0aeaf3ba9f7b219799f3c8f86dfe51f5c1cfd6bc49",
     ".deploy/verify-live-telegram-r8.py": "1152f67ba6d05a856fa5abb74236c3c1ac6bf9556b02e3070e47d21867fb82c3"
   }
